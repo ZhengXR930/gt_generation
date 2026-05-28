@@ -146,6 +146,8 @@ Append all commands, decisions, failures, and evidence summaries to `generation.
 
 Do not rely on separate intermediate summary JSON files for final review. If a stage produces useful intermediate observations, summarize them in `generation.log` and copy the important status into `sample_state.json`.
 
+When a build requires packages beyond the common Docker image, record the package names in `build.sh` and mention them in `generation.log`. Do not mutate the shared Docker image for a single project.
+
 ## Cleanup Rule
 
 After a completed or terminal failed run:
@@ -157,4 +159,3 @@ After a completed or terminal failed run:
 - Delete large temporary files.
 
 Never delete the dataset sample directory under `final_dataset/pocs/<sample_id>/`.
-

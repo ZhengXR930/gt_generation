@@ -26,12 +26,14 @@ This skill writes validation results into `sample_state.json` and `generation.lo
 Check:
 
 - Required top-level schema exists.
-- Each vulnerability has `source`, `sink`, `call_chain`, `data_flow_chain`, and `root_cause`.
+- The GT has `source`, `sink`, `root_cause`, `trace`, and `poc`.
 - Source and sink file/line/function fields are present.
+- Root cause file/line/function fields are present.
 - Source and sink lines exist in vulnerable source when source is available.
 - Sink is supported by sanitizer or Valgrind trace.
-- Root cause explanation is consistent with patch diff.
-- Data-flow chain starts at attacker-controlled input and ends at the sink.
+- Root cause explanation is consistent with the external patch diff.
+- `trace` starts at attacker-controlled input or trigger entry and ends at the sink.
+- `trace` includes the data/state transitions needed to understand why the sink is unsafe.
 - Indirect call, callback, parser dispatch, or generated-code edges are not silently skipped when relevant.
 - Normalized issue description is not contradicted by the reproduced crash.
 
@@ -57,4 +59,3 @@ Use `needs_human_review` when:
 ## Final Rule
 
 Do not mark a sample `completed` only because it has a crash trace. Completion requires a coherent source-to-sink explanation supported by traces and source inspection.
-

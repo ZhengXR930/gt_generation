@@ -1,6 +1,6 @@
 ---
 name: instrumentation-coverage-check
-description: Check whether source, sink, call-chain, and data-flow locations in generated memory-safety GT are actually covered by the PoC. Use this after a draft GT exists and before final validation.
+description: Check whether source, sink, root-cause, and trace locations in generated memory-safety GT are actually covered by the PoC. Use this after a draft GT exists and before final validation.
 ---
 
 # Instrumentation Coverage Check
@@ -36,9 +36,8 @@ Instrument locations from:
 
 - `source`
 - `sink`
-- `call_chain`
-- `data_flow_chain`
-- Fine-grained slice statements when available
+- `root_cause`
+- `trace`
 
 Deduplicate identical file/line/function triples.
 
@@ -68,4 +67,3 @@ Use these failure types:
 - `instrumentation_failed`
 - `instrumentation_not_covered`
 - `needs_human_review`
-

@@ -28,19 +28,40 @@ Create and preserve `gt_results/<sample_id>/build.sh`. This script must be suffi
 
 The script should:
 
+- Start with a project dependency section.
+- Install only the extra apt packages needed by this project.
 - Record environment variables.
 - Record configure/cmake/make commands.
 - Build sanitizer and Valgrind variants in separate directories.
 - Use debug symbols.
 - Avoid destructive changes to source unless documented.
 
+Use this pattern near the top of `build.sh`:
+
+```bash
+install_project_deps() {
+  local deps=(
+    # Example: ruby rake bison libpcre2-dev
+  )
+  if [ "${#deps[@]}" -gt 0 ]; then
+    apt-get update
+    apt-get install -y --no-install-recommends "${deps[@]}"
+    rm -rf /var/lib/apt/lists/*
+  fi
+}
+```
+
+Keep the dependency list explicit even when it is short. Do not hide project-specific dependencies by baking them into `gt-memory-env:latest`.
+
 ## Sanitizer Build
 
-Prefer Clang with:
+Prefer GCC with:
 
 ```text
 -g -O1 -fno-omit-frame-pointer
 ```
+
+Use Clang only when its sanitizer runtime is available in the active Docker architecture. If Clang sanitizer linking fails, switch the sample build recipe to GCC rather than expanding the common Docker image for that single project.
 
 Use the sanitizer matching the issue when known:
 
@@ -74,4 +95,3 @@ Use these failure types:
 - `sanitizer_build_failed`
 - `valgrind_build_failed`
 - `needs_human_review`
-
