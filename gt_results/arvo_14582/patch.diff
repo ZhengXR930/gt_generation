@@ -1,0 +1,218 @@
+--- a/lwan/src/lib/lwan-request.c
++++ b/lwan/src/lib/lwan-request.c
+@@ -66,8 +66,6 @@
+     struct lwan_value cookie;		/* Cookie: */
+     struct lwan_value query_string;	/* Stuff after ? and before # */
+     struct lwan_value fragment;		/* Stuff after # */
+-
+-    struct lwan_value authorization;	/* Authorization: */
+ 
+     struct lwan_value post_data;	/* Request body for POST */
+     struct lwan_value content_type;	/* Content-Type: for POST */
+@@ -138,11 +136,14 @@
+ }
+ 
+ static char *
+-strsep_char(char *strp, char delim)
++strsep_char(char *strp, const char *end, char delim)
+ {
+     char *ptr;
+ 
+     if (UNLIKELY(!strp))
++        return NULL;
++
++    if (UNLIKELY(strp > end))
+         return NULL;
+ 
+     ptr = strchr(strp, delim);
+@@ -168,10 +169,10 @@
+     size = (unsigned int) (end + 2 - buffer);
+ 
+     protocol = buffer + sizeof("PROXY ") - 1;
+-    src_addr = strsep_char(protocol, ' ');
+-    dst_addr = strsep_char(src_addr, ' ');
+-    src_port = strsep_char(dst_addr, ' ');
+-    dst_port = strsep_char(src_port, ' ');
++    src_addr = strsep_char(protocol, end, ' ');
++    dst_addr = strsep_char(src_addr, end, ' ');
++    src_port = strsep_char(dst_addr, end, ' ');
++    dst_port = strsep_char(src_port, end, ' ');
+ 
+     if (UNLIKELY(!dst_port))
+         return NULL;
+@@ -351,6 +352,7 @@
+ {
+     struct lwan_key_value *kv;
+     char *ptr = helper_value->value;
++    const char *end = helper_value->value + helper_value->len;
+ 
+     if (!helper_value->len)
+         return;
+@@ -369,9 +371,9 @@
+             goto error;
+ 
+         key = ptr;
+-        ptr = strsep_char(key, separator);
+-
+-        value = strsep_char(key, '=');
++        ptr = strsep_char(key, end, separator);
++
++        value = strsep_char(key, end, '=');
+         if (UNLIKELY(!value)) {
+             value = "";
+         } else if (UNLIKELY(decode_value(value) < 0)) {
+@@ -526,35 +528,42 @@
+ {
+     char *buffer_end = helper->buffer->value + helper->buffer->len;
+     char **header_start = helper->header_start;
++    size_t n_headers = 0;
+     char *p;
+-    size_t n_headers = 0;
+-    bool ret = false;
+-
+-    for (p = buffer + 1; n_headers < N_HEADER_START && buffer_end > p;) {
++
++    for (p = buffer + 1;;) {
+         char *next_chr = p;
+         char *next_hdr = memchr(next_chr, '\r', (size_t)(buffer_end - p));
+ 
+         if (!next_hdr)
+-            goto process;
++            break;
+ 
+         if (next_chr == next_hdr) {
+-            STRING_SWITCH_SMALL(next_hdr) {
+-            case MULTICHAR_CONSTANT_SMALL('\r', '\n'):
+-                helper->next_request = next_hdr + 2;
++            if (buffer_end - next_chr > 2) {
++                STRING_SWITCH_SMALL (next_hdr) {
++                case MULTICHAR_CONSTANT_SMALL('\r', '\n'):
++                    helper->next_request = next_hdr + 2;
++                }
+             }
+-            goto process;
+-        }
+-
+-        header_start[n_headers++] = next_chr;
+-        header_start[n_headers++] = next_hdr;
++            break;
++        }
++
++        /* Is there at least a space for a minimal (H)eader and a (V)alue? */
++        if (LIKELY(next_hdr - next_chr > (ptrdiff_t)(sizeof("H: V") - 1))) {
++            header_start[n_headers++] = next_chr;
++            header_start[n_headers++] = next_hdr;
++        } else {
++            /* Better to abort early if there's no space. */
++            return false;
++        }
+ 
+         p = next_hdr + 2;
+-    }
+-
+-    goto out; /* Header array isn't large enough */
+-
+-process:
+-    ret = true;
++
++        if (n_headers >= N_HEADER_START || p >= buffer_end) {
++            helper->n_header_start = 0;
++            return false;
++        }
++    }
+ 
+     for (size_t i = 0; i < n_headers; i += 2) {
+         char *end = header_start[i + 1];
+@@ -570,9 +579,6 @@
+                 helper->accept_encoding = HEADER("-Encoding");
+                 break;
+             }
+-            break;
+-        case MULTICHAR_CONSTANT_L('A', 'u', 't', 'h'):
+-            helper->authorization = HEADER("Authorization");
+             break;
+         case MULTICHAR_CONSTANT_L('C', 'o', 'n', 'n'):
+             helper->connection = HEADER("Connection");
+@@ -601,9 +607,8 @@
+         }
+     }
+ 
+-out:
+     helper->n_header_start = n_headers;
+-    return ret;
++    return true;
+ }
+ #undef HEADER_LENGTH
+ #undef HEADER
+@@ -796,10 +801,11 @@
+             helper->next_request = NULL;
+         } else {
+             /* FIXME: This memmove() could be eventually removed if a better
+-             * stucture were used for the request buffer. */
+-            buffer->len = new_len;
+-            memmove(buffer->value, helper->next_request, buffer->len);
+-            total_read = buffer->len;
++             * stucture (maybe a ringbuffer, reading with readv(), and each
++             * pointer is coro_strdup() if they wrap around?) were used for
++             * the request buffer.  */
++            total_read = buffer->len = new_len;
++            memmove(buffer->value, helper->next_request, new_len);
+             goto try_to_finalize;
+         }
+     }
+@@ -1186,8 +1192,12 @@
+ 
+ static enum lwan_http_status parse_http_request(struct lwan_request *request)
+ {
++    const size_t min_request_size = sizeof("GET / HTTP/1.1\r\n\r\n") - 1;
+     struct lwan_request_parser_helper *helper = request->helper;
+     char *buffer = helper->buffer->value;
++
++    if (UNLIKELY(helper->buffer->len < min_request_size))
++        return HTTP_BAD_REQUEST;
+ 
+     if (request->flags & REQUEST_ALLOW_PROXY_REQS) {
+         /* REQUEST_ALLOW_PROXY_REQS will be cleared in lwan_process_request() */
+@@ -1198,6 +1208,10 @@
+     }
+ 
+     buffer = ignore_leading_whitespace(buffer);
++
++    if (UNLIKELY(buffer >= helper->buffer->value + helper->buffer->len -
++                               min_request_size))
++        return HTTP_BAD_REQUEST;
+ 
+     char *path = identify_http_method(request, buffer);
+     if (UNLIKELY(!path))
+@@ -1284,13 +1298,18 @@
+ static enum lwan_http_status prepare_for_response(struct lwan_url_map *url_map,
+                                                   struct lwan_request *request)
+ {
+-    struct lwan_request_parser_helper *helper = request->helper;
+-
+     request->url.value += url_map->prefix_len;
+     request->url.len -= url_map->prefix_len;
+ 
+     if (url_map->flags & HANDLER_MUST_AUTHORIZE) {
+-        if (!lwan_http_authorize(request, &helper->authorization,
++        const char *authorization =
++            lwan_request_get_header(request, "Authorization");
++        struct lwan_value header = {
++            .value = (char*)authorization,
++            .len = authorization ? strlen(authorization) : 0,
++        };
++
++        if (!lwan_http_authorize(request, &header,
+                                  url_map->authorization.realm,
+                                  url_map->authorization.password_file))
+             return HTTP_NOT_AUTHORIZED;
+@@ -1676,6 +1695,9 @@
+         FINALIZER_DONE)
+         return 0;
+ 
++    /* read_from_request_socket() NUL-terminates the string */
++    data_copy[length - 1] = '\0';
++
+     if (parse_http_request(&request) == HTTP_OK) {
+         size_t gen = coro_deferred_get_generation(coro);
+ 

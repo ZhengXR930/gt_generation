@@ -1,0 +1,2239 @@
+--- a/fuzz/pdf_fuzzer.cc
++++ b/fuzz/pdf_fuzzer.cc
+@@ -41,6 +41,7 @@
+       continue;
+     }
+     r.render_page(p);
++    p->text_list();
+     delete p;
+   }
+ 
+--- a/libfuzzer/FuzzerDriver.cpp
++++ b/libfuzzer/FuzzerDriver.cpp
+@@ -1,9 +1,8 @@
+ //===- FuzzerDriver.cpp - FuzzerDriver function and flags -----------------===//
+ //
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ //===----------------------------------------------------------------------===//
+ // FuzzerDriver and flag parsing.
+@@ -11,12 +10,13 @@
+ 
+ #include "FuzzerCommand.h"
+ #include "FuzzerCorpus.h"
++#include "FuzzerFork.h"
+ #include "FuzzerIO.h"
+ #include "FuzzerInterface.h"
+ #include "FuzzerInternal.h"
++#include "FuzzerMerge.h"
+ #include "FuzzerMutate.h"
+ #include "FuzzerRandom.h"
+-#include "FuzzerShmem.h"
+ #include "FuzzerTracePC.h"
+ #include <algorithm>
+ #include <atomic>
+@@ -26,10 +26,16 @@
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include <fstream>
+ 
+ // This function should be present in the libFuzzer so that the client
+ // binary can test for its existence.
++#if LIBFUZZER_MSVC
++extern "C" void __libfuzzer_is_present() {}
++#pragma comment(linker, "/include:__libfuzzer_is_present")
++#else
+ extern "C" __attribute__((used)) void __libfuzzer_is_present() {}
++#endif  // LIBFUZZER_MSVC
+ 
+ namespace fuzzer {
+ 
+@@ -316,10 +322,8 @@
+   assert(Cmd.hasArgument(InputFilePath));
+   Cmd.removeArgument(InputFilePath);
+ 
+-  auto LogFilePath = DirPlusFile(
+-      TmpDir(), "libFuzzerTemp." + std::to_string(GetPid()) + ".txt");
+-  auto TmpFilePath = DirPlusFile(
+-      TmpDir(), "libFuzzerTemp." + std::to_string(GetPid()) + ".repro");
++  auto LogFilePath = TempPath(".txt");
++  auto TmpFilePath = TempPath(".repro");
+   Cmd.addArgument(TmpFilePath);
+   Cmd.setOutputFile(LogFilePath);
+   Cmd.combineOutAndErr();
+@@ -379,8 +383,7 @@
+     BaseCmd.addFlag("max_total_time", "600");
+   }
+ 
+-  auto LogFilePath = DirPlusFile(
+-      TmpDir(), "libFuzzerTemp." + std::to_string(GetPid()) + ".txt");
++  auto LogFilePath = TempPath(".txt");
+   BaseCmd.setOutputFile(LogFilePath);
+   BaseCmd.combineOutAndErr();
+ 
+@@ -464,6 +467,34 @@
+   return 0;
+ }
+ 
++void Merge(Fuzzer *F, FuzzingOptions &Options, const Vector<std::string> &Args,
++           const Vector<std::string> &Corpora, const char *CFPathOrNull) {
++  if (Corpora.size() < 2) {
++    Printf("INFO: Merge requires two or more corpus dirs\n");
++    exit(0);
++  }
++
++  Vector<SizedFile> OldCorpus, NewCorpus;
++  GetSizedFilesFromDir(Corpora[0], &OldCorpus);
++  for (size_t i = 1; i < Corpora.size(); i++)
++    GetSizedFilesFromDir(Corpora[i], &NewCorpus);
++  std::sort(OldCorpus.begin(), OldCorpus.end());
++  std::sort(NewCorpus.begin(), NewCorpus.end());
++
++  std::string CFPath = CFPathOrNull ? CFPathOrNull : TempPath(".txt");
++  Vector<std::string> NewFiles;
++  Set<uint32_t> NewFeatures, NewCov;
++  CrashResistantMerge(Args, OldCorpus, NewCorpus, &NewFiles, {}, &NewFeatures,
++                      {}, &NewCov, CFPath, true);
++  for (auto &Path : NewFiles)
++    F->WriteToOutputCorpus(FileToVector(Path, Options.MaxLen));
++  // We are done, delete the control file if it was a temporary one.
++  if (!Flags.merge_control_file)
++    RemoveFile(CFPath);
++
++  exit(0);
++}
++
+ int AnalyzeDictionary(Fuzzer *F, const Vector<Unit>& Dict,
+                       UnitVector& Corpus) {
+   Printf("Started dictionary minimization (up to %d tests)\n",
+@@ -573,6 +604,9 @@
+   Options.UnitTimeoutSec = Flags.timeout;
+   Options.ErrorExitCode = Flags.error_exitcode;
+   Options.TimeoutExitCode = Flags.timeout_exitcode;
++  Options.IgnoreTimeouts = Flags.ignore_timeouts;
++  Options.IgnoreOOMs = Flags.ignore_ooms;
++  Options.IgnoreCrashes = Flags.ignore_crashes;
+   Options.MaxTotalTimeSec = Flags.max_total_time;
+   Options.DoCrossOver = Flags.cross_over;
+   Options.MutateDepth = Flags.mutate_depth;
+@@ -617,11 +651,6 @@
+   Options.PrintFinalStats = Flags.print_final_stats;
+   Options.PrintCorpusStats = Flags.print_corpus_stats;
+   Options.PrintCoverage = Flags.print_coverage;
+-  Options.PrintUnstableStats = Flags.print_unstable_stats;
+-  if (Flags.handle_unstable == TracePC::MinUnstable ||
+-      Flags.handle_unstable == TracePC::ZeroUnstable)
+-    Options.HandleUnstable = Flags.handle_unstable;
+-  Options.DumpCoverage = Flags.dump_coverage;
+   if (Flags.exit_on_src_pos)
+     Options.ExitOnSrcPos = Flags.exit_on_src_pos;
+   if (Flags.exit_on_item)
+@@ -630,6 +659,9 @@
+     Options.FocusFunction = Flags.focus_function;
+   if (Flags.data_flow_trace)
+     Options.DataFlowTrace = Flags.data_flow_trace;
++  if (Flags.features_dir)
++    Options.FeaturesDir = Flags.features_dir;
++  Options.LazyCounters = Flags.lazy_counters;
+ 
+   unsigned Seed = Flags.seed;
+   // Initialize Seed.
+@@ -672,34 +704,6 @@
+ 
+   if (Flags.cleanse_crash)
+     return CleanseCrashInput(Args, Options);
+-
+-#if 0  // deprecated, to be removed.
+-  if (auto Name = Flags.run_equivalence_server) {
+-    SMR.Destroy(Name);
+-    if (!SMR.Create(Name)) {
+-       Printf("ERROR: can't create shared memory region\n");
+-      return 1;
+-    }
+-    Printf("INFO: EQUIVALENCE SERVER UP\n");
+-    while (true) {
+-      SMR.WaitClient();
+-      size_t Size = SMR.ReadByteArraySize();
+-      SMR.WriteByteArray(nullptr, 0);
+-      const Unit tmp(SMR.GetByteArray(), SMR.GetByteArray() + Size);
+-      F->ExecuteCallback(tmp.data(), tmp.size());
+-      SMR.PostServer();
+-    }
+-    return 0;
+-  }
+-
+-  if (auto Name = Flags.use_equivalence_server) {
+-    if (!SMR.Open(Name)) {
+-      Printf("ERROR: can't open shared memory region\n");
+-      return 1;
+-    }
+-    Printf("INFO: EQUIVALENCE CLIENT UP\n");
+-  }
+-#endif
+ 
+   if (DoPlainRun) {
+     Options.SaveArtifacts = false;
+@@ -723,13 +727,11 @@
+     exit(0);
+   }
+ 
+-  if (Flags.merge) {
+-    F->CrashResistantMerge(Args, *Inputs,
+-                           Flags.load_coverage_summary,
+-                           Flags.save_coverage_summary,
+-                           Flags.merge_control_file);
+-    exit(0);
+-  }
++  if (Flags.fork)
++    FuzzWithFork(F->GetMD().GetRand(), Options, Args, *Inputs, Flags.fork);
++
++  if (Flags.merge)
++    Merge(F, Options, Args, *Inputs, Flags.merge_control_file);
+ 
+   if (Flags.merge_inner) {
+     const size_t kDefaultMaxMergeLen = 1 << 20;
+@@ -761,7 +763,19 @@
+     exit(0);
+   }
+ 
+-  F->Loop(*Inputs);
++  // Parse -seed_inputs=file1,file2,...
++  Vector<std::string> ExtraSeedFiles;
++  if (Flags.seed_inputs) {
++    std::string s = Flags.seed_inputs;
++    size_t comma_pos;
++    while ((comma_pos = s.find_last_of(',')) != std::string::npos) {
++      ExtraSeedFiles.push_back(s.substr(comma_pos + 1));
++      s = s.substr(0, comma_pos);
++    }
++    ExtraSeedFiles.push_back(s);
++  }
++
++  F->Loop(*Inputs, ExtraSeedFiles);
+ 
+   if (Flags.verbosity)
+     Printf("Done %zd runs in %zd second(s)\n", F->getTotalNumberOfRuns(),
+--- a/libfuzzer/FuzzerLoop.cpp
++++ b/libfuzzer/FuzzerLoop.cpp
+@@ -1,9 +1,8 @@
+ //===- FuzzerLoop.cpp - Fuzzer's main loop --------------------------------===//
+ //
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ //===----------------------------------------------------------------------===//
+ // Fuzzer's main loop.
+@@ -14,7 +13,6 @@
+ #include "FuzzerInternal.h"
+ #include "FuzzerMutate.h"
+ #include "FuzzerRandom.h"
+-#include "FuzzerShmem.h"
+ #include "FuzzerTracePC.h"
+ #include <algorithm>
+ #include <cstring>
+@@ -40,8 +38,6 @@
+ static const size_t kMaxUnitSizeToPrint = 256;
+ 
+ thread_local bool Fuzzer::IsMyThread;
+-
+-SharedMemoryRegion SMR;
+ 
+ bool RunningUserCallback = false;
+ 
+@@ -135,7 +131,7 @@
+   DumpCurrentUnit("oom-");
+   Printf("SUMMARY: libFuzzer: out-of-memory\n");
+   PrintFinalStats();
+-  _Exit(Options.ErrorExitCode); // Stop right now.
++  _Exit(Options.OOMExitCode); // Stop right now.
+ }
+ 
+ Fuzzer::Fuzzer(UserCallback CB, InputCorpus &Corpus, MutationDispatcher &MD,
+@@ -157,7 +153,7 @@
+   if (!Options.OutputCorpus.empty() && Options.ReloadIntervalSec)
+     EpochOfLastReadOfOutputCorpus = GetEpoch(Options.OutputCorpus);
+   MaxInputLen = MaxMutationLen = Options.MaxLen;
+-  TmpMaxMutationLen = Max(size_t(4), Corpus.MaxInputSize());
++  TmpMaxMutationLen = 0;  // Will be set once we load the corpus.
+   AllocateCurrentUnitData();
+   CurrentUnitSize = 0;
+   memset(BaseSha1, 0, sizeof(BaseSha1));
+@@ -231,8 +227,9 @@
+ }
+ 
+ void Fuzzer::CrashCallback() {
+-  if (EF->__sanitizer_acquire_crash_state)
+-    EF->__sanitizer_acquire_crash_state();
++  if (EF->__sanitizer_acquire_crash_state &&
++      !EF->__sanitizer_acquire_crash_state())
++    return;
+   Printf("==%lu== ERROR: libFuzzer: deadly signal\n", GetPid());
+   PrintStackTrace();
+   Printf("NOTE: libFuzzer has rudimentary signal handlers.\n"
+@@ -259,23 +256,27 @@
+ }
+ 
+ void Fuzzer::MaybeExitGracefully() {
+-  if (!GracefulExitRequested) return;
++  if (!F->GracefulExitRequested) return;
+   Printf("==%lu== INFO: libFuzzer: exiting as requested\n", GetPid());
+-  PrintFinalStats();
++  RmDirRecursive(TempPath(".dir"));
++  F->PrintFinalStats();
+   _Exit(0);
+ }
+ 
+ void Fuzzer::InterruptCallback() {
+   Printf("==%lu== libFuzzer: run interrupted; exiting\n", GetPid());
+   PrintFinalStats();
+-  _Exit(0); // Stop right now, don't perform any at-exit actions.
++  RmDirRecursive(TempPath(".dir"));
++  // Stop right now, don't perform any at-exit actions.
++  _Exit(Options.InterruptExitCode);
+ }
+ 
+ NO_SANITIZE_MEMORY
+ void Fuzzer::AlarmCallback() {
+   assert(Options.UnitTimeoutSec > 0);
+   // In Windows Alarm callback is executed by a different thread.
+-#if !LIBFUZZER_WINDOWS
++  // NetBSD's current behavior needs this change too.
++#if !LIBFUZZER_WINDOWS && !LIBFUZZER_NETBSD
+   if (!InFuzzingThread())
+     return;
+ #endif
+@@ -316,7 +317,7 @@
+   DumpCurrentUnit("oom-");
+   Printf("SUMMARY: libFuzzer: out-of-memory\n");
+   PrintFinalStats();
+-  _Exit(Options.ErrorExitCode); // Stop right now.
++  _Exit(Options.OOMExitCode); // Stop right now.
+ }
+ 
+ void Fuzzer::PrintStats(const char *Where, const char *End, size_t Units) {
+@@ -354,10 +355,6 @@
+ void Fuzzer::PrintFinalStats() {
+   if (Options.PrintCoverage)
+     TPC.PrintCoverage();
+-  if (Options.PrintUnstableStats)
+-    TPC.PrintUnstableStats();
+-  if (Options.DumpCoverage)
+-    TPC.DumpCoverage();
+   if (Options.PrintCorpusStats)
+     Corpus.PrintStats();
+   if (!Options.PrintFinalStats)
+@@ -389,10 +386,10 @@
+ void Fuzzer::CheckExitOnSrcPosOrItem() {
+   if (!Options.ExitOnSrcPos.empty()) {
+     static auto *PCsSet = new Set<uintptr_t>;
+-    auto HandlePC = [&](uintptr_t PC) {
+-      if (!PCsSet->insert(PC).second)
++    auto HandlePC = [&](const TracePC::PCTableEntry *TE) {
++      if (!PCsSet->insert(TE->PC).second)
+         return;
+-      std::string Descr = DescribePC("%F %L", PC + 1);
++      std::string Descr = DescribePC("%F %L", TE->PC + 1);
+       if (Descr.find(Options.ExitOnSrcPos) != std::string::npos) {
+         Printf("INFO: found line matching '%s', exiting.\n",
+                Options.ExitOnSrcPos.c_str());
+@@ -448,27 +445,21 @@
+   }
+ }
+ 
+-void Fuzzer::CheckForUnstableCounters(const uint8_t *Data, size_t Size) {
+-  auto CBSetupAndRun = [&]() {
+-    ScopedEnableMsanInterceptorChecks S;
+-    UnitStartTime = system_clock::now();
+-    TPC.ResetMaps();
+-    RunningUserCallback = true;
+-    CB(Data, Size);
+-    RunningUserCallback = false;
+-    UnitStopTime = system_clock::now();
+-  };
+-
+-  // Copy original run counters into our unstable counters
+-  TPC.InitializeUnstableCounters();
+-
+-  // First Rerun
+-  CBSetupAndRun();
+-  if (TPC.UpdateUnstableCounters(Options.HandleUnstable)) {
+-    // Second Rerun
+-    CBSetupAndRun();
+-    TPC.UpdateAndApplyUnstableCounters(Options.HandleUnstable);
+-  }
++static void WriteFeatureSetToFile(const std::string &FeaturesDir,
++                                  const std::string &FileName,
++                                  const Vector<uint32_t> &FeatureSet) {
++  if (FeaturesDir.empty() || FeatureSet.empty()) return;
++  WriteToFile(reinterpret_cast<const uint8_t *>(FeatureSet.data()),
++              FeatureSet.size() * sizeof(FeatureSet[0]),
++              DirPlusFile(FeaturesDir, FileName));
++}
++
++static void RenameFeatureSetFile(const std::string &FeaturesDir,
++                                 const std::string &OldFile,
++                                 const std::string &NewFile) {
++  if (FeaturesDir.empty()) return;
++  RenameFile(DirPlusFile(FeaturesDir, OldFile),
++             DirPlusFile(FeaturesDir, NewFile));
+ }
+ 
+ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
+@@ -481,17 +472,6 @@
+   UniqFeatureSetTmp.clear();
+   size_t FoundUniqFeaturesOfII = 0;
+   size_t NumUpdatesBefore = Corpus.NumFeatureUpdates();
+-  bool NewFeaturesUnstable = false;
+-
+-  if (Options.HandleUnstable || Options.PrintUnstableStats) {
+-    TPC.CollectFeatures([&](size_t Feature) {
+-      if (Corpus.IsFeatureNew(Feature, Size, Options.Shrink))
+-        NewFeaturesUnstable = true;
+-    });
+-    if (NewFeaturesUnstable)
+-      CheckForUnstableCounters(Data, Size);
+-  }
+-
+   TPC.CollectFeatures([&](size_t Feature) {
+     if (Corpus.AddFeature(Feature, Size, Options.Shrink))
+       UniqFeatureSetTmp.push_back(Feature);
+@@ -500,23 +480,27 @@
+                              II->UniqFeatureSet.end(), Feature))
+         FoundUniqFeaturesOfII++;
+   });
+-
+   if (FoundUniqFeatures)
+     *FoundUniqFeatures = FoundUniqFeaturesOfII;
+   PrintPulseAndReportSlowInput(Data, Size);
+   size_t NumNewFeatures = Corpus.NumFeatureUpdates() - NumUpdatesBefore;
+-
+   if (NumNewFeatures) {
+     TPC.UpdateObservedPCs();
+-    Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures, MayDeleteFile,
+-                       TPC.ObservedFocusFunction(), UniqFeatureSetTmp, DFT, II);
++    auto NewII = Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures,
++                                    MayDeleteFile, TPC.ObservedFocusFunction(),
++                                    UniqFeatureSetTmp, DFT, II);
++    WriteFeatureSetToFile(Options.FeaturesDir, Sha1ToString(NewII->Sha1),
++                          NewII->UniqFeatureSet);
+     return true;
+   }
+   if (II && FoundUniqFeaturesOfII &&
+       II->DataFlowTraceForFocusFunction.empty() &&
+       FoundUniqFeaturesOfII == II->UniqFeatureSet.size() &&
+       II->U.size() > Size) {
++    auto OldFeaturesFile = Sha1ToString(II->Sha1);
+     Corpus.Replace(II, {Data, Data + Size});
++    RenameFeatureSetFile(Options.FeaturesDir, OldFeaturesFile,
++                         Sha1ToString(II->Sha1));
+     return true;
+   }
+   return false;
+@@ -550,8 +534,6 @@
+   TPC.RecordInitialStack();
+   TotalNumberOfRuns++;
+   assert(InFuzzingThread());
+-  if (SMR.IsClient())
+-    SMR.WriteByteArray(Data, Size);
+   // We copy the contents of Unit into a separate heap buffer
+   // so that we reliably find buffer overflows in it.
+   uint8_t *DataCopy = new uint8_t[Size];
+@@ -580,15 +562,16 @@
+   delete[] DataCopy;
+ }
+ 
+-void Fuzzer::WriteToOutputCorpus(const Unit &U) {
++std::string Fuzzer::WriteToOutputCorpus(const Unit &U) {
+   if (Options.OnlyASCII)
+     assert(IsASCII(U));
+   if (Options.OutputCorpus.empty())
+-    return;
++    return "";
+   std::string Path = DirPlusFile(Options.OutputCorpus, Hash(U));
+   WriteToFile(U, Path);
+   if (Options.Verbosity >= 2)
+     Printf("Written %zd bytes to %s\n", U.size(), Path.c_str());
++  return Path;
+ }
+ 
+ void Fuzzer::WriteUnitToFileWithPrefix(const Unit &U, const char *Prefix) {
+@@ -674,6 +657,8 @@
+   MD.StartMutationSequence();
+ 
+   auto &II = Corpus.ChooseUnitToMutate(MD.GetRand());
++  if (Options.DoCrossOver)
++    MD.SetCrossOverWith(&Corpus.ChooseUnitToMutate(MD.GetRand()).U);
+   const auto &U = II.U;
+   memcpy(BaseSha1, II.Sha1, sizeof(BaseSha1));
+   assert(CurrentUnitData);
+@@ -696,7 +681,9 @@
+         Size <= CurrentMaxMutationLen)
+       NewSize = MD.MutateWithMask(CurrentUnitData, Size, Size,
+                                   II.DataFlowTraceForFocusFunction);
+-    else
++    
++    // If MutateWithMask either failed or wasn't called, call default Mutate.
++    if (!NewSize)
+       NewSize = MD.Mutate(CurrentUnitData, Size, CurrentMaxMutationLen);
+     assert(NewSize > 0 && "Mutator returned empty unit");
+     assert(NewSize <= CurrentMaxMutationLen && "Mutator return oversized unit");
+@@ -732,7 +719,9 @@
+   LastAllocatorPurgeAttemptTime = system_clock::now();
+ }
+ 
+-void Fuzzer::ReadAndExecuteSeedCorpora(const Vector<std::string> &CorpusDirs) {
++void Fuzzer::ReadAndExecuteSeedCorpora(
++    const Vector<std::string> &CorpusDirs,
++    const Vector<std::string> &ExtraSeedFiles) {
+   const size_t kMaxSaneLen = 1 << 20;
+   const size_t kMinDefaultLen = 4096;
+   Vector<SizedFile> SizedFiles;
+@@ -746,6 +735,11 @@
+            Dir.c_str());
+     LastNumFiles = SizedFiles.size();
+   }
++  // Add files from -seed_inputs.
++  for (auto &File : ExtraSeedFiles)
++    if (auto Size = FileSize(File))
++      SizedFiles.push_back({File, Size});
++
+   for (auto &File : SizedFiles) {
+     MaxSize = Max(File.Size, MaxSize);
+     MinSize = Min(File.Size, MinSize);
+@@ -758,6 +752,10 @@
+   // Test the callback with empty input and never try it again.
+   uint8_t dummy = 0;
+   ExecuteCallback(&dummy, 0);
++
++  // Protect lazy counters here, after the once-init code has been executed.
++  if (Options.LazyCounters)
++    TPC.ProtectLazyCounters();
+ 
+   if (SizedFiles.empty()) {
+     Printf("INFO: A corpus is not provided, starting from an empty corpus\n");
+@@ -801,14 +799,17 @@
+   }
+ }
+ 
+-void Fuzzer::Loop(const Vector<std::string> &CorpusDirs) {
+-  ReadAndExecuteSeedCorpora(CorpusDirs);
++void Fuzzer::Loop(const Vector<std::string> &CorpusDirs,
++                  const Vector<std::string> &ExtraSeedFiles) {
++  ReadAndExecuteSeedCorpora(CorpusDirs, ExtraSeedFiles);
+   DFT.Clear();  // No need for DFT any more.
+   TPC.SetPrintNewPCs(Options.PrintNewCovPcs);
+   TPC.SetPrintNewFuncs(Options.PrintNewCovFuncs);
+   system_clock::time_point LastCorpusReload = system_clock::now();
+-  if (Options.DoCrossOver)
+-    MD.SetCorpus(&Corpus);
++
++  TmpMaxMutationLen =
++      Min(MaxMutationLen, Max(size_t(4), Corpus.MaxInputSize()));
++
+   while (true) {
+     auto Now = system_clock::now();
+     if (duration_cast<seconds>(Now - LastCorpusReload).count() >=
+@@ -861,44 +862,14 @@
+   }
+ }
+ 
+-void Fuzzer::AnnounceOutput(const uint8_t *Data, size_t Size) {
+-  if (SMR.IsServer()) {
+-    SMR.WriteByteArray(Data, Size);
+-  } else if (SMR.IsClient()) {
+-    SMR.PostClient();
+-    SMR.WaitServer();
+-    size_t OtherSize = SMR.ReadByteArraySize();
+-    uint8_t *OtherData = SMR.GetByteArray();
+-    if (Size != OtherSize || memcmp(Data, OtherData, Size) != 0) {
+-      size_t i = 0;
+-      for (i = 0; i < Min(Size, OtherSize); i++)
+-        if (Data[i] != OtherData[i])
+-          break;
+-      Printf("==%lu== ERROR: libFuzzer: equivalence-mismatch. Sizes: %zd %zd; "
+-             "offset %zd\n",
+-             GetPid(), Size, OtherSize, i);
+-      DumpCurrentUnit("mismatch-");
+-      Printf("SUMMARY: libFuzzer: equivalence-mismatch\n");
+-      PrintFinalStats();
+-      _Exit(Options.ErrorExitCode);
+-    }
+-  }
+-}
+-
+ } // namespace fuzzer
+ 
+ extern "C" {
+ 
+-__attribute__((visibility("default"))) size_t
++ATTRIBUTE_INTERFACE size_t
+ LLVMFuzzerMutate(uint8_t *Data, size_t Size, size_t MaxSize) {
+   assert(fuzzer::F);
+   return fuzzer::F->GetMD().DefaultMutate(Data, Size, MaxSize);
+ }
+ 
+-// Experimental
+-__attribute__((visibility("default"))) void
+-LLVMFuzzerAnnounceOutput(const uint8_t *Data, size_t Size) {
+-  assert(fuzzer::F);
+-  fuzzer::F->AnnounceOutput(Data, Size);
+-}
+ } // extern "C"
+--- a/libfuzzer/FuzzerMain.cpp
++++ b/libfuzzer/FuzzerMain.cpp
+@@ -1,9 +1,8 @@
+ //===- FuzzerMain.cpp - main() function and flags -------------------------===//
+ //
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ //===----------------------------------------------------------------------===//
+ // main() and flags.
+@@ -16,6 +15,6 @@
+ int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+ }  // extern "C"
+ 
+-__attribute__((visibility("default"))) int main(int argc, char **argv) {
++ATTRIBUTE_INTERFACE int main(int argc, char **argv) {
+   return fuzzer::FuzzerDriver(&argc, &argv, LLVMFuzzerTestOneInput);
+ }
+--- a/poppler/cpp/poppler-document.cpp
++++ b/poppler/cpp/poppler-document.cpp
+@@ -3,6 +3,7 @@
+  * Copyright (C) 2016 Jakub Alba <jakubalba@gmail.com>
+  * Copyright (C) 2017, Albert Astals Cid <aacid@kde.org>
+  * Copyright (C) 2018, Adam Reichold <adam.reichold@t-online.de>
++ * Copyright (C) 2019, Masamichi Hosoda <trueroad@trueroad.jp>
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -19,11 +20,16 @@
+  * Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA 02110-1301, USA.
+  */
+ 
++/**
++ \file poppler-document.h
++ */
++#include "poppler-destination.h"
+ #include "poppler-document.h"
+ #include "poppler-embedded-file.h"
+ #include "poppler-page.h"
+ #include "poppler-toc.h"
+ 
++#include "poppler-destination-private.h"
+ #include "poppler-document-private.h"
+ #include "poppler-embedded-file-private.h"
+ #include "poppler-page-private.h"
+@@ -34,6 +40,7 @@
+ #include "DateInfo.h"
+ #include "ErrorCodes.h"
+ #include "GlobalParams.h"
++#include "Link.h"
+ #include "Outline.h"
+ 
+ #include <algorithm>
+@@ -42,12 +49,16 @@
+ 
+ using namespace poppler;
+ 
++std::mutex poppler::initer::mutex;
+ unsigned int poppler::initer::count = 0U;
++std::string poppler::initer::data_dir;
+ 
+ initer::initer()
+ {
++    std::lock_guard<std::mutex> lock{mutex};
++
+     if (!count) {
+-        globalParams = new GlobalParams();
++        globalParams = new GlobalParams(!data_dir.empty() ? data_dir.c_str() : nullptr);
+         setErrorCallback(detail::error_function, nullptr);
+     }
+     count++;
+@@ -55,6 +66,8 @@
+ 
+ initer::~initer()
+ {
++    std::lock_guard<std::mutex> lock{mutex};
++
+     if (count > 0) {
+         --count;
+         if (!count) {
+@@ -62,6 +75,18 @@
+             globalParams = nullptr;
+         }
+     }
++}
++
++bool initer::set_data_dir(const std::string &new_data_dir)
++{
++    std::lock_guard<std::mutex> lock{mutex};
++
++    if (count == 0) {
++        data_dir = new_data_dir;
++        return true;
++    }
++
++    return false;
+ }
+ 
+ 
+@@ -371,7 +396,7 @@
+ }
+ 
+ /**
+- Gets the time_t value value of the specified \p key of the document
++ Gets the time_t value of the specified \p key of the document
+  information.
+ 
+  \returns the time_t value for the \p key
+@@ -864,10 +889,10 @@
+     }
+ 
+     if (permanent_id) {
+-        *permanent_id = goo_permanent_id.getCString();
++        *permanent_id = goo_permanent_id.c_str();
+     }
+     if (update_id) {
+-        *update_id = goo_update_id.getCString();
++        *update_id = goo_update_id.c_str();
+     }
+ 
+     return true;
+@@ -1005,6 +1030,58 @@
+ }
+ 
+ /**
++ Creates a map of all the named destinations in the %document.
++
++ \note The destination names may contain \\0 and other binary values
++ so they are not printable and cannot convert to null-terminated C strings.
++
++ \returns the map of the each name and destination
++
++ \since 0.74
++ */
++std::map<std::string, destination> document::create_destination_map() const
++{
++    std::map<std::string, destination> m;
++
++    Catalog *catalog = d->doc->getCatalog();
++    if (!catalog)
++        return m;
++
++    // Iterate from name-dict
++    const int nDests = catalog->numDests();
++    for (int i = 0; i < nDests; ++i ) {
++        std::string key(catalog->getDestsName (i));
++        LinkDest *link_dest = catalog->getDestsDest (i);
++
++        if (link_dest) {
++            destination dest(new destination_private(link_dest, d->doc));
++
++            m.emplace(std::move(key), std::move(dest));
++
++            delete link_dest;
++        }
++    }
++
++    // Iterate from name-tree
++    const int nDestsNameTree = catalog->numDestNameTree();
++    for (int i = 0; i < nDestsNameTree; ++i ) {
++        std::string key(catalog->getDestNameTreeName (i)->c_str (),
++                        catalog->getDestNameTreeName (i)->getLength ());
++        LinkDest *link_dest = catalog->getDestNameTreeDest (i);
++
++        if (link_dest) {
++            destination dest(new destination_private(link_dest, d->doc));
++
++            m.emplace(std::move(key), std::move(dest));
++
++            delete link_dest;
++        }
++    }
++
++    return m;
++}
++
++/**
+  Saves the %document to file \p file_name.
+ 
+  \returns true on success, false on failure
+--- a/poppler/cpp/poppler-page-renderer.cpp
++++ b/poppler/cpp/poppler-page-renderer.cpp
+@@ -18,6 +18,9 @@
+  * Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA 02110-1301, USA.
+  */
+ 
++/**
++ \file poppler-page-renderer.h
++ */
+ #include "poppler-page-renderer.h"
+ 
+ #include "poppler-document-private.h"
+--- a/poppler/poppler/Hints.cc
++++ b/poppler/poppler/Hints.cc
+@@ -10,6 +10,8 @@
+ // Copyright 2013 Adrian Johnson <ajohnson@redneon.com>
+ // Copyright 2014 Fabio D'Urso <fabiodurso@hotmail.it>
+ // Copyright 2016 Jeffrey Morlan <jmmorlan@sonic.net>
++// Copyright 2019 LE GARREC Vincent <legarrec.vincent@gmail.com>
++// Copyright 2019 Adam Reichold <adam.reichold@t-online.de>
+ //
+ //========================================================================
+ 
+@@ -46,15 +48,15 @@
+     return isAtEof;
+   }
+ 
+-  Guint readBit()
++  unsigned int readBit()
+   {
+-    Guint bit;
++    unsigned int bit;
+     int c;
+ 
+     if (inputBits == 0) {
+       if ((c = str->getChar()) == EOF) {
+         isAtEof = true;
+-        return (Guint) -1;
++        return (unsigned int) -1;
+       }
+       bitsBuffer = c;
+       inputBits = 8;
+@@ -64,9 +66,9 @@
+     return bit;
+   }
+ 
+-  Guint readBits(int n)
++  unsigned int readBits(int n)
+   {
+-    Guint bit, bits;
++    unsigned int bit, bits;
+ 
+     if (n < 0) return -1;
+     if (n == 0) return 0;
+@@ -75,13 +77,13 @@
+       return readBit();
+ 
+     bit = readBit();
+-    if (bit == (Guint) -1)
++    if (bit == (unsigned int) -1)
+       return -1;
+ 
+     bit = bit << (n-1);
+ 
+     bits = readBits(n - 1);
+-    if (bits == (Guint) -1)
++    if (bits == (unsigned int) -1)
+       return -1;
+ 
+     return bit | bits;
+@@ -119,27 +121,29 @@
+       pageOffsetFirst = pageObjectFirstXRefEntry->offset;
+   }
+ 
+-  if (nPages >= INT_MAX / (int)sizeof(Guint)) {
++  if (nPages >= INT_MAX / (int)sizeof(unsigned int)) {
+      error(errSyntaxWarning, -1, "Invalid number of pages ({0:d}) for hints table", nPages);
+      nPages = 0;
+   }
+-  nObjects = (Guint *) gmallocn_checkoverflow(nPages, sizeof(Guint));
++  nObjects = (unsigned int *) gmallocn_checkoverflow(nPages, sizeof(unsigned int));
+   pageObjectNum = (int *) gmallocn_checkoverflow(nPages, sizeof(int));
+-  xRefOffset = (Guint *) gmallocn_checkoverflow(nPages, sizeof(Guint));
+-  pageLength = (Guint *) gmallocn_checkoverflow(nPages, sizeof(Guint));
++  xRefOffset = (unsigned int *) gmallocn_checkoverflow(nPages, sizeof(unsigned int));
++  pageLength = (unsigned int *) gmallocn_checkoverflow(nPages, sizeof(unsigned int));
+   pageOffset = (Goffset *) gmallocn_checkoverflow(nPages, sizeof(Goffset));
+-  numSharedObject = (Guint *) gmallocn_checkoverflow(nPages, sizeof(Guint));
+-  sharedObjectId = (Guint **) gmallocn_checkoverflow(nPages, sizeof(Guint*));
++  numSharedObject = (unsigned int *) gmallocn_checkoverflow(nPages, sizeof(unsigned int));
++  sharedObjectId = (unsigned int **) gmallocn_checkoverflow(nPages, sizeof(unsigned int*));
+   if (!nObjects || !pageObjectNum || !xRefOffset || !pageLength || !pageOffset ||
+       !numSharedObject || !sharedObjectId) {
+     error(errSyntaxWarning, -1, "Failed to allocate memory for hints table");
+     nPages = 0;
+   }
+ 
+-  memset(pageLength, 0, nPages * sizeof(Guint));
+-  memset(pageOffset, 0, nPages * sizeof(Guint));
+-  memset(numSharedObject, 0, nPages * sizeof(Guint));
+-  memset(pageObjectNum, 0, nPages * sizeof(int));
++  if (nPages != 0) {
++    memset(pageLength, 0, nPages * sizeof(unsigned int));
++    memset(pageOffset, 0, nPages * sizeof(unsigned int));
++    memset(numSharedObject, 0, nPages * sizeof(unsigned int));
++    memset(pageObjectNum, 0, nPages * sizeof(int));
++  }
+ 
+   groupLength = nullptr;
+   groupOffset = nullptr;
+@@ -189,19 +193,19 @@
+ 
+   Stream *s = str->makeSubStream(hintsOffset, false, hintsLength, Object(objNull));
+   s->reset();
+-  for (Guint i=0; i < hintsLength; i++) { *p++ = s->getChar(); }
++  for (unsigned int i=0; i < hintsLength; i++) { *p++ = s->getChar(); }
+   delete s;
+ 
+   if (hintsOffset2 && hintsLength2) {
+     s = str->makeSubStream(hintsOffset2, false, hintsLength2, Object(objNull));
+     s->reset();
+-    for (Guint i=0; i < hintsLength2; i++) { *p++ = s->getChar(); }
++    for (unsigned int i=0; i < hintsLength2; i++) { *p++ = s->getChar(); }
+     delete s;
+   }
+ 
+   MemStream *memStream = new MemStream (&buf[0], 0, bufLength, Object(objNull));
+ 
+-  parser = new Parser(xref, new Lexer(xref, memStream), true);
++  parser = new Parser(xref, memStream, true);
+ 
+   int num, gen;
+   Object obj;
+@@ -315,12 +319,12 @@
+   sharedObjectId[0] = nullptr;
+   for (int i = 1; i < nPages && !sbr.atEOF(); i++) {
+     numSharedObject[i] = sbr.readBits(nBitsNumShared);
+-    if (numSharedObject[i] >= INT_MAX / (int)sizeof(Guint)) {
++    if (numSharedObject[i] >= INT_MAX / (int)sizeof(unsigned int)) {
+        error(errSyntaxWarning, -1, "Invalid number of shared objects");
+        numSharedObject[i] = 0;
+        return false;
+     }
+-    sharedObjectId[i] = (Guint *) gmallocn_checkoverflow(numSharedObject[i], sizeof(Guint));
++    sharedObjectId[i] = (unsigned int *) gmallocn_checkoverflow(numSharedObject[i], sizeof(unsigned int));
+     if (numSharedObject[i] && !sharedObjectId[i]) {
+        error(errSyntaxWarning, -1, "Failed to allocate memory for shared object IDs");
+        numSharedObject[i] = 0;
+@@ -332,7 +336,7 @@
+ 
+   sbr.resetInputBits(); // reset on byte boundary. Not in specs!
+   for (int i=1; i<nPages; i++) {
+-    for (Guint j = 0; j < numSharedObject[i] && !sbr.atEOF(); j++) {
++    for (unsigned int j = 0; j < numSharedObject[i] && !sbr.atEOF(); j++) {
+       sharedObjectId[i][j] = sbr.readBits(nBitsShared);
+     }
+   }
+@@ -350,21 +354,21 @@
+ {
+   StreamBitReader sbr(str);
+ 
+-  const Guint firstSharedObjectNumber = sbr.readBits(32);
+-
+-  const Guint firstSharedObjectOffset = sbr.readBits(32) + hintsLength;
+-
+-  const Guint nSharedGroupsFirst = sbr.readBits(32);
+-
+-  const Guint nSharedGroups = sbr.readBits(32);
+-
+-  const Guint nBitsNumObjects = sbr.readBits(16);
+-
+-  const Guint groupLengthLeast = sbr.readBits(32);
+-
+-  const Guint nBitsDiffGroupLength = sbr.readBits(16);
+-
+-  if ((!nSharedGroups) || (nSharedGroups >= INT_MAX / (int)sizeof(Guint))) {
++  const unsigned int firstSharedObjectNumber = sbr.readBits(32);
++
++  const unsigned int firstSharedObjectOffset = sbr.readBits(32) + hintsLength;
++
++  const unsigned int nSharedGroupsFirst = sbr.readBits(32);
++
++  const unsigned int nSharedGroups = sbr.readBits(32);
++
++  const unsigned int nBitsNumObjects = sbr.readBits(16);
++
++  const unsigned int groupLengthLeast = sbr.readBits(32);
++
++  const unsigned int nBitsDiffGroupLength = sbr.readBits(16);
++
++  if ((!nSharedGroups) || (nSharedGroups >= INT_MAX / (int)sizeof(unsigned int))) {
+      error(errSyntaxWarning, -1, "Invalid number of shared object groups");
+      return false;
+   }
+@@ -377,11 +381,11 @@
+      return false;
+   }
+ 
+-  groupLength = (Guint *) gmallocn_checkoverflow(nSharedGroups, sizeof(Guint));
+-  groupOffset = (Guint *) gmallocn_checkoverflow(nSharedGroups, sizeof(Guint));
+-  groupHasSignature = (Guint *) gmallocn_checkoverflow(nSharedGroups, sizeof(Guint));
+-  groupNumObjects = (Guint *) gmallocn_checkoverflow(nSharedGroups, sizeof(Guint));
+-  groupXRefOffset = (Guint *) gmallocn_checkoverflow(nSharedGroups, sizeof(Guint));
++  groupLength = (unsigned int *) gmallocn_checkoverflow(nSharedGroups, sizeof(unsigned int));
++  groupOffset = (unsigned int *) gmallocn_checkoverflow(nSharedGroups, sizeof(unsigned int));
++  groupHasSignature = (unsigned int *) gmallocn_checkoverflow(nSharedGroups, sizeof(unsigned int));
++  groupNumObjects = (unsigned int *) gmallocn_checkoverflow(nSharedGroups, sizeof(unsigned int));
++  groupXRefOffset = (unsigned int *) gmallocn_checkoverflow(nSharedGroups, sizeof(unsigned int));
+   if (!groupLength || !groupOffset || !groupHasSignature ||
+       !groupNumObjects || !groupXRefOffset) {
+      error(errSyntaxWarning, -1, "Failed to allocate memory for shared object groups");
+@@ -389,53 +393,57 @@
+   }
+ 
+   sbr.resetInputBits(); // reset on byte boundary. Not in specs!
+-  for (Guint i = 0; i < nSharedGroups && !sbr.atEOF(); i++) {
++  for (unsigned int i = 0; i < nSharedGroups && !sbr.atEOF(); i++) {
+     groupLength[i] = groupLengthLeast + sbr.readBits(nBitsDiffGroupLength);
+   }
+   if (sbr.atEOF())
+     return false;
+ 
+   groupOffset[0] = objectOffsetFirst;
+-  for (Guint i=1; i<nSharedGroupsFirst; i++) {
++  for (unsigned int i=1; i<nSharedGroupsFirst; i++) {
+     groupOffset[i] = groupOffset[i-1] + groupLength[i-1];
+   }
+   if (nSharedGroups > nSharedGroupsFirst ) {
+     groupOffset[nSharedGroupsFirst] = firstSharedObjectOffset;
+-    for (Guint i=nSharedGroupsFirst+1; i<nSharedGroups; i++) {
++    for (unsigned int i=nSharedGroupsFirst+1; i<nSharedGroups; i++) {
+       groupOffset[i] = groupOffset[i-1] + groupLength[i-1];
+     }
+   }
+ 
+   sbr.resetInputBits(); // reset on byte boundary. Not in specs!
+-  for (Guint i = 0; i < nSharedGroups && !sbr.atEOF(); i++) {
++  for (unsigned int i = 0; i < nSharedGroups && !sbr.atEOF(); i++) {
+     groupHasSignature[i] = sbr.readBits(1);
+   }
+   if (sbr.atEOF())
+     return false;
+ 
+   sbr.resetInputBits(); // reset on byte boundary. Not in specs!
+-  for (Guint i = 0; i < nSharedGroups && !sbr.atEOF(); i++) {
++  for (unsigned int i = 0; i < nSharedGroups && !sbr.atEOF(); i++) {
+     if (groupHasSignature[i]) {
+-       sbr.readBits(128);
++       // readBits doesn't supports more than 32 bits.
++       sbr.readBits(32);
++       sbr.readBits(32);
++       sbr.readBits(32);
++       sbr.readBits(32);
+     }
+   }
+   if (sbr.atEOF())
+     return false;
+ 
+   sbr.resetInputBits(); // reset on byte boundary. Not in specs!
+-  for (Guint i = 0; i < nSharedGroups && !sbr.atEOF(); i++) {
++  for (unsigned int i = 0; i < nSharedGroups && !sbr.atEOF(); i++) {
+     groupNumObjects[i] =
+        nBitsNumObjects ? 1 + sbr.readBits(nBitsNumObjects) : 1;
+   }
+ 
+-  for (Guint i=0; i<nSharedGroupsFirst; i++) {
++  for (unsigned int i=0; i<nSharedGroupsFirst; i++) {
+     groupNumObjects[i] = 0;
+     groupXRefOffset[i] = 0;
+   }
+   if (nSharedGroups > nSharedGroupsFirst ) {
+     groupXRefOffset[nSharedGroupsFirst] =
+         mainXRefEntriesOffset + 20*firstSharedObjectNumber;
+-    for (Guint i=nSharedGroupsFirst+1; i<nSharedGroups; i++) {
++    for (unsigned int i=nSharedGroupsFirst+1; i<nSharedGroups; i++) {
+       groupXRefOffset[i] = groupXRefOffset[i-1] + 20*groupNumObjects[i-1];
+     }
+   }
+@@ -483,8 +491,8 @@
+   pageRange.length = 20*nObjects[idx];
+   v->push_back(pageRange);
+ 
+-  for (Guint j=0; j<numSharedObject[idx]; j++) {
+-     Guint k = sharedObjectId[idx][j];
++  for (unsigned int j=0; j<numSharedObject[idx]; j++) {
++     unsigned int k = sharedObjectId[idx][j];
+ 
+      pageRange.offset = groupOffset[k];
+      pageRange.length = groupLength[k];
+--- a/poppler/poppler/PDFDoc.cc
++++ b/poppler/poppler/PDFDoc.cc
+@@ -14,7 +14,7 @@
+ // under GPL version 2 or later
+ //
+ // Copyright (C) 2005, 2006, 2008 Brad Hards <bradh@frogmouth.net>
+-// Copyright (C) 2005, 2007-2009, 2011-2018 Albert Astals Cid <aacid@kde.org>
++// Copyright (C) 2005, 2007-2009, 2011-2019 Albert Astals Cid <aacid@kde.org>
+ // Copyright (C) 2008 Julien Rebetez <julienr@svn.gnome.org>
+ // Copyright (C) 2008, 2010 Pino Toscano <pino@kde.org>
+ // Copyright (C) 2008, 2010, 2011 Carlos Garcia Campos <carlosgc@gnome.org>
+@@ -42,6 +42,7 @@
+ // Copyright (C) 2018 Klarälvdalens Datakonsult AB, a KDAB Group company, <info@kdab.com>. Work sponsored by the LiMux project of the city of Munich
+ // Copyright (C) 2018 Evangelos Rigas <erigas@rnd2.org>
+ // Copyright (C) 2018 Philipp Knechtges <philipp-dev@knechtges.com>
++// Copyright (C) 2019 Christian Persch <chpe@src.gnome.org>
+ //
+ // To see a description of the changes please see the Changelog file that
+ // came with your tarball or type make ChangeLog if you are building from git
+@@ -148,7 +149,7 @@
+ 
+   // try to open file
+ #ifdef _WIN32
+-  wchar_t *wFileName = (wchar_t*)utf8ToUtf16(fileName->getCString());
++  wchar_t *wFileName = (wchar_t*)utf8ToUtf16(fileName->c_str());
+   file = GooFile::open(wFileName);
+   gfree(wFileName);
+ #else
+@@ -293,7 +294,7 @@
+   if (catalog && !catalog->isOk()) {
+     if (!wasReconstructed)
+     {
+-      // try one more time to contruct the Catalog, maybe the problem is damaged XRef 
++      // try one more time to construct the Catalog, maybe the problem is damaged XRef
+       delete catalog;
+       delete xref;
+       xref = new XRef(str, 0, 0, nullptr, true);
+@@ -721,7 +722,7 @@
+     }
+ 
+     pageRef.gen = xref->getEntry(pageRef.num)->gen;
+-    Object obj = xref->fetch(pageRef.num, pageRef.gen);
++    Object obj = xref->fetch(pageRef);
+     if (!obj.isDict("Page")) {
+       linearizationState = 2;
+       return false;
+@@ -799,7 +800,7 @@
+ 
+ static bool
+ get_id (const GooString *encodedidstring, GooString *id) {
+-  const char *encodedid = encodedidstring->getCString();
++  const char *encodedid = encodedidstring->c_str();
+   char pdfid[pdfIdLength + 1];
+   int n;
+ 
+@@ -861,7 +862,7 @@
+   return hints;
+ }
+ 
+-int PDFDoc::savePageAs(GooString *name, int pageNo) 
++int PDFDoc::savePageAs(const GooString *name, int pageNo)
+ {
+   FILE *f;
+   OutStream *outStr;
+@@ -877,7 +878,7 @@
+   // all objects, including Unencrypted ones.
+   xref->scanSpecialFlags();
+ 
+-  Guchar *fileKey;
++  unsigned char *fileKey;
+   CryptAlgorithm encAlgorithm;
+   int keyLength;
+   xref->getEncryptionParameters(&fileKey, &encAlgorithm, &keyLength);
+@@ -895,9 +896,9 @@
+     getCatalog()->getPage(pageNo)->getMediaBox(),
+     cropBox);
+   Ref *refPage = getCatalog()->getPageRef(pageNo);
+-  Object page = getXRef()->fetch(refPage->num, refPage->gen);
+-
+-  if (!(f = fopen(name->getCString(), "wb"))) {
++  Object page = getXRef()->fetch(*refPage);
++
++  if (!(f = openFile(name->c_str(), "wb"))) {
+     error(errIO, -1, "Couldn't open file '{0:t}'", name);
+     return errOpenFile;
+   }
+@@ -924,7 +925,7 @@
+     markPageObjects(infoDict, yRef, countRef, 0, refPage->num, rootNum + 2);
+     if (trailerObj->isDict()) {
+       Dict *trailerDict = trailerObj->getDict();
+-      Object ref = trailerDict->lookupNF("Info");
++      const Object &ref = trailerDict->lookupNF("Info");
+       if (ref.isRef()) {
+         yRef->add(ref.getRef().num, ref.getRef().gen, 0, true);
+         if (getXRef()->getEntry(ref.getRef().num)->type == xrefEntryCompressed) {
+@@ -938,7 +939,7 @@
+   Object catObj = getXRef()->getCatalog();
+   Dict *catDict = catObj.getDict();
+   Object pagesObj = catDict->lookup("Pages");
+-  Object afObj = catDict->lookupNF("AcroForm");
++  Object afObj = catDict->lookupNF("AcroForm").copy();
+   if (!afObj.isNull()) {
+     markAcroForm(&afObj, yRef, countRef, 0, refPage->num, rootNum + 2);
+   }
+@@ -957,7 +958,7 @@
+     }
+   }
+   markPageObjects(pageDict, yRef, countRef, 0, refPage->num, rootNum + 2);
+-  Object annotsObj = pageDict->lookupNF("Annots");
++  Object annotsObj = pageDict->lookupNF("Annots").copy();
+   if (!annotsObj.isNull()) {
+     markAnnotations(&annotsObj, yRef, countRef, 0, refPage->num, rootNum + 2);
+   }
+@@ -974,7 +975,7 @@
+       strcmp(key, "Pages") != 0) 
+     {
+       if (j > 0) outStr->printf(" ");
+-      Object value = catDict->getValNF(j);
++      Object value = catDict->getValNF(j).copy();
+       outStr->printf("/%s ", key);
+       writeObject(&value, outStr, getXRef(), 0, nullptr, cryptRC4, 0, 0, 0);
+     }
+@@ -997,7 +998,7 @@
+   for (int n = 0; n < pageDict->getLength(); n++) {
+     if (n > 0) outStr->printf(" ");
+     const char *key = pageDict->getKey(n);
+-    Object value = pageDict->getValNF(n);
++    Object value = pageDict->getValNF(n).copy();
+     if (strcmp(key, "Parent") == 0) {
+       outStr->printf("/Parent %d 0 R", rootNum + 1);
+     } else {
+@@ -1012,7 +1013,7 @@
+   ref.num = rootNum;
+   ref.gen = 0;
+   Object trailerDict = createTrailerDict(rootNum + 3, false, 0, &ref, getXRef(),
+-                                        name->getCString(), uxrefOffset);
++                                        name->c_str(), uxrefOffset);
+   writeXRefTableTrailer(std::move(trailerDict), yRef, false /* do not write unnecessary entries */,
+                         uxrefOffset, outStr, getXRef());
+ 
+@@ -1025,12 +1026,12 @@
+   return errNone;
+ }
+ 
+-int PDFDoc::saveAs(GooString *name, PDFWriteMode mode) {
++int PDFDoc::saveAs(const GooString *name, PDFWriteMode mode) {
+   FILE *f;
+   OutStream *outStr;
+   int res;
+ 
+-  if (!(f = fopen(name->getCString(), "wb"))) {
++  if (!(f = openFile(name->c_str(), "wb"))) {
+     error(errIO, -1, "Couldn't open file '{0:t}'", name);
+     return errOpenFile;
+   }
+@@ -1057,12 +1058,12 @@
+   return errNone;
+ }
+ 
+-int PDFDoc::saveWithoutChangesAs(GooString *name) {
++int PDFDoc::saveWithoutChangesAs(const GooString *name) {
+   FILE *f;
+   OutStream *outStr;
+   int res;
+ 
+-  if (!(f = fopen(name->getCString(), "wb"))) {
++  if (!(f = openFile(name->c_str(), "wb"))) {
+     error(errIO, -1, "Couldn't open file '{0:t}'", name);
+     return errOpenFile;
+   }
+@@ -1106,7 +1107,7 @@
+   copyStr->close();
+   delete copyStr;
+ 
+-  Guchar *fileKey;
++  unsigned char *fileKey;
+   CryptAlgorithm encAlgorithm;
+   int keyLength;
+   xref->getEncryptionParameters(&fileKey, &encAlgorithm, &keyLength);
+@@ -1124,7 +1125,7 @@
+       ref.num = i;
+       ref.gen = xref->getEntry(i)->type == xrefEntryCompressed ? 0 : xref->getEntry(i)->gen;
+       if (xref->getEntry(i)->type != xrefEntryFree) {
+-        Object obj1 = xref->fetch(ref.num, ref.gen, 1);
++        Object obj1 = xref->fetch(ref, 1 /* recursion */);
+         Goffset offset = writeObjectHeader(&ref, outStr);
+         writeObject(&obj1, outStr, fileKey, encAlgorithm, keyLength, ref.num, ref.gen);
+         writeObjectFooter(outStr);
+@@ -1144,7 +1145,7 @@
+ 
+   Goffset uxrefOffset = outStr->getPos();
+   int numobjects = xref->getNumObjects();
+-  const char *fileNameA = fileName ? fileName->getCString() : nullptr;
++  const char *fileNameA = fileName ? fileName->c_str() : nullptr;
+   Ref rootRef, uxrefStreamRef;
+   rootRef.num = getXRef()->getRootNum();
+   rootRef.gen = getXRef()->getRootGen();
+@@ -1175,7 +1176,7 @@
+   // all objects, including Unencrypted ones.
+   xref->scanSpecialFlags();
+ 
+-  Guchar *fileKey;
++  unsigned char *fileKey;
+   CryptAlgorithm encAlgorithm;
+   int keyLength;
+   xref->getEncryptionParameters(&fileKey, &encAlgorithm, &keyLength);
+@@ -1202,7 +1203,7 @@
+     } else if (type == xrefEntryUncompressed){ 
+       ref.num = i;
+       ref.gen = xref->getEntry(i)->gen;
+-      Object obj1 = xref->fetch(ref.num, ref.gen, 1);
++      Object obj1 = xref->fetch(ref, 1 /* recursion */);
+       Goffset offset = writeObjectHeader(&ref, outStr);
+       // Write unencrypted objects in unencrypted form
+       if (xref->getEntry(i)->getFlag(XRefEntry::Unencrypted)) {
+@@ -1215,7 +1216,7 @@
+     } else if (type == xrefEntryCompressed) {
+       ref.num = i;
+       ref.gen = 0; //compressed entries have gen == 0
+-      Object obj1 = xref->fetch(ref.num, ref.gen, 1);
++      Object obj1 = xref->fetch(ref, 1 /* recursion */);
+       Goffset offset = writeObjectHeader(&ref, outStr);
+       writeObject(&obj1, outStr, fileKey, encAlgorithm, keyLength, ref.num, ref.gen);
+       writeObjectFooter(outStr);
+@@ -1229,7 +1230,7 @@
+   delete uxref;
+ }
+ 
+-void PDFDoc::writeDictionnary (Dict* dict, OutStream* outStr, XRef *xRef, Guint numOffset, Guchar *fileKey,
++void PDFDoc::writeDictionnary (Dict* dict, OutStream* outStr, XRef *xRef, unsigned int numOffset, unsigned char *fileKey,
+                                CryptAlgorithm encAlgorithm, int keyLength, int objNum, int objGen, std::set<Dict*> *alreadyWrittenDicts)
+ {
+   bool deleteSet = false;
+@@ -1250,9 +1251,9 @@
+   for (int i=0; i<dict->getLength(); i++) {
+     GooString keyName(dict->getKey(i));
+     GooString *keyNameToPrint = keyName.sanitizedName(false /* non ps mode */);
+-    outStr->printf("/%s ", keyNameToPrint->getCString());
++    outStr->printf("/%s ", keyNameToPrint->c_str());
+     delete keyNameToPrint;
+-    Object obj1 = dict->getValNF(i);
++    Object obj1 = dict->getValNF(i).copy();
+     writeObject(&obj1, outStr, xRef, numOffset, fileKey, encAlgorithm, keyLength, objNum, objGen, alreadyWrittenDicts);
+   }
+   outStr->printf(">> ");
+@@ -1300,13 +1301,13 @@
+   outStr->printf("\r\nendstream\r\n");
+ }
+ 
+-void PDFDoc::writeString (const GooString* s, OutStream* outStr, const Guchar *fileKey,
++void PDFDoc::writeString (const GooString* s, OutStream* outStr, const unsigned char *fileKey,
+                           CryptAlgorithm encAlgorithm, int keyLength, int objNum, int objGen)
+ {
+   // Encrypt string if encryption is enabled
+   GooString *sEnc = nullptr;
+   if (fileKey) {
+-    EncryptStream *enc = new EncryptStream(new MemStream(s->getCString(), 0, s->getLength(), Object(objNull)),
++    EncryptStream *enc = new EncryptStream(new MemStream(s->c_str(), 0, s->getLength(), Object(objNull)),
+                                            fileKey, encAlgorithm, keyLength, objNum, objGen);
+     sEnc = new GooString();
+     int c;
+@@ -1322,7 +1323,7 @@
+   // Write data
+   if (s->hasUnicodeMarker()) {
+     //unicode string don't necessary end with \0
+-    const char* c = s->getCString();
++    const char* c = s->c_str();
+     outStr->printf("(");
+     for(int i=0; i<s->getLength(); i++) {
+       char unescaped = *(c+i)&0x000000ff;
+@@ -1333,7 +1334,7 @@
+     }
+     outStr->printf(") ");
+   } else {
+-    const char* c = s->getCString();
++    const char* c = s->c_str();
+     outStr->printf("(");
+     for(int i=0; i<s->getLength(); i++) {
+       char unescaped = *(c+i)&0x000000ff;
+@@ -1362,7 +1363,7 @@
+   return offset;
+ }
+ 
+-void PDFDoc::writeObject (Object* obj, OutStream* outStr, XRef *xRef, Guint numOffset, Guchar *fileKey,
++void PDFDoc::writeObject (Object* obj, OutStream* outStr, XRef *xRef, unsigned int numOffset, unsigned char *fileKey,
+                           CryptAlgorithm encAlgorithm, int keyLength, int objNum, int objGen, std::set<Dict*> *alreadyWrittenDicts)
+ {
+   Array *array;
+@@ -1381,7 +1382,7 @@
+     {
+       GooString s;
+       s.appendf("{0:.10g}", obj->getReal());
+-      outStr->printf("%s ", s.getCString());
++      outStr->printf("%s ", s.c_str());
+       break;
+     }
+     case objString:
+@@ -1391,7 +1392,7 @@
+     {
+       GooString name(obj->getName());
+       GooString *nameToPrint = name.sanitizedName(false /* non ps mode */);
+-      outStr->printf("/%s ", nameToPrint->getCString());
++      outStr->printf("/%s ", nameToPrint->c_str());
+       delete nameToPrint;
+       break;
+     }
+@@ -1402,7 +1403,7 @@
+       array = obj->getArray();
+       outStr->printf("[");
+       for (int i=0; i<array->getLength(); i++) {
+-	Object obj1 = array->getNF(i);
++	Object obj1 = array->getNF(i).copy();
+         writeObject(&obj1, outStr, xRef, numOffset, fileKey, encAlgorithm, keyLength, objNum, objGen);
+       }
+       outStr->printf("] ");
+@@ -1468,6 +1469,12 @@
+           writeDictionnary (stream->getDict(),outStr, xRef, numOffset, fileKey, encAlgorithm, keyLength, objNum, objGen, alreadyWrittenDicts);
+           writeStream (stream,outStr);
+           delete encStream;
++        } else if (fileKey != nullptr && stream->getKind() == strFile && static_cast<FileStream*>(stream)->getNeedsEncryptionOnSave()) {
++          EncryptStream *encStream = new EncryptStream(stream, fileKey, encAlgorithm, keyLength, objNum, objGen);
++          encStream->setAutoDelete(false);
++          writeDictionnary (encStream->getDict(), outStr, xRef, numOffset, fileKey, encAlgorithm, keyLength, objNum, objGen, alreadyWrittenDicts);
++          writeStream (encStream, outStr);
++          delete encStream;
+         } else {
+           //raw stream copy
+           FilterStream *fs = dynamic_cast<FilterStream*>(stream);
+@@ -1549,7 +1556,7 @@
+ 
+   bool hasEncrypt = false;
+   if (!xRef->getTrailerDict()->isNone()) {
+-    Object obj2 = xRef->getTrailerDict()->dictLookupNF("Encrypt");
++    Object obj2 = xRef->getTrailerDict()->dictLookupNF("Encrypt").copy();
+     if (!obj2.isNull()) {
+       trailerDict->set("Encrypt", std::move(obj2));
+       hasEncrypt = true;
+@@ -1557,8 +1564,8 @@
+   }
+ 
+   //calculate md5 digest
+-  Guchar digest[16];
+-  md5((Guchar*)message.getCString(), message.getLength(), digest);
++  unsigned char digest[16];
++  md5((unsigned char*)message.c_str(), message.getLength(), digest);
+ 
+   //create ID array
+   // In case of encrypted files, the ID must not be changed because it's used to calculate the key
+@@ -1582,7 +1589,7 @@
+     trailerDict->set("ID", Object(array));
+   }
+ 
+-  trailerDict->set("Root", Object(root->num, root->gen));
++  trailerDict->set("Root", Object(*root));
+ 
+   if (incrUpdate) { 
+     trailerDict->set("Prev", Object(startxRef));
+@@ -1616,7 +1623,7 @@
+   uxref->writeStreamToBuffer(&stmData, trailerDict.getDict(), xRef);
+ 
+   // Create XRef stream object and write it
+-  MemStream *mStream = new MemStream( stmData.getCString(), 0, stmData.getLength(), std::move(trailerDict) );
++  MemStream *mStream = new MemStream( stmData.c_str(), 0, stmData.getLength(), std::move(trailerDict) );
+   writeObjectHeader(uxrefStreamRef, outStr);
+   Object obj1(static_cast<Stream*>(mStream));
+   writeObject(&obj1, outStr, xRef, 0, nullptr, cryptRC4, 0, 0, 0);
+@@ -1630,7 +1637,7 @@
+ void PDFDoc::writeXRefTableTrailer(Goffset uxrefOffset, XRef *uxref, bool writeAllEntries,
+                                    int uxrefSize, OutStream* outStr, bool incrUpdate)
+ {
+-  const char *fileNameA = fileName ? fileName->getCString() : nullptr;
++  const char *fileNameA = fileName ? fileName->c_str() : nullptr;
+   // file size (doesn't include the trailer)
+   unsigned int fileSize = 0;
+   int c;
+@@ -1653,7 +1660,7 @@
+    outStr->printf("%%%c%c%c%c\n", 0xE2, 0xE3, 0xCF, 0xD3);
+ }
+ 
+-void PDFDoc::markDictionnary (Dict* dict, XRef * xRef, XRef *countRef, Guint numOffset, int oldRefNum, int newRefNum, std::set<Dict*> *alreadyMarkedDicts)
++void PDFDoc::markDictionnary (Dict* dict, XRef * xRef, XRef *countRef, unsigned int numOffset, int oldRefNum, int newRefNum, std::set<Dict*> *alreadyMarkedDicts)
+ {
+   bool deleteSet = false;
+   if (!alreadyMarkedDicts) {
+@@ -1672,10 +1679,10 @@
+   for (int i=0; i<dict->getLength(); i++) {
+     const char *key = dict->getKey(i);
+     if (strcmp(key, "Annots") != 0) {
+-      Object obj1 = dict->getValNF(i);
++      Object obj1 = dict->getValNF(i).copy();
+       markObject(&obj1, xRef, countRef, numOffset, oldRefNum, newRefNum, alreadyMarkedDicts);
+     } else {
+-      Object annotsObj = dict->getValNF(i);
++      Object annotsObj = dict->getValNF(i).copy();
+       if (!annotsObj.isNull()) {
+         markAnnotations(&annotsObj, xRef, countRef, 0, oldRefNum, newRefNum, alreadyMarkedDicts);
+       }
+@@ -1687,7 +1694,7 @@
+   }
+ }
+ 
+-void PDFDoc::markObject (Object* obj, XRef *xRef, XRef *countRef, Guint numOffset, int oldRefNum, int newRefNum, std::set<Dict*> *alreadyMarkedDicts)
++void PDFDoc::markObject (Object* obj, XRef *xRef, XRef *countRef, unsigned int numOffset, int oldRefNum, int newRefNum, std::set<Dict*> *alreadyMarkedDicts)
+ {
+   Array *array;
+ 
+@@ -1695,8 +1702,8 @@
+     case objArray:
+       array = obj->getArray();
+       for (int i=0; i<array->getLength(); i++) {
+-        Object obj1 = array->getNF(i);
+-        markObject(&obj1, xRef, countRef, numOffset, oldRefNum, newRefNum);
++        Object obj1 = array->getNF(i).copy();
++        markObject(&obj1, xRef, countRef, numOffset, oldRefNum, newRefNum, alreadyMarkedDicts);
+       }
+       break;
+     case objDict:
+@@ -1729,7 +1736,7 @@
+           if (entry->gen > 9)
+             break;
+         } 
+-        Object obj1 = getXRef()->fetch(obj->getRef().num, obj->getRef().gen);
++        Object obj1 = getXRef()->fetch(obj->getRef());
+         markObject(&obj1, xRef, countRef, numOffset, oldRefNum, newRefNum);
+       }
+       break;
+@@ -1743,7 +1750,7 @@
+                              const PDFRectangle *cropBox)
+ {
+   Ref *refPage = getCatalog()->getPageRef(pageNo);
+-  Object page = getXRef()->fetch(refPage->num, refPage->gen);
++  Object page = getXRef()->fetch(*refPage);
+   Dict *pageDict = page.getDict();
+   pageDict->remove("MediaBoxssdf");
+   pageDict->remove("MediaBox");
+@@ -1775,7 +1782,7 @@
+   getXRef()->setModifiedObject(&page, *refPage);
+ }
+ 
+-void PDFDoc::markPageObjects(Dict *pageDict, XRef *xRef, XRef *countRef, Guint numOffset, int oldRefNum, int newRefNum, std::set<Dict*> *alreadyMarkedDicts)
++void PDFDoc::markPageObjects(Dict *pageDict, XRef *xRef, XRef *countRef, unsigned int numOffset, int oldRefNum, int newRefNum, std::set<Dict*> *alreadyMarkedDicts)
+ {
+   pageDict->remove("OpenAction");
+   pageDict->remove("Outlines");
+@@ -1783,7 +1790,7 @@
+ 
+   for (int n = 0; n < pageDict->getLength(); n++) {
+     const char *key = pageDict->getKey(n);
+-    Object value  = pageDict->getValNF(n);
++    Object value  = pageDict->getValNF(n).copy();
+     if (strcmp(key, "Parent") != 0 &&
+ 	      strcmp(key, "Pages") != 0 &&
+ 	      strcmp(key, "AcroForm") != 0 &&
+@@ -1795,7 +1802,7 @@
+   }
+ }
+ 
+-bool PDFDoc::markAnnotations(Object *annotsObj, XRef *xRef, XRef *countRef, Guint numOffset, int oldPageNum, int newPageNum, std::set<Dict*> *alreadyMarkedDicts) {
++bool PDFDoc::markAnnotations(Object *annotsObj, XRef *xRef, XRef *countRef, unsigned int numOffset, int oldPageNum, int newPageNum, std::set<Dict*> *alreadyMarkedDicts) {
+   bool modified = false;
+   Object annots = annotsObj->fetch(getXRef());
+   if (annots.isArray()) {
+@@ -1806,18 +1813,21 @@
+           Dict *dict = obj1.getDict();
+           Object type = dict->lookup("Type");
+           if (type.isName() && strcmp(type.getName(), "Annot") == 0) {
+-            Object obj2 = dict->lookupNF("P");
++            const Object &obj2 = dict->lookupNF("P");
+             if (obj2.isRef()) {
+               if (obj2.getRef().num == oldPageNum) {
+-                Object obj3 = array->getNF(i);
++                const Object &obj3 = array->getNF(i);
+                 if (obj3.isRef()) {
+-                  dict->set("P", Object(newPageNum, 0));
++                  Ref r;
++                  r.num = newPageNum;
++                  r.gen = 0;
++                  dict->set("P", Object(r));
+                   getXRef()->setModifiedObject(&obj1, obj3.getRef());
+                 }
+               } else if (obj2.getRef().num == newPageNum) {
+                 continue;
+               } else {
+-                Object page  = getXRef()->fetch(obj2.getRef().num, obj2.getRef().gen);
++                Object page  = getXRef()->fetch(obj2.getRef());
+                 if (page.isDict()) {
+                   Dict *pageDict = page.getDict();
+                   Object pagetype = pageDict->lookup("Type");
+@@ -1833,7 +1843,7 @@
+           }
+           markPageObjects(dict, xRef, countRef, numOffset, oldPageNum, newPageNum, alreadyMarkedDicts);
+         }
+-        obj1 = array->getNF(i);
++        obj1 = array->getNF(i).copy();
+         if (obj1.isRef()) {
+           if (obj1.getRef().num + (int) numOffset >= xRef->getNumObjects() || xRef->getEntry(obj1.getRef().num + numOffset)->type == xrefEntryFree) {
+             if (getXRef()->getEntry(obj1.getRef().num)->type == xrefEntryFree) {
+@@ -1878,17 +1888,17 @@
+   return modified;
+ }
+ 
+-void PDFDoc::markAcroForm(Object *afObj, XRef *xRef, XRef *countRef, Guint numOffset, int oldRefNum, int newRefNum) {
++void PDFDoc::markAcroForm(Object *afObj, XRef *xRef, XRef *countRef, unsigned int numOffset, int oldRefNum, int newRefNum) {
+   bool modified = false;
+   Object acroform = afObj->fetch(getXRef());
+   if (acroform.isDict()) {
+       Dict *dict = acroform.getDict();
+       for (int i=0; i < dict->getLength(); i++) {
+         if (strcmp(dict->getKey(i), "Fields") == 0) {
+-          Object fields = dict->getValNF(i);
++          Object fields = dict->getValNF(i).copy();
+           modified = markAnnotations(&fields, xRef, countRef, numOffset, oldRefNum, newRefNum);
+         } else {
+-          Object obj = dict->getValNF(i);
++          Object obj = dict->getValNF(i).copy();
+           markObject(&obj, xRef, countRef, numOffset, oldRefNum, newRefNum);
+         }
+       }
+@@ -1918,10 +1928,10 @@
+   return;
+ }
+ 
+-Guint PDFDoc::writePageObjects(OutStream *outStr, XRef *xRef, Guint numOffset, bool combine) 
+-{
+-  Guint objectsCount = 0; //count the number of objects in the XRef(s)
+-  Guchar *fileKey;
++unsigned int PDFDoc::writePageObjects(OutStream *outStr, XRef *xRef, unsigned int numOffset, bool combine) 
++{
++  unsigned int objectsCount = 0; //count the number of objects in the XRef(s)
++  unsigned char *fileKey;
+   CryptAlgorithm encAlgorithm;
+   int keyLength;
+   xRef->getEncryptionParameters(&fileKey, &encAlgorithm, &keyLength);
+@@ -2054,7 +2064,7 @@
+ 
+ Goffset PDFDoc::getMainXRefEntriesOffset(bool tryingToReconstruct)
+ {
+-  Guint mainXRefEntriesOffset = 0;
++  unsigned int mainXRefEntriesOffset = 0;
+ 
+   if (isLinearized(tryingToReconstruct)) {
+     mainXRefEntriesOffset = getLinearization()->getMainXRefEntriesOffset();
+@@ -2092,14 +2102,14 @@
+   }
+ 
+   pageRef.gen = xref->getEntry(pageRef.num)->gen;
+-  Object obj = xref->fetch(pageRef.num, pageRef.gen);
++  Object obj = xref->fetch(pageRef);
+   if (!obj.isDict("Page")) {
+     error(errSyntaxWarning, -1, "Object ({0:d} {1:d}) is not a pageDict", pageRef.num, pageRef.gen);
+     return nullptr;
+   }
+   Dict *pageDict = obj.getDict();
+ 
+-  return new Page(this, page, &obj, pageRef,
++  return new Page(this, page, std::move(obj), pageRef,
+                new PageAttrs(nullptr, pageDict), catalog->getForm());
+ }
+ 
+--- a/poppler/poppler/Parser.cc
++++ b/poppler/poppler/Parser.cc
+@@ -13,14 +13,14 @@
+ // All changes made under the Poppler project to this file are licensed
+ // under GPL version 2 or later
+ //
+-// Copyright (C) 2006, 2009, 201, 2010, 2013, 2014, 2017, 2018 Albert Astals Cid <aacid@kde.org>
++// Copyright (C) 2006, 2009, 201, 2010, 2013, 2014, 2017-2019 Albert Astals Cid <aacid@kde.org>
+ // Copyright (C) 2006 Krzysztof Kowalczyk <kkowalczyk@gmail.com>
+ // Copyright (C) 2009 Ilya Gorenbein <igorenbein@finjan.com>
+ // Copyright (C) 2012 Hib Eris <hib@hiberis.nl>
+ // Copyright (C) 2013 Adrian Johnson <ajohnson@redneon.com>
+ // Copyright (C) 2013 Thomas Freitag <Thomas.Freitag@alfa.de>
+ // Copyright (C) 2018 Klarälvdalens Datakonsult AB, a KDAB Group company, <info@kdab.com>. Work sponsored by the LiMux project of the city of Munich
+-// Copyright (C) 2018 Adam Reichold <adam.reichold@t-online.de>
++// Copyright (C) 2018, 2019 Adam Reichold <adam.reichold@t-online.de>
+ // Copyright (C) 2018 Marek Kasik <mkasik@redhat.com>
+ //
+ // To see a description of the changes please see the Changelog file that
+@@ -44,18 +44,21 @@
+ // lots of nested arrays that made us consume all the stack
+ #define recursionLimit 500
+ 
+-Parser::Parser(XRef *xrefA, Lexer *lexerA, bool allowStreamsA) {
+-  xref = xrefA;
+-  lexer = lexerA;
++Parser::Parser(XRef *xrefA, Stream *streamA, bool allowStreamsA) : lexer{xrefA, streamA} {
++  allowStreams = allowStreamsA;
++  buf1 = lexer.getObj();
++  buf2 = lexer.getObj();
+   inlineImg = 0;
++}
++
++Parser::Parser(XRef *xrefA, Object *objectA, bool allowStreamsA) : lexer{xrefA, objectA} {
+   allowStreams = allowStreamsA;
+-  buf1 = lexer->getObj();
+-  buf2 = lexer->getObj();
+-}
+-
+-Parser::~Parser() {
+-  delete lexer;
+-}
++  buf1 = lexer.getObj();
++  buf2 = lexer.getObj();
++  inlineImg = 0;
++}
++
++Parser::~Parser() = default;
+ 
+ Object Parser::getObj(int recursion)
+ {
+@@ -63,7 +66,7 @@
+ }
+ 
+ Object Parser::getObj(bool simpleOnly,
+-           Guchar *fileKey,
++           unsigned char *fileKey,
+ 		       CryptAlgorithm encAlgorithm, int keyLength,
+ 		       int objNum, int objGen, int recursion,
+ 		       bool strict) {
+@@ -76,8 +79,8 @@
+ 
+   // refill buffer after inline image data
+   if (inlineImg == 2) {
+-    buf1 = lexer->getObj();
+-    buf2 = lexer->getObj();
++    buf1 = lexer.getObj();
++    buf2 = lexer.getObj();
+     inlineImg = 0;
+   }
+ 
+@@ -88,7 +91,7 @@
+   // array
+   if (!simpleOnly && buf1.isCmd("[")) {
+     shift();
+-    obj = Object(new Array(xref));
++    obj = Object(new Array(lexer.getXRef()));
+     while (!buf1.isCmd("]") && !buf1.isEOF() && recursion + 1 < recursionLimit) {
+       Object obj2 = getObj(false, fileKey, encAlgorithm, keyLength, objNum, objGen, recursion + 1);
+       obj.arrayAdd(std::move(obj2));
+@@ -103,7 +106,7 @@
+   // dictionary or stream
+   } else if (!simpleOnly && buf1.isCmd("<<")) {
+     shift(objNum);
+-    obj = Object(new Dict(xref));
++    obj = Object(new Dict(lexer.getXRef()));
+     while (!buf1.isCmd(">>") && !buf1.isEOF()) {
+       if (!buf1.isName()) {
+ 	error(errSyntaxError, getPos(), "Dictionary key must be a name object");
+@@ -155,7 +158,10 @@
+           return Object();
+       }
+ 
+-      return Object(num, gen);
++      Ref r;
++      r.num = num;
++      r.gen = gen;
++      return Object(r);
+     } else {
+       return Object(num);
+     }
+@@ -164,7 +170,7 @@
+   } else if (buf1.isString() && fileKey) {
+     s = buf1.getString();
+     s2 = new GooString();
+-    decrypt = new DecryptStream(new MemStream(s->getCString(), 0, s->getLength(), Object(objNull)),
++    decrypt = new DecryptStream(new MemStream(s->c_str(), 0, s->getLength(), Object(objNull)),
+ 				fileKey, encAlgorithm, keyLength,
+ 				objNum, objGen);
+     decrypt->reset();
+@@ -190,7 +196,7 @@
+   return Object(objError);
+ }
+ 
+-Stream *Parser::makeStream(Object &&dict, Guchar *fileKey,
++Stream *Parser::makeStream(Object &&dict, unsigned char *fileKey,
+ 			   CryptAlgorithm encAlgorithm, int keyLength,
+ 			   int objNum, int objGen, int recursion,
+                            bool strict) {
+@@ -198,22 +204,25 @@
+   Stream *str;
+   Goffset length;
+   Goffset pos, endPos;
+-  XRefEntry *entry = nullptr;
+-
+-  if (xref && (entry = xref->getEntry(objNum, false))) {
+-    if (!entry->getFlag(XRefEntry::Parsing) ||
+-        (objNum == 0 && objGen == 0)) {
+-      entry->setFlag(XRefEntry::Parsing, true);
+-    } else {
+-      error(errSyntaxError, getPos(),
+-            "Object '{0:d} {1:d} obj' is being already parsed", objNum, objGen);
+-      return nullptr;
++
++
++  if (XRef *xref = lexer.getXRef()) {
++    XRefEntry *entry = xref->getEntry(objNum, false);
++    if (entry) {
++      if (!entry->getFlag(XRefEntry::Parsing) ||
++	  (objNum == 0 && objGen == 0)) {
++	entry->setFlag(XRefEntry::Parsing, true);
++      } else {
++	error(errSyntaxError, getPos(),
++	      "Object '{0:d} {1:d} obj' is being already parsed", objNum, objGen);
++	return nullptr;
++      }
+     }
+   }
+ 
+   // get stream start position
+-  lexer->skipToNextLine();
+-  if (!(str = lexer->getStream())) {
++  lexer.skipToNextLine();
++  if (!(str = lexer.getStream())) {
+     return nullptr;
+   }
+   pos = str->getPos();
+@@ -231,22 +240,22 @@
+   }
+ 
+   // check for length in damaged file
+-  if (xref && xref->getStreamEnd(pos, &endPos)) {
++  if (lexer.hasXRef() && lexer.getXRef()->getStreamEnd(pos, &endPos)) {
+     length = endPos - pos;
+   }
+ 
+   // in badly damaged PDF files, we can run off the end of the input
+   // stream immediately after the "stream" token
+-  if (!lexer->getStream()) {
++  if (!lexer.getStream()) {
+     return nullptr;
+   }
+-  baseStr = lexer->getStream()->getBaseStream();
++  baseStr = lexer.getStream()->getBaseStream();
+ 
+   // skip over stream data
+-  if (Lexer::LOOK_VALUE_NOT_CACHED != lexer->lookCharLastValueCached) {
++  if (Lexer::LOOK_VALUE_NOT_CACHED != lexer.lookCharLastValueCached) {
+       // take into account the fact that we've cached one value
+       pos = pos - 1;
+-      lexer->lookCharLastValueCached = Lexer::LOOK_VALUE_NOT_CACHED;
++      lexer.lookCharLastValueCached = Lexer::LOOK_VALUE_NOT_CACHED;
+   }
+   if (unlikely(length < 0)) {
+       return nullptr;
+@@ -254,7 +263,7 @@
+   if (unlikely(pos > LLONG_MAX - length)) {
+       return nullptr;
+   }
+-  lexer->setPos(pos + length);
++  lexer.setPos(pos + length);
+ 
+   // refill token buffers and check for 'endstream'
+   shift();  // kill '>>'
+@@ -264,9 +273,9 @@
+   } else {
+     error(errSyntaxError, getPos(), "Missing 'endstream' or incorrect stream length");
+     if (strict) return nullptr;
+-    if (xref && lexer->getStream()) {
++    if (lexer.hasXRef() && lexer.getStream()) {
+       // shift until we find the proper endstream or we change to another object or reach eof
+-      length = lexer->getPos() - pos;
++      length = lexer.getPos() - pos;
+       if (buf1.isCmd("endstream")) {
+         dict.dictSet("Length", Object(length));
+       }
+@@ -291,8 +300,15 @@
+   // get filters
+   str = str->addFilters(str->getDict(), recursion);
+ 
+-  if (entry)
+-    entry->setFlag(XRefEntry::Parsing, false);
++  if (XRef *xref = lexer.getXRef()) {
++    // Don't try to reuse the entry from the block at the start
++    // of the function, xref can change in the middle because of
++    // reconstruction
++    XRefEntry *entry = xref->getEntry(objNum, false);
++    if (entry) {
++      entry->setFlag(XRefEntry::Parsing, false);
++    }
++  }
+ 
+   return str;
+ }
+@@ -307,14 +323,14 @@
+       inlineImg = 0;
+     }
+   } else if (buf2.isCmd("ID")) {
+-    lexer->skipChar();		// skip char after 'ID' command
++    lexer.skipChar();		// skip char after 'ID' command
+     inlineImg = 1;
+   }
+   buf1 = std::move(buf2);
+   if (inlineImg > 0)		// don't buffer inline image data
+     buf2.setToNull();
+   else {
+-    buf2 = lexer->getObj(objNum);
++    buf2 = lexer.getObj(objNum);
+   }
+ }
+ 
+@@ -328,15 +344,15 @@
+       inlineImg = 0;
+     }
+   } else if (buf2.isCmd("ID")) {
+-    lexer->skipChar();		// skip char after 'ID' command
++    lexer.skipChar();		// skip char after 'ID' command
+     inlineImg = 1;
+   }
+   buf1 = std::move(buf2);
+   if (inlineImg > 0) {
+     buf2.setToNull();
+   } else if (buf1.isCmd(cmdA)) {
+-    buf2 = lexer->getObj(objNum);
++    buf2 = lexer.getObj(objNum);
+   } else {
+-    buf2 = lexer->getObj(cmdA, objNum);
+-  }
+-}
++    buf2 = lexer.getObj(cmdA, objNum);
++  }
++}
+--- a/poppler/poppler/XRef.cc
++++ b/poppler/poppler/XRef.cc
+@@ -15,7 +15,7 @@
+ //
+ // Copyright (C) 2005 Dan Sheridan <dan.sheridan@postman.org.uk>
+ // Copyright (C) 2005 Brad Hards <bradh@frogmouth.net>
+-// Copyright (C) 2006, 2008, 2010, 2012-2014, 2016-2018 Albert Astals Cid <aacid@kde.org>
++// Copyright (C) 2006, 2008, 2010, 2012-2014, 2016-2019 Albert Astals Cid <aacid@kde.org>
+ // Copyright (C) 2007-2008 Julien Rebetez <julienr@svn.gnome.org>
+ // Copyright (C) 2007 Carlos Garcia Campos <carlosgc@gnome.org>
+ // Copyright (C) 2009, 2010 Ilya Gorenbein <igorenbein@finjan.com>
+@@ -25,8 +25,9 @@
+ // Copyright (C) 2013, 2014, 2017 Adrian Johnson <ajohnson@redneon.com>
+ // Copyright (C) 2013 Pino Toscano <pino@kde.org>
+ // Copyright (C) 2016 Jakub Alba <jakubalba@gmail.com>
+-// Copyright (C) 2018 Adam Reichold <adam.reichold@t-online.de>
++// Copyright (C) 2018, 2019 Adam Reichold <adam.reichold@t-online.de>
+ // Copyright (C) 2018 Tobias Deiminger <haxtibal@posteo.de>
++// Copyright (C) 2019 LE GARREC Vincent <legarrec.vincent@gmail.com>
+ //
+ // To see a description of the changes please see the Changelog file that
+ // came with your tarball or type make ChangeLog if you are building from git
+@@ -157,7 +158,7 @@
+   // parse the header: object numbers and offsets
+   objStr.streamReset();
+   str = new EmbedStream(objStr.getStream(), Object(objNull), true, first);
+-  parser = new Parser(xref, new Lexer(xref, str), false);
++  parser = new Parser(xref, str, false);
+   for (i = 0; i < nObjects; ++i) {
+     obj1 = parser->getObj();
+     Object obj2 = parser->getObj();
+@@ -196,7 +197,7 @@
+       str = new EmbedStream(objStr.getStream(), Object(objNull), true,
+ 			    offsets[i+1] - offsets[i]);
+     }
+-    parser = new Parser(xref, new Lexer(xref, str), false);
++    parser = new Parser(xref, str, false);
+     objs[i] = parser->getObj();
+     while (str->getChar() != EOF) ;
+     delete parser;
+@@ -291,7 +292,7 @@
+     }
+ 
+     // set size to (at least) the size specified in trailer dict
+-    obj = trailerDict.dictLookupNF("Size");
++    obj = trailerDict.dictLookupNF("Size").copy();
+     if (!obj.isInt()) {
+         error(errSyntaxWarning, -1, "No valid XRef size in trailer");
+     } else {
+@@ -306,7 +307,7 @@
+     }
+ 
+     // get the root dictionary (catalog) object
+-    obj = trailerDict.dictLookupNF("Root");
++    obj = trailerDict.dictLookupNF("Root").copy();
+     if (obj.isRef()) {
+       rootNum = obj.getRefNum();
+       rootGen = obj.getRefGen();
+@@ -459,8 +460,7 @@
+ 
+   // start up a parser, parse one token
+   parser = new Parser(nullptr,
+-	     new Lexer(nullptr,
+-	       str->makeSubStream(start + *pos, false, 0, Object(objNull))),
++	     str->makeSubStream(start + *pos, false, 0, Object(objNull)),
+ 	     true);
+   obj = parser->getObj(true);
+ 
+@@ -588,7 +588,7 @@
+   }
+ 
+   // get the 'Prev' pointer
+-  obj2 = obj.getDict()->lookupNF("Prev");
++  obj2 = obj.getDict()->lookupNF("Prev").copy();
+   if (obj2.isInt() || obj2.isInt64()) {
+     if (obj2.isInt())
+       pos2 = obj2.getInt();
+@@ -604,7 +604,7 @@
+   } else if (obj2.isRef()) {
+     // certain buggy PDF generators generate "/Prev NNN 0 R" instead
+     // of "/Prev NNN"
+-    pos2 = (Guint)obj2.getRefNum();
++    pos2 = (unsigned int)obj2.getRefNum();
+     if (pos2 != *pos) {
+       *pos = pos2;
+       more = true;
+@@ -657,7 +657,7 @@
+   ok = false;
+ 
+   Dict *dict = xrefStr->getDict();
+-  obj = dict->lookupNF("Size");
++  obj = dict->lookupNF("Size").copy();
+   if (!obj.isInt()) {
+     return false;
+   }
+@@ -672,7 +672,7 @@
+     }
+   }
+ 
+-  obj = dict->lookupNF("W");
++  obj = dict->lookupNF("W").copy();
+   if (!obj.isArray() || obj.arrayGetLength() < 3) {
+     return false;
+   }
+@@ -691,7 +691,7 @@
+   }
+ 
+   xrefStr->reset();
+-  Object idx = dict->lookupNF("Index");
++  const Object &idx = dict->lookupNF("Index");
+   if (idx.isArray()) {
+     for (int i = 0; i+1 < idx.arrayGetLength(); i += 2) {
+       obj = idx.arrayGet(i);
+@@ -715,7 +715,7 @@
+     }
+   }
+ 
+-  obj = dict->lookupNF("Prev");
++  obj = dict->lookupNF("Prev").copy();
+   if (obj.isInt() && obj.getInt() >= 0) {
+     *pos = obj.getInt();
+     more = true;
+@@ -816,7 +816,6 @@
+ //          Existing data in XRef::entries may get corrupted if applied anyway.
+ bool XRef::constructXRef(bool *wasReconstructed, bool needCatalogDict) {
+   Parser *parser;
+-  Object obj;
+   char buf[256];
+   Goffset pos;
+   int num, gen;
+@@ -867,12 +866,11 @@
+       // got trailer dictionary
+       if (!strncmp(p, "trailer", 7)) {
+         parser = new Parser(nullptr,
+-		 new Lexer(nullptr,
+-		   str->makeSubStream(pos + 7, false, 0, Object(objNull))),
++		 str->makeSubStream(pos + 7, false, 0, Object(objNull)),
+ 		 false);
+         Object newTrailerDict = parser->getObj();
+         if (newTrailerDict.isDict()) {
+-	  obj = newTrailerDict.dictLookupNF("Root");
++	  const Object &obj = newTrailerDict.dictLookupNF("Root");
+ 	  if (obj.isRef() && (!gotRoot || !needCatalogDict) && rootNum != obj.getRefNum()) {
+ 	    rootNum = obj.getRefNum();
+ 	    rootGen = obj.getRefGen();
+@@ -979,7 +977,7 @@
+ }
+ 
+ void XRef::setEncryption(int permFlagsA, bool ownerPasswordOkA,
+-			 const Guchar *fileKeyA, int keyLengthA,
++			 const unsigned char *fileKeyA, int keyLengthA,
+ 			 int encVersionA, int encRevisionA,
+ 			 CryptAlgorithm encAlgorithmA) {
+   int i;
+@@ -1000,7 +998,7 @@
+   encAlgorithm = encAlgorithmA;
+ }
+ 
+-void XRef::getEncryptionParameters(Guchar **fileKeyA, CryptAlgorithm *encAlgorithmA,
++void XRef::getEncryptionParameters(unsigned char **fileKeyA, CryptAlgorithm *encAlgorithmA,
+                               int *keyLengthA) {
+   if (encrypted) {
+     *fileKeyA = fileKey;
+@@ -1072,9 +1070,13 @@
+   return catalog;
+ }
+ 
++Object XRef::fetch(const Ref ref, int recursion)
++{
++    return fetch(ref.num, ref.gen, recursion);
++}
++
+ Object XRef::fetch(int num, int gen, int recursion) {
+   XRefEntry *e;
+-  Parser *parser;
+   Object obj1, obj2, obj3;
+ 
+   xrefLocker();
+@@ -1095,13 +1097,12 @@
+     if (e->gen != gen || e->offset < 0) {
+       goto err;
+     }
+-    parser = new Parser(this,
+-	       new Lexer(this,
+-		 str->makeSubStream(start + e->offset, false, 0, Object(objNull))),
+-	       true);
+-    obj1 = parser->getObj(recursion);
+-    obj2 = parser->getObj(recursion);
+-    obj3 = parser->getObj(recursion);
++    Parser parser{this,
++	       str->makeSubStream(start + e->offset, false, 0, Object(objNull)),
++	       true};
++    obj1 = parser.getObj(recursion);
++    obj2 = parser.getObj(recursion);
++    obj3 = parser.getObj(recursion);
+     if (!obj1.isInt() || obj1.getInt() != num ||
+ 	!obj2.isInt() || obj2.getInt() != gen ||
+ 	!obj3.isCmd("obj")) {
+@@ -1120,17 +1121,14 @@
+ 	  if (longNumber <= INT_MAX && longNumber >= INT_MIN && *end_ptr == '\0') {
+ 	    int number = longNumber;
+ 	    error(errSyntaxWarning, -1, "Cmd was not obj but {0:s}, assuming the creator meant obj {1:d}", cmd, number);
+-	    delete parser;
+ 	    return Object(number);
+ 	  }
+ 	}
+       }
+-      delete parser;
+       goto err;
+     }
+-    Object obj = parser->getObj(false, (encrypted && !e->getFlag(XRefEntry::Unencrypted)) ? fileKey : nullptr,
++    Object obj = parser.getObj(false, (encrypted && !e->getFlag(XRefEntry::Unencrypted)) ? fileKey : nullptr,
+ 		   encAlgorithm, keyLength, num, gen, recursion);
+-    delete parser;
+     return obj;
+   }
+ 
+@@ -1141,7 +1139,7 @@
+       goto err;
+     }
+ #endif
+-    if (e->offset >= (Guint)size ||
++    if (e->offset >= (unsigned int)size ||
+ 	entries[e->offset].type != xrefEntryUncompressed) {
+       error(errSyntaxError, -1, "Invalid object stream");
+       goto err;
+@@ -1191,7 +1189,7 @@
+ 
+ // Added for the pdftex project.
+ Object XRef::getDocInfoNF() {
+-  return trailerDict.dictLookupNF("Info");
++  return trailerDict.dictLookupNF("Info").copy();
+ }
+ 
+ Object XRef::createDocInfoIfNoneExists() {
+@@ -1206,7 +1204,7 @@
+ 
+   obj = Object(new Dict(this));
+   const Ref ref = addIndirectObject(&obj);
+-  trailerDict.dictSet("Info", Object(ref.num, ref.gen));
++  trailerDict.dictSet("Info", Object(ref));
+ 
+   return obj;
+ }
+@@ -1482,8 +1480,8 @@
+   if (unlikely(entry == nullptr))
+     return false;
+ 
+-  Parser parser(nullptr, new Lexer(nullptr,
+-     str->makeSubStream(offset, false, 20, Object(objNull))), true);
++  Parser parser(nullptr,
++     str->makeSubStream(offset, false, 20, Object(objNull)), true);
+ 
+   Object obj1, obj2, obj3;
+   if (((obj1 = parser.getObj(), obj1.isInt()) || obj1.isInt64()) &&
+@@ -1548,13 +1546,39 @@
+   }
+ }
+ 
++namespace {
++
++struct DummyXRefEntry : XRefEntry {
++  DummyXRefEntry() {
++    offset = 0;
++    gen = -1;
++    type = xrefEntryNone;
++    flags = 0;
++  }
++};
++
++DummyXRefEntry dummyXRefEntry;
++
++}
++
+ XRefEntry *XRef::getEntry(int i, bool complainIfMissing)
+ {
++  if (unlikely(i < 0)) {
++    error(errInternal, -1, "Request for invalid XRef entry [{0:d}]", i);
++    return &dummyXRefEntry;
++  }
++
+   if (i >= size || entries[i].type == xrefEntryNone) {
+ 
+     if ((!xRefStream) && mainXRefEntriesOffset) {
++      if (unlikely(i >= capacity)) {
++	error(errInternal, -1, "Request for out-of-bounds XRef entry [{0:d}]", i);
++	return &dummyXRefEntry;
++      }
++
+       if (!parseEntry(mainXRefEntriesOffset + 20*i, &entries[i])) {
+-        error(errSyntaxError, -1, "Failed to parse XRef entry [{0:d}].", i);
++	error(errSyntaxError, -1, "Failed to parse XRef entry [{0:d}].", i);
++	return &dummyXRefEntry;
+       }
+     } else {
+       // Read XRef tables until the entry we're looking for is found
+@@ -1563,12 +1587,7 @@
+       // We might have reconstructed the xref
+       // Check again i is in bounds
+       if (unlikely(i >= size)) {
+-        static XRefEntry dummy;
+-        dummy.offset = 0;
+-        dummy.gen = -1;
+-        dummy.type = xrefEntryNone;
+-        dummy.flags = 0;
+-        return &dummy;
++	return &dummyXRefEntry;
+       }
+ 
+       if (entries[i].type == xrefEntryNone) {
+@@ -1592,7 +1611,7 @@
+     {
+       Array *array = obj->getArray();
+       for (int i = 0; i < array->getLength(); i++) {
+-	obj1 = array->getNF(i);
++	obj1 = array->getNF(i).copy();
+         markUnencrypted(&obj1);
+       }
+       break;
+@@ -1608,19 +1627,19 @@
+         dict = obj->getDict();
+       }
+       for (int i = 0; i < dict->getLength(); i++) {
+-	obj1 = dict->getValNF(i);
++	obj1 = dict->getValNF(i).copy();
+         markUnencrypted(&obj1);
+       }
+       break;
+     }
+     case objRef:
+     {
+-      Ref ref = obj->getRef();
++      const Ref ref = obj->getRef();
+       XRefEntry *e = getEntry(ref.num);
+       if (e->getFlag(XRefEntry::Unencrypted))
+         return; // We've already been here: prevent infinite recursion
+       e->setFlag(XRefEntry::Unencrypted, true);
+-      obj1 = fetch(ref.num, ref.gen);
++      obj1 = fetch(ref);
+       markUnencrypted(&obj1);
+       break;
+     }
+@@ -1670,7 +1689,7 @@
+ 
+ void XRef::markUnencrypted() {
+   // Mark objects referred from the Encrypt dict as Unencrypted
+-  Object obj = trailerDict.dictLookupNF("Encrypt");
++  const Object &obj = trailerDict.dictLookupNF("Encrypt");
+   if (obj.isRef()) {
+     XRefEntry *e = getEntry(obj.getRefNum());
+     e->setFlag(XRefEntry::Unencrypted, true);

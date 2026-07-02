@@ -1,0 +1,594 @@
+--- a/libfuzzer/FuzzerDriver.cpp
++++ b/libfuzzer/FuzzerDriver.cpp
+@@ -29,7 +29,12 @@
+ 
+ // This function should be present in the libFuzzer so that the client
+ // binary can test for its existence.
++#if LIBFUZZER_MSVC
++extern "C" void __libfuzzer_is_present() {}
++#pragma comment(linker, "/include:__libfuzzer_is_present")
++#else
+ extern "C" __attribute__((used)) void __libfuzzer_is_present() {}
++#endif  // LIBFUZZER_MSVC
+ 
+ namespace fuzzer {
+ 
+@@ -617,10 +622,6 @@
+   Options.PrintFinalStats = Flags.print_final_stats;
+   Options.PrintCorpusStats = Flags.print_corpus_stats;
+   Options.PrintCoverage = Flags.print_coverage;
+-  Options.PrintUnstableStats = Flags.print_unstable_stats;
+-  if (Flags.handle_unstable == TracePC::MinUnstable ||
+-      Flags.handle_unstable == TracePC::ZeroUnstable)
+-    Options.HandleUnstable = Flags.handle_unstable;
+   Options.DumpCoverage = Flags.dump_coverage;
+   if (Flags.exit_on_src_pos)
+     Options.ExitOnSrcPos = Flags.exit_on_src_pos;
+--- a/libfuzzer/FuzzerLoop.cpp
++++ b/libfuzzer/FuzzerLoop.cpp
+@@ -275,7 +275,8 @@
+ void Fuzzer::AlarmCallback() {
+   assert(Options.UnitTimeoutSec > 0);
+   // In Windows Alarm callback is executed by a different thread.
+-#if !LIBFUZZER_WINDOWS
++  // NetBSD's current behavior needs this change too.
++#if !LIBFUZZER_WINDOWS && !LIBFUZZER_NETBSD
+   if (!InFuzzingThread())
+     return;
+ #endif
+@@ -354,8 +355,6 @@
+ void Fuzzer::PrintFinalStats() {
+   if (Options.PrintCoverage)
+     TPC.PrintCoverage();
+-  if (Options.PrintUnstableStats)
+-    TPC.PrintUnstableStats();
+   if (Options.DumpCoverage)
+     TPC.DumpCoverage();
+   if (Options.PrintCorpusStats)
+@@ -448,29 +447,6 @@
+   }
+ }
+ 
+-void Fuzzer::CheckForUnstableCounters(const uint8_t *Data, size_t Size) {
+-  auto CBSetupAndRun = [&]() {
+-    ScopedEnableMsanInterceptorChecks S;
+-    UnitStartTime = system_clock::now();
+-    TPC.ResetMaps();
+-    RunningUserCallback = true;
+-    CB(Data, Size);
+-    RunningUserCallback = false;
+-    UnitStopTime = system_clock::now();
+-  };
+-
+-  // Copy original run counters into our unstable counters
+-  TPC.InitializeUnstableCounters();
+-
+-  // First Rerun
+-  CBSetupAndRun();
+-  if (TPC.UpdateUnstableCounters(Options.HandleUnstable)) {
+-    // Second Rerun
+-    CBSetupAndRun();
+-    TPC.UpdateAndApplyUnstableCounters(Options.HandleUnstable);
+-  }
+-}
+-
+ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
+                     InputInfo *II, bool *FoundUniqFeatures) {
+   if (!Size)
+@@ -481,17 +457,6 @@
+   UniqFeatureSetTmp.clear();
+   size_t FoundUniqFeaturesOfII = 0;
+   size_t NumUpdatesBefore = Corpus.NumFeatureUpdates();
+-  bool NewFeaturesUnstable = false;
+-
+-  if (Options.HandleUnstable || Options.PrintUnstableStats) {
+-    TPC.CollectFeatures([&](size_t Feature) {
+-      if (Corpus.IsFeatureNew(Feature, Size, Options.Shrink))
+-        NewFeaturesUnstable = true;
+-    });
+-    if (NewFeaturesUnstable)
+-      CheckForUnstableCounters(Data, Size);
+-  }
+-
+   TPC.CollectFeatures([&](size_t Feature) {
+     if (Corpus.AddFeature(Feature, Size, Options.Shrink))
+       UniqFeatureSetTmp.push_back(Feature);
+@@ -500,12 +465,10 @@
+                              II->UniqFeatureSet.end(), Feature))
+         FoundUniqFeaturesOfII++;
+   });
+-
+   if (FoundUniqFeatures)
+     *FoundUniqFeatures = FoundUniqFeaturesOfII;
+   PrintPulseAndReportSlowInput(Data, Size);
+   size_t NumNewFeatures = Corpus.NumFeatureUpdates() - NumUpdatesBefore;
+-
+   if (NumNewFeatures) {
+     TPC.UpdateObservedPCs();
+     Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures, MayDeleteFile,
+@@ -889,14 +852,14 @@
+ 
+ extern "C" {
+ 
+-__attribute__((visibility("default"))) size_t
++ATTRIBUTE_INTERFACE size_t
+ LLVMFuzzerMutate(uint8_t *Data, size_t Size, size_t MaxSize) {
+   assert(fuzzer::F);
+   return fuzzer::F->GetMD().DefaultMutate(Data, Size, MaxSize);
+ }
+ 
+ // Experimental
+-__attribute__((visibility("default"))) void
++ATTRIBUTE_INTERFACE void
+ LLVMFuzzerAnnounceOutput(const uint8_t *Data, size_t Size) {
+   assert(fuzzer::F);
+   fuzzer::F->AnnounceOutput(Data, Size);
+--- a/libfuzzer/FuzzerMain.cpp
++++ b/libfuzzer/FuzzerMain.cpp
+@@ -16,6 +16,6 @@
+ int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+ }  // extern "C"
+ 
+-__attribute__((visibility("default"))) int main(int argc, char **argv) {
++ATTRIBUTE_INTERFACE int main(int argc, char **argv) {
+   return fuzzer::FuzzerDriver(&argc, &argv, LLVMFuzzerTestOneInput);
+ }
+--- a/openvswitch/lib/odp-util.c
++++ b/openvswitch/lib/odp-util.c
+@@ -57,8 +57,15 @@
+ static const char *delimiters = ", \t\r\n";
+ static const char *delimiters_end = ", \t\r\n)";
+ 
+-static int parse_odp_key_mask_attr(const char *, const struct simap *port_names,
+-                              struct ofpbuf *, struct ofpbuf *);
++#define MAX_ODP_NESTED 32
++
++struct parse_odp_context {
++    const struct simap *port_names;
++    int depth; /* Current nested depth of odp string. */
++};
++
++static int parse_odp_key_mask_attr(struct parse_odp_context *, const char *,
++                                   struct ofpbuf *, struct ofpbuf *);
+ static void format_odp_key_attr(const struct nlattr *a,
+                                 const struct nlattr *ma,
+                                 const struct hmap *portno_names, struct ds *ds,
+@@ -489,8 +496,8 @@
+                               ",controller_id=%"PRIu16
+                               ",max_len=%"PRIu16,
+                               cookie.controller.reason,
+-                              cookie.controller.dont_send ? 1 : 0,
+-                              cookie.controller.continuation ? 1 : 0,
++                              !!cookie.controller.dont_send,
++                              !!cookie.controller.continuation,
+                               cookie.controller.recirc_id,
+                               ntohll(get_32aligned_be64(
+                                          &cookie.controller.rule_cookie)),
+@@ -1915,8 +1922,8 @@
+ 
+                     s += n;
+                     retval = scan_u128(s, &ct_label.value, &ct_label.mask);
+-                    if (retval < 0) {
+-                        return retval;
++                    if (retval == 0) {
++                        return -EINVAL;
+                     }
+                     s += retval;
+                     continue;
+@@ -2104,14 +2111,14 @@
+             struct ofpbuf b;
+             char buf[512];
+             size_t mdlen, padding;
+-            if (ovs_scan_len(s, &n, "md2=0x%511[0-9a-fA-F]", buf)) {
+-                ofpbuf_use_stub(&b, metadata,
+-                                NSH_CTX_HDRS_MAX_LEN);
++            if (ovs_scan_len(s, &n, "md2=0x%511[0-9a-fA-F]", buf)
++                && n/2 <= sizeof metadata) {
++                ofpbuf_use_stub(&b, metadata, sizeof metadata);
+                 ofpbuf_put_hex(&b, buf, &mdlen);
+                 /* Pad metadata to 4 bytes. */
+                 padding = PAD_SIZE(mdlen, 4);
+                 if (padding > 0) {
+-                    ofpbuf_push_zeros(&b, padding);
++                    ofpbuf_put_zeros(&b, padding);
+                 }
+                 md_size = mdlen + padding;
+                 ofpbuf_uninit(&b);
+@@ -2216,9 +2223,12 @@
+         struct ofpbuf maskbuf = OFPBUF_STUB_INITIALIZER(mask);
+         struct nlattr *nested, *key;
+         size_t size;
++        struct parse_odp_context context = (struct parse_odp_context) {
++            .port_names = port_names,
++        };
+ 
+         start_ofs = nl_msg_start_nested(actions, OVS_ACTION_ATTR_SET);
+-        retval = parse_odp_key_mask_attr(s + 4, port_names, actions, &maskbuf);
++        retval = parse_odp_key_mask_attr(&context, s + 4, actions, &maskbuf);
+         if (retval < 0) {
+             ofpbuf_uninit(&maskbuf);
+             return retval;
+@@ -2242,13 +2252,14 @@
+                 key->nla_len += size;
+                 ofpbuf_put(actions, mask + 1, size);
+ 
++                /* 'actions' may have been reallocated by ofpbuf_put(). */
++                nested = ofpbuf_at_assert(actions, start_ofs, sizeof *nested);
++                nested->nla_type = OVS_ACTION_ATTR_SET_MASKED;
++
++                key = nested + 1;
+                 /* Add new padding as needed */
+                 ofpbuf_put_zeros(actions, NLA_ALIGN(key->nla_len) -
+                                           key->nla_len);
+-
+-                /* 'actions' may have been reallocated by ofpbuf_put(). */
+-                nested = ofpbuf_at_assert(actions, start_ofs, sizeof *nested);
+-                nested->nla_type = OVS_ACTION_ATTR_SET_MASKED;
+             }
+         }
+         ofpbuf_uninit(&maskbuf);
+@@ -2271,6 +2282,10 @@
+                         &tpid, &vid, &pcp, &n)
+             || ovs_scan(s, "push_vlan(tpid=%i,vid=%i,pcp=%i,cfi=%i)%n",
+                         &tpid, &vid, &pcp, &cfi, &n)) {
++            if ((vid & ~(VLAN_VID_MASK >> VLAN_VID_SHIFT)) != 0
++                || (pcp & ~(VLAN_PCP_MASK >> VLAN_PCP_SHIFT)) != 0) {
++                return -EINVAL;
++            }
+             push.vlan_tpid = htons(tpid);
+             push.vlan_tci = htons((vid << VLAN_VID_SHIFT)
+                                   | (pcp << VLAN_PCP_SHIFT)
+@@ -2558,6 +2573,8 @@
+     size_t mdlen = 0;
+     bool has_md1 = false;
+     bool has_md2 = false;
++
++    memset(nsh_hdr, 0, size);
+ 
+     NL_NESTED_FOR_EACH (a, left, attr) {
+         uint16_t type = nl_attr_type(a);
+@@ -4804,10 +4821,15 @@
+     const char *s_base = s;
+     ovs_be16 id = 0, id_mask = 0;
+     uint8_t flags = 0, flags_mask = 0;
++    int len;
+ 
+     if (!strncmp(s, "id=", 3)) {
+         s += 3;
+-        s += scan_be16(s, &id, mask ? &id_mask : NULL);
++        len = scan_be16(s, &id, mask ? &id_mask : NULL);
++        if (len == 0) {
++            return 0;
++        }
++        s += len;
+     }
+ 
+     if (s[0] == ',') {
+@@ -4815,7 +4837,11 @@
+     }
+     if (!strncmp(s, "flags=", 6)) {
+         s += 6;
+-        s += scan_u8(s, &flags, mask ? &flags_mask : NULL);
++        len = scan_u8(s, &flags, mask ? &flags_mask : NULL);
++        if (len == 0) {
++            return 0;
++        }
++        s += len;
+     }
+ 
+     if (!strncmp(s, "))", 2)) {
+@@ -4841,10 +4867,15 @@
+     uint32_t idx = 0, idx_mask = 0;
+     uint8_t ver = 0, dir = 0, hwid = 0;
+     uint8_t ver_mask = 0, dir_mask = 0, hwid_mask = 0;
++    int len;
+ 
+     if (!strncmp(s, "ver=", 4)) {
+         s += 4;
+-        s += scan_u8(s, &ver, mask ? &ver_mask : NULL);
++        len = scan_u8(s, &ver, mask ? &ver_mask : NULL);
++        if (len == 0) {
++            return 0;
++        }
++        s += len;
+     }
+ 
+     if (s[0] == ',') {
+@@ -4854,7 +4885,11 @@
+     if (ver == 1) {
+         if (!strncmp(s, "idx=", 4)) {
+             s += 4;
+-            s += scan_u32(s, &idx, mask ? &idx_mask : NULL);
++            len = scan_u32(s, &idx, mask ? &idx_mask : NULL);
++            if (len == 0) {
++                return 0;
++            }
++            s += len;
+         }
+ 
+         if (!strncmp(s, ")", 1)) {
+@@ -4870,14 +4905,22 @@
+     } else if (ver == 2) {
+         if (!strncmp(s, "dir=", 4)) {
+             s += 4;
+-            s += scan_u8(s, &dir, mask ? &dir_mask : NULL);
++            len = scan_u8(s, &dir, mask ? &dir_mask : NULL);
++            if (len == 0) {
++                return 0;
++            }
++            s += len;
+         }
+         if (s[0] == ',') {
+             s++;
+         }
+         if (!strncmp(s, "hwid=", 5)) {
+             s += 5;
+-            s += scan_u8(s, &hwid, mask ? &hwid_mask : NULL);
++            len = scan_u8(s, &hwid, mask ? &hwid_mask : NULL);
++            if (len == 0) {
++                return 0;
++            }
++            s += len;
+         }
+ 
+         if (!strncmp(s, ")", 1)) {
+@@ -4903,6 +4946,7 @@
+     struct geneve_opt *opt = key->d;
+     struct geneve_opt *opt_mask = mask ? mask->d : NULL;
+     int len_remain = sizeof key->d;
++    int len;
+ 
+     while (s[0] == '{' && len_remain >= sizeof *opt) {
+         int data_len = 0;
+@@ -4912,8 +4956,12 @@
+ 
+         if (!strncmp(s, "class=", 6)) {
+             s += 6;
+-            s += scan_be16(s, &opt->opt_class,
+-                           mask ? &opt_mask->opt_class : NULL);
++            len = scan_be16(s, &opt->opt_class,
++                            mask ? &opt_mask->opt_class : NULL);
++            if (len == 0) {
++                return 0;
++            }
++            s += len;
+         } else if (mask) {
+             memset(&opt_mask->opt_class, 0, sizeof opt_mask->opt_class);
+         }
+@@ -4923,7 +4971,11 @@
+         }
+         if (!strncmp(s, "type=", 5)) {
+             s += 5;
+-            s += scan_u8(s, &opt->type, mask ? &opt_mask->type : NULL);
++            len = scan_u8(s, &opt->type, mask ? &opt_mask->type : NULL);
++            if (len == 0) {
++                return 0;
++            }
++            s += len;
+         } else if (mask) {
+             memset(&opt_mask->type, 0, sizeof opt_mask->type);
+         }
+@@ -4934,7 +4986,11 @@
+         if (!strncmp(s, "len=", 4)) {
+             uint8_t opt_len, opt_len_mask;
+             s += 4;
+-            s += scan_u8(s, &opt_len, mask ? &opt_len_mask : NULL);
++            len = scan_u8(s, &opt_len, mask ? &opt_len_mask : NULL);
++            if (len == 0) {
++                return 0;
++            }
++            s += len;
+ 
+             if (opt_len > 124 || opt_len % 4 || opt_len > len_remain) {
+                 return 0;
+@@ -4950,11 +5006,11 @@
+ 
+         if (s[0] == ',') {
+             s++;
+-        }
+-        if (parse_int_string(s, (uint8_t *)(opt + 1), data_len, (char **)&s)) {
+-            return 0;
+-        }
+-
++            if (parse_int_string(s, (uint8_t *)(opt + 1),
++                                 data_len, (char **)&s)) {
++                return 0;
++            }
++        }
+         if (mask) {
+             if (s[0] == '/') {
+                 s++;
+@@ -4975,11 +5031,13 @@
+                 opt_mask += 1 + data_len / 4;
+             }
+             len_remain -= data_len;
++        } else {
++            return 0;
+         }
+     }
+ 
+     if (s[0] == ')') {
+-        int len = sizeof key->d - len_remain;
++        len = sizeof key->d - len_remain;
+ 
+         s++;
+         key->len = len;
+@@ -5116,7 +5174,7 @@
+ /* Beginning of nested attribute. */
+ #define SCAN_BEGIN_NESTED(NAME, ATTR)                      \
+     SCAN_IF(NAME);                                         \
+-        size_t key_offset, mask_offset;                    \
++        size_t key_offset, mask_offset = 0;                \
+         key_offset = nl_msg_start_nested(key, ATTR);       \
+         if (mask) {                                        \
+             mask_offset = nl_msg_start_nested(mask, ATTR); \
+@@ -5225,7 +5283,8 @@
+ /* scan_port needs one extra argument. */
+ #define SCAN_SINGLE_PORT(NAME, TYPE, ATTR)  \
+     SCAN_BEGIN(NAME, TYPE) {                            \
+-        len = scan_port(s, &skey, &smask, port_names);  \
++        len = scan_port(s, &skey, &smask,               \
++                        context->port_names);           \
+         if (len == 0) {                                 \
+             return -EINVAL;                             \
+         }                                               \
+@@ -5361,16 +5420,9 @@
+ }
+ 
+ static int
+-parse_odp_key_mask_attr(const char *s, const struct simap *port_names,
++parse_odp_key_mask_attr(struct parse_odp_context *context, const char *s,
+                         struct ofpbuf *key, struct ofpbuf *mask)
+ {
+-    /* Skip UFID. */
+-    ovs_u128 ufid;
+-    int ufid_len = odp_ufid_from_string(s, &ufid);
+-    if (ufid_len) {
+-        return ufid_len;
+-    }
+-
+     SCAN_SINGLE("skb_priority(", uint32_t, u32, OVS_KEY_ATTR_PRIORITY);
+     SCAN_SINGLE("skb_mark(", uint32_t, u32, OVS_KEY_ATTR_SKB_MARK);
+     SCAN_SINGLE_FULLY_MASKED("recirc_id(", uint32_t, u32,
+@@ -5521,6 +5573,11 @@
+         const char *start = s;
+         size_t encap, encap_mask = 0;
+ 
++        if (context->depth + 1 == MAX_ODP_NESTED) {
++            return -EINVAL;
++        }
++        context->depth++;
++
+         encap = nl_msg_start_nested(key, OVS_KEY_ATTR_ENCAP);
+         if (mask) {
+             encap_mask = nl_msg_start_nested(mask, OVS_KEY_ATTR_ENCAP);
+@@ -5532,13 +5589,15 @@
+ 
+             s += strspn(s, delimiters);
+             if (!*s) {
++                context->depth--;
+                 return -EINVAL;
+             } else if (*s == ')') {
+                 break;
+             }
+ 
+-            retval = parse_odp_key_mask_attr(s, port_names, key, mask);
++            retval = parse_odp_key_mask_attr(context, s, key, mask);
+             if (retval < 0) {
++                context->depth--;
+                 return retval;
+             }
+             s += retval;
+@@ -5549,6 +5608,7 @@
+         if (mask) {
+             nl_msg_end_nested(mask, encap_mask);
+         }
++        context->depth--;
+ 
+         return s - start;
+     }
+@@ -5575,6 +5635,9 @@
+                      struct ofpbuf *key, struct ofpbuf *mask)
+ {
+     const size_t old_size = key->size;
++    struct parse_odp_context context = (struct parse_odp_context) {
++        .port_names = port_names,
++    };
+     for (;;) {
+         int retval;
+ 
+@@ -5583,7 +5646,18 @@
+             return 0;
+         }
+ 
+-        retval = parse_odp_key_mask_attr(s, port_names, key, mask);
++        /* Skip UFID. */
++        ovs_u128 ufid;
++        retval = odp_ufid_from_string(s, &ufid);
++        if (retval < 0) {
++            key->size = old_size;
++            return -retval;
++        } else if (retval > 0) {
++            s += retval;
++            s += s[0] == ' ' ? 1 : 0;
++        }
++
++        retval = parse_odp_key_mask_attr(&context, s, key, mask);
+         if (retval < 0) {
+             key->size = old_size;
+             return -retval;
+--- a/openvswitch/lib/util.h
++++ b/openvswitch/lib/util.h
+@@ -435,6 +435,39 @@
+ static inline ovs_be32 be32_prefix_mask(int plen)
+ {
+     return htonl((uint64_t)UINT32_MAX << (32 - plen));
++}
++
++
++/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
++ * false otherwise. */
++static inline bool
++uint_is_superset(uintmax_t super, uintmax_t sub)
++{
++    return (super & sub) == sub;
++}
++
++/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
++ * false otherwise. */
++static inline bool
++be16_is_superset(ovs_be16 super, ovs_be16 sub)
++{
++    return (super & sub) == sub;
++}
++
++/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
++ * false otherwise. */
++static inline bool
++be32_is_superset(ovs_be32 super, ovs_be32 sub)
++{
++    return (super & sub) == sub;
++}
++
++/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
++ * false otherwise. */
++static inline bool
++be64_is_superset(ovs_be64 super, ovs_be64 sub)
++{
++    return (super & sub) == sub;
+ }
+ 
+ 
+@@ -511,6 +544,20 @@
+     return dst;
+ }
+ 
++static inline bool
++ovs_be128_is_superset(ovs_be128 super, ovs_be128 sub)
++{
++    return (be64_is_superset(super.be64.hi, sub.be64.hi) &&
++            be64_is_superset(super.be64.lo, sub.be64.lo));
++}
++
++static inline bool
++ovs_u128_is_superset(ovs_u128 super, ovs_u128 sub)
++{
++    return (uint_is_superset(super.u64.hi, sub.u64.hi) &&
++            uint_is_superset(super.u64.lo, sub.u64.lo));
++}
++
+ void xsleep(unsigned int seconds);
+ void xnanosleep(uint64_t nanoseconds);
+ 
+--- a/openvswitch/tests/oss-fuzz/odp_target.c
++++ b/openvswitch/tests/oss-fuzz/odp_target.c
+@@ -125,7 +125,8 @@
+ {
+     /* Bail out if we cannot construct at least a 1 char string. */
+     const char *input = (const char *) data;
+-    if (size < 2 || input[size - 1] != '\0' || strchr(input, '\n')) {
++    if (size < 2 || input[size - 1] != '\0' || strchr(input, '\n') ||
++        strlen(input) != size - 1) {
+         return 0;
+     }
+ 
