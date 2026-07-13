@@ -131,6 +131,28 @@ def litellm_backend(model: str | None = None, api_key: str | None = None,
     return _call
 
 
+def openai_backend(model: str, api_key: str, base_url: str | None = None,
+                   temperature: float | None = 0.0) -> LLMBackend:
+    """Backend for any OpenAI-compatible endpoint (OpenAI, a gateway, DeepSeek, ...).
+    Uses the `openai` SDK. `temperature=None` omits the param (some reasoning models
+    reject non-default temperature)."""
+    from openai import OpenAI  # lazy
+    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+
+    def _call(prompt: str) -> str:
+        kw = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+        if temperature is not None:
+            kw["temperature"] = temperature
+        try:
+            resp = client.chat.completions.create(**kw)
+        except Exception:
+            kw.pop("temperature", None)  # retry once without temperature
+            resp = client.chat.completions.create(**kw)
+        return resp.choices[0].message.content or ""
+
+    return _call
+
+
 def _parse_json(text: str) -> dict[str, Any]:
     """Tolerant extraction of the first JSON object from an LLM reply."""
     if not text:
