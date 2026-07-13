@@ -1,4 +1,16 @@
-"""T3 root-cause understanding evaluator."""
+"""T3 root-cause understanding evaluator (structured).
+
+Distinct from t1 (endpoints) and invariant (between-chain): T3 isolates the
+CAUSE-vs-SYMPTOM distinction — did the agent identify a root cause that is
+
+  1. correctly LOCATED at the patch-fixed fault,
+  2. DISTINCT from the crash point (not the naive "the crash line is the bug"), and
+  3. causally LINKED to the crash (an edge from the fault toward the sink).
+
+Scored from the agent's structured recorder claims, not trajectory text. The
+causal-link check needs GT variables; when they are absent it degrades to the
+position-only verdict rather than failing the sample.
+"""
 
 from __future__ import annotations
 
@@ -6,158 +18,137 @@ import json
 from typing import Any
 
 from .base import BaseEvaluator, EvaluationInput
-from .recorder_evidence import recorder_as_trajectory
-from .t2_trace import T2PropagationTraceEvaluator
-from .trajectory import EvidenceEvent, load_openhands_trajectory
+from .invariant import _sym_eq, build_agent_state, nodes_in_group
+from .trajectory import path_suffix_matches
 
-
-CAUSE_KEYWORDS = [
-    "root cause",
-    "cause",
-    "because",
-    "premature",
-    "after",
-    "before",
-    "free",
-    "overflow",
-    "underflow",
-    "wrap",
-    "alloc",
-    "use-after-free",
-    "out-of-bounds",
-]
+LINE_TOLERANCE = 3
 
 
 class T3RootCauseEvaluator(BaseEvaluator):
-    """Evaluate whether the trajectory distinguishes cause from symptom."""
-
     name = "t3_root_cause"
-    version = "0.1"
-
-    def __init__(self, phase: str = "pre_submit") -> None:
-        self.phase = phase
-        self._matcher = T2PropagationTraceEvaluator(phase=phase)
+    version = "0.3"
 
     def evaluate(self, inputs: EvaluationInput) -> dict[str, Any]:
         gt = json.loads(inputs.ground_truth.read_text(encoding="utf-8"))
-        recorder = recorder_as_trajectory(inputs.ground_truth)
-        trajectory = recorder or load_openhands_trajectory(inputs.trajectory)
-        events = trajectory.events_for_phase(self.phase)
+        agent, has_records = build_agent_state(inputs.ground_truth)
 
-        root_step = _as_step(
-            _merge_fine_trace_defaults(gt.get("root_cause"), gt.get("fine_trace"), roles={"root_cause"}),
-            role="root_cause",
-        )
-        sink_step = _as_step(
-            _merge_fine_trace_defaults(gt.get("sink"), gt.get("fine_trace"), roles={"sink", "unsafe_use"}),
-            role="sink",
-        )
-        root_result = self._matcher._match_step(root_step, events, trajectory)
-        sink_result = self._matcher._match_step(sink_step, events, trajectory)
-        relation = _cause_sink_relation(root_step, sink_step, events)
-        mechanism = _mechanism_evidence(gt, events)
+        gt_root = _loc(gt.get("root_cause"))
+        gt_sink = _loc(gt.get("sink"))
+        crash = _loc((gt.get("sanitizer_ground_truth") or {}).get("crash_location")) or gt_sink
 
-        strict = root_result["status"] == "matched" and relation["seen"]
-        lenient = root_result["status"] in {"matched", "partial"} and (relation["seen"] or mechanism["seen"])
-        distinguishes = strict or (root_step.get("line") != sink_step.get("line") and relation["seen"])
+        claims = nodes_in_group(agent["nodes"], "root_causes")
+        # Line-discriminative: when the fault and crash share a function, a function
+        # match cannot tell them apart — require line proximity to the fault, closer
+        # to it than to the crash.
+        located = _locates(gt_root, gt_sink, claims)
+        status = "located" if located else ("wrong_location" if _in_file(gt_root, claims) else "missing")
+
+        # Is there a real cause/symptom distinction to test, and did the agent make it?
+        gt_distinguishable = not _same_point(gt_root, gt_sink)
+        at_symptom = _locates(gt_sink, gt_root, claims) or _locates(crash, gt_root, claims)
+        distinguishes = gt_distinguishable and located
+        mistook_crash_for_cause = gt_distinguishable and not located and at_symptom
+
+        link = _cause_crash_link(_role_var(gt, "root_cause"), _role_var(gt, "sink"), agent["edges"])
+
+        position_ok = located and (distinguishes or not gt_distinguishable)
+        strict = position_ok and (link["strict"] if link["evaluable"] else True)
+        lenient = located and (link["lenient"] if link["evaluable"] else True)
 
         return {
             "evaluator": self.name,
             "version": self.version,
-            "phase_policy": self.phase,
-            "evidence_mode": "recorder" if recorder else "trajectory",
-            "structured_reasoning_evaluable": bool(recorder),
-            "inputs": {"ground_truth": str(inputs.ground_truth), "trajectory": str(inputs.trajectory)},
+            "structured_reasoning_evaluable": has_records,
+            "inputs": {"ground_truth": str(inputs.ground_truth)},
             "summary": {
-                "root_cause_status": root_result["status"],
-                "sink_status": sink_result["status"],
-                "cause_sink_relation_seen": relation["seen"],
-                "mechanism_seen": mechanism["seen"],
+                "root_cause_status": status,
+                "gt_distinguishable": gt_distinguishable,
+                "distinguishes_cause_from_crash_symptom": distinguishes,
+                "mistook_crash_for_cause": mistook_crash_for_cause,
+                "cause_crash_link_evaluable": link["evaluable"],
+                "cause_crash_link_seen": link["strict"],
                 "strict_root_cause_understood": strict,
                 "lenient_root_cause_understood": lenient,
-                "distinguishes_cause_from_crash_symptom": distinguishes,
             },
-            "root_cause_result": root_result,
-            "sink_result": sink_result,
-            "cause_sink_relation": relation,
-            "mechanism_evidence": mechanism,
+            "cause_crash_link": link,
         }
 
 
-def _as_step(obj: Any, *, role: str) -> dict[str, Any]:
+def _in_file(gt_pos: dict, claims: list[dict]) -> bool:
+    gf = str(gt_pos.get("file") or "")
+    return any(path_suffix_matches(gf, str(c.get("file") or "")) or
+               path_suffix_matches(str(c.get("file") or ""), gf) for c in claims if c.get("file"))
+
+
+def _locates(target: dict, other: dict, claims: list[dict]) -> bool:
+    """Does any agent claim locate `target` while staying discriminative against
+    `other`? Line proximity is required; a bare function match is accepted only when
+    the function does not also contain `other` (otherwise it can't tell them apart)."""
+    tf = str(target.get("file") or "")
+    tl, ol = _safe_int(target.get("line")), _safe_int(other.get("line"))
+    tfn, ofn = str(target.get("function") or ""), str(other.get("function") or "")
+    same_func_diff_line = bool(tfn and tfn == ofn and tl is not None and ol is not None and tl != ol)
+    for c in claims:
+        cf = str(c.get("file") or "")
+        if not (path_suffix_matches(tf, cf) or path_suffix_matches(cf, tf)):
+            continue
+        cl = _safe_int(c.get("line"))
+        if cl is not None and tl is not None:
+            if abs(cl - tl) <= LINE_TOLERANCE and not (
+                same_func_diff_line and ol is not None and abs(cl - ol) < abs(cl - tl)
+            ):
+                return True
+        elif not same_func_diff_line and tfn and str(c.get("function") or "") == tfn:
+            return True
+    return False
+
+
+def _loc(obj: Any) -> dict[str, Any]:
     if not isinstance(obj, dict):
-        obj = {}
-    return {
-        "step": role,
-        "role": role,
-        "file": obj.get("file"),
-        "function": obj.get("function"),
-        "line": obj.get("line"),
-        "var": obj.get("var", ""),
-        "code": obj.get("code", ""),
-    }
+        return {}
+    return {"file": obj.get("file"), "function": obj.get("function"), "line": obj.get("line")}
 
 
-def _cause_sink_relation(root_step: dict[str, Any], sink_step: dict[str, Any], events: list[EvidenceEvent]) -> dict[str, Any]:
-    root_terms = [str(root_step.get("function") or ""), str(root_step.get("line") or ""), str(root_step.get("var") or "")]
-    sink_terms = [str(sink_step.get("function") or ""), str(sink_step.get("line") or ""), str(sink_step.get("var") or "")]
-    for event in events:
-        if event.source not in {"agent", "recorder"} or not (event.thought or event.action in {"think", "finish", "root_cause", "sink", "edge"}):
-            continue
-        text = event.text.lower()
-        root_hit = any(term and term.lower() in text for term in root_terms)
-        sink_hit = any(term and term.lower() in text for term in sink_terms)
-        cause_hit = any(k in text for k in CAUSE_KEYWORDS)
-        if root_hit and sink_hit and cause_hit:
-            return {
-                "seen": True,
-                "event_index": event.index,
-                "mode": "same_reasoning_event",
-                "excerpt": _excerpt(event.text),
-            }
-    return {"seen": False, "mode": None}
+def _same_point(a: dict, b: dict) -> bool:
+    """Two GT points are the same fault when same file and line within tolerance."""
+    if not (a.get("file") and b.get("file")):
+        return False
+    if str(a["file"]) != str(b["file"]):
+        return False
+    la, lb = _safe_int(a.get("line")), _safe_int(b.get("line"))
+    if la is not None and lb is not None:
+        return abs(la - lb) <= LINE_TOLERANCE
+    return str(a.get("function") or "") == str(b.get("function") or "")
 
 
-def _mechanism_evidence(gt: dict[str, Any], events: list[EvidenceEvent]) -> dict[str, Any]:
-    root = gt.get("root_cause") if isinstance(gt.get("root_cause"), dict) else {}
-    analysis = gt.get("root_cause_analysis") if isinstance(gt.get("root_cause_analysis"), dict) else {}
-    mechanism = str(
-        root.get("mechanism")
-        or analysis.get("key_mechanism")
-        or root.get("description")
-        or ""
-    ).replace("_", " ").lower()
-    words = [w for w in mechanism.split() if len(w) >= 4]
-    for event in events:
-        if event.source not in {"agent", "recorder"}:
-            continue
-        text = event.text.lower()
-        if words and sum(1 for w in words if w in text) >= max(1, min(2, len(words))):
-            return {"seen": True, "event_index": event.index, "mode": "key_mechanism_words", "excerpt": _excerpt(event.text)}
-    return {"seen": False, "mode": None}
+def _role_var(gt: dict, role: str) -> str:
+    for step in gt.get("fine_trace") or []:
+        if isinstance(step, dict) and step.get("role") == role and step.get("var"):
+            return str(step["var"])
+    obj = gt.get(role)
+    if isinstance(obj, dict) and obj.get("var"):
+        return str(obj["var"])
+    return ""
 
 
-def _excerpt(text: str, limit: int = 500) -> str:
-    return " ".join((text or "").split())[:limit]
+def _cause_crash_link(root_var: str, sink_var: str, agent_edges: list[dict]) -> dict[str, Any]:
+    """Did the agent connect the fault to the crash? strict = one edge touches both
+    the root-cause var and the sink var; lenient = the root-cause var participates in
+    any recorded edge. Not evaluable without both GT variables."""
+    if not (root_var and sink_var and agent_edges):
+        return {"evaluable": False, "strict": False, "lenient": False}
+    strict = lenient = False
+    for e in agent_edges:
+        ends = [str(e.get("from") or ""), str(e.get("to") or ""), str(e.get("obj") or "")]
+        touches_root = any(_sym_eq(root_var, x) for x in ends if x)
+        touches_sink = any(_sym_eq(sink_var, x) for x in ends if x)
+        lenient = lenient or touches_root
+        strict = strict or (touches_root and touches_sink)
+    return {"evaluable": True, "strict": strict, "lenient": lenient}
 
 
-def _merge_fine_trace_defaults(obj: Any, fine_trace: Any, *, roles: set[str]) -> dict[str, Any]:
-    base = dict(obj) if isinstance(obj, dict) else {}
-    if not isinstance(fine_trace, list):
-        return base
-    for step in fine_trace:
-        if not isinstance(step, dict) or step.get("role") not in roles:
-            continue
-        same_location = (
-            base.get("file")
-            and base.get("line")
-            and str(base.get("file")) == str(step.get("file"))
-            and str(base.get("line")) == str(step.get("line"))
-        )
-        same_function = base.get("function") and str(base.get("function")) == str(step.get("function"))
-        no_location = not base.get("file") and not base.get("line")
-        if same_location or (same_function and not base.get("var")) or no_location:
-            merged = dict(step)
-            merged.update({k: v for k, v in base.items() if v not in (None, "")})
-            return merged
-    return base
+def _safe_int(v: Any) -> int | None:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None

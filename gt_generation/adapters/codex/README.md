@@ -38,6 +38,6 @@ Your `GT_AGENT_COMMAND` wrapper is responsible for:
 2. giving the agent access to the sample inputs and `--result-dir`,
 3. letting the agent call `python3 -m gt_toolkit ...` for deterministic checks.
 
-Deterministic stages (like `06_validate`) have their own `command_template` and
+Deterministic stages (like `05_validate`) have their own `command_template` and
 do not use `GT_AGENT_COMMAND` at all — they call `gt_toolkit` directly, so the
 schema gate is identical across every CLI.

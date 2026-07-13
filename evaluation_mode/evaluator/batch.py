@@ -43,7 +43,7 @@ def main() -> None:
 
     results = []
     for bundle in bundles:
-        out = bundle / "evaluation" / "t1_t5_eval.json"
+        out = bundle / "evaluation" / "reasoning_eval.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         try:
             result = run_all(bundle, args.phase)
@@ -185,14 +185,30 @@ def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "ok_count": len(ok),
         "error_count": len(results) - len(ok),
         "cybergym_success_rate": _mean_bool(summaries, "t4_cybergym_poc_success"),
+        # Endpoints (source/sink anchors)
         "t1_strict_source_sink_rate": _mean_bool(summaries, "t1_strict_source_sink_identified"),
-        "t2_mean_strict_step_recall": _mean_num(summaries, "t2_strict_step_recall"),
-        "t2_mean_lenient_step_recall": _mean_num(summaries, "t2_lenient_step_recall"),
-        "t2_mean_strict_edge_recall": _mean_num(summaries, "t2_strict_edge_recall"),
-        "t2_mean_lenient_edge_recall": _mean_num(summaries, "t2_lenient_edge_recall"),
+        # Invariant (reasoning between the anchors)
+        "invariant_mean_reasoning_recall": _mean_num(summaries, "invariant_reasoning_recall"),
+        "invariant_mean_position_recall": _mean_num(summaries, "invariant_position_recall"),
+        "invariant_mean_node_precision": _mean_num(summaries, "invariant_node_precision"),
+        "invariant_mean_edge_recall": _mean_num(summaries, "invariant_edge_recall"),
+        "invariant_mean_edge_precision": _mean_num(summaries, "invariant_edge_precision"),
+        "invariant_mean_edge_f1": _mean_num(summaries, "invariant_edge_f1"),
+        "invariant_mean_edge_recall_by_type": _mean_edge_by_type(summaries),
         "t3_strict_root_cause_rate": _mean_bool(summaries, "t3_strict_root_cause_understood"),
-        "t5_root_cause_rationale_rate": _mean_bool(summaries, "t5_root_cause_rationale_seen"),
     }
+
+
+def _mean_edge_by_type(items: list[dict[str, Any]]) -> dict[str, float | None]:
+    out: dict[str, float | None] = {}
+    for etype in ("data", "control", "order"):
+        vals = []
+        for item in items:
+            by_type = item.get("invariant_edge_recall_by_type")
+            if isinstance(by_type, dict) and isinstance(by_type.get(etype), (int, float)):
+                vals.append(float(by_type[etype]))
+        out[etype] = round(sum(vals) / len(vals), 4) if vals else None
+    return out
 
 
 def _mean_bool(items: list[dict[str, Any]], key: str) -> float | None:
@@ -214,16 +230,20 @@ def _write_csv(path: Path, results: list[dict[str, Any]]) -> None:
         "status",
         "t4_cybergym_poc_success",
         "t1_strict_source_sink_identified",
-        "t2_strict_step_recall",
-        "t2_lenient_step_recall",
-        "t2_strict_edge_recall",
-        "t2_lenient_edge_recall",
+        "invariant_reasoning_recall",
+        "invariant_position_recall",
+        "invariant_node_precision",
+        "invariant_edge_recall",
+        "invariant_edge_precision",
+        "invariant_edge_f1",
+        "invariant_edge_recall_data",
+        "invariant_edge_recall_control",
+        "invariant_edge_recall_order",
         "t3_strict_root_cause_understood",
-        "t5_root_cause_rationale_seen",
         "error",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for result in results:
             row = {
@@ -234,7 +254,11 @@ def _write_csv(path: Path, results: list[dict[str, Any]]) -> None:
                 "error": result.get("error", ""),
             }
             if result.get("status") == "ok":
-                row.update(result.get("summary", {}))
+                summary = dict(result.get("summary", {}))
+                by_type = summary.pop("invariant_edge_recall_by_type", None) or {}
+                for etype in ("data", "control", "order"):
+                    summary[f"invariant_edge_recall_{etype}"] = by_type.get(etype) if isinstance(by_type, dict) else None
+                row.update(summary)
             writer.writerow(row)
 
 

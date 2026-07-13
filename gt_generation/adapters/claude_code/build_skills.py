@@ -25,9 +25,8 @@ SKILLS = {
     "00_materialize": ("gt-materialize", "Resolve one vulnerability id into a self-contained sample workspace (repo, commit, PoC, patch.diff, sample_state.json) before GT generation."),
     "01_reproducer": ("gt-reproduce", "Build sanitizer/debug variants in Docker and reproduce a memory-safety crash, capturing sanitizer_trace.txt and valgrind_trace.txt."),
     "02_gt_generator": ("gt-generate", "Author fine-grained ground_truth.json (source, sink, root cause, coarse/fine trace, sanitizer_ground_truth, poc) for a reproduced memory-safety bug."),
-    "03_source_auditor": ("gt-source-audit", "Audit the source/tainted-value-origin/parser-admitted parts of a ground_truth.json and emit source_review.json."),
-    "04_semantic_reviewer": ("gt-semantic-review", "Audit whether a ground_truth.json faithfully represents the vulnerability logic and emit semantic_review.json."),
-    "05_runtime_validator": ("gt-runtime-validate", "Validate GT against runtime artifacts via gt-toolkit reachability (R1-R5) and gdb watchpoints, emitting reachability_report.json."),
+    "03_static_review": ("gt-static-review", "Static review of a ground_truth.json (merged source audit + semantic faithfulness) emitting static_review.json."),
+    "04_runtime_validator": ("gt-runtime-validate", "Dynamically verify a GT's invariants: read the GT to select the invariant points + root_cause criterion, then instrument+reproduce to emit verified_invariants.json + reachability_report.json."),
 }
 
 TOOLKIT_NOTE = (

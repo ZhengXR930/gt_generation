@@ -36,10 +36,10 @@ not from any one CLI's skill mechanism.
 
 ## Pipeline stages
 
-`00_materialize -> 01_reproducer -> 02_gt_generator -> 03_source_auditor ->
-04_semantic_reviewer -> 05_runtime_validator -> 06_validate`
+`00_materialize -> 01_reproducer -> 02_gt_generator -> 03_static_review ->
+04_runtime_validator -> 05_validate`
 
-- `06_validate` is a deterministic gate: `gt-toolkit validate` against the
+- `05_validate` is a deterministic gate: `gt-toolkit validate` against the
   canonical schema. No agent judgment.
 
 ## Quick start

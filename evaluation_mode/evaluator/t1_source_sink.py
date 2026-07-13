@@ -1,4 +1,12 @@
-"""T1 source-sink identification evaluator."""
+"""Endpoints evaluator: structured localization of the two artifact-grounded
+anchors — the source (attacker input load point) and the sink (crash point).
+
+These are deliberately scored separately from the between-source-and-sink reasoning
+(handled by the invariant evaluator): the anchors are directly artifact-grounded
+(sink = sanitizer crash stack, source = input load) and answer a localization
+question, while the invariant evaluator scores the harder propagation reasoning that
+connects them. Deterministic; the agent's structured recorder claims are the input.
+"""
 
 from __future__ import annotations
 
@@ -6,119 +14,69 @@ import json
 from typing import Any
 
 from .base import BaseEvaluator, EvaluationInput
-from .recorder_evidence import recorder_as_trajectory
-from .t2_trace import T2PropagationTraceEvaluator
-from .trajectory import load_openhands_trajectory
+from .invariant import _match_position, build_agent_state, nodes_in_group
 
 
 class T1SourceSinkEvaluator(BaseEvaluator):
-    """Evaluate whether trajectory evidence identifies source and sink."""
+    """Evaluate whether the agent's recorded node-trace locates the source and sink."""
 
     name = "t1_source_sink"
-    version = "0.1"
-
-    def __init__(self, phase: str = "pre_submit") -> None:
-        self.phase = phase
-        self._matcher = T2PropagationTraceEvaluator(phase=phase)
+    version = "0.3"
 
     def evaluate(self, inputs: EvaluationInput) -> dict[str, Any]:
         gt = json.loads(inputs.ground_truth.read_text(encoding="utf-8"))
-        recorder = recorder_as_trajectory(inputs.ground_truth)
-        trajectory = recorder or load_openhands_trajectory(inputs.trajectory)
-        events = trajectory.events_for_phase(self.phase)
+        agent, has_records = build_agent_state(inputs.ground_truth)
+        source_nodes = nodes_in_group(agent["nodes"], "sources")
+        sink_nodes = nodes_in_group(agent["nodes"], "sinks")
 
-        source = _as_step(
-            _merge_fine_trace_defaults(gt.get("source"), gt.get("fine_trace"), roles={"source", "tainted_read"}),
-            role="source",
-            step_name="source",
-        )
-        sink = _as_step(
-            _merge_fine_trace_defaults(gt.get("sink"), gt.get("fine_trace"), roles={"sink", "unsafe_use"}),
-            role="sink",
-            step_name="sink",
-        )
-        source_result = self._matcher._match_step(source, events, trajectory)
-        sink_result = self._matcher._match_step(sink, events, trajectory)
-        source_value = _as_step(
-            _merge_fine_trace_defaults(gt.get("tainted_value_origin"), gt.get("fine_trace"), roles={"tainted_read", "source"}),
-            role="tainted_value_origin",
-            step_name="tainted_value_origin",
-        )
-        source_value_result = self._matcher._match_step(source_value, events, trajectory) if source_value.get("file") else None
+        source_pos = _best_source_position(gt, source_nodes)
+        sink_pos = _match_position(_loc(gt.get("sink")), sink_nodes)
 
-        source_status = _combine_source_status(source_result["status"], source_value_result["status"] if source_value_result else None)
-        sink_status = sink_result["status"]
-        strict = source_status == "matched" and sink_status == "matched"
-        lenient = source_status in {"matched", "partial"} and sink_status in {"matched", "partial"}
+        source_status = source_pos["status"]
+        sink_status = sink_pos["status"]
+        strict = source_status == "located" and sink_status == "located"
+        lenient = source_status in {"located", "wrong_location"} and sink_status in {"located", "wrong_location"}
 
         return {
             "evaluator": self.name,
             "version": self.version,
-            "phase_policy": self.phase,
-            "evidence_mode": "recorder" if recorder else "trajectory",
-            "structured_reasoning_evaluable": bool(recorder),
-            "inputs": {"ground_truth": str(inputs.ground_truth), "trajectory": str(inputs.trajectory)},
+            "structured_reasoning_evaluable": has_records,
+            "inputs": {"ground_truth": str(inputs.ground_truth)},
             "summary": {
                 "source_status": source_status,
                 "sink_status": sink_status,
                 "strict_source_sink_identified": strict,
                 "lenient_source_sink_identified": lenient,
             },
-            "source_result": source_result,
-            "tainted_value_origin_result": source_value_result,
-            "sink_result": sink_result,
+            "source_result": source_pos,
+            "sink_result": sink_pos,
             "notes": [
-                "T1 is scored on source/sink identification only; propagation edges belong to T2.",
-                "For parser/fuzzer cases, tainted_value_origin can provide source-side evidence when GT distinguishes harness boundary from parser load point.",
+                "Endpoints are scored on source/sink localization only; the reasoning between "
+                "them (intermediate invariants + typed edges) is scored by the invariant evaluator.",
+                "The source anchor may be matched either by the GT `source` location or by "
+                "`tainted_value_origin` when the GT distinguishes the harness boundary from the "
+                "parser load point.",
             ],
         }
 
 
-def _as_step(obj: Any, *, role: str, step_name: str) -> dict[str, Any]:
-    if not isinstance(obj, dict):
-        obj = {}
-    return {
-        "step": step_name,
-        "role": role,
-        "file": obj.get("file"),
-        "function": obj.get("function"),
-        "line": obj.get("line"),
-        "var": obj.get("var") or _var_from_description(obj.get("description", "")),
-        "code": obj.get("code", ""),
-    }
-
-
-def _var_from_description(text: str) -> str:
-    # Keep this intentionally conservative. Free text descriptions should not
-    # invent source variables; they only provide a weak fallback for matching.
-    return ""
-
-
-def _combine_source_status(source_status: str, value_status: str | None) -> str:
-    order = {"missing": 0, "weak": 1, "partial": 2, "matched": 3}
-    best = source_status
-    if value_status and order.get(value_status, 0) > order.get(best, 0):
-        best = value_status
+def _best_source_position(gt: dict, candidates: list[dict]) -> dict[str, Any]:
+    """Match the source anchor against the GT source, falling back to
+    tainted_value_origin when it locates a stronger source-side point."""
+    best = _match_position(_loc(gt.get("source")), candidates)
+    origin = gt.get("tainted_value_origin")
+    if best["status"] != "located" and isinstance(origin, dict) and origin.get("file"):
+        alt = _match_position(_loc(origin), candidates)
+        if _rank(alt["status"]) > _rank(best["status"]):
+            best = alt
     return best
 
 
-def _merge_fine_trace_defaults(obj: Any, fine_trace: Any, *, roles: set[str]) -> dict[str, Any]:
-    base = dict(obj) if isinstance(obj, dict) else {}
-    if not isinstance(fine_trace, list):
-        return base
-    for step in fine_trace:
-        if not isinstance(step, dict) or step.get("role") not in roles:
-            continue
-        same_location = (
-            base.get("file")
-            and base.get("line")
-            and str(base.get("file")) == str(step.get("file"))
-            and str(base.get("line")) == str(step.get("line"))
-        )
-        same_function = base.get("function") and str(base.get("function")) == str(step.get("function"))
-        no_location = not base.get("file") and not base.get("line")
-        if same_location or (same_function and not base.get("var")) or no_location:
-            merged = dict(step)
-            merged.update({k: v for k, v in base.items() if v not in (None, "")})
-            return merged
-    return base
+def _loc(obj: Any) -> dict[str, Any]:
+    if not isinstance(obj, dict):
+        return {}
+    return {"file": obj.get("file"), "function": obj.get("function"), "line": obj.get("line")}
+
+
+def _rank(status: str) -> int:
+    return {"missing": 0, "wrong_location": 1, "located": 2}.get(status, 0)

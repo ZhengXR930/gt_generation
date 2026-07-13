@@ -6,6 +6,7 @@ def _snapshot(*, stage: str = "pre_submit", edge_count: int = 1) -> dict:
         {
             "from": f"input{i}",
             "to": f"value{i}",
+            "type": "data",
             "relation": "parse",
             "file": "parser.c",
             "function": "parse",

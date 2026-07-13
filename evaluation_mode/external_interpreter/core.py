@@ -83,6 +83,8 @@ def run_interpreter(config: InterpreterConfig) -> dict[str, Any]:
         config=config, attempts=attempts, events_path=events_path
     )
 
+    observer_summary = _run_observer_if_enabled(config, reasoning_state, events_path)
+
     state = {
         "trajectory": str(config.trajectory),
         "out_dir": str(config.out_dir),
@@ -98,6 +100,7 @@ def run_interpreter(config: InterpreterConfig) -> dict[str, Any]:
         },
         "raw_context": raw_context_summary,
         "reachability_reports": reachability_reports,
+        "observer": observer_summary,
         "events_path": str(events_path),
     }
     state_path = config.out_dir / "interpreter_state.json"
@@ -106,6 +109,26 @@ def run_interpreter(config: InterpreterConfig) -> dict[str, Any]:
         encoding="utf-8",
     )
     return state
+
+
+def _run_observer_if_enabled(config, reasoning_state, events_path) -> dict[str, Any]:
+    """GT-blind citation-grounded observer. Off unless GT_EVAL_RUN_OBSERVER is set
+    (it calls an LLM). Failures — incl. model safeguards — are recorded, never fatal."""
+    import os
+    if not os.getenv("GT_EVAL_RUN_OBSERVER"):
+        return {"ran": False, "reason": "GT_EVAL_RUN_OBSERVER not set"}
+    try:
+        from external_interpreter.observer import litellm_backend, run_observer
+        summary = run_observer(
+            config.trajectory, config.out_dir, backend=litellm_backend(),
+            recorder_state=reasoning_state, skeptic=True,
+        )
+        _append_event(events_path, {"type": "observer_ran", **{k: summary[k] for k in
+                      ("input_events", "nodes", "edges", "citations_dropped", "skeptic_rejected")}})
+        return {"ran": True, **summary}
+    except Exception as exc:  # safeguard trip, missing key, litellm absent, ...
+        _append_event(events_path, {"type": "observer_failed", "error": f"{type(exc).__name__}: {exc}"})
+        return {"ran": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
 def _summarize_reasoning_state(

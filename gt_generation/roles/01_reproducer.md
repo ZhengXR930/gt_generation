@@ -41,7 +41,20 @@ Inputs that should already exist or be referenced from sample metadata:
 - issue description
 - vulnerable source information
 
-Procedure:
+ARVO samples (fast path — `sample.json` has `arvo_image_vul`):
+
+- The target is ALREADY built with a sanitizer inside the image; do NOT clone or rebuild.
+- Reproduce directly and save the crash:
+  ```
+  docker run --rm --entrypoint /bin/bash <arvo_image_vul> -c '/bin/arvo run' > sanitizer_trace.txt 2>&1
+  ```
+  (`/bin/arvo run` runs the prebuilt fuzzer on `/tmp/poc`.) Write `build.sh` as that command.
+- Record in `sample_state.json`: `detector=address`, the observed crash line, and that the
+  build was reused from the arvo image (no local build). Then skip the generic build steps below.
+- Use `docker run --rm` / `docker rm`; never leave containers running. This keeps line numbers
+  identical to what stage 02 reads from the same image.
+
+Procedure (non-ARVO / when no prebuilt image is provided):
 
 1. Use the provided vulnerable source/repository and vulnerable commit.
 2. Use the provided PoC path/URL. Materialize it only if the runner supplied a URL or external path.

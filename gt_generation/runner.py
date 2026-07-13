@@ -254,8 +254,8 @@ def build_variables(
         "state_file": str(result_dir / "gt_generation_state.json"),
         "sample_state": str(result_dir / "sample_state.json"),
         "gt_path": str(result_dir / "ground_truth.json"),
-        "source_review_path": str(result_dir / "source_review.json"),
-        "semantic_review_path": str(result_dir / "semantic_review.json"),
+        "static_review_path": str(result_dir / "static_review.json"),
+        "verified_invariants_path": str(result_dir / "verified_invariants.json"),
         "reachability_report_path": str(result_dir / "reachability_report.json"),
     }
     for key, value in (config.get("vars") or {}).items():

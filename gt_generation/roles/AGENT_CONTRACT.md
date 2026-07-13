@@ -29,8 +29,8 @@ standard build tools.
 
 - Reproducer writes runtime artifacts only.
 - GT Generator writes `ground_truth.json` semantics only.
-- Source Auditor writes `source_review.json`.
-- Semantic Reviewer writes `semantic_review.json`.
+- Static Reviewer writes `static_review.json`.
+- Runtime Validator reads the GT to select+verify the invariant points, writing `verified_invariants.json` + `reachability_report.json`.
 - Runtime Validator writes `reachability_report.json`.
 
 Do not write model-authored grounding labels into `ground_truth.json`. Runtime

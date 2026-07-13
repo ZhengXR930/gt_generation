@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 VALID_KINDS = {'source', 'sink', 'edge', 'root_cause', 'vulnerability_state', 'retraction'}
+VALID_EDGE_TYPES = {'data', 'control', 'order'}
 VALID_STATUSES = {'hypothesis', 'confirmed', 'retracted'}
 VALID_EVIDENCE = {'description', 'code', 'runtime', 'submit', 'inference', ''}
 VALID_STAGES = {'', 'early', 'partial', 'pre_submit', 'revision', 'final'}
@@ -20,16 +21,66 @@ VALID_ROLES = {
     'parameter_pass',
     'return_value',
     'dispatch',
+    'indirect_call',
     'alias',
     'condition',
     'size_calculation',
     'allocation',
+    'alloc',
+    'unsafe_allocation',
     'root_cause',
     'free',
+    'invalid_free',
+    'sink',
     'sink_access',
+    'unsafe_use',
     'post_free_use',
     'control_dependency',
+    'tainted_value_materialization',
+    'tainted_value_origin',
 }
+
+# Role -> reasoning-group. The agent records a trace of typed nodes (roles); the
+# group routes each node to the source / root_cause / sink family and lets the
+# invariant evaluator match GT key nodes against agent nodes by role (exact) or by
+# group (compatible). Single source of truth, imported by the evaluators.
+_SOURCE_ROLES = {
+    'source', 'tainted_read', 'tainted_value_origin', 'tainted_value_materialization',
+    'input_materialization', 'materialization', 'field_assignment', 'propagation',
+    'parameter_pass', 'return_value', 'dispatch', 'indirect_call', 'alias', 'parse',
+}
+_SINK_ROLES = {'sink', 'sink_access', 'unsafe_use'}
+_ROOT_CAUSE_ROLES = {
+    'root_cause', 'free', 'invalid_free', 'alloc', 'allocation', 'unsafe_allocation',
+    'post_free_use', 'size_calculation', 'condition', 'control_dependency',
+}
+_GROUP_DEFAULT_ROLE = {'sources': 'source', 'root_causes': 'root_cause', 'sinks': 'sink'}
+
+
+def role_group(role: Any) -> str | None:
+    r = str(role or '').strip().lower()
+    if r in _SINK_ROLES:
+        return 'sinks'
+    if r in _ROOT_CAUSE_ROLES:
+        return 'root_causes'
+    if r in _SOURCE_ROLES:
+        return 'sources'
+    return None
+
+
+def build_all_nodes(all_sources: list, all_root_causes: list, all_sinks: list) -> list[dict[str, Any]]:
+    """Flatten the three claim families into one unified reasoning-trace node list,
+    each node carrying its (finer) `role` and its `group`."""
+    out: list[dict[str, Any]] = []
+    for group, items in (('sources', all_sources), ('root_causes', all_root_causes), ('sinks', all_sinks)):
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            node = dict(item)
+            node['role'] = item.get('role') or _GROUP_DEFAULT_ROLE[group]
+            node['group'] = group
+            out.append(node)
+    return out
 
 
 def parse_int(value: Any) -> int | None:
@@ -69,6 +120,7 @@ def normalize_edge(item: Any) -> dict[str, Any]:
     edge['from'] = edge.get('from') or edge.get('from_') or ''
     edge['to'] = edge.get('to') or ''
     edge['relation'] = edge.get('relation') or edge.get('condition') or ''
+    edge['type'] = str(edge.get('type') or '').strip().lower()  # data / control / order
     return edge
 
 
@@ -299,6 +351,7 @@ def missing_edge_fields(edge: dict[str, Any]) -> list[str]:
         ('line', edge.get('line')),
         ('from', edge.get('from') or edge.get('from_')),
         ('to', edge.get('to')),
+        ('type', edge.get('type')),
         ('relation', edge.get('relation')),
         ('code', edge.get('code')),
         ('text', edge.get('text') or edge.get('note')),
@@ -328,6 +381,7 @@ def missing_record_fields(record: dict[str, Any]) -> list[str]:
             ('line', record.get('line')),
             ('from', record.get('from') or record.get('from_')),
             ('to', record.get('to')),
+            ('type', record.get('type')),
             ('relation', record.get('relation')),
             ('code', record.get('code')),
             ('text', record.get('text')),
@@ -386,6 +440,11 @@ def validate_record(record: dict[str, Any]) -> tuple[list[str], list[str], list[
                 )
             if edge.get('evidence', '') not in VALID_EVIDENCE:
                 errors.append(f'edges[{index}] invalid evidence: {edge.get("evidence")!r}')
+            etype = str(edge.get('type') or '')
+            if etype and etype not in VALID_EDGE_TYPES:
+                errors.append(
+                    f'edges[{index}] invalid type: {edge.get("type")!r} (must be data/control/order)'
+                )
         if not has_recordable_snapshot_fact(record):
             errors.append(
                 'empty vulnerability_state: include at least one complete source, '
@@ -522,6 +581,8 @@ def edge_to_state(record: dict[str, Any], step: int) -> dict[str, Any]:
         'status': record.get('status'),
         'from': record.get('from') or record.get('from_'),
         'to': record.get('to'),
+        'obj': record.get('obj'),
+        'type': record.get('type'),
         'relation': record.get('relation'),
         'file': record.get('file'),
         'function': record.get('function'),
@@ -543,6 +604,7 @@ def claim_to_state(claim: dict[str, Any], event_id: Any = None) -> dict[str, Any
         'function',
         'line',
         'var',
+        'role',
         'code',
         'text',
         'note',
@@ -559,6 +621,8 @@ def edge_claim_to_state(edge: dict[str, Any], step: int, event_id: Any = None) -
         'step': step,
         'from': edge.get('from') or edge.get('from_'),
         'to': edge.get('to'),
+        'obj': edge.get('obj'),
+        'type': edge.get('type'),
         'relation': edge.get('relation'),
         'file': edge.get('file'),
         'function': edge.get('function'),
@@ -730,7 +794,7 @@ def state_from_snapshot(
     }
     next_missing = missing_targets_from_coverage(coverage)
     event_id = snapshot.get('event_id')
-    return {
+    state = {
         'primary_source': claim_to_state(sources[0], event_id) if sources else {},
         'all_sources': [claim_to_state(source, event_id) for source in sources],
         'primary_sink': claim_to_state(sinks[-1], event_id) if sinks else {},
@@ -759,6 +823,8 @@ def state_from_snapshot(
         'next_tools': next_tools_for_missing(next_missing),
         'last_event_id': records[-1].get('event_id') if records else None,
     }
+    state['all_nodes'] = build_all_nodes(state['all_sources'], state['all_root_causes'], state['all_sinks'])
+    return state
 
 
 def reduce_records(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -796,7 +862,7 @@ def reduce_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         'retractions': sum(1 for r in records if r.get('kind') == 'retraction'),
     }
     next_missing = missing_targets_from_coverage(coverage)
-    return {
+    state = {
         'primary_source': event_to_state(choose_latest(active, 'source')),
         'all_sources': [
             event_to_state(record)
@@ -821,6 +887,8 @@ def reduce_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         'next_tools': next_tools_for_missing(next_missing),
         'last_event_id': records[-1].get('event_id') if records else None,
     }
+    state['all_nodes'] = build_all_nodes(state['all_sources'], state['all_root_causes'], state['all_sinks'])
+    return state
 
 
 def missing_targets_from_coverage(coverage: dict[str, int]) -> list[str]:

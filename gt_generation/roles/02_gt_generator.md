@@ -19,6 +19,29 @@ Required output:
 
 Generate vulnerability semantics only. Do not write runtime grounding labels.
 
+Source of truth for line numbers (CRITICAL):
+
+- Every `file`/`line` in the GT MUST be grounded in the SAME source that was built and
+  reproduced — never a fresh commit checkout (line numbers drift between them).
+- For ARVO samples (`sample.json` has `arvo_image_vul`): the authoritative source lives
+  in that docker image. Extract it into a `_work/` subdir of the result directory and
+  read line numbers there:
+  ```
+  cid=$(docker create <arvo_image_vul>); docker cp "$cid:/src/<proj>" "<result_dir>/_work/src"; docker rm "$cid"
+  ```
+  Reproduce with `docker run --rm --entrypoint /bin/bash <arvo_image_vul> -c '/bin/arvo run'`
+  when you need to confirm the crash line. Use `--rm`; never leave containers running.
+- Write each GT `file` as the repo-relative path EXACTLY as it appears in
+  `sanitizer_trace.txt` (e.g. `libarchive/libarchive/archive_read_support_format_rar5.c`,
+  not a shortened `libarchive/...`), so evaluation path matching is exact.
+
+Cleanup before you finish (disk hygiene):
+
+- Delete the `_work/` source copy and ANY `.git` directory under the result directory
+  (`find <result_dir> -name .git -type d -prune -exec rm -rf {} +`).
+- Keep only the canonical artifacts (`ground_truth.json`, and the reproducer outputs).
+  Do not leave stray docker-cp'd source files in the result directory.
+
 Required `ground_truth.json` top-level fields:
 
 - `sample_id`
@@ -63,9 +86,59 @@ Rules for `reachability_checkpoints.parser_admitted`:
 Rules for `fine_trace`:
 
 - It must be a step-by-step vulnerability logic trace, not a sanitizer crash stack.
-- Include only steps that matter for source-to-sink propagation, control dispatch, allocation/free/lifetime, size calculation, bounds check omission, or sink access.
-- Each step must include `step`, `file`, `function`, `line`, `role`, `var`, `code`, and `note`.
-- Do not include `depends_on` or `grounding`; these are not required for GT generation.
+  Keep it FINE-GRAINED — do not collapse it to only the anchor checkpoints; the
+  intermediate propagation steps are part of GT quality.
+- Include the steps that matter for source-to-sink propagation, control dispatch,
+  allocation/free/lifetime, size calculation, bounds check omission, or sink access.
+- Each step must include `step`, `file`, `function`, `line`, `role`, `var`, `code`, `note`,
+  and (except the first) `depends_on`.
+- Do NOT include `grounding` (per-step evidence labels are intentionally excluded).
+
+The `role` field names each step's semantics. Use this vocabulary:
+
+- endpoint roles (the two artifact-grounded anchors): `source`, `sink`.
+- between roles (the reasoning that connects the anchors): `tainted_value_materialization`,
+  `dispatch`/`indirect_call`, `alloc`/`unsafe_allocation`, `root_cause`, `free`/`invalid_free`.
+- connective roles (help explain propagation): `tainted_read`, `propagate`, `alias`,
+  `bounds_state`, `lifetime_state`, `entry`.
+
+`depends_on` is the trace's EDGE set (the source->sink association). Nodes are the
+steps; edges connect them. Data flow alone is not enough — encode three edge types.
+CRITICAL: `via` is code (a symbol, an expression, or a relation keyword), never a
+natural-language sentence. Explanation goes in the step's `note`, which is not scored.
+
+- `data`: value provenance — `via` is the variable —
+  `{"on": <step>, "type": "data", "via": "len"}`.
+- `control`: the guard that makes the sink reachable, or the missing check that is the
+  root cause. `via` is the guard PREDICATE EXPRESSION verbatim from the patch/source
+  (say "missing" vs "taken" in `note`) —
+  `{"on": <step>, "type": "control", "via": "out + count > end"}`.
+- `order`: temporal happens-before for lifetime bugs (UAF/double-free/uninit). `via` is
+  a relation keyword from {free_before_use, double_free, use_before_init,
+  use_after_return, use_after_scope}; add `obj` only if the pointer is not already a
+  step variable — `{"on": <step>, "type": "order", "via": "free_before_use"}`.
+
+Per bug class the essential edges are: OOB/overflow = data + control(missing check);
+UAF = data + order(free_before_use) + control(path); double-free = order(two frees);
+uninit = control(skipped init) + data. The `order`/lifetime checkpoints (alloc/free/use)
+should be taken from `sanitizer_ground_truth` (allocation_stack / free_stack / crash_stack),
+not invented.
+
+Do NOT mark `key` on any step. Selecting which nodes are the scored invariants is NOT
+this role's job — the Runtime Validator (stage 04) selects them deterministically from
+the artifacts (crash trace -> sink; patch -> root_cause; sanitizer alloc/free/crash
+stacks -> lifetime order points; the input load -> source; the faulting value's
+materialization) and then VERIFIES them by instrumentation. Your job here is only to
+author a complete, correct `fine_trace` (nodes + typed `depends_on` edges) with exact
+line numbers and code; make sure the artifact-anchored points (source, the value
+materialization, root_cause, sink, and any alloc/free for lifetime bugs) are present as
+steps with their edges so stage 04 can find and verify them.
+
+Completeness for batch production: produce a COMPLETE GT for every sample, filling
+even the SOFT control/order edges yourself. Do not leave anchor checkpoints or edges
+blank pending review — the dataset is verified by later sampling, not per-sample
+blocking. If a soft control edge is uncertain, still author your best judgement and
+mark uncertainty in `note`.
 
 Rules for root cause:
 

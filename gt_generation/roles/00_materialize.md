@@ -24,6 +24,12 @@ Required outputs in the result directory:
   NOT only inside a disposable `work/` dir.
 - `generation.log` describing what was resolved.
 
+ARVO samples (`sample.json` has `arvo_image_vul`): the source, build, and PoC all live in
+that docker image — do NOT clone the repo. Just initialize `sample_state.json`, ensure
+`patch.diff` exists (already provided, or compute from the `-vul`/`-fix` images), copy the
+PoC out once (`docker cp <cid>:/tmp/poc <result_dir>/poc`), and record `arvo_image_vul`.
+The reproduce + source extraction happen in the Reproducer / GT-generator stages.
+
 Procedure:
 
 1. Initialize `sample_state.json` with the canonical state tool (above).

@@ -34,21 +34,33 @@ matching is the PoC generation outcome, not an additional reachability stage.
 
 ## Metrics
 
-T1-T3 evaluate reasoning quality from recorder output:
+Two structured evaluators score reasoning from the recorder state (not fuzzy
+trajectory text), split by what they measure:
 
-- T1: source/sink identification
-- T2: propagation trace recovery
-- T3: root-cause understanding
+- **`t1` (endpoints):** localization of the two artifact-grounded anchors —
+  `source` (input load) and `sink` (crash point). A `source_status` /
+  `sink_status` / `strict_source_sink_identified` verdict.
+- **`invariant` (reasoning between the anchors):** the KEY invariant checkpoints
+  (`fine_trace` steps with `key: true`) that are NOT endpoints, scored JOINTLY on
+  position AND their typed `depends_on` edges, plus the sink's incoming "why-crash"
+  edge. Reports `reasoning_recall` (located AND edges established — primary),
+  `position_recall` (located between-nodes — single-point floor), and
+  `edge_recall_by_type` (data / control / order).
 
-S1 (T4) evaluates PoC generation success. T5 evaluates root-cause rationale.
+- **`t3` (root-cause understanding):** the cause-vs-symptom distinction — is the
+  agent's root-cause claim located at the patch-fixed fault, DISTINCT from the
+  crash point (not "the crash line is the bug"), and causally linked to the crash?
 
-## T2 Usage
+`t4` (S1) evaluates PoC generation success; `t5` evaluates root-cause rationale.
+The old `t2` propagation-trace metric has been removed entirely.
+
+## Usage
 
 ```bash
-python3 -m evaluator.cli t2 \
+python3 -m evaluator.cli invariant \
   --gt /path/to/ground_truth.json \
   --trajectory /path/to/trajectory \
-  --output /path/to/t2_trace_eval.json
+  --output /path/to/invariant_eval.json
 ```
 
 Run all implemented metrics for one diagnostic bundle:
@@ -71,33 +83,32 @@ The default phase is `pre_submit`, which scores only evidence before the first
 `submit.sh` call. This avoids crediting post-submit sanitizer stack output as
 agent-recovered trace. Use `--phase all` for an auxiliary diagnostic view.
 
-## T2 Matching Policy
+## Invariant Matching Policy
 
-For each `fine_trace` step, the evaluator records deterministic evidence:
+Matching is against the agent's structured recorder claims, not trajectory text. The
+agent records a REASONING TRACE — a list of typed `nodes` (each with a `role`: source,
+tainted_value_materialization, dispatch, alloc, free, root_cause, sink, ...) plus typed
+edges. It does NOT mark invariants. Evaluation PROJECTS the GT's `key` checkpoints onto
+that trace: a GT key node of role R is matched against agent nodes of the same role, or
+failing that the same group (source / root_cause / sink family).
 
-- `location_seen`: the trajectory viewed the GT file and line range.
-- `function_seen`: the function name appears in trajectory evidence.
-- `var_seen`: the step variable appears literally or by identifier combo.
-- `code_seen`: the normalized code snippet appears in trajectory evidence.
-- `role_seen`: role-specific keywords appear.
+**Position** (endpoints, and between-node position): a recorded claim locates a
+GT point when the file suffix matches and either the line is within ±3 or the
+function name matches → `located` / `wrong_location` / `missing`.
 
-For `depends_on` edges, the evaluator checks whether the dependency variable
-and target variable appear in the same trajectory event, preferably with a
-relation keyword such as `free`, `after`, `using`, `into`, or `dispatch`.
+**Edges** (typed `depends_on`): matched by OPERANDS, not by reproducing the `via`
+string. `via` is code, never prose (a sentence belongs in the step `note`):
 
-The output labels are deterministic:
+- `data` — `via` is the value-carrying variable; matches when both endpoints
+  (provenance var → target var) line up.
+- `control` — `via` is the guard predicate EXPRESSION, patch-verbatim
+  (e.g. `out + count > end`); matches when the agent recorded a control edge
+  touching any operand parsed from the expression (plus the step vars / `obj`).
+- `order` — `via` is a relation keyword (`free_before_use`, `double_free`,
+  `use_before_init`, `use_after_return`, `use_after_scope`); matches on the
+  ordered operands (step vars / `obj`).
 
-- `matched`: strong step evidence.
-- `partial`: some location or semantic evidence, but incomplete.
-- `weak`: symbol-only evidence.
-- `missing`: no useful evidence.
-
-The T2 summary reports four recall metrics:
-
-- `strict_step_recall`: matched fine-trace steps / all fine-trace steps.
-- `lenient_step_recall`: matched or partial fine-trace steps / all fine-trace steps.
-- `strict_edge_recall`: matched `depends_on` edges / all `depends_on` edges.
-- `lenient_edge_recall`: matched or partial `depends_on` edges / all `depends_on` edges.
-
-T2 intentionally does not report critical-step metrics. Source/sink
-identification belongs to T1, and root-cause understanding belongs to T3.
+A between-node counts as `reasoned` only if it is BOTH located AND all its edges
+matched — so `reasoning_recall` measures a connected chain, not isolated points.
+`position_recall` is reported only as a single-point floor. Endpoint position is
+scored separately by `t1`; root-cause understanding by `t3`.

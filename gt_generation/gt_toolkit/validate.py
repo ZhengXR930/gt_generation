@@ -219,6 +219,7 @@ def validate_data(
             report.warn("fine_trace does not start at / contain a 'source' role step")
         if roles and "sink" not in roles:
             report.warn("fine_trace has no 'sink' role step")
+        _check_edges(fine, report)
 
     _check_sanitizer_gt(data, report)
     _check_poc(data, report)
@@ -228,6 +229,70 @@ def validate_data(
         _check_source_lines(data, source_root, report)
 
     return report
+
+
+EDGE_TYPES = {"data", "control", "order"}
+ORDER_RELATIONS = {
+    "free_before_use", "double_free", "use_before_init",
+    "use_after_return", "use_after_scope",
+}
+# Two+ word-like tokens with no operator/punctuation between them = a prose sentence.
+_PROSE_RE = re.compile(r"[A-Za-z]{2,}\s+[A-Za-z]{2,}")
+_OPERATOR_RE = re.compile(r"[<>=!+\-*/\[\]&|%().]")
+
+
+def _check_edges(fine: list, report: Report) -> None:
+    """Validate the typed depends_on edges (the source->sink association)."""
+    any_edge = False
+    any_control_or_order = False
+    for idx, step in enumerate(fine):
+        if not isinstance(step, dict):
+            continue
+        deps = step.get("depends_on")
+        if deps is None:
+            if idx > 0:
+                report.warn(f"fine_trace[{idx}] has no depends_on edge (source->sink association missing)")
+            continue
+        if not isinstance(deps, list):
+            report.err(f"fine_trace[{idx}].depends_on must be a list")
+            continue
+        for edge in deps:
+            if not isinstance(edge, dict):
+                report.err(f"fine_trace[{idx}].depends_on edge must be an object {{on,type,via}}")
+                continue
+            any_edge = True
+            if "on" not in edge:
+                report.err(f"fine_trace[{idx}].depends_on edge missing 'on'")
+            etype = edge.get("type")
+            if etype not in EDGE_TYPES:
+                report.err(f"fine_trace[{idx}].depends_on edge type must be one of {sorted(EDGE_TYPES)}")
+            elif etype in ("control", "order"):
+                any_control_or_order = True
+                _check_relation_via(idx, etype, edge, report)
+    if fine and not any_edge:
+        report.warn("fine_trace has no typed depends_on edges; data/control/order association not represented")
+    elif any_edge and not any_control_or_order:
+        report.warn("fine_trace has only data edges; control/order association (why unsafe / free-before-use) may be missing")
+
+
+def _check_relation_via(idx: int, etype: str, edge: dict, report: Report) -> None:
+    """control `via` is a guard expression (code); order `via` is a relation keyword.
+    Neither may be a natural-language sentence."""
+    via = edge.get("via")
+    if not isinstance(via, str) or not via.strip():
+        report.warn(f"fine_trace[{idx}].depends_on {etype} edge has no `via`")
+        return
+    via = via.strip()
+    if etype == "order":
+        if via not in ORDER_RELATIONS:
+            report.warn(f"fine_trace[{idx}].depends_on order edge `via`={via!r} is not a known relation ({sorted(ORDER_RELATIONS)})")
+        return
+    # control: expect a guard expression, reject prose (words without operators).
+    if _PROSE_RE.search(via) and not _OPERATOR_RE.search(via):
+        report.err(
+            f"fine_trace[{idx}].depends_on control edge `via`={via!r} looks like prose; "
+            f"use the guard predicate expression (patch-verbatim) and put explanation in the step `note`"
+        )
 
 
 def _check_sanitizer_gt(data: dict, report: Report) -> None:
