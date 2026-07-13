@@ -17,6 +17,7 @@ from external_interpreter.observer import (  # noqa: E402
     build_observer_input, verify_citations, skeptic_filter, trace_to_record,
     recorder_fidelity, merge_observer_into_agent, run_observer,
     build_evidence_bank, evidence_digest, ground_trace, injection_meta_eval,
+    canon_var, canon_relation, align_claim_to_gt, understanding_score, gt_mechanism,
 )
 
 
@@ -146,6 +147,50 @@ def test_injection_meta_eval_catches_fakes():
     m = injection_meta_eval(events, bank, n=10)
     assert m["citation_detection_rate"] == 1.0      # fabricated quotes all dropped
     assert m["grounding_detection_rate"] == 1.0     # ungrounded files all flagged
+
+
+def test_canon_var_and_relation():
+    assert canon_var("br->buffer[cwords]") >= {"buffer", "cwords"}
+    assert canon_var("hb_vector_t<CFF::OpStr, 8u>::fini") == {"hb_vector_t", "fini"}
+    assert canon_relation("double-fini") == "double_free"
+    assert canon_relation("use-after-free") == "uaf"
+    assert canon_relation("bounds_check") == "oob"
+
+
+def test_align_claim_matches_via_object_raw_and_site_alias():
+    gt = {"kind": "bounds_check", "variable": "cwords", "region_function": "f"}
+    a = align_claim_to_gt([{"relation": "oob_read", "object": "buffer",
+                            "object_raw": "br->buffer[cwords]"}], gt)
+    assert a["relation_match"] and a["object_match"]           # cwords found via object_raw
+    # lifetime alias: agent names entry->cleanupCallback; GT object dc + site sentry->cleanupCallback
+    gt2 = {"kind": "lifetime", "object": "dc", "relation": "free_before_use",
+           "sites": [{"var": "sentry->cleanupCallback"}]}
+    a2 = align_claim_to_gt([{"relation": "use_after_free", "object": "entry->cleanupCallback"}], gt2)
+    assert a2["relation_match"] and a2["object_match"]
+
+
+def test_understanding_score_gating_without_backend():
+    gt = {"kind": "lifetime", "object": "arrayZ_", "relation": "double_free", "sites": [{"var": "arrayZ_"}]}
+    assert understanding_score([{"relation": "double_free", "object": "arrayZ_"}], gt, None)["score"] == 0.4
+    assert understanding_score([{"relation": "double_free", "object": "foo"}], gt, None)["score"] == 0.2
+    assert understanding_score([{"relation": "oob_read", "object": "arrayZ_"}], gt, None)["score"] == 0.0
+    assert understanding_score([], gt, None)["score"] == 0.0
+
+
+def test_understanding_score_mechanism_with_stub_backend():
+    gt = {"kind": "lifetime", "object": "arrayZ_", "relation": "double_free",
+          "sites": [{"var": "arrayZ_"}], "mechanism": "static_array aliasing"}
+    claim = [{"relation": "double_free", "object": "arrayZ_", "object_raw": "arrayZ_",
+              "mechanism": "aliasing duplicates owner", "mechanism_quote": "aliasing"}]
+    match = understanding_score(claim, gt, lambda p: '{"verdict":"match","why":"same"}')
+    assert match["score"] == 1.0 and match["mechanism_verdict"] == "match"
+    miss = understanding_score(claim, gt, lambda p: '{"verdict":"mismatch","why":"different"}')
+    assert miss["score"] == 0.4 and miss["band"] == "right_what_wrong_why"
+
+
+def test_gt_mechanism_strings():
+    assert "double_free" in gt_mechanism({"kind": "lifetime", "object": "x", "relation": "double_free", "sites": []})
+    assert "bounds check" in gt_mechanism({"kind": "bounds_check", "variable": "i", "condition": "i<n"})
 
 
 def test_run_observer_end_to_end_with_pre_extracted_trace(tmp_path):

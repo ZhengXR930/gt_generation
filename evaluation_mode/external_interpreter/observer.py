@@ -291,6 +291,30 @@ def azure_backend(model: str, api_key: str, azure_endpoint: str,
     return _call
 
 
+def backend_from_config(config_path: str = "config.txt") -> LLMBackend | None:
+    """Build the default observer backend (gpt-5.5 via the AIDP/modelhub gateway) from
+    config.txt's OPENAI_API_KEY (the aidp_ak). Returns None if unavailable — callers
+    must treat a None backend as 'mechanism judging deferred', never fatal."""
+    import re as _re
+    from pathlib import Path as _Path
+    model = os.getenv("GT_OBSERVER_MODEL", "gpt-5.5-2026-04-24")
+    endpoint = os.getenv("GT_OBSERVER_AZURE_ENDPOINT",
+                         "https://aidp.bytedance.net/api/modelhub/online/v2/crawl")
+    key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not key:
+        try:
+            m = _re.search(r'OPENAI_API_KEY\s*[=:]\s*"?([^"\n]+)"?', _Path(config_path).read_text())
+            key = m.group(1).strip() if m else None
+        except OSError:
+            key = None
+    if not key:
+        return None
+    try:
+        return azure_backend(model, key, endpoint)
+    except Exception:
+        return None
+
+
 def _parse_json(text: str) -> dict[str, Any]:
     """Tolerant extraction of the first JSON object from an LLM reply."""
     if not text:
@@ -606,6 +630,110 @@ def align_claim_to_gt(claims: list[dict[str, Any]], gt_criterion: dict[str, Any]
                     "gt_object": sorted(gt_obj), "gt_relation": gt_rel,
                     "mechanism": c.get("mechanism"), "n_claims": len(claims)}
     return best
+
+
+# --------------------------------------------------------------------------- #
+# 6d. Layer-2 mechanism judge + composite understanding score.                  #
+#     Layer-1 (object+relation) is cheap but the crash TYPE is given to the      #
+#     agent, so relation is nearly free and Layer-1 alone over-credits. The      #
+#     understanding score is gated on Layer-2 (the WHY): you cannot exceed 0.4   #
+#     without explaining the same root-cause mechanism as the GT.                #
+# --------------------------------------------------------------------------- #
+def gt_mechanism(criterion: dict[str, Any]) -> str:
+    if criterion.get("kind") == "lifetime":
+        sites = "; ".join(f"{s.get('role')}@{s.get('function')}:{s.get('line')}(var={s.get('var')})"
+                          for s in criterion.get("sites") or [])
+        base = f"{criterion.get('relation')} of `{criterion.get('object')}`"
+        extra = criterion.get("mechanism") or criterion.get("evidence") or ""
+        return f"{base}. sites: {sites}. {str(extra)[:400]}"
+    return (f"missing bounds check `{criterion.get('condition')}` on `{criterion.get('variable')}` "
+            f"in {criterion.get('region_function')}{criterion.get('region_lines')}. "
+            f"{str(criterion.get('note') or '')[:300]}")
+
+
+MECHANISM_JUDGE_PROMPT = """\
+You judge whether a coding agent EXPLAINED THE SAME ROOT-CAUSE MECHANISM as the ground
+truth — not merely the same crash symptom. The crash type is GIVEN to the agent, so
+naming the bug class is NOT understanding; the mechanism (WHY it happens) is.
+
+GROUND-TRUTH mechanism:
+{gt_mechanism}
+
+AGENT's mechanism claim: {agent_mechanism}
+AGENT's cited evidence:  {agent_quote}
+
+Output ONLY: {{"verdict":"match|partial|mismatch","why":"<one short sentence>"}}
+- match    = same causal reason (same missing check / same aliasing / same lifecycle path).
+- partial  = related and on the right object but incomplete or a slightly different cause.
+- mismatch = a different cause, or only restates the crash symptom.
+Be strict: default to mismatch/partial when unsure."""
+
+
+def judge_mechanism(agent_mechanism: str, agent_quote: str, gt_criterion: dict[str, Any],
+                    backend: LLMBackend) -> dict[str, Any]:
+    out = _parse_json(backend(MECHANISM_JUDGE_PROMPT.format(
+        gt_mechanism=gt_mechanism(gt_criterion),
+        agent_mechanism=agent_mechanism or "(none)", agent_quote=agent_quote or "(none)")))
+    v = str(out.get("verdict", "mismatch")).lower()
+    if v not in ("match", "partial", "mismatch"):
+        v = "mismatch"
+    return {"verdict": v, "why": out.get("why", "")}
+
+
+_MECH_SCORE = {"match": 1.0, "partial": 0.7, "mismatch": 0.4}
+
+
+def understanding_score(claims: list[dict[str, Any]], gt_criterion: dict[str, Any],
+                        backend: LLMBackend | None = None) -> dict[str, Any]:
+    """Composite score. relation(given)→object→MECHANISM. Ceiling 0.4 without a
+    mechanism match; only the Layer-2 judge lifts it to 0.7/1.0."""
+    al = align_claim_to_gt(claims, gt_criterion)
+    result = {"score": 0.0, "band": "no_bug_class", "relation_match": al["relation_match"],
+              "object_match": al["object_match"], "object_overlap": al["object_overlap"],
+              "mechanism_verdict": None, "mechanism_why": None, "agent_mechanism": al.get("mechanism")}
+    if not al["relation_match"]:
+        return result
+    if not al["object_match"]:
+        result.update(score=0.2, band="right_class_wrong_object")
+        return result
+    # Layer-1 satisfied → the WHY decides. Without a backend we can't judge → cap at 0.4.
+    if backend is None or not al.get("mechanism"):
+        result.update(score=0.4, band="right_what_mechanism_unjudged")
+        return result
+    # pick the cited quote of the best-aligned claim for grounding
+    quote = ""
+    for c in claims:
+        if c.get("mechanism") == al.get("mechanism"):
+            quote = c.get("mechanism_quote") or ""
+            break
+    j = judge_mechanism(al["mechanism"], quote, gt_criterion, backend)
+    result.update(score=_MECH_SCORE[j["verdict"]],
+                  band={"match": "understood", "partial": "partial", "mismatch": "right_what_wrong_why"}[j["verdict"]],
+                  mechanism_verdict=j["verdict"], mechanism_why=j["why"])
+    return result
+
+
+def aggregate_claims(events: list[dict[str, Any]], backend: LLMBackend,
+                     evidence: str = "(none)", k: int = 3) -> list[dict[str, Any]]:
+    """Run extraction k times and union the claims — align/score then picks the best,
+    so this raises recall and damps single-run variance (reported via `k`)."""
+    out: list[dict[str, Any]] = []
+    for _ in range(max(1, k)):
+        out.extend(extract_invariant_claims(events, backend, evidence))
+    return out
+
+
+def score_understanding_from_trajectory(trajectory: list, gt_criterion: dict[str, Any],
+                                        backend: LLMBackend, k: int = 3) -> dict[str, Any]:
+    """End-to-end: extract (k-run aggregated) invariant claims from a trajectory and
+    score understanding against the GT criterion. GT-blind extraction, GT used only here."""
+    events = build_observer_input(trajectory)
+    bank = build_evidence_bank(trajectory)
+    claims = aggregate_claims(events, backend, evidence_digest(bank), k=k)
+    res = understanding_score(claims, gt_criterion, backend)
+    res["k_runs"] = k
+    res["n_claims"] = len(claims)
+    return res
 
 
 # --------------------------------------------------------------------------- #

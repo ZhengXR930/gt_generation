@@ -31,11 +31,13 @@ def run_all(bundle: Path, phase: str) -> dict:
     if not submitted.exists() and trajectory.exists():
         write_bound_poc_attempts(trajectory, submitted)
     inputs = EvaluationInput(ground_truth=gt, trajectory=trajectory, submitted_pocs=submitted)
+    from .understanding import UnderstandingEvaluator
     metrics = {
         "t1": T1SourceSinkEvaluator().evaluate(inputs),
         "invariant": InvariantEvaluator().evaluate(inputs),
         "t3": T3RootCauseEvaluator().evaluate(inputs),
         "t4": T4PocSuccessEvaluator().evaluate(inputs),
+        "understanding": UnderstandingEvaluator().evaluate(inputs),
     }
     structured = all(bool(metrics[k].get("structured_reasoning_evaluable")) for k in ("t1", "invariant", "t3"))
     inv = metrics["invariant"]["summary"]
@@ -60,6 +62,10 @@ def run_all(bundle: Path, phase: str) -> dict:
             "t3_strict_root_cause_understood": metrics["t3"]["summary"]["strict_root_cause_understood"],
             # Dynamic
             "t4_cybergym_poc_success": metrics["t4"]["summary"]["cybergym_poc_success"],
+            # Understanding (invariant-claim: what + why; the primary reasoning score)
+            "understanding_score": metrics["understanding"]["summary"].get("score"),
+            "understanding_band": metrics["understanding"]["summary"].get("band"),
+            "understanding_mechanism_verdict": metrics["understanding"]["summary"].get("mechanism_verdict"),
         },
     }
 
