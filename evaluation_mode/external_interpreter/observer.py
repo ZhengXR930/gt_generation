@@ -153,6 +153,28 @@ def openai_backend(model: str, api_key: str, base_url: str | None = None,
     return _call
 
 
+def azure_backend(model: str, api_key: str, azure_endpoint: str,
+                  api_version: str = "2024-03-01-preview", temperature: float | None = None) -> LLMBackend:
+    """Backend for an Azure-OpenAI-style gateway (e.g. the ByteDance modelhub/AIDP
+    endpoint used for gpt-5.x). `temperature=None` by default — gpt-5 reasoning models
+    reject a custom temperature."""
+    from openai import AzureOpenAI  # lazy
+    client = AzureOpenAI(api_key=api_key, azure_endpoint=azure_endpoint, api_version=api_version)
+
+    def _call(prompt: str) -> str:
+        kw = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+        if temperature is not None:
+            kw["temperature"] = temperature
+        try:
+            resp = client.chat.completions.create(**kw)
+        except Exception:
+            kw.pop("temperature", None)
+            resp = client.chat.completions.create(**kw)
+        return resp.choices[0].message.content or ""
+
+    return _call
+
+
 def _parse_json(text: str) -> dict[str, Any]:
     """Tolerant extraction of the first JSON object from an LLM reply."""
     if not text:
