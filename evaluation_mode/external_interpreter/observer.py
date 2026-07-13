@@ -67,6 +67,117 @@ def render_input(events: list[dict[str, Any]]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 1b. Evidence bank — MECHANICAL record of what the agent actually SAW         #
+#     (read/grep tools + their outputs). Used to GROUND the LLM extraction so  #
+#     the model can only anchor reasoning to code the agent genuinely looked   #
+#     at — shrinking the LLM's job toward labelling, not free invention.       #
+# --------------------------------------------------------------------------- #
+_SRC_EXT = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp")
+_CATN_HEADER = re.compile(r"cat -n`? on (\S+)", re.I)          # read tool: "...cat -n on /path/foo.c:"
+_GREP_PATH = re.compile(r"\b(\S+\.(?:c|cc|cpp|cxx|h|hh|hpp))\b", re.I)
+_LINE_TAB = re.compile(r"(?m)^\s*(\d+)\t")                     # read/cat -n:  "1980\t<code>"
+_LINE_COLON = re.compile(r"(?m)^\s*(\d+):(?!:)")              # grep -n:      "1988:<code>"
+_FUNC_ON_LINE = re.compile(r"\b([A-Za-z_]\w{2,})\s*\(")       # any funcname( on a numbered line
+_NOT_FUNC = {"if", "for", "while", "switch", "return", "sizeof", "static", "int", "void"}
+
+
+def _observations_by_cause(trajectory: list) -> dict[Any, dict]:
+    obs: dict[Any, dict] = {}
+    for it in trajectory:
+        if isinstance(it, dict) and "observation" in it and it.get("cause") is not None:
+            obs.setdefault(it.get("cause"), it)
+    return obs
+
+
+def build_evidence_bank(trajectory: list) -> dict[str, Any]:
+    """MECHANICAL record of what the agent actually SAW: which source files it read,
+    which (file,line) it viewed (from `cat -n`/`grep -n` output), and where each
+    function it saw is defined. No LLM. Handles the real OpenHands output formats
+    (`NNNN\\t<code>` for reads, `NNNN:<code>` for grep -n)."""
+    obs = _observations_by_cause(trajectory)
+    files: set[str] = set()
+    locations: set[tuple[str, int]] = set()
+    func_file: dict[str, str] = {}          # funcname -> basename it was seen in
+    for it in trajectory:
+        if not isinstance(it, dict) or it.get("source") != "agent":
+            continue
+        args = it.get("args") if isinstance(it.get("args"), dict) else {}
+        o = obs.get(it.get("id")) or {}
+        content = str(o.get("content") or o.get("message") or "")
+        path, cmd = str(args.get("path") or ""), str(args.get("command") or "")
+        # which source file is this content about?
+        base = ""
+        mh = _CATN_HEADER.search(content)
+        if mh and mh.group(1).endswith(_SRC_EXT):
+            base = mh.group(1).split("/")[-1]
+        elif path.endswith(_SRC_EXT):
+            base = path.split("/")[-1]
+        else:
+            mg = _GREP_PATH.search(cmd)
+            if mg:
+                base = mg.group(1).split("/")[-1]
+        if base:
+            files.add(base)
+        for line, is_tab in ([(m, True) for m in _LINE_TAB.finditer(content)]
+                             + [(m, False) for m in _LINE_COLON.finditer(content)]):
+            ln = int(line.group(1))
+            row = content[line.end():content.find("\n", line.end()) if content.find("\n", line.end()) > 0 else None]
+            if base:
+                locations.add((base, ln))
+                for fm in _FUNC_ON_LINE.finditer(row):
+                    fn = fm.group(1)
+                    if fn not in _NOT_FUNC:
+                        func_file.setdefault(fn, base)
+    return {"files": files, "locations": locations, "func_file": func_file}
+
+
+def evidence_digest(bank: dict[str, Any], max_files: int = 50) -> str:
+    byf: dict[str, list[int]] = {}
+    for f, ln in bank.get("locations", set()):
+        byf.setdefault(f, []).append(ln)
+    files = sorted(bank.get("files", set()))[:max_files]
+    ranges = "; ".join(f"{f}:{min(ls)}-{max(ls)}" for f, ls in sorted(byf.items())[:max_files])
+    funcs = sorted(bank.get("func_file", {}).items())[:60]
+    fmap = ", ".join(f"{fn}()->{fb}" for fn, fb in funcs)
+    return (f"Files the agent read: {', '.join(files) or '(none)'}\n"
+            f"Line ranges it viewed: {ranges or '(none)'}\n"
+            f"Functions it saw (name->file): {fmap or '(none)'}")
+
+
+def _resolve_file(node: dict[str, Any], func_file: dict[str, str]) -> str:
+    f = str(node.get("file") or "").split("/")[-1].lower()
+    if f and f != "unknown":
+        return f
+    fn = str(node.get("function") or "")
+    return str(func_file.get(fn, "")).lower()          # resolve file from the function name
+
+
+def ground_trace(trace: dict[str, Any], bank: dict[str, Any]) -> dict[str, Any]:
+    """Annotate each node with whether it is grounded in what the agent actually
+    read. The file is resolved from node.file OR (since agents name functions, not
+    files) from the function->file map. A node whose location the agent never viewed
+    is flagged (likely hallucinated / mis-extracted)."""
+    files = {f.lower() for f in bank.get("files", set())}
+    func_file = {k: v.lower() for k, v in bank.get("func_file", {}).items()}
+    byf: dict[str, list[int]] = {}
+    for f, ln in bank.get("locations", set()):
+        byf.setdefault(f.lower(), []).append(ln)
+    grounded = 0
+    for n in trace.get("nodes", []):
+        rf = _resolve_file(n, func_file)
+        fn_ok = bool(rf) and rf in files
+        ln = n.get("line")
+        line_ok = bool(fn_ok and isinstance(ln, int) and byf.get(rf)
+                       and any(abs(ln - x) <= 3 for x in byf[rf]))
+        n["grounded_in_reads"] = fn_ok
+        n["line_in_viewed_range"] = line_ok
+        grounded += fn_ok
+    total = len(trace.get("nodes", []))
+    return {"nodes": total, "grounded_nodes": grounded,
+            "grounded_ratio": round(grounded / total, 3) if total else None}
+
+
+# --------------------------------------------------------------------------- #
 # 2. Prompts                                                                   #
 # --------------------------------------------------------------------------- #
 OBSERVER_PROMPT = """\
@@ -77,6 +188,11 @@ Report only the memory-safety reasoning THIS agent actually committed to.
 Below is the agent's reasoning surface as numbered `[event N]` blocks:
 
 {input}
+
+EVIDENCE the agent actually read (use it to fill file/line — prefer real values from
+here; if the agent only named a function and a line, give `function` + `line` and set
+`file` to the matching one from the map, else null. NEVER write "unknown"):
+{evidence}
 
 Output ONLY a JSON object:
 {{"nodes":[{{"role":"source|tainted_read|materialization|dispatch|alloc|free|root_cause|sink",
@@ -206,8 +322,9 @@ def _parse_json(text: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 4. Extraction + the two gates                                                #
 # --------------------------------------------------------------------------- #
-def extract_trace(events: list[dict[str, Any]], backend: LLMBackend) -> dict[str, Any]:
-    out = _parse_json(backend(OBSERVER_PROMPT.format(input=render_input(events))))
+def extract_trace(events: list[dict[str, Any]], backend: LLMBackend,
+                  evidence: str = "(none)") -> dict[str, Any]:
+    out = _parse_json(backend(OBSERVER_PROMPT.format(input=render_input(events), evidence=evidence)))
     return {"nodes": list(out.get("nodes") or []), "edges": list(out.get("edges") or [])}
 
 
@@ -306,36 +423,40 @@ def run_observer(trajectory_path: Path, out_dir: Path, *, backend: LLMBackend | 
     out_dir.mkdir(parents=True, exist_ok=True)
     trajectory = json.loads(Path(trajectory_path).read_text(encoding="utf-8", errors="replace"))
     events = build_observer_input(trajectory)
+    bank = build_evidence_bank(trajectory)
 
     if pre_extracted_trace is not None:
         raw = {"nodes": list(pre_extracted_trace.get("nodes") or []),
                "edges": list(pre_extracted_trace.get("edges") or [])}
     elif backend is not None:
-        raw = extract_trace(events, backend)
+        raw = extract_trace(events, backend, evidence_digest(bank))
     else:
         raise ValueError("run_observer needs either backend= or pre_extracted_trace=")
 
-    verified = verify_citations(raw, events)
+    verified = verify_citations(raw, events)          # GATE 1: no fabricated citations
     if skeptic and backend is not None:
-        kept = skeptic_filter(verified, events, backend)
+        kept = skeptic_filter(verified, events, backend)   # GATE 2: committed, not explored
         kept["dropped"] = verified["dropped"]
     else:
         kept = {**verified, "rejected": []}
+    grounding = ground_trace(kept, bank)              # GATE 3: grounded in what it read
 
     record = trace_to_record(kept)
     fidelity = recorder_fidelity(kept, recorder_state)
 
     (out_dir / "observer_trace.json").write_text(
         json.dumps({"nodes": kept["nodes"], "edges": kept["edges"],
-                    "dropped": kept.get("dropped", []), "rejected": kept.get("rejected", [])},
-                   ensure_ascii=False, indent=2))
+                    "dropped": kept.get("dropped", []), "rejected": kept.get("rejected", []),
+                    "grounding": grounding}, ensure_ascii=False, indent=2))
     (out_dir / "observed_reasoning_events.jsonl").write_text(
         json.dumps(normalize_record(record), ensure_ascii=False) + "\n")
     (out_dir / "recorder_fidelity.json").write_text(json.dumps(fidelity, ensure_ascii=False, indent=2))
 
     return {"input_events": len(events), "nodes": len(kept["nodes"]), "edges": len(kept["edges"]),
+            "evidence_files": len(bank["files"]),
             "citations_dropped": len(verified["dropped"]),
-            "skeptic_rejected": len(kept.get("rejected", [])), "fidelity": fidelity}
+            "skeptic_rejected": len(kept.get("rejected", [])),
+            "grounding": grounding, "fidelity": fidelity}
 
 
 def observed_state(out_dir: Path) -> dict[str, Any]:
@@ -348,6 +469,29 @@ def observed_state(out_dir: Path) -> dict[str, Any]:
         return {}
     recs = [normalize_record(json.loads(ln)) for ln in path.read_text().splitlines() if ln.strip()]
     return reduce_records(recs) if recs else {}
+
+
+# --------------------------------------------------------------------------- #
+# 6b. Injection meta-evaluation — MEASURE the precision defence (à la TRACE):  #
+#     inject synthetic fabricated / ungrounded claims and confirm the          #
+#     deterministic gates reject or flag them. Turns "faithfulness" into a      #
+#     number instead of an assertion.                                          #
+# --------------------------------------------------------------------------- #
+def injection_meta_eval(events: list[dict[str, Any]], bank: dict[str, Any], n: int = 20) -> dict[str, Any]:
+    ev0 = events[0]["event_id"] if events else 0
+    fabricated = {"nodes": [{"role": "root_cause", "file": "x.c", "function": "f", "line": 1,
+                             "event_id": ev0, "quote": f"__INJECTED_NONEXISTENT_QUOTE_{i}__"}
+                            for i in range(n)], "edges": []}
+    kept = verify_citations(fabricated, events)                 # GATE 1 must drop all
+    cite_caught = n - len(kept["nodes"])
+    ungrounded = {"nodes": [{"role": "sink", "file": f"never_read_{i}.c", "function": "g", "line": 9,
+                             "event_id": ev0, "quote": ""} for i in range(n)], "edges": []}
+    ground_trace(ungrounded, bank)                              # GATE 3 must flag all
+    ground_flagged = sum(1 for x in ungrounded["nodes"] if not x.get("grounded_in_reads"))
+    return {"citation_injections": n, "citation_caught": cite_caught,
+            "citation_detection_rate": round(cite_caught / n, 3) if n else None,
+            "grounding_injections": n, "grounding_flagged": ground_flagged,
+            "grounding_detection_rate": round(ground_flagged / n, 3) if n else None}
 
 
 # --------------------------------------------------------------------------- #

@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "evaluation_mode"))
 from external_interpreter.observer import (  # noqa: E402
     build_observer_input, verify_citations, skeptic_filter, trace_to_record,
     recorder_fidelity, merge_observer_into_agent, run_observer,
+    build_evidence_bank, evidence_digest, ground_trace, injection_meta_eval,
 )
 
 
@@ -99,6 +100,52 @@ def test_merge_observer_into_agent_unions_and_dedups():
     # idempotent
     merge_observer_into_agent(agent, trace)
     assert len(agent["nodes"]) == 2 and len(agent["edges"]) == 1
+
+
+def _traj_with_reads():
+    # content uses the REAL OpenHands formats: `cat -n` -> "NNNN\t<code>", grep -n -> "NNNN:<code>"
+    return [
+        {"source": "agent", "action": "read", "id": "a1",
+         "args": {"path": "src/bitreader.c", "thought": "check the loop"}},
+        {"source": "observation", "cause": "a1", "observation": "read",
+         "content": "Here's the result of running `cat -n` on src/bitreader.c:\n"
+                    "   866\tstatic int read_rice_signed_block(BitReader* br) {\n"
+                    "   867\t    b = br->buffer[cwords];\n"},
+        {"source": "agent", "action": "run", "id": "a2",
+         "args": {"command": "grep -n cwords src/bitreader.c"}},
+        {"source": "observation", "cause": "a2", "observation": "run",
+         "content": "867:    b = br->buffer[cwords];"},
+    ]
+
+
+def test_build_evidence_bank_and_digest():
+    bank = build_evidence_bank(_traj_with_reads())
+    assert "bitreader.c" in bank["files"]
+    assert ("bitreader.c", 867) in bank["locations"]     # from read range AND grep hit
+    dig = evidence_digest(bank)
+    assert "bitreader.c" in dig
+
+
+def test_ground_trace_flags_ungrounded():
+    bank = build_evidence_bank(_traj_with_reads())
+    trace = {"nodes": [
+        {"role": "sink", "file": "bitreader.c", "line": 867},       # grounded (file + line viewed)
+        {"role": "root_cause", "file": "bitreader.c", "line": 999},  # file ok, line not viewed
+        {"role": "source", "file": "never_read.c", "line": 5},       # ungrounded file
+    ], "edges": []}
+    stats = ground_trace(trace, bank)
+    assert trace["nodes"][0]["grounded_in_reads"] and trace["nodes"][0]["line_in_viewed_range"]
+    assert trace["nodes"][1]["grounded_in_reads"] and not trace["nodes"][1]["line_in_viewed_range"]
+    assert not trace["nodes"][2]["grounded_in_reads"]
+    assert stats["grounded_nodes"] == 2
+
+
+def test_injection_meta_eval_catches_fakes():
+    events = build_observer_input(_traj_with_reads()) or [{"event_id": 0, "action": "x", "text": "hi"}]
+    bank = build_evidence_bank(_traj_with_reads())
+    m = injection_meta_eval(events, bank, n=10)
+    assert m["citation_detection_rate"] == 1.0      # fabricated quotes all dropped
+    assert m["grounding_detection_rate"] == 1.0     # ungrounded files all flagged
 
 
 def test_run_observer_end_to_end_with_pre_extracted_trace(tmp_path):
