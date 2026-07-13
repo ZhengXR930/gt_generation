@@ -495,6 +495,120 @@ def injection_meta_eval(events: list[dict[str, Any]], bank: dict[str, Any], n: i
 
 
 # --------------------------------------------------------------------------- #
+# 6c. Invariant-shaped reasoning record — align the RECORD to the frozen GT     #
+#     invariant ({relation, object, mechanism}), instead of a path graph.       #
+#     Matching then compares invariant-to-invariant: object (canonicalized) +   #
+#     relation (controlled vocab), NO function/line/path string matching.       #
+# --------------------------------------------------------------------------- #
+_VAR_STOP = {"struct", "const", "unsigned", "signed", "int", "char", "void", "static",
+             "long", "short", "the", "this", "return", "sizeof"}
+_REL_FAMILY = {
+    "double_free": "double_free", "doublefree": "double_free", "freed_twice": "double_free",
+    "double_fini": "double_free", "free_free": "double_free",
+    "free_before_use": "uaf", "use_after_free": "uaf", "uaf": "uaf", "read_after_free": "uaf",
+    "write_after_free": "uaf", "use_before_free": "uaf",
+    "oob_read": "oob", "out_of_bounds_read": "oob", "buffer_overflow_read": "oob",
+    "heap_buffer_overflow_read": "oob", "oob": "oob", "oob_write": "oob", "bounds_check": "oob",
+    "out_of_bounds_write": "oob", "buffer_overflow_write": "oob", "missing_bounds_check": "oob",
+    "missing_check": "oob", "overflow": "oob", "underflow": "oob", "index_oob": "oob",
+    "uninit_use": "uninit", "uninitialized": "uninit", "use_of_uninitialized": "uninit",
+    "uninit": "uninit", "null_deref": "null_deref", "null_dereference": "null_deref",
+}
+
+
+def canon_var(v: Any) -> set[str]:
+    """Canonicalize an object/variable to a token set: drop template args, then keep
+    identifier tokens (>=2 chars). `br->buffer[cwords]` -> {br,buffer,cwords};
+    `fontDicts.values.arrayZ_` -> {fontdicts,values,arrayz_}; `hb_vector_t<..>::fini`
+    -> {hb_vector_t,fini}. Match = non-empty intersection, never string ==."""
+    s = re.sub(r"<[^>]*>", "", str(v or ""))
+    return {t.lower() for t in re.findall(r"[A-Za-z_]\w+", s) if t.lower() not in _VAR_STOP}
+
+
+def canon_relation(r: Any) -> str:
+    """Map a relation/kind to a canonical family (double_free | uaf | oob | uninit | ...)."""
+    k = re.sub(r"[^a-z_]", "", str(r or "").lower().replace("-", "_").replace(" ", "_"))
+    return _REL_FAMILY.get(k, k or "other")
+
+
+INVARIANT_CLAIM_PROMPT = """\
+You are analyzing a coding agent's reasoning about a C/C++ memory-safety bug. Extract the
+INVARIANT the agent COMMITTED to — the core memory-safety violation it concluded — as JSON.
+You are GROUND-TRUTH-BLIND; report only what the agent concluded.
+
+Agent reasoning (numbered [event N]):
+{input}
+
+Evidence it read (for grounding file/var):
+{evidence}
+
+Output ONLY:
+{{"claims": [
+  {{"relation": "double_free|free_before_use|use_after_free|oob_read|oob_write|uninit_use|null_deref|other",
+    "object": "<bare program variable that is mismanaged, e.g. cwords / arrayZ_ / dc — NO -> [] casts>",
+    "object_raw": "<how the agent referred to it>",
+    "sites": [{{"role":"alloc|free|first_free|second_free|use|guard|root_cause",
+               "function":"...","var":"...","event_id":<N>,"quote":"<verbatim from event N>"}}],
+    "mechanism": "<one sentence: WHY the violation happens (the root cause)>",
+    "mechanism_quote": "<verbatim span from an event supporting the mechanism>",
+    "event_id": <N>}}
+]}}
+RULES: committed only (not explored-then-dropped); `object` is the bare variable; every quote
+VERBATIM from its event; if the agent committed to no clear invariant, return {{"claims": []}}."""
+
+
+def _quote_ok(item: dict, by_ev: dict) -> bool:
+    ev, q = item.get("event_id"), item.get("quote") or item.get("mechanism_quote")
+    return isinstance(ev, int) and ev in by_ev and isinstance(q, str) and bool(q) and q in by_ev[ev]
+
+
+def extract_invariant_claims(events: list[dict[str, Any]], backend: LLMBackend,
+                             evidence: str = "(none)") -> list[dict[str, Any]]:
+    out = _parse_json(backend(INVARIANT_CLAIM_PROMPT.format(input=render_input(events), evidence=evidence)))
+    by_ev = {e["event_id"]: e["text"] for e in events}
+    claims = []
+    for c in (out.get("claims") or []):
+        if not isinstance(c, dict):
+            continue
+        # keep only sites whose quote verifies; keep the claim if the mechanism quote verifies
+        c["sites"] = [s for s in (c.get("sites") or []) if isinstance(s, dict) and _quote_ok(s, by_ev)]
+        c["mechanism_verified"] = _quote_ok({"event_id": c.get("event_id"),
+                                             "mechanism_quote": c.get("mechanism_quote")}, by_ev)
+        claims.append(c)
+    return claims
+
+
+def align_claim_to_gt(claims: list[dict[str, Any]], gt_criterion: dict[str, Any]) -> dict[str, Any]:
+    """Layer-1 alignment: canonical object overlap + relation family. No path/line matching.
+    Returns the best-matching claim's alignment; `mechanism` is passed through for Layer-2."""
+    # GT object tokens: the criterion object/variable PLUS the site vars (aliases of the
+    # same physical object, e.g. dc == &sentry->cleanupCallback).
+    gt_obj = canon_var(gt_criterion.get("object") or gt_criterion.get("variable"))
+    for s in gt_criterion.get("sites") or []:
+        gt_obj |= canon_var(s.get("var"))
+    gt_rel = canon_relation(gt_criterion.get("relation") or gt_criterion.get("kind"))
+    best = {"relation_match": False, "object_match": False, "gt_object": sorted(gt_obj),
+            "gt_relation": gt_rel, "agent_object": None, "agent_relation": None,
+            "object_overlap": [], "mechanism": None, "n_claims": len(claims)}
+    best_score = -1
+    for c in claims:
+        # agent object tokens: the object field + how it wrote it + the site vars
+        agent_toks = canon_var(c.get("object")) | canon_var(c.get("object_raw"))
+        for s in c.get("sites") or []:
+            agent_toks |= canon_var(s.get("var"))
+        ov = agent_toks & gt_obj
+        rel_ok = canon_relation(c.get("relation")) == gt_rel
+        score = (2 if rel_ok else 0) + (1 if ov else 0)
+        if score > best_score:
+            best_score = score
+            best = {"relation_match": rel_ok, "object_match": bool(ov), "object_overlap": sorted(ov),
+                    "agent_object": c.get("object"), "agent_relation": canon_relation(c.get("relation")),
+                    "gt_object": sorted(gt_obj), "gt_relation": gt_rel,
+                    "mechanism": c.get("mechanism"), "n_claims": len(claims)}
+    return best
+
+
+# --------------------------------------------------------------------------- #
 # 7. Scoring integration: merge observer nodes/edges into agent state          #
 #    (function-level allowed — the recorder completeness gate does NOT apply    #
 #     to the observer, whose reasoning is reconstructed from prose)            #
