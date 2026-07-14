@@ -70,8 +70,11 @@ Procedure (non-ARVO / when no prebuilt image is provided):
 
 1. Use the provided vulnerable source/repository and vulnerable commit.
 2. Use the provided PoC path/URL. Materialize it only if the runner supplied a URL or external path.
-3. Write `build.sh` that can reproduce the vulnerable checkout/build/run in the unified Docker environment.
-4. Add project-specific dependencies at the top of `build.sh`, not to the global Docker image.
+3. Write `build.sh` that reproduces the checkout/build/run inside the shared `gt-memory-env`
+   Docker environment (`docker/gt-memory-env`, already built and available locally by the
+   00_prepare stage). The source is pre-cloned at the vulnerable commit in `_work/src`.
+4. Add project-specific dependencies (apt-get, pip, etc.) at the top of `build.sh` — install
+   them into the running container, not into the global gt-memory-env image.
 5. Build a sanitizer binary. Use ASan for heap/stack/global OOB, UAF, double free, invalid free, and downstream integer-overflow memory corruption. Use MSan when the sample is uninitialized-memory focused and feasible.
 6. Build a debug/Valgrind binary with `-O0 -g -fno-omit-frame-pointer` when feasible.
 7. Run the GT PoC on the vulnerable sanitizer build and save complete output to `sanitizer_trace.txt`.
