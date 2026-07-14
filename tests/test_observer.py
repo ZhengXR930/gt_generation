@@ -18,6 +18,7 @@ from external_interpreter.observer import (  # noqa: E402
     recorder_fidelity, merge_observer_into_agent, run_observer,
     build_evidence_bank, evidence_digest, ground_trace, injection_meta_eval,
     canon_var, canon_relation, align_claim_to_gt, propagation_score, reasoning_score,
+    mechanism_score, mechanism_subfacts,
 )
 
 
@@ -187,7 +188,23 @@ def test_propagation_score_semantic_edge_match():
     assert 0 < p["layer3_score"] < 1
     tl = reasoning_score([{"relation": "oob_read", "object": "cwords", "object_raw": "cwords"}],
                          agent, {"kind": "bounds_check", "variable": "cwords"}, gt)
-    assert tl["layer3_how"]["score"] is not None and tl["composite"] is not None
+    assert tl["propagation"]["score"] is not None and tl["composite"] is not None
+    assert "mechanism" in tl and "missed" in tl["mechanism"]
+
+
+def test_mechanism_subfacts_deterministic_partial():
+    # double_free: GT requires {cause=static_array aliasing, double_free order}. Agent that
+    # only reasons the double-free path (fini twice) but NOT the aliasing -> cause MISSED.
+    crit = {"kind": "lifetime", "relation": "double_free", "object": "arrayZ_",
+            "sites": [{"role": "root_cause", "var": "static_array"}, {"role": "free", "var": "arrayZ_"}]}
+    agent = {"nodes": [{"var": "arrayZ_"}],
+             "edges": [{"from": "fini", "to": "arrayZ_", "type": "order", "relation": "double_free"}]}
+    m = mechanism_score(agent, crit)
+    assert "double_free_order" in m["covered"] and "cause" in m["missed"]   # got the path, missed the aliasing
+    assert 0 < m["score"] < 1
+    # an agent that ALSO reasons the aliasing (static_array) -> full
+    agent2 = {"nodes": [{"var": "arrayZ_"}, {"var": "static_array"}], "edges": agent["edges"]}
+    assert mechanism_score(agent2, crit)["score"] == 1.0
 
 
 

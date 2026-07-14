@@ -605,11 +605,14 @@ def extract_invariant_claims(events: list[dict[str, Any]], backend: LLMBackend,
 def align_claim_to_gt(claims: list[dict[str, Any]], gt_criterion: dict[str, Any]) -> dict[str, Any]:
     """Layer-1 alignment: canonical object overlap + relation family. No path/line matching.
     Returns the best-matching claim's alignment; `mechanism` is passed through for Layer-2."""
-    # GT object tokens: the criterion object/variable PLUS the site vars (aliases of the
-    # same physical object, e.g. dc == &sentry->cleanupCallback).
+    # GT object tokens = the faulting/freed ENTITY and its lifecycle aliases (alloc/free/use
+    # site vars). The root_cause site var is the CAUSE (e.g. static_array aliasing) and belongs
+    # to MECHANISM, not object — excluding it keeps "named the right entity" (object) cleanly
+    # separate from "understood why" (mechanism), so reach cannot borrow credit from reason.
     gt_obj = canon_var(gt_criterion.get("object") or gt_criterion.get("variable"))
     for s in gt_criterion.get("sites") or []:
-        gt_obj |= canon_var(s.get("var"))
+        if str(s.get("role") or "").lower() != "root_cause":
+            gt_obj |= canon_var(s.get("var"))
     gt_rel = canon_relation(gt_criterion.get("relation") or gt_criterion.get("kind"))
     best = {"relation_match": False, "object_match": False, "gt_object": sorted(gt_obj),
             "gt_relation": gt_rel, "agent_object": None, "agent_relation": None,
@@ -695,6 +698,63 @@ def propagation_score(agent_trace: dict[str, Any], gt_verified: dict[str, Any]) 
             "gt_between_nodes": n_tot, "matched_edges": matched_edges}
 
 
+def mechanism_subfacts(criterion: dict[str, Any]) -> list[dict[str, Any]]:
+    """The REQUIRED causal sub-facts a COMPLETE root-cause understanding must cover, derived
+    from the GT criterion. Each is a typed, deterministically-checkable claim — this replaces
+    a prose-vs-prose mechanism comparison (which token-overlap mis-judges and an LLM judge
+    only launders). The `cause` sub-fact is the aliasing/premature-teardown reason (the half
+    the 12241 agent missed), kept DISTINCT from the freed object."""
+    kind = criterion.get("kind")
+    facts: list[dict[str, Any]] = []
+    if kind == "lifetime":
+        rel = canon_relation(criterion.get("relation"))
+        cause = next((s.get("var") for s in (criterion.get("sites") or [])
+                      if str(s.get("role") or "").lower() == "root_cause"), None)
+        if cause:
+            facts.append({"name": "cause", "need_var": cause,
+                          "desc": "why the object is mis-owned/freed early (aliasing / premature teardown)"})
+        if rel == "double_free":
+            facts.append({"name": "double_free_order", "need_relation": "double_free",
+                          "desc": "the object is freed twice (temporal order)"})
+        else:
+            facts.append({"name": "free_before_use_order", "need_relation": "uaf",
+                          "desc": "free happens-before use (temporal order)"})
+    else:  # bounds/oob
+        v = criterion.get("variable")
+        facts.append({"name": "faulting_index", "need_var": v, "desc": "the faulting index variable"})
+        facts.append({"name": "missing_bound", "need_relation": "control", "need_var": v,
+                      "desc": "the missing bound condition (a control/missing-check edge on the index)"})
+    return facts
+
+
+def mechanism_score(agent_trace: dict[str, Any], criterion: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic mechanism coverage: for each required causal sub-fact, is it present in
+    the agent's graph (a node with the cause var, or an edge with the required relation+var)?
+    Reports which sub-facts were covered vs MISSED (e.g. 12241 -> 'cause' missed = the agent
+    got the double-free path but not the static_array aliasing)."""
+    facts = mechanism_subfacts(criterion)
+    node_vars: set[str] = set()
+    for n in agent_trace.get("nodes", []):
+        node_vars |= canon_var(n.get("var"))
+    edges = [( _edge_type(e), canon_relation(e.get("relation")), _edge_ops(e))
+             for e in agent_trace.get("edges", [])]
+    covered, missed = [], []
+    for f in facts:
+        nv = canon_var(f.get("need_var"))
+        nr = f.get("need_relation")
+        if nr:
+            want = canon_relation(nr)
+            hit = any((rel == want or (nr == "control" and t == "control")) and (not nv or (ops & nv))
+                      for (t, rel, ops) in edges)
+        else:
+            hit = bool(nv and (node_vars & nv or any(nv & ops for _, _, ops in edges)))
+        (covered if hit else missed).append(f["name"])
+    total = len(facts)
+    return {"score": round(len(covered) / total, 3) if total else None,
+            "covered": covered, "missed": missed,
+            "subfacts": [{"name": f["name"], "desc": f["desc"]} for f in facts]}
+
+
 def reasoning_score(claims: list[dict[str, Any]], agent_trace: dict[str, Any],
                     gt_criterion: dict[str, Any], gt_verified: dict[str, Any]) -> dict[str, Any]:
     """FULLY DETERMINISTIC reasoning score — NO LLM-as-a-judge anywhere in the number.
@@ -704,24 +764,32 @@ def reasoning_score(claims: list[dict[str, Any]], agent_trace: dict[str, Any],
                 root_cause node and its causal edge — so mechanism correctness ("why") is
                 scored STRUCTURALLY (did the agent's graph cover the GT root_cause + causal
                 edge), not by an LLM opinion.
-    composite: relation-gate -> object-gate -> 0.3 floor + 0.7 * propagation. Given the
-    (LLM-extracted, citation-gated) trace, this function is a pure deterministic map."""
+    Composite is REASON-heavy so reach (object+relation, cheap since the crash type is given)
+    cannot dominate — the reach⊥reason dissociation the benchmark targets stays visible:
+        relation gate -> object gate -> 0.2 (reach floor) + 0.5*mechanism + 0.3*propagation.
+    Reach alone (right object+relation, wrong mechanism, no propagation) caps at 0.2. Given
+    the (LLM-extracted, citation-gated) trace, this is a pure deterministic map."""
     al = align_claim_to_gt(claims, gt_criterion)
     p = propagation_score(agent_trace, gt_verified)
+    m = mechanism_score(agent_trace, gt_criterion)
     l3 = p["layer3_score"] if p["layer3_score"] is not None else 0.0
+    mech = m["score"] if m["score"] is not None else 0.0
     if not al["relation_match"]:
-        composite, band = 0.0, "no_bug_class"
+        composite, band = 0.0, "no_bug_class"          # didn't even get the bug class
     elif not al["object_match"]:
-        composite, band = 0.2, "right_class_wrong_object"
+        composite, band = 0.2, "reached_wrong_object"  # named the wrong entity
     else:
-        composite, band = round(0.3 + 0.7 * l3, 3), "scored"
+        composite = round(0.2 + 0.5 * mech + 0.3 * l3, 3)
+        band = "understood" if mech >= 0.99 else ("partial" if mech > 0 else "reached_not_reasoned")
     return {
         "composite": composite, "band": band,
-        "layer1_what": {"relation_match": al["relation_match"], "object_match": al["object_match"],
-                        "object_overlap": al["object_overlap"]},
-        "layer3_how": {"score": p["layer3_score"], "edge_recall": p["edge_recall"],
-                       "edge_recall_by_type": p["edge_recall_by_type"], "node_recall": p["node_recall"]},
-        "propagation_reasoning": p["layer3_score"],
+        "reach_layer1": {"relation_match": al["relation_match"], "object_match": al["object_match"],
+                         "object_overlap": al["object_overlap"]},
+        "mechanism": {"score": m["score"], "covered": m["covered"], "missed": m["missed"],
+                      "subfacts": m["subfacts"]},
+        "propagation": {"score": p["layer3_score"], "edge_recall_by_type": p["edge_recall_by_type"],
+                        "node_recall": p["node_recall"]},
+        "reason_mechanism": m["score"], "reason_propagation": p["layer3_score"],
     }
 
 

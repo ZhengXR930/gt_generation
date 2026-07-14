@@ -65,9 +65,11 @@ def run_all(bundle: Path, phase: str) -> dict:
             # Reasoning (deterministic: L1 what + L3 source->sink propagation; NO LLM judge)
             "reasoning_composite": metrics["understanding"]["summary"].get("composite"),
             "reasoning_band": metrics["understanding"]["summary"].get("band"),
-            "reasoning_propagation": metrics["understanding"]["summary"].get("propagation_reasoning"),
-            "reasoning_layer1_what": metrics["understanding"]["summary"].get("layer1_what"),
-            "reasoning_layer3_how": metrics["understanding"]["summary"].get("layer3_how"),
+            "reasoning_mechanism_score": metrics["understanding"]["summary"].get("reason_mechanism"),
+            "reasoning_propagation": metrics["understanding"]["summary"].get("reason_propagation"),
+            "reasoning_reach": metrics["understanding"]["summary"].get("reach_layer1"),
+            "reasoning_mechanism": metrics["understanding"]["summary"].get("mechanism"),
+            "reasoning_propagation_detail": metrics["understanding"]["summary"].get("propagation"),
         },
     }
 
