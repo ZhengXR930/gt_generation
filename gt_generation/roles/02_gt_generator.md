@@ -23,14 +23,13 @@ Source of truth for line numbers (CRITICAL):
 
 - Every `file`/`line` in the GT MUST be grounded in the SAME source that was built and
   reproduced — never a fresh commit checkout (line numbers drift between them).
-- For ARVO samples (`sample.json` has `arvo_image_vul`): the authoritative source lives
-  in that docker image. Extract it into a `_work/` subdir of the result directory and
-  read line numbers there:
-  ```
-  cid=$(docker create <arvo_image_vul>); docker cp "$cid:/src/<proj>" "<result_dir>/_work/src"; docker rm "$cid"
-  ```
-  Reproduce with `docker run --rm --entrypoint /bin/bash <arvo_image_vul> -c '/bin/arvo run'`
-  when you need to confirm the crash line. Use `--rm`; never leave containers running.
+- The `00_prepare` stage has ALREADY staged everything you need — do NOT pull images or
+  run docker. Read line numbers directly from the pre-extracted source tree at
+  `<result_dir>/_work/src` and the crash from `<result_dir>/sanitizer_trace.txt`
+  (both are on disk). The vulnerable/fix images are already pulled locally if you need
+  to spot-check, but you should not need to. NEVER `docker pull` / `docker create` here —
+  that is the prepare stage's job and pulling in this stage is what previously caused
+  failures.
 - Write each GT `file` as the repo-relative path EXACTLY as it appears in
   `sanitizer_trace.txt` (e.g. `libarchive/libarchive/archive_read_support_format_rar5.c`,
   not a shortened `libarchive/...`), so evaluation path matching is exact.

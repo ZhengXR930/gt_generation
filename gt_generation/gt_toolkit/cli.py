@@ -26,11 +26,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"gt-toolkit {__version__}")
     parser.add_argument(
         "command",
-        choices=["validate", "state", "reachability", "gdb-watch", "schema-path"],
+        choices=["prepare", "validate", "state", "reachability", "gdb-watch", "schema-path"],
         help="Subcommand to run.",
     )
     ns, rest = parser.parse_known_args(argv)
 
+    if ns.command == "prepare":
+        from . import prepare
+        return prepare.main(rest)
     if ns.command == "validate":
         from . import validate
         return validate.main(rest)
