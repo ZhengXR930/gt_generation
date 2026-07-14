@@ -713,6 +713,91 @@ def understanding_score(claims: list[dict[str, Any]], gt_criterion: dict[str, An
     return result
 
 
+def _edge_ops(e: dict[str, Any]) -> set[str]:
+    """The variables an edge is about — from/to/via/relation/obj, canonicalized."""
+    ops: set[str] = set()
+    for k in ("from", "to", "via", "relation", "obj"):
+        ops |= canon_var(e.get(k))
+    return ops
+
+
+def _edge_type(e: dict[str, Any]) -> str:
+    t = str(e.get("type") or "").lower()
+    return t if t in ("data", "control", "order") else "other"
+
+
+def propagation_score(agent_trace: dict[str, Any], gt_verified: dict[str, Any]) -> dict[str, Any]:
+    """Layer 3 (HOW) — the source->sink reasoning: did the agent capture the GT's typed
+    relationships between variables (data/control/order edges) and the between-nodes?
+    Matched SEMANTICALLY: same edge-type family + canonical variable-token overlap. NO
+    function-name / line-number / string matching."""
+    gt_edges = [e for e in (gt_verified.get("edges") or []) if isinstance(e, dict)]
+    ag_edges = [e for e in (agent_trace.get("edges") or []) if isinstance(e, dict)]
+    by_type: dict[str, dict[str, int]] = {}
+    matched_edges = []
+    for ge in gt_edges:
+        t = _edge_type(ge)
+        slot = by_type.setdefault(t, {"total": 0, "matched": 0})
+        slot["total"] += 1
+        gops = _edge_ops(ge)
+        hit = any(_edge_type(ae) == t and (_edge_ops(ae) & gops) for ae in ag_edges) if gops else False
+        slot["matched"] += 1 if hit else 0
+        matched_edges.append({"type": t, "via": ge.get("via") or ge.get("relation"),
+                              "ops": sorted(gops), "matched": hit})
+    e_tot = sum(v["total"] for v in by_type.values())
+    e_hit = sum(v["matched"] for v in by_type.values())
+    # between-node coverage (the necessary checkpoints that are NOT the source/sink endpoints),
+    # matched by canonical VARIABLE overlap — not line.
+    gt_nodes = [n for n in (gt_verified.get("nodes") or []) if isinstance(n, dict)
+                and str(n.get("role") or "").lower() not in ("source", "sink")]
+    ag_nodes = [n for n in (agent_trace.get("nodes") or []) if isinstance(n, dict)]
+    n_tot = n_hit = 0
+    for gn in gt_nodes:
+        gv = canon_var(gn.get("var"))
+        if not gv:
+            continue
+        n_tot += 1
+        if any(canon_var(an.get("var")) & gv for an in ag_nodes):
+            n_hit += 1
+    edge_recall = round(e_hit / e_tot, 3) if e_tot else None
+    node_recall = round(n_hit / n_tot, 3) if n_tot else None
+    parts = [x for x in (edge_recall, node_recall) if x is not None]
+    layer3 = round(sum(parts) / len(parts), 3) if parts else None
+    return {"layer3_score": layer3, "edge_recall": edge_recall, "node_recall": node_recall,
+            "edge_recall_by_type": {t: round(v["matched"] / v["total"], 3)
+                                    for t, v in by_type.items() if v["total"]},
+            "gt_edges": e_tot, "agent_edges": len(ag_edges),
+            "gt_between_nodes": n_tot, "matched_edges": matched_edges}
+
+
+def three_layer_score(claims: list[dict[str, Any]], agent_trace: dict[str, Any],
+                      gt_criterion: dict[str, Any], gt_verified: dict[str, Any],
+                      backend: LLMBackend | None = None) -> dict[str, Any]:
+    """Compose the reasoning score across the three layers the GT emphasizes:
+      L1 what  = root_cause object + relation
+      L2 why   = root_cause mechanism (semantic judge)
+      L3 how   = source->sink typed-edge propagation + between-nodes
+    Composite weights root-cause understanding (L1+L2) and propagation (L3)."""
+    u = understanding_score(claims, gt_criterion, backend)     # L1 + L2
+    p = propagation_score(agent_trace, gt_verified)            # L3
+    rc = u["score"]
+    prop = p["layer3_score"]
+    if rc is None:
+        composite = None
+    elif prop is None:
+        composite = rc
+    else:
+        composite = round(0.6 * rc + 0.4 * prop, 3)
+    return {
+        "layer1_what": {"relation_match": u["relation_match"], "object_match": u["object_match"],
+                        "object_overlap": u["object_overlap"]},
+        "layer2_why": {"verdict": u.get("mechanism_verdict"), "why": u.get("mechanism_why")},
+        "layer3_how": {"score": prop, "edge_recall": p["edge_recall"],
+                       "edge_recall_by_type": p["edge_recall_by_type"], "node_recall": p["node_recall"]},
+        "root_cause_understanding": rc, "propagation_reasoning": prop, "composite": composite,
+    }
+
+
 def aggregate_claims(events: list[dict[str, Any]], backend: LLMBackend,
                      evidence: str = "(none)", k: int = 3) -> list[dict[str, Any]]:
     """Run extraction k times and union the claims — align/score then picks the best,

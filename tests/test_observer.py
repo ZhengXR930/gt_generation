@@ -18,6 +18,7 @@ from external_interpreter.observer import (  # noqa: E402
     recorder_fidelity, merge_observer_into_agent, run_observer,
     build_evidence_bank, evidence_digest, ground_trace, injection_meta_eval,
     canon_var, canon_relation, align_claim_to_gt, understanding_score, gt_mechanism,
+    propagation_score, three_layer_score,
 )
 
 
@@ -186,6 +187,25 @@ def test_understanding_score_mechanism_with_stub_backend():
     assert match["score"] == 1.0 and match["mechanism_verdict"] == "match"
     miss = understanding_score(claim, gt, lambda p: '{"verdict":"mismatch","why":"different"}')
     assert miss["score"] == 0.4 and miss["band"] == "right_what_wrong_why"
+
+
+def test_propagation_score_semantic_edge_match():
+    gt = {"nodes": [{"role": "materialization", "var": "cwords"}, {"role": "sink", "var": "x"}],
+          "edges": [{"from": "cwords", "to": "br->buffer[cwords]", "type": "data"},
+                    {"from": "cwords >= words", "to": "read", "type": "control", "relation": "missing_check"},
+                    {"from": "s", "to": "s->ht", "type": "order", "relation": "free_before_use"}]}
+    agent = {"nodes": [{"var": "cwords"}],
+             "edges": [{"from": "br->consumed_words", "to": "cwords", "type": "data"},   # cwords overlap
+                       {"from": "cwords >= words", "to": "oob", "type": "control"}]}      # control operand overlap
+    p = propagation_score(agent, gt)
+    assert p["edge_recall_by_type"]["data"] == 1.0      # cwords data edge matched
+    assert p["edge_recall_by_type"]["control"] == 1.0   # cwords>=words control matched
+    assert p["edge_recall_by_type"]["order"] == 0.0     # free_before_use of s NOT captured
+    assert p["node_recall"] == 1.0                      # materialization(cwords) matched by var
+    assert 0 < p["layer3_score"] < 1
+    tl = three_layer_score([{"relation": "oob_read", "object": "cwords", "object_raw": "cwords"}],
+                           agent, {"kind": "bounds_check", "variable": "cwords"}, gt, backend=None)
+    assert tl["layer3_how"]["score"] is not None and tl["composite"] is not None
 
 
 def test_gt_mechanism_strings():
