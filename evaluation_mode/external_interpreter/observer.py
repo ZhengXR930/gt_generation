@@ -654,12 +654,16 @@ def _edge_type(e: dict[str, Any]) -> str:
     return t if t in ("data", "control", "order") else "other"
 
 
-def propagation_score(agent_trace: dict[str, Any], gt_verified: dict[str, Any]) -> dict[str, Any]:
-    """Layer 3 (HOW) — the source->sink reasoning: did the agent capture the GT's typed
-    relationships between variables (data/control/order edges) and the between-nodes?
-    Matched SEMANTICALLY: same edge-type family + canonical variable-token overlap. NO
-    function-name / line-number / string matching."""
-    gt_edges = [e for e in (gt_verified.get("edges") or []) if isinstance(e, dict)]
+def propagation_score(agent_trace: dict[str, Any], gt_verified: dict[str, Any],
+                      exclude_edge_types: frozenset = frozenset(),
+                      exclude_node_roles: frozenset = frozenset()) -> dict[str, Any]:
+    """Layer 3 (HOW) — the source->sink DATA-FLOW path: did the agent capture the GT's typed
+    relationships and between-nodes? Matched SEMANTICALLY (edge-type family + canonical var
+    overlap; no string/line matching). `exclude_edge_types`/`exclude_node_roles` remove the
+    elements already OWNED by the mechanism layer (the signature causal edge + the root_cause
+    node) so each GT element is scored exactly once — no double-counting the causal spine."""
+    gt_edges = [e for e in (gt_verified.get("edges") or [])
+                if isinstance(e, dict) and _edge_type(e) not in exclude_edge_types]
     ag_edges = [e for e in (agent_trace.get("edges") or []) if isinstance(e, dict)]
     by_type: dict[str, dict[str, int]] = {}
     matched_edges = []
@@ -677,7 +681,8 @@ def propagation_score(agent_trace: dict[str, Any], gt_verified: dict[str, Any]) 
     # between-node coverage (the necessary checkpoints that are NOT the source/sink endpoints),
     # matched by canonical VARIABLE overlap — not line.
     gt_nodes = [n for n in (gt_verified.get("nodes") or []) if isinstance(n, dict)
-                and str(n.get("role") or "").lower() not in ("source", "sink")]
+                and str(n.get("role") or "").lower() not in ("source", "sink")
+                and str(n.get("role") or "").lower() not in exclude_node_roles]
     ag_nodes = [n for n in (agent_trace.get("nodes") or []) if isinstance(n, dict)]
     n_tot = n_hit = 0
     for gn in gt_nodes:
@@ -818,7 +823,14 @@ def reasoning_score(claims: list[dict[str, Any]], agent_trace: dict[str, Any],
     Reach alone (right object+relation, wrong mechanism, no propagation) caps at 0.2. Given
     the (LLM-extracted, citation-gated) trace, this is a pure deterministic map."""
     al = align_claim_to_gt(claims, gt_criterion)
-    p = propagation_score(agent_trace, gt_verified)
+    # De-dup: mechanism OWNS the root_cause node + the signature causal edge (order for
+    # lifetime bugs, control/missing-check for oob); propagation scores only the REMAINING
+    # data-flow edges + non-cause between-nodes, so no GT element is counted twice.
+    fam = _cwe_family(gt_verified.get("vulnerability_class"), gt_criterion)
+    sig_edge = "control" if fam == "oob" else "order"
+    p = propagation_score(agent_trace, gt_verified,
+                          exclude_edge_types=frozenset({sig_edge}),
+                          exclude_node_roles=frozenset({"root_cause"}))
     m = mechanism_score(agent_trace, gt_criterion, gt_verified.get("vulnerability_class"))
     l3 = p["layer3_score"] if p["layer3_score"] is not None else 0.0
     mech = m["score"] if m["score"] is not None else 0.0
