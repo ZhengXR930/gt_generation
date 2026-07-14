@@ -10,6 +10,19 @@ Required output:
 - `verified_invariants.json`   (the invariant points/edges YOU selected and verified;
                                 this is what the agent evaluator scores against)
 
+CRITICAL — DO NOT BLOCK ON A REBUILD. Produce `verified_invariants.json` FIRST from the
+NO-REBUILD tiers, which fully cover the load-bearing invariants:
+  - SINK / ORDER  ← Tier A `asan_reproduce`: run the PoC on the (already-local) vul image;
+    the ASan crash line is the sink, alloc/free/crash stacks give the order edges.
+  - ROOT_CAUSE / CONTROL ← Tier A `patch_differential`: run the SAME PoC on the fix image
+    (already local). vul-crash + fix-clean confirms the root cause. NO compilation needed.
+Write `verified_invariants.json` (+ `reachability_report.json`) from these BEFORE attempting
+anything else. Coverage/DFSan tiers that need a rebuild are OPTIONAL: if a rebuild is slow
+or out of budget (it is, under qemu), set those `method="deferred"` and MOVE ON — never let
+a `make`/rebuild hang consume your budget before the required outputs are on disk. A slow
+instrumentation build that leaves `verified_invariants.json` unwritten is the top failure
+mode; avoid it by writing the Tier-A result first.
+
 Step 1 — SELECT the invariant points + derive the root_cause CRITERION by READING the GT
 (use your understanding of the vulnerability — NOT string/role matching; pick the right
 nodes even if their `role` label is imperfect):
