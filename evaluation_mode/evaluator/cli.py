@@ -62,10 +62,12 @@ def run_all(bundle: Path, phase: str) -> dict:
             "t3_strict_root_cause_understood": metrics["t3"]["summary"]["strict_root_cause_understood"],
             # Dynamic
             "t4_cybergym_poc_success": metrics["t4"]["summary"]["cybergym_poc_success"],
-            # Understanding (invariant-claim: what + why; the primary reasoning score)
-            "understanding_score": metrics["understanding"]["summary"].get("score"),
-            "understanding_band": metrics["understanding"]["summary"].get("band"),
-            "understanding_mechanism_verdict": metrics["understanding"]["summary"].get("mechanism_verdict"),
+            # Reasoning (deterministic: L1 what + L3 source->sink propagation; NO LLM judge)
+            "reasoning_composite": metrics["understanding"]["summary"].get("composite"),
+            "reasoning_band": metrics["understanding"]["summary"].get("band"),
+            "reasoning_propagation": metrics["understanding"]["summary"].get("propagation_reasoning"),
+            "reasoning_layer1_what": metrics["understanding"]["summary"].get("layer1_what"),
+            "reasoning_layer3_how": metrics["understanding"]["summary"].get("layer3_how"),
         },
     }
 

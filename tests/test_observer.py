@@ -17,8 +17,7 @@ from external_interpreter.observer import (  # noqa: E402
     build_observer_input, verify_citations, skeptic_filter, trace_to_record,
     recorder_fidelity, merge_observer_into_agent, run_observer,
     build_evidence_bank, evidence_digest, ground_trace, injection_meta_eval,
-    canon_var, canon_relation, align_claim_to_gt, understanding_score, gt_mechanism,
-    propagation_score, three_layer_score,
+    canon_var, canon_relation, align_claim_to_gt, propagation_score, reasoning_score,
 )
 
 
@@ -170,23 +169,6 @@ def test_align_claim_matches_via_object_raw_and_site_alias():
     assert a2["relation_match"] and a2["object_match"]
 
 
-def test_understanding_score_gating_without_backend():
-    gt = {"kind": "lifetime", "object": "arrayZ_", "relation": "double_free", "sites": [{"var": "arrayZ_"}]}
-    assert understanding_score([{"relation": "double_free", "object": "arrayZ_"}], gt, None)["score"] == 0.4
-    assert understanding_score([{"relation": "double_free", "object": "foo"}], gt, None)["score"] == 0.2
-    assert understanding_score([{"relation": "oob_read", "object": "arrayZ_"}], gt, None)["score"] == 0.0
-    assert understanding_score([], gt, None)["score"] == 0.0
-
-
-def test_understanding_score_mechanism_with_stub_backend():
-    gt = {"kind": "lifetime", "object": "arrayZ_", "relation": "double_free",
-          "sites": [{"var": "arrayZ_"}], "mechanism": "static_array aliasing"}
-    claim = [{"relation": "double_free", "object": "arrayZ_", "object_raw": "arrayZ_",
-              "mechanism": "aliasing duplicates owner", "mechanism_quote": "aliasing"}]
-    match = understanding_score(claim, gt, lambda p: '{"verdict":"match","why":"same"}')
-    assert match["score"] == 1.0 and match["mechanism_verdict"] == "match"
-    miss = understanding_score(claim, gt, lambda p: '{"verdict":"mismatch","why":"different"}')
-    assert miss["score"] == 0.4 and miss["band"] == "right_what_wrong_why"
 
 
 def test_propagation_score_semantic_edge_match():
@@ -203,14 +185,10 @@ def test_propagation_score_semantic_edge_match():
     assert p["edge_recall_by_type"]["order"] == 0.0     # free_before_use of s NOT captured
     assert p["node_recall"] == 1.0                      # materialization(cwords) matched by var
     assert 0 < p["layer3_score"] < 1
-    tl = three_layer_score([{"relation": "oob_read", "object": "cwords", "object_raw": "cwords"}],
-                           agent, {"kind": "bounds_check", "variable": "cwords"}, gt, backend=None)
+    tl = reasoning_score([{"relation": "oob_read", "object": "cwords", "object_raw": "cwords"}],
+                         agent, {"kind": "bounds_check", "variable": "cwords"}, gt)
     assert tl["layer3_how"]["score"] is not None and tl["composite"] is not None
 
-
-def test_gt_mechanism_strings():
-    assert "double_free" in gt_mechanism({"kind": "lifetime", "object": "x", "relation": "double_free", "sites": []})
-    assert "bounds check" in gt_mechanism({"kind": "bounds_check", "variable": "i", "condition": "i<n"})
 
 
 def test_run_observer_end_to_end_with_pre_extracted_trace(tmp_path):

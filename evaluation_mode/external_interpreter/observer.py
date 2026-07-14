@@ -633,86 +633,11 @@ def align_claim_to_gt(claims: list[dict[str, Any]], gt_criterion: dict[str, Any]
 
 
 # --------------------------------------------------------------------------- #
-# 6d. Layer-2 mechanism judge + composite understanding score.                  #
-#     Layer-1 (object+relation) is cheap but the crash TYPE is given to the      #
-#     agent, so relation is nearly free and Layer-1 alone over-credits. The      #
-#     understanding score is gated on Layer-2 (the WHY): you cannot exceed 0.4   #
-#     without explaining the same root-cause mechanism as the GT.                #
+# NOTE: there is deliberately NO LLM-as-a-judge in the reasoning score. The     #
+# root_cause "why" is scored STRUCTURALLY by Layer 3 (coverage of the GT        #
+# root_cause node + its causal edge), so a mechanism semantic judge is neither  #
+# used nor kept — the whole score is deterministic given the extracted trace.   #
 # --------------------------------------------------------------------------- #
-def gt_mechanism(criterion: dict[str, Any]) -> str:
-    if criterion.get("kind") == "lifetime":
-        sites = "; ".join(f"{s.get('role')}@{s.get('function')}:{s.get('line')}(var={s.get('var')})"
-                          for s in criterion.get("sites") or [])
-        base = f"{criterion.get('relation')} of `{criterion.get('object')}`"
-        extra = criterion.get("mechanism") or criterion.get("evidence") or ""
-        return f"{base}. sites: {sites}. {str(extra)[:400]}"
-    return (f"missing bounds check `{criterion.get('condition')}` on `{criterion.get('variable')}` "
-            f"in {criterion.get('region_function')}{criterion.get('region_lines')}. "
-            f"{str(criterion.get('note') or '')[:300]}")
-
-
-MECHANISM_JUDGE_PROMPT = """\
-You judge whether a coding agent EXPLAINED THE SAME ROOT-CAUSE MECHANISM as the ground
-truth — not merely the same crash symptom. The crash type is GIVEN to the agent, so
-naming the bug class is NOT understanding; the mechanism (WHY it happens) is.
-
-GROUND-TRUTH mechanism:
-{gt_mechanism}
-
-AGENT's mechanism claim: {agent_mechanism}
-AGENT's cited evidence:  {agent_quote}
-
-Output ONLY: {{"verdict":"match|partial|mismatch","why":"<one short sentence>"}}
-- match    = same causal reason (same missing check / same aliasing / same lifecycle path).
-- partial  = related and on the right object but incomplete or a slightly different cause.
-- mismatch = a different cause, or only restates the crash symptom.
-Be strict: default to mismatch/partial when unsure."""
-
-
-def judge_mechanism(agent_mechanism: str, agent_quote: str, gt_criterion: dict[str, Any],
-                    backend: LLMBackend) -> dict[str, Any]:
-    out = _parse_json(backend(MECHANISM_JUDGE_PROMPT.format(
-        gt_mechanism=gt_mechanism(gt_criterion),
-        agent_mechanism=agent_mechanism or "(none)", agent_quote=agent_quote or "(none)")))
-    v = str(out.get("verdict", "mismatch")).lower()
-    if v not in ("match", "partial", "mismatch"):
-        v = "mismatch"
-    return {"verdict": v, "why": out.get("why", "")}
-
-
-_MECH_SCORE = {"match": 1.0, "partial": 0.7, "mismatch": 0.4}
-
-
-def understanding_score(claims: list[dict[str, Any]], gt_criterion: dict[str, Any],
-                        backend: LLMBackend | None = None) -> dict[str, Any]:
-    """Composite score. relation(given)→object→MECHANISM. Ceiling 0.4 without a
-    mechanism match; only the Layer-2 judge lifts it to 0.7/1.0."""
-    al = align_claim_to_gt(claims, gt_criterion)
-    result = {"score": 0.0, "band": "no_bug_class", "relation_match": al["relation_match"],
-              "object_match": al["object_match"], "object_overlap": al["object_overlap"],
-              "mechanism_verdict": None, "mechanism_why": None, "agent_mechanism": al.get("mechanism")}
-    if not al["relation_match"]:
-        return result
-    if not al["object_match"]:
-        result.update(score=0.2, band="right_class_wrong_object")
-        return result
-    # Layer-1 satisfied → the WHY decides. Without a backend we can't judge → cap at 0.4.
-    if backend is None or not al.get("mechanism"):
-        result.update(score=0.4, band="right_what_mechanism_unjudged")
-        return result
-    # pick the cited quote of the best-aligned claim for grounding
-    quote = ""
-    for c in claims:
-        if c.get("mechanism") == al.get("mechanism"):
-            quote = c.get("mechanism_quote") or ""
-            break
-    j = judge_mechanism(al["mechanism"], quote, gt_criterion, backend)
-    result.update(score=_MECH_SCORE[j["verdict"]],
-                  band={"match": "understood", "partial": "partial", "mismatch": "right_what_wrong_why"}[j["verdict"]],
-                  mechanism_verdict=j["verdict"], mechanism_why=j["why"])
-    return result
-
-
 def _edge_ops(e: dict[str, Any]) -> set[str]:
     """The variables an edge is about — from/to/via/relation/obj, canonicalized."""
     ops: set[str] = set()
@@ -770,31 +695,33 @@ def propagation_score(agent_trace: dict[str, Any], gt_verified: dict[str, Any]) 
             "gt_between_nodes": n_tot, "matched_edges": matched_edges}
 
 
-def three_layer_score(claims: list[dict[str, Any]], agent_trace: dict[str, Any],
-                      gt_criterion: dict[str, Any], gt_verified: dict[str, Any],
-                      backend: LLMBackend | None = None) -> dict[str, Any]:
-    """Compose the reasoning score across the three layers the GT emphasizes:
-      L1 what  = root_cause object + relation
-      L2 why   = root_cause mechanism (semantic judge)
-      L3 how   = source->sink typed-edge propagation + between-nodes
-    Composite weights root-cause understanding (L1+L2) and propagation (L3)."""
-    u = understanding_score(claims, gt_criterion, backend)     # L1 + L2
-    p = propagation_score(agent_trace, gt_verified)            # L3
-    rc = u["score"]
-    prop = p["layer3_score"]
-    if rc is None:
-        composite = None
-    elif prop is None:
-        composite = rc
+def reasoning_score(claims: list[dict[str, Any]], agent_trace: dict[str, Any],
+                    gt_criterion: dict[str, Any], gt_verified: dict[str, Any]) -> dict[str, Any]:
+    """FULLY DETERMINISTIC reasoning score — NO LLM-as-a-judge anywhere in the number.
+      L1 what : root_cause object + relation (canonical token overlap; a coarse gate —
+                the crash type is given, so this alone cannot score high).
+      L3 how  : source->sink typed-edge propagation + between-node coverage, INCLUDING the
+                root_cause node and its causal edge — so mechanism correctness ("why") is
+                scored STRUCTURALLY (did the agent's graph cover the GT root_cause + causal
+                edge), not by an LLM opinion.
+    composite: relation-gate -> object-gate -> 0.3 floor + 0.7 * propagation. Given the
+    (LLM-extracted, citation-gated) trace, this function is a pure deterministic map."""
+    al = align_claim_to_gt(claims, gt_criterion)
+    p = propagation_score(agent_trace, gt_verified)
+    l3 = p["layer3_score"] if p["layer3_score"] is not None else 0.0
+    if not al["relation_match"]:
+        composite, band = 0.0, "no_bug_class"
+    elif not al["object_match"]:
+        composite, band = 0.2, "right_class_wrong_object"
     else:
-        composite = round(0.6 * rc + 0.4 * prop, 3)
+        composite, band = round(0.3 + 0.7 * l3, 3), "scored"
     return {
-        "layer1_what": {"relation_match": u["relation_match"], "object_match": u["object_match"],
-                        "object_overlap": u["object_overlap"]},
-        "layer2_why": {"verdict": u.get("mechanism_verdict"), "why": u.get("mechanism_why")},
-        "layer3_how": {"score": prop, "edge_recall": p["edge_recall"],
+        "composite": composite, "band": band,
+        "layer1_what": {"relation_match": al["relation_match"], "object_match": al["object_match"],
+                        "object_overlap": al["object_overlap"]},
+        "layer3_how": {"score": p["layer3_score"], "edge_recall": p["edge_recall"],
                        "edge_recall_by_type": p["edge_recall_by_type"], "node_recall": p["node_recall"]},
-        "root_cause_understanding": rc, "propagation_reasoning": prop, "composite": composite,
+        "propagation_reasoning": p["layer3_score"],
     }
 
 
@@ -808,14 +735,18 @@ def aggregate_claims(events: list[dict[str, Any]], backend: LLMBackend,
     return out
 
 
-def score_understanding_from_trajectory(trajectory: list, gt_criterion: dict[str, Any],
-                                        backend: LLMBackend, k: int = 3) -> dict[str, Any]:
-    """End-to-end: extract (k-run aggregated) invariant claims from a trajectory and
-    score understanding against the GT criterion. GT-blind extraction, GT used only here."""
+def score_reasoning_from_trajectory(trajectory: list, gt_verified: dict[str, Any],
+                                    backend: LLMBackend, k: int = 3) -> dict[str, Any]:
+    """End-to-end: GT-blind extraction (invariant claims + typed-edge graph, both from the
+    trajectory), then the DETERMINISTIC reasoning_score against the GT. The LLM only
+    extracts (citation-gated); the score itself has no LLM-as-a-judge."""
     events = build_observer_input(trajectory)
     bank = build_evidence_bank(trajectory)
-    claims = aggregate_claims(events, backend, evidence_digest(bank), k=k)
-    res = understanding_score(claims, gt_criterion, backend)
+    dig = evidence_digest(bank)
+    claims = aggregate_claims(events, backend, dig, k=k)
+    graph = verify_citations(extract_trace(events, backend, dig), events)
+    criterion = gt_verified.get("root_cause_criterion") or {}
+    res = reasoning_score(claims, graph, criterion, gt_verified)
     res["k_runs"] = k
     res["n_claims"] = len(claims)
     return res

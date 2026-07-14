@@ -25,43 +25,34 @@ class UnderstandingEvaluator(BaseEvaluator):
     name = "understanding"
 
     def evaluate(self, inputs: EvaluationInput) -> dict[str, Any]:
-        from external_interpreter.observer import (
-            backend_from_config, score_understanding_from_trajectory,
-        )
+        from external_interpreter.observer import backend_from_config, score_reasoning_from_trajectory
 
         gt_path = Path(inputs.ground_truth)
         vi_path = gt_path.parent / "verified_invariants.json"
-        criterion = None
+        gt_verified = None
         if vi_path.exists():
             try:
-                criterion = json.loads(vi_path.read_text()).get("root_cause_criterion")
+                gt_verified = json.loads(vi_path.read_text())
             except (json.JSONDecodeError, OSError):
-                criterion = None
+                gt_verified = None
         traj_path = Path(inputs.trajectory)
-        if not isinstance(criterion, dict) or not traj_path.exists():
-            return self._out({"score": None, "band": "not_evaluable",
-                              "reason": "missing verified_invariants.root_cause_criterion or trajectory"})
+        if not isinstance(gt_verified, dict) or not gt_verified.get("root_cause_criterion") \
+                or not traj_path.exists():
+            return self._out({"composite": None, "band": "not_evaluable",
+                              "reason": "missing verified_invariants (criterion/edges/nodes) or trajectory"})
 
-        # pre-extracted claims (from a prior observer run) take precedence over re-extracting
-        pre = traj_path.parent / "observer_claims.json"
         backend = backend_from_config()
+        if backend is None:
+            return self._out({"composite": None, "band": "deferred",
+                              "reason": "no LLM backend (config.txt OPENAI_API_KEY) for extraction"})
         try:
-            if pre.exists():
-                from external_interpreter.observer import understanding_score
-                claims = json.loads(pre.read_text()).get("claims") or []
-                res = understanding_score(claims, criterion, backend)
-                res.update(k_runs=0, n_claims=len(claims))
-            else:
-                if backend is None:
-                    return self._out({"score": None, "band": "deferred",
-                                      "reason": "no LLM backend (config.txt OPENAI_API_KEY) for extraction"})
-                trajectory = json.loads(traj_path.read_text(errors="replace"))
-                k = int(os.getenv("GT_OBSERVER_K", "3"))
-                res = score_understanding_from_trajectory(trajectory, criterion, backend, k=k)
-        except Exception as exc:  # backend/model failure must never crash scoring
-            return self._out({"score": None, "band": "error", "reason": f"{type(exc).__name__}: {exc}"})
+            trajectory = json.loads(traj_path.read_text(errors="replace"))
+            k = int(os.getenv("GT_OBSERVER_K", "3"))
+            res = score_reasoning_from_trajectory(trajectory, gt_verified, backend, k=k)
+        except Exception as exc:  # extraction/model failure must never crash scoring
+            return self._out({"composite": None, "band": "error", "reason": f"{type(exc).__name__}: {exc}"})
         return self._out(res)
 
     @staticmethod
     def _out(summary: dict[str, Any]) -> dict[str, Any]:
-        return {"summary": summary, "structured_reasoning_evaluable": summary.get("score") is not None}
+        return {"summary": summary, "structured_reasoning_evaluable": summary.get("composite") is not None}
