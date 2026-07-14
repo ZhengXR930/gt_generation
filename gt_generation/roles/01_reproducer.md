@@ -41,18 +41,30 @@ Inputs that should already exist or be referenced from sample metadata:
 - issue description
 - vulnerable source information
 
-ARVO samples (fast path — `sample.json` has `arvo_image_vul`):
+The `00_prepare` stage already ran: the vul (and fix) images are **pulled locally**, the
+source is extracted to `<result_dir>/_work/src`, and `poc`/`patch.diff`/`build.sh` are
+staged (see `prepare_report.json`). **Do NOT `docker pull` / clone** — pulling here is what
+caused the earlier failures (Claude API drops while waiting on a multi-minute pull). Your
+docker work now runs against the already-local image, so it is fast.
 
-- The target is ALREADY built with a sanitizer inside the image; do NOT clone or rebuild.
-- Reproduce directly and save the crash:
+ARVO samples (fast path — `sample.json` has `arvo_image_vul`, target pre-built in the image):
+
+- The target is ALREADY built with a sanitizer inside the local image; just reproduce:
   ```
   docker run --rm --entrypoint /bin/bash <arvo_image_vul> -c '/bin/arvo run' > sanitizer_trace.txt 2>&1
   ```
-  (`/bin/arvo run` runs the prebuilt fuzzer on `/tmp/poc`.) Write `build.sh` as that command.
-- Record in `sample_state.json`: `detector=address`, the observed crash line, and that the
-  build was reused from the arvo image (no local build). Then skip the generic build steps below.
-- Use `docker run --rm` / `docker rm`; never leave containers running. This keeps line numbers
-  identical to what stage 02 reads from the same image.
+  (`/bin/arvo run` runs the prebuilt fuzzer on `/tmp/poc`; the command is in `build.sh`.)
+- Record in `sample_state.json`: `detector=address`, the observed crash line, build reused
+  from the image. Then skip the generic build steps below.
+
+Samples NOT pre-built (no runnable target in the image, or a non-ARVO codebase):
+
+- This is why reproduction stays an agent stage: **build the target yourself** from the
+  pre-staged source (`<result_dir>/_work/src`) with a sanitizer (ASan/MSan), **fixing build
+  errors as needed** (missing deps, flags, harness wiring), then run the PoC and capture the
+  full sanitizer output to `sanitizer_trace.txt`. Images/toolchains are already local — no pull.
+- Use `docker run --rm` / `docker rm`; never leave containers running. Keep line numbers
+  identical to what stage 02 reads from the same source.
 
 Procedure (non-ARVO / when no prebuilt image is provided):
 

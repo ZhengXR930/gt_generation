@@ -1,14 +1,16 @@
-"""gt-toolkit prepare: deterministic per-sample material prep (NO LLM).
+"""gt-toolkit prepare: deterministic per-sample material FETCH (NO LLM).
 
-Pulls the ARVO images (with retries), extracts the source tree, reproduces the crash,
-and stages poc/patch/sample_state — everything the reasoning stages (02+) need — so the
-LLM never touches a slow docker pull. This replaces the old LLM-driven 00_materialize +
-01_reproducer stages, whose docker work entangled with the agent's turns caused API
-drops, pull stalls, and timeouts.
+Pulls the ARVO images (vul + fix, with retries), extracts the source tree, and stages
+poc/patch/sample_state. It does NOT reproduce or build — reproduction (which may require
+compiling or fixing a target that is not pre-built) stays an AGENT stage (01_reproducer)
+that runs against these already-pulled local images. This replaces only the deterministic
+"materialize" work whose slow docker PULL, when entangled with the agent's turns, caused
+the Claude API to drop mid-response (the dominant v1 failure). Moving the pull here — a
+retryable script holding no API session — removes that failure mode.
 
     gt-toolkit prepare --sample sample.json --result-dir gt_results/arvo_<id>
 
-Exit 0 only when the source tree AND a crashing sanitizer trace were produced.
+Exit 0 when the source tree was extracted (writes prepare_report.json).
 """
 from __future__ import annotations
 
@@ -66,9 +68,10 @@ def prepare(sample_path: str, result_dir: str) -> dict[str, Any]:
         _sh(["docker", "cp", f"{cid}:/tmp/poc", str(d / "poc")])
         _sh(["docker", "rm", cid])
 
-    r = _sh(["docker", "run", "--rm", "--entrypoint", "/bin/bash", vul, "-c", "/bin/arvo run"],
-            timeout=1200)
-    (d / "sanitizer_trace.txt").write_text((r.stdout or "") + (r.stderr or ""), errors="replace")
+    # NOTE: prepare does NOT reproduce/build — reproduction (which may require compiling
+    # or fixing a not-pre-built target) is the job of the AGENT stage 01_reproducer, which
+    # runs against these already-pulled local images. prepare records the reproduce command
+    # for 01 to use on the pre-built ARVO images.
     (d / "build.sh").write_text(
         f"docker run --rm --entrypoint /bin/bash {vul} -c '/bin/arvo run'\n")
 
@@ -83,11 +86,11 @@ def prepare(sample_path: str, result_dir: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    trace = (d / "sanitizer_trace.txt").read_text(errors="replace")
-    crash = any(m in trace for m in _CRASH_MARKERS)
-    return {"arvo_id": aid, "source": src.exists(), "crash": crash, "fix_image": fix_ok,
-            "poc": (d / "poc").exists(), "patch": (d / "patch.diff").exists(),
-            "trace_bytes": len(trace), "prepared": bool(src.exists() and crash)}
+    report = {"arvo_id": aid, "vul_image": vul, "fix_image_name": fix, "fix_image_pulled": fix_ok,
+              "source": src.exists(), "poc": (d / "poc").exists(), "patch": (d / "patch.diff").exists(),
+              "prepared": bool(src.exists())}
+    (d / "prepare_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
