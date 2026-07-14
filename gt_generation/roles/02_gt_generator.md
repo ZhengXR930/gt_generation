@@ -19,6 +19,24 @@ Required output:
 
 Generate vulnerability semantics only. Do not write runtime grounding labels.
 
+REQUIRED SCHEMA — your `ground_truth.json` MUST pass `python3 -m gt_toolkit validate
+{result_dir}/ground_truth.json` before you finish (run it yourself and fix every error;
+this stage is REJECTED if validation fails). It requires ALL of these top-level keys:
+
+- `sample_id` (string), `vuln_id` (string)
+- `project` = object `{id, repo, vulnerable_commit, fixed_commit}` (from sample metadata)
+- `classification` = object `{class, cwe}` (bug class + CWE, e.g. `{"class":"heap-buffer-overflow","cwe":"CWE-125"}`)
+- `bug_description` = object `{original, original_source, normalized}` (from the sample's issue/report)
+- `source`, `sink`, `root_cause`, `tainted_value_origin` = node objects (file/function/line/var/…)
+- `coarse_trace` = array of steps (function-level call chain from the crash stack); each step is an object
+- `fine_trace` = array of the fine-grained nodes (source→materialization→root_cause→sink + alloc/free)
+- `sanitizer_ground_truth` = object with at least `{detector, trace_format, crash_type, crash_location}`
+  (fill from `sanitizer_trace.txt`: detector=address/memory, crash_type, the crashing file:line)
+- `poc` = object referencing the PoC (path/size/…)
+
+Copy `project`/`bug_description`/`classification` fields straight from the sample metadata
+and the sanitizer trace — do NOT leave them empty or as strings. Self-validate, fix, repeat.
+
 Source of truth for line numbers (CRITICAL):
 
 - Every `file`/`line` in the GT MUST be grounded in the SAME source that was built and
