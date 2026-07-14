@@ -698,41 +698,89 @@ def propagation_score(agent_trace: dict[str, Any], gt_verified: dict[str, Any]) 
             "gt_between_nodes": n_tot, "matched_edges": matched_edges}
 
 
-def mechanism_subfacts(criterion: dict[str, Any]) -> list[dict[str, Any]]:
-    """The REQUIRED causal sub-facts a COMPLETE root-cause understanding must cover, derived
-    from the GT criterion. Each is a typed, deterministically-checkable claim — this replaces
-    a prose-vs-prose mechanism comparison (which token-overlap mis-judges and an LLM judge
-    only launders). The `cause` sub-fact is the aliasing/premature-teardown reason (the half
-    the 12241 agent missed), kept DISTINCT from the freed object."""
-    kind = criterion.get("kind")
-    facts: list[dict[str, Any]] = []
-    if kind == "lifetime":
-        rel = canon_relation(criterion.get("relation"))
-        cause = next((s.get("var") for s in (criterion.get("sites") or [])
-                      if str(s.get("role") or "").lower() == "root_cause"), None)
-        if cause:
-            facts.append({"name": "cause", "need_var": cause,
-                          "desc": "why the object is mis-owned/freed early (aliasing / premature teardown)"})
-        if rel == "double_free":
-            facts.append({"name": "double_free_order", "need_relation": "double_free",
-                          "desc": "the object is freed twice (temporal order)"})
-        else:
-            facts.append({"name": "free_before_use_order", "need_relation": "uaf",
-                          "desc": "free happens-before use (temporal order)"})
-    else:  # bounds/oob
-        v = criterion.get("variable")
-        facts.append({"name": "faulting_index", "need_var": v, "desc": "the faulting index variable"})
-        facts.append({"name": "missing_bound", "need_relation": "control", "need_var": v,
-                      "desc": "the missing bound condition (a control/missing-check edge on the index)"})
-    return facts
+# CWE-LEVEL mechanism rubric: the required causal sub-facts follow from the bug's DEFINITION,
+# not from any single sample. Each CWE family lists the typed sub-facts a COMPLETE root-cause
+# understanding must contain; the GT criterion only fills in the concrete variables. This is
+# an explicit, auditable rule table (reviewers can inspect it), general across the dataset's
+# CWEs, and free of prose-vs-prose / LLM-judge mechanism comparison.
+_CWE_FAMILY = {
+    "125": "oob", "787": "oob", "119": "oob", "122": "oob", "124": "oob", "126": "oob",
+    "127": "oob", "131": "oob", "193": "oob", "788": "oob", "805": "oob", "823": "oob",
+    "416": "uaf", "415": "double_free", "590": "double_free", "763": "double_free",
+    "457": "uninit", "908": "uninit", "824": "uninit", "476": "null_deref",
+}
+# family -> ordered required sub-facts. `src`: where the concrete var comes from in the GT
+# criterion (index=faulting variable; cause=root_cause site var = the aliasing/teardown reason).
+CWE_RULES: dict[str, list[dict[str, Any]]] = {
+    "oob": [  # CWE-125/787/119...: access outside the bounds of a buffer
+        {"name": "faulting_index", "src": "index", "check": "var",
+         "desc": "the index/offset that leaves the bounds"},
+        {"name": "missing_bound", "src": "index", "check": "control",
+         "desc": "the bound (index < size) is not enforced — a control/missing-check edge"},
+    ],
+    "double_free": [  # CWE-415: the same memory is freed twice
+        {"name": "cause", "src": "cause", "check": "var",
+         "desc": "why one allocation reaches two frees (aliasing / ownership duplication)"},
+        {"name": "double_free_order", "src": None, "check": "order", "relation": "double_free",
+         "desc": "the object is freed twice (temporal order)"},
+    ],
+    "uaf": [  # CWE-416: use of memory after it is freed
+        {"name": "cause", "src": "cause", "check": "var",
+         "desc": "why the free happens before the use (premature teardown / lifecycle)"},
+        {"name": "free_before_use_order", "src": None, "check": "order", "relation": "uaf",
+         "desc": "free happens-before use (temporal order)"},
+    ],
+    "uninit": [  # CWE-457: use of an uninitialized value
+        {"name": "cause", "src": "cause", "check": "var",
+         "desc": "the path on which initialization is skipped"},
+        {"name": "use_before_init_order", "src": None, "check": "order", "relation": "use_before_init",
+         "desc": "the value is used before it is initialized (temporal order)"},
+    ],
+}
 
 
-def mechanism_score(agent_trace: dict[str, Any], criterion: dict[str, Any]) -> dict[str, Any]:
-    """Deterministic mechanism coverage: for each required causal sub-fact, is it present in
-    the agent's graph (a node with the cause var, or an edge with the required relation+var)?
-    Reports which sub-facts were covered vs MISSED (e.g. 12241 -> 'cause' missed = the agent
-    got the double-free path but not the static_array aliasing)."""
-    facts = mechanism_subfacts(criterion)
+def _cwe_family(vuln_class: str | None, criterion: dict[str, Any]) -> str:
+    """Resolve the CWE family from the GT's CWE id / class string, else the criterion."""
+    s = str(vuln_class or "").lower()
+    m = re.search(r"cwe[-\s]?(\d+)", s)
+    if m and m.group(1) in _CWE_FAMILY:
+        return _CWE_FAMILY[m.group(1)]
+    if "double" in s and "free" in s:
+        return "double_free"
+    if "use-after-free" in s or "use after free" in s or "uaf" in s:
+        return "uaf"
+    if "overflow" in s or "out-of-bounds" in s or "oob" in s or "out of bounds" in s:
+        return "oob"
+    if "uninit" in s:
+        return "uninit"
+    if criterion.get("kind") == "lifetime":
+        return canon_relation(criterion.get("relation"))     # double_free | uaf
+    return "oob"
+
+
+def mechanism_subfacts(criterion: dict[str, Any], vuln_class: str | None = None) -> list[dict[str, Any]]:
+    """Instantiate the CWE-level rubric with this GT's concrete variables. Returns the ordered
+    required sub-facts, each carrying need_var / need_relation for deterministic checking."""
+    fam = _cwe_family(vuln_class, criterion)
+    cause = next((s.get("var") for s in (criterion.get("sites") or [])
+                  if str(s.get("role") or "").lower() == "root_cause"), None)
+    index = criterion.get("variable") or criterion.get("object")
+    out: list[dict[str, Any]] = []
+    for r in CWE_RULES.get(fam, []):
+        need_var = index if r.get("src") == "index" else (cause if r.get("src") == "cause" else None)
+        out.append({"name": r["name"], "family": fam, "desc": r["desc"],
+                    "need_var": need_var, "need_relation": r.get("relation") or r.get("check")
+                    if r["check"] in ("order", "control") else None})
+    return out
+
+
+def mechanism_score(agent_trace: dict[str, Any], criterion: dict[str, Any],
+                    vuln_class: str | None = None) -> dict[str, Any]:
+    """Deterministic mechanism coverage against the CWE-level rubric: for each required causal
+    sub-fact, is it present in the agent's graph (a node with the cause var, or an edge with
+    the required relation+var)? Reports covered vs MISSED (e.g. 12241 -> 'cause' missed = the
+    agent got the double-free path but not the static_array aliasing)."""
+    facts = mechanism_subfacts(criterion, vuln_class)
     node_vars: set[str] = set()
     for n in agent_trace.get("nodes", []):
         node_vars |= canon_var(n.get("var"))
@@ -771,7 +819,7 @@ def reasoning_score(claims: list[dict[str, Any]], agent_trace: dict[str, Any],
     the (LLM-extracted, citation-gated) trace, this is a pure deterministic map."""
     al = align_claim_to_gt(claims, gt_criterion)
     p = propagation_score(agent_trace, gt_verified)
-    m = mechanism_score(agent_trace, gt_criterion)
+    m = mechanism_score(agent_trace, gt_criterion, gt_verified.get("vulnerability_class"))
     l3 = p["layer3_score"] if p["layer3_score"] is not None else 0.0
     mech = m["score"] if m["score"] is not None else 0.0
     if not al["relation_match"]:
