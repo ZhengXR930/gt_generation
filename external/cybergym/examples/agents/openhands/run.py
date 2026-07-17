@@ -3,7 +3,6 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import tomllib
@@ -25,28 +24,11 @@ ENVS = [
     "DOCKER_HOST",
     "DOCKER_CONFIG",
     "OPENHANDS_RUNTIME_READY_TIMEOUT",
-    "OPENHANDS_ENABLE_REASONING_RECORDER",
-    "OPENHANDS_REASONING_RECORDER_POLICY",
-    "OPENHANDS_REASONING_RECORDER_INTERVAL",
-    "OPENHANDS_REASONING_RECORDER_REQUIRE_TRACE_COMPLETE",
-    "OPENHANDS_REASONING_OBSERVER_MODEL",
-    "OPENHANDS_REASONING_OBSERVER_CONFIG",
-    "OPENHANDS_REASONING_OBSERVER_DECISIONS_PATH",
-    "OPENHANDS_REASONING_OBSERVER_STATE_PATH",
-    "OPENHANDS_REASONING_OBSERVER_MEMORY_PATH",
     "OPENHANDS_HARNESS_MODE",
-    "OPENHANDS_HARNESS_FSM",
+    "OPENHANDS_EVAL_PROBING",
+    "OPENHANDS_EVAL_PROBES_PATH",
+    "OPENHANDS_EVAL_PROBE_OUTPUT",
     "OPENHANDS_TASK_WORKSPACE",
-    "OPENHANDS_ENHANCEMENT_STAGE_CONTROLLER",
-    "RECORDER_EVENTS_PATH",
-    "RECORDER_STATE_PATH",
-    "OPENHANDS_ENFORCE_CONSTRUCTION_LOOP",
-    "CYBERGYM_ENABLE_CANDIDATE_SYNTHESIS_MCP",
-    "CANDIDATE_SYNTHESIS_WORKSPACE",
-    "CANDIDATE_SYNTHESIS_REACHABILITY_DEBUG_COMMAND",
-    "CANDIDATE_SYNTHESIS_REACHABILITY_COVERAGE_COMMAND",
-    "CANDIDATE_SYNTHESIS_REACHABILITY_SANITIZER_COMMAND",
-    "CANDIDATE_SYNTHESIS_SUBMIT_SERVER",
 ]
 API_KEY_ENVS = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "LLM_API_KEY"]
 OPENAI_PREFIXES = ["gpt-", "o3", "o4"]
@@ -357,38 +339,7 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
 
     logger.info(f"Saving task info to: {log_dir / 'args.json'}")
 
-    managed_mcp_processes: list[subprocess.Popen] = []
-    managed_mcp_servers: list[str] = []
     os.environ["OPENHANDS_TASK_WORKSPACE"] = str(task_dir)
-    if _env_flag("OPENHANDS_ENABLE_REASONING_RECORDER", False):
-        os.environ["RECORDER_EVENTS_PATH"] = str(log_dir / "reasoning_events.jsonl")
-        os.environ["RECORDER_STATE_PATH"] = str(log_dir / "reasoning_state.json")
-        if os.getenv("OPENHANDS_REASONING_RECORDER_POLICY", "").lower() == "observer":
-            os.environ["OPENHANDS_REASONING_OBSERVER_DECISIONS_PATH"] = str(
-                log_dir / "observer_decisions.jsonl"
-            )
-            os.environ["OPENHANDS_REASONING_OBSERVER_STATE_PATH"] = str(
-                log_dir / "observer_state.json"
-            )
-            os.environ["OPENHANDS_REASONING_OBSERVER_MEMORY_PATH"] = str(
-                log_dir / "observer_memory.jsonl"
-            )
-        proc, server_url = _start_reasoning_recorder_mcp(
-            log_dir=log_dir,
-            openhands_repo=openhands_args.repo,
-        )
-        managed_mcp_processes.append(proc)
-        managed_mcp_servers.append(server_url)
-        logger.info("Started reasoning recorder MCP server: %s", server_url)
-    if _env_flag("CYBERGYM_ENABLE_CANDIDATE_SYNTHESIS_MCP", False):
-        proc, server_url = _start_candidate_synthesis_mcp(
-            workspace=task_dir,
-            log_dir=log_dir,
-            openhands_repo=openhands_args.repo,
-        )
-        managed_mcp_processes.append(proc)
-        managed_mcp_servers.append(server_url)
-        logger.info("Started candidate synthesis MCP server: %s", server_url)
 
     # 3. prepare the config file
     config_path = tmp_input_dir / "template" / "config.toml"
@@ -425,17 +376,6 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
     if runtime_image_override:
         config.setdefault("sandbox", {})["runtime_container_image"] = runtime_image_override
 
-    mcp_servers_override = os.getenv("OPENHANDS_MCP_SERVERS")
-    mcp_servers = list(managed_mcp_servers)
-    if mcp_servers_override:
-        mcp_servers.extend([
-            item.strip()
-            for item in mcp_servers_override.split(",")
-            if item.strip()
-        ])
-    if mcp_servers:
-        config.setdefault("mcp", {})["mcp_servers"] = mcp_servers
-
     with open(config_path, "w") as f:
         f.write(tomli_w.dumps(config))
 
@@ -447,25 +387,19 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
         if not prompt_override_path.exists():
             raise FileNotFoundError(f"CYBERGYM_OPENHANDS_PROMPT_FILE does not exist: {prompt_override_path}")
         shutil.copy2(prompt_override_path, tmp_input_dir / "template" / prompt_file)
-    try:
-        run_openhands(
-            config_path=config_path,
-            prompt_path=tmp_input_dir / "template" / prompt_file,
-            log_dir=log_dir / "logs",
-            timeout=openhands_args.timeout,
-            repo=openhands_args.repo,
-            silent=openhands_args.silent,
-            max_iter=openhands_args.max_iter,
-            model=openhands_args.llm.model,
-            llm_api_key=openhands_args.llm.api_key,
-            debug=openhands_args.debug,
-            enable_thinking=enable_thinking,
-        )
-    finally:
-        for proc in managed_mcp_processes:
-            _terminate_process(proc)
-
-    _export_candidate_synthesis_artifacts(task_dir=task_dir, log_dir=log_dir)
+    run_openhands(
+        config_path=config_path,
+        prompt_path=tmp_input_dir / "template" / prompt_file,
+        log_dir=log_dir / "logs",
+        timeout=openhands_args.timeout,
+        repo=openhands_args.repo,
+        silent=openhands_args.silent,
+        max_iter=openhands_args.max_iter,
+        model=openhands_args.llm.model,
+        llm_api_key=openhands_args.llm.api_key,
+        debug=openhands_args.debug,
+        enable_thinking=enable_thinking,
+    )
 
     # 5. remove the tmp directory
     if openhands_args.remove_tmp:
@@ -476,143 +410,6 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
     is_valid = validate_output(log_dir)
 
     return agent_id if is_valid else None
-
-
-def _export_candidate_synthesis_artifacts(*, task_dir: Path, log_dir: Path) -> None:
-    """Preserve minimal candidate/PoC artifacts before CyberGym tmp cleanup."""
-    export_dir = log_dir / "candidate_synthesis"
-    names = [
-        "construction_support_requests.jsonl",
-        "candidate_plans.jsonl",
-        "candidates.jsonl",
-        "candidate_runs.jsonl",
-        "candidate_submissions.jsonl",
-        "candidates",
-        "runs",
-        "submissions",
-    ]
-    copied = False
-    for name in names:
-        src = task_dir / name
-        if not src.exists():
-            continue
-        dst = export_dir / name
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if src.is_dir():
-            if dst.exists():
-                shutil.rmtree(dst, ignore_errors=True)
-            shutil.copytree(src, dst)
-        else:
-            shutil.copy2(src, dst)
-        copied = True
-    if copied:
-        logger.info("Exported candidate synthesis artifacts to: %s", export_dir)
-
-
-def _free_tcp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _start_candidate_synthesis_mcp(
-    *,
-    workspace: Path,
-    log_dir: Path,
-    openhands_repo: Path,
-) -> tuple[subprocess.Popen, str]:
-    port = int(os.getenv("CANDIDATE_SYNTHESIS_MCP_PORT") or _free_tcp_port())
-    python_bin = openhands_repo / ".venv" / "bin" / "python"
-    if not python_bin.exists():
-        python_bin = Path(sys.executable)
-    mcp_log = open(log_dir / "candidate_synthesis_mcp.log", "w")
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{PROJECT_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
-    cmd = [
-        str(python_bin),
-        "-m",
-        "enhance_mcp_servers.candidate_synthesis_server",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--workspace",
-        str(workspace),
-    ]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=PROJECT_ROOT,
-        env=env,
-        stdout=mcp_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    # FastMCP starts quickly; fail early if imports or binding fail.
-    import time
-
-    time.sleep(1.0)
-    if proc.poll() is not None:
-        raise RuntimeError(
-            f"candidate synthesis MCP server exited early; see {log_dir / 'candidate_synthesis_mcp.log'}"
-        )
-    return proc, f"http://127.0.0.1:{port}/sse"
-
-
-def _start_reasoning_recorder_mcp(
-    *,
-    log_dir: Path,
-    openhands_repo: Path,
-) -> tuple[subprocess.Popen, str]:
-    port = int(os.getenv("RECORDER_MCP_PORT") or _free_tcp_port())
-    python_bin = openhands_repo / ".venv" / "bin" / "python"
-    if not python_bin.exists():
-        python_bin = Path(sys.executable)
-    mcp_log = open(log_dir / "reasoning_recorder_mcp.log", "w")
-    events_path = log_dir / "reasoning_events.jsonl"
-    state_path = log_dir / "reasoning_state.json"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{PROJECT_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
-    cmd = [
-        str(python_bin),
-        "-m",
-        "mcp_servers.reasoning_recorder_server",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--events-path",
-        str(events_path),
-        "--state-path",
-        str(state_path),
-    ]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=PROJECT_ROOT,
-        env=env,
-        stdout=mcp_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    import time
-
-    time.sleep(1.0)
-    if proc.poll() is not None:
-        raise RuntimeError(
-            f"reasoning recorder MCP server exited early; see {log_dir / 'reasoning_recorder_mcp.log'}"
-        )
-    return proc, f"http://127.0.0.1:{port}/sse"
-
-
-def _terminate_process(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
 
 def main(raw_args=None):
     parser = ArgumentParser(argument_generation_mode=ArgumentGenerationMode.BOTH)

@@ -55,6 +55,15 @@ LEGACY_KEYS = {
 
 BOOTSTRAP_WORDING = ("first-pass", "selected as", "requires review")
 
+# libFuzzer entry points are the documented unscored test boundary, never the scored
+# source. Deliberately limited to fuzzer entries: a CLI-repro sample may legitimately
+# read its input in main(), and widening this set would retroactively invalidate such
+# ground truth on a rule the contract does not actually state.
+HARNESS_ENTRY_FUNCTIONS = {
+    "LLVMFuzzerTestOneInput",
+    "LLVMFuzzerInitialize",
+}
+
 
 @dataclass
 class Report:
@@ -105,6 +114,26 @@ def _check_location(data: dict, key: str, report: Report) -> None:
         report.warn(f"{key} missing non-empty description")
     if key == "source" and not str(loc.get("value_from", "")).strip():
         report.warn("source missing value_from (untrusted-input provenance)")
+
+
+def _check_scored_source_boundary(data: dict, report: Report) -> None:
+    """`source` must be project code, not the libFuzzer entry point.
+
+    LLVMFuzzerTestOneInput is the unscored test boundary: every libFuzzer sample
+    shares it, so scoring it gives the answer away for free. The scored source is
+    the project parser/helper statement that reads `data,size` into a length,
+    count, object, ownership state, or dispatch key on the vulnerable path.
+    Shallow traces are the most exposed, because the harness sits close to the sink.
+    """
+    source = data.get("source")
+    if not isinstance(source, dict):
+        return
+    function = str(source.get("function") or "").strip()
+    if function in HARNESS_ENTRY_FUNCTIONS:
+        report.err(
+            f"source.function is the unscored harness boundary '{function}'; "
+            "use the project statement that first consumes the fuzzer buffer"
+        )
 
 
 def _check_bootstrap_wording(data: dict, report: Report) -> None:
@@ -173,6 +202,7 @@ def validate_data(
 
     for key in ("source", "sink", "root_cause", "tainted_value_origin"):
         _check_location(data, key, report)
+    _check_scored_source_boundary(data, report)
 
     # tainted_value_origin should carry the concrete value fields.
     tvo = data.get("tainted_value_origin", {})
@@ -201,7 +231,9 @@ def validate_data(
         report.err("coarse_trace must be a non-empty list")
     else:
         for idx, step in enumerate(coarse):
-            _require_keys(step, ["step", "file", "function", "role", "summary"], f"coarse_trace[{idx}]", report)
+            _require_keys(step, ["step", "file", "function", "summary"], f"coarse_trace[{idx}]", report)
+            if isinstance(step, dict) and ({"role", "kind"} & step.keys()):
+                report.err(f"coarse_trace[{idx}] must not contain role or kind")
 
     fine = data.get("fine_trace")
     if not isinstance(fine, list) or not fine:
@@ -210,15 +242,35 @@ def validate_data(
         for idx, step in enumerate(fine):
             _require_keys(
                 step,
-                ["step", "file", "function", "line", "role", "var", "code", "note"],
+                ["step", "file", "function", "line", "var", "code", "note"],
                 f"fine_trace[{idx}]",
                 report,
             )
-        roles = [str(s.get("role", "")) for s in fine if isinstance(s, dict)]
-        if roles and roles[0] != "source" and "source" not in roles:
-            report.warn("fine_trace does not start at / contain a 'source' role step")
-        if roles and "sink" not in roles:
-            report.warn("fine_trace has no 'sink' role step")
+            if isinstance(step, dict) and ({"role", "kind"} & step.keys()):
+                report.err(f"fine_trace[{idx}] must not contain role or kind")
+        for anchor_name in ("source", "root_cause", "sink"):
+            anchor = data.get(anchor_name)
+            if not isinstance(anchor, dict):
+                continue
+            trace_step = anchor.get("trace_step")
+            if not isinstance(trace_step, int):
+                report.err(f"top-level {anchor_name} missing integer trace_step")
+                continue
+            matched = next(
+                (
+                    step for step in fine
+                    if isinstance(step, dict) and step.get("step") == trace_step
+                ),
+                None,
+            )
+            if matched is None:
+                report.err(
+                    f"top-level {anchor_name}.trace_step={trace_step} does not exist in fine_trace"
+                )
+            elif not _trace_step_matches_location(matched, anchor):
+                report.warn(
+                    f"top-level {anchor_name} location differs from fine_trace step {trace_step}"
+                )
         _check_edges(fine, report)
 
     _check_sanitizer_gt(data, report)
@@ -239,6 +291,26 @@ ORDER_RELATIONS = {
 # Two+ word-like tokens with no operator/punctuation between them = a prose sentence.
 _PROSE_RE = re.compile(r"[A-Za-z]{2,}\s+[A-Za-z]{2,}")
 _OPERATOR_RE = re.compile(r"[<>=!+\-*/\[\]&|%().]")
+
+
+def _trace_step_matches_location(step: dict, anchor: dict) -> bool:
+    """Check the source-location consistency of an explicit top-level trace_step link."""
+    anchor_file = str(anchor.get("file") or "")
+    anchor_function = str(anchor.get("function") or "")
+    try:
+        anchor_line = int(anchor.get("line"))
+    except (TypeError, ValueError):
+        return False
+    if str(step.get("file") or "") != anchor_file:
+        return False
+    if str(step.get("function") or "") != anchor_function:
+        return False
+    try:
+        line = int(step.get("line"))
+        line_end = int(step.get("line_end", line))
+    except (TypeError, ValueError):
+        return False
+    return line <= anchor_line <= line_end
 
 
 def _check_edges(fine: list, report: Report) -> None:

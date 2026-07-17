@@ -1,2 +1,199 @@
-Patch not materialized locally. Fix reference: https://github.com/OISF/suricata/commit/404bb53ce96564cbf964bb1e513a6107b7f744dc
-Fix commit: 404bb53ce96564cbf964bb1e513a6107b7f744dc
+From 404bb53ce96564cbf964bb1e513a6107b7f744dc Mon Sep 17 00:00:00 2001
+From: Juliana Fajardini <jufajardini@oisf.net>
+Date: Sun, 25 May 2025 18:58:40 -0300
+Subject: [PATCH] pgsql: add query keyword
+
+Add the `pgsql.query` rule keyword to match on PGSQL's query
+request message contents. This currently matches on the EVE field:
+
+pgsql.request.simple_query
+
+`pgsql.query` is a sticky buffer and can be used as a fast_pattern.
+
+Task #6259
+---
+ doc/userguide/rules/index.rst          |  1 +
+ doc/userguide/rules/pgsql-keywords.rst | 33 +++++++++++
+ rust/src/pgsql/detect.rs               | 76 ++++++++++++++++++++++++++
+ rust/src/pgsql/mod.rs                  |  3 +-
+ rust/src/pgsql/pgsql.rs                |  2 +-
+ src/detect-engine-register.c           |  1 +
+ 6 files changed, 114 insertions(+), 2 deletions(-)
+ create mode 100644 doc/userguide/rules/pgsql-keywords.rst
+ create mode 100644 rust/src/pgsql/detect.rs
+
+diff --git a/doc/userguide/rules/index.rst b/doc/userguide/rules/index.rst
+index c4b42fa2d88a..a1192741c92f 100644
+--- a/doc/userguide/rules/index.rst
++++ b/doc/userguide/rules/index.rst
+@@ -53,5 +53,6 @@ Suricata Rules
+    tag
+    vlan-keywords
+    ldap-keywords
++   pgsql-keywords
+    rule-types
+    email-keywords
+diff --git a/doc/userguide/rules/pgsql-keywords.rst b/doc/userguide/rules/pgsql-keywords.rst
+new file mode 100644
+index 000000000000..8c63233372e7
+--- /dev/null
++++ b/doc/userguide/rules/pgsql-keywords.rst
+@@ -0,0 +1,33 @@
++PGSQL Keywords
++##############
++
++.. role:: example-rule-emphasis
++
++pgsql.query
++***********
++
++This keyword is a sticky buffer that allows matching on the contents of
++PostgreSQL's `query` request messages parsed by the engine. Note that this
++buffer inspects only the `string` portion of the PostgreSQL message, skipping
++other fields such as identifier and length, and focusing on the query itself.
++
++Currently, it exposes the contents of the ``pgsql.request.simple_query`` field
++from EVE output.
++
++``pgsql.query`` can be used as a ``fast_pattern``
++(see :ref:`rules-keyword-fast_pattern`).
++
++Use ``nocase`` with this keyword to avoid case sensitivity for the matches.
++
++Examples
++========
++
++.. container:: example-rule
++
++    alert pgsql any any -> any any (msg:"Simple SELECT rule";
++    :example-rule-emphasis:`pgsql.query; content:"SELECT \*";` sid:1;)
++
++.. container:: example-rule
++
++    alert pgsql any any -> any any (msg:"Simple delete rule";
++    :example-rule-emphasis:`pgsql.query; content:"delete"; nocase` sid:2;)
+diff --git a/rust/src/pgsql/detect.rs b/rust/src/pgsql/detect.rs
+new file mode 100644
+index 000000000000..de58f8ae3ea6
+--- /dev/null
++++ b/rust/src/pgsql/detect.rs
+@@ -0,0 +1,76 @@
++/* Copyright (C) 2025 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++// written by Juliana Fajardini <jufajardini@oisf.net>
++
++use super::pgsql::{PgsqlTransaction, ALPROTO_PGSQL};
++use crate::pgsql::parser::PgsqlFEMessage;
++use crate::core::{STREAM_TOSERVER};
++use crate::detect::{helper_keyword_register_sticky_buffer, SigTableElmtStickyBuffer};
++use suricata_sys::sys::{
++    DetectEngineCtx, SCDetectBufferSetActiveList, SCDetectHelperBufferMpmRegister, SCDetectSignatureSetAppProto,
++    Signature,
++};
++use std::os::raw::{c_int, c_void};
++
++static mut G_PGSQL_QUERY_BUFFER_ID: c_int = 0;
++
++unsafe extern "C" fn pgsql_detect_query_setup(
++    de: *mut DetectEngineCtx, s: *mut Signature, _raw: *const std::os::raw::c_char,) -> c_int
++{
++    if SCDetectSignatureSetAppProto(s, ALPROTO_PGSQL) != 0 {
++        return - 1;
++    }
++    if SCDetectBufferSetActiveList(de, s, G_PGSQL_QUERY_BUFFER_ID) < 0 {
++        return - 1;
++    }
++    0
++}
++
++unsafe extern "C" fn pgsql_detect_query_get_data(
++    tx: *const c_void, _flags: u8, buffer: *mut *const u8, buffer_len: *mut u32,
++) -> bool {
++    let tx = cast_pointer!(tx, PgsqlTransaction);
++
++    if let Some(PgsqlFEMessage::SimpleQuery(ref query)) = &tx.request {
++        *buffer = query.payload.as_ptr();
++        *buffer_len = query.payload.len() as u32;
++        return true;
++    }
++
++    *buffer = std::ptr::null();
++    *buffer_len = 0;
++    false
++}
++
++#[no_mangle]
++pub unsafe extern "C" fn SCDetectPgsqlRegister() {
++    let kw = SigTableElmtStickyBuffer {
++        name: String::from("pgsql.query"),
++        desc: String::from("match PGSQL  query request content"),
++        url: String::from("/rules/pgsql-keywords.html#pgsql.query"),
++        setup: pgsql_detect_query_setup,
++    };
++    let _g_pgsql_query_kw_id = helper_keyword_register_sticky_buffer(&kw);
++    G_PGSQL_QUERY_BUFFER_ID = SCDetectHelperBufferMpmRegister(
++        b"pgsql.query\0".as_ptr() as *const libc::c_char,
++        b"pgsql query request content\0".as_ptr() as *const libc::c_char,
++        ALPROTO_PGSQL,
++        STREAM_TOSERVER,
++        Some(pgsql_detect_query_get_data),
++    );
++}
+diff --git a/rust/src/pgsql/mod.rs b/rust/src/pgsql/mod.rs
+index a4c79c03192f..3c329139381f 100644
+--- a/rust/src/pgsql/mod.rs
++++ b/rust/src/pgsql/mod.rs
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2022 Open Information Security Foundation
++/* Copyright (C) 2022-2025 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -19,6 +19,7 @@
+ //!
+ //! written by Juliana Fajardini <jufajardini@oisf.net>
+ 
++pub mod detect;
+ pub mod logger;
+ pub mod parser;
+ pub mod pgsql;
+diff --git a/rust/src/pgsql/pgsql.rs b/rust/src/pgsql/pgsql.rs
+index 14d5f09f4f6c..eba26cbebd54 100644
+--- a/rust/src/pgsql/pgsql.rs
++++ b/rust/src/pgsql/pgsql.rs
+@@ -34,7 +34,7 @@ use suricata_sys::sys::AppProto;
+ 
+ pub const PGSQL_CONFIG_DEFAULT_STREAM_DEPTH: u32 = 0;
+ 
+-static mut ALPROTO_PGSQL: AppProto = ALPROTO_UNKNOWN;
++pub(crate) static mut ALPROTO_PGSQL: AppProto = ALPROTO_UNKNOWN;
+ 
+ static mut PGSQL_MAX_TX: usize = 1024;
+ 
+diff --git a/src/detect-engine-register.c b/src/detect-engine-register.c
+index 741baffdc426..a5899f33377c 100644
+--- a/src/detect-engine-register.c
++++ b/src/detect-engine-register.c
+@@ -772,6 +772,7 @@ void SigTableSetup(void)
+     SCDetectLdapRegister();
+     SCDetectSdpRegister();
+     SCDetectDNSRegister();
++    SCDetectPgsqlRegister();
+ 
+     for (size_t i = 0; i < preregistered_callbacks_nb; i++) {
+         PreregisteredCallbacks[i]();

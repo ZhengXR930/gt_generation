@@ -1,0 +1,975 @@
+diff --git a/.gitignore b/.gitignore
+index 9e0a0b9008f..8d6ea853fa3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -70,6 +70,7 @@ doc_src/
+ /src_generated/
+ **/build
+ **/build_*
++**/build-*
+ /cmake-build*
+ /tools/certs/certs/*
+ Pipfile
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 01a2b862261..7bb85d2938f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -44,7 +44,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+ # overwritten with more detailed information if git is available.
+ set(OPEN62541_VER_MAJOR 1)
+ set(OPEN62541_VER_MINOR 5)
+-set(OPEN62541_VER_PATCH 4)
++set(OPEN62541_VER_PATCH 5)
+ set(OPEN62541_VER_LABEL "") # like "-rc1" or "-g4538abcd" or "-g4538abcd-dirty"
+ set(OPEN62541_VER_COMMIT "unknown-commit")
+ 
+@@ -753,13 +753,23 @@ if((CMAKE_COMPILER_IS_GNUCC OR CMAKE_C_COMPILER_ID MATCHES "Clang") AND
+        CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT UA_ENABLE_UNIT_TESTS_MEMCHECK)
+         # Add default sanitizer settings when using clang and Debug build.
+         # This allows e.g. CLion to find memory locations for SegFaults
+-        message(STATUS "Sanitizer enabled")
+         set(SANITIZER_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address,undefined")
+         if(CMAKE_CXX_COMPILER_VERSION AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10.0)
+             set(SANITIZER_FLAGS "${SANITIZER_FLAGS} -fsanitize-coverage=trace-pc-guard")
+         endif()
+-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${SANITIZER_FLAGS}")
+-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SANITIZER_FLAGS}")
++        set(CMAKE_REQUIRED_FLAGS_BACKUP "${CMAKE_REQUIRED_FLAGS}")
++        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${SANITIZER_FLAGS}")
++        check_c_compiler_flag("${SANITIZER_FLAGS}" CC_HAS_DEBUG_SANITIZER)
++        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS_BACKUP}")
++        unset(CMAKE_REQUIRED_FLAGS_BACKUP)
++        if(CC_HAS_DEBUG_SANITIZER)
++            message(STATUS "Sanitizer enabled")
++            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${SANITIZER_FLAGS}")
++            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SANITIZER_FLAGS}")
++        else()
++            message(STATUS "Sanitizer disabled: compiler does not support ${SANITIZER_FLAGS}")
++        endif()
++        unset(CC_HAS_DEBUG_SANITIZER CACHE)
+     endif()
+ 
+     # Strip release builds
+@@ -1009,8 +1019,8 @@ if(UA_ENABLE_DISCOVERY_MULTICAST_MDNSD)
+     set(MDNSD_GENERATED_DIR "${PROJECT_BINARY_DIR}/src_generated/mdnsd")
+     file(MAKE_DIRECTORY "${MDNSD_GENERATED_DIR}")
+ 
+-    set(MDNSD_LIBMDNSD_HEADERS 1035.h xht.h sdtxt.h mdnsd.h)
+-    set(MDNSD_LIBMDNSD_SOURCES 1035.c xht.c sdtxt.c mdnsd.c log.c)
++    set(MDNSD_LIBMDNSD_HEADERS 1035.h xht.h sdtxt.h inet.h mdnsd.h)
++    set(MDNSD_LIBMDNSD_SOURCES 1035.c xht.c sdtxt.c inet.c mdnsd.c log.c)
+ 
+     foreach(_f IN LISTS MDNSD_LIBMDNSD_HEADERS MDNSD_LIBMDNSD_SOURCES)
+         configure_file(
+@@ -1035,6 +1045,7 @@ if(UA_ENABLE_DISCOVERY_MULTICAST_MDNSD)
+         ${MDNSD_GENERATED_DIR}/1035.c
+         ${MDNSD_GENERATED_DIR}/xht.c
+         ${MDNSD_GENERATED_DIR}/sdtxt.c
++        ${MDNSD_GENERATED_DIR}/inet.c
+         ${MDNSD_GENERATED_DIR}/mdnsd.c
+         ${MDNSD_GENERATED_DIR}/log.c
+         PROPERTIES COMPILE_FLAGS
+@@ -1049,12 +1060,14 @@ if(UA_ENABLE_DISCOVERY_MULTICAST_MDNSD)
+         ${MDNSD_GENERATED_DIR}/1035.h
+         ${MDNSD_GENERATED_DIR}/xht.h
+         ${MDNSD_GENERATED_DIR}/sdtxt.h
++        ${MDNSD_GENERATED_DIR}/inet.h
+         ${MDNSD_GENERATED_DIR}/mdnsd.h)
+     list(APPEND lib_sources
+         ${PROJECT_SOURCE_DIR}/src/server/ua_discovery_mdns.c
+         ${MDNSD_GENERATED_DIR}/1035.c
+         ${MDNSD_GENERATED_DIR}/xht.c
+         ${MDNSD_GENERATED_DIR}/sdtxt.c
++        ${MDNSD_GENERATED_DIR}/inet.c
+         ${MDNSD_GENERATED_DIR}/mdnsd.c
+         ${MDNSD_GENERATED_DIR}/log.c)
+ elseif(UA_ENABLE_DISCOVERY_MULTICAST_AVAHI)
+diff --git a/arch/common/eventloop_mqtt.c b/arch/common/eventloop_mqtt.c
+index 47eb9585386..10889e3a827 100644
+--- a/arch/common/eventloop_mqtt.c
++++ b/arch/common/eventloop_mqtt.c
+@@ -784,13 +784,13 @@ MQTT_sendWithConnection(UA_ConnectionManager *cm, uintptr_t connectionId,
+     MQTTConnectionManager *mcm = (MQTTConnectionManager*)cm;
+     MQTTTopicConnection *tc = findTopicConnection(mcm, connectionId);
+     if(!tc) {
+-        UA_ByteString_clear(buf);
++        MQTT_freeNetworkBuffer(cm, connectionId, buf);
+         return UA_STATUSCODE_BADINTERNALERROR;
+     }
+ 
+     MQTTBrokerConnection *bc = tc->brokerConnection;
+     if(bc->tcpConnectionState != UA_CONNECTIONSTATE_ESTABLISHED) {
+-        UA_ByteString_clear(buf);
++        MQTT_freeNetworkBuffer(cm, connectionId, buf);
+         return UA_STATUSCODE_BADCONNECTIONREJECTED;
+     }
+ 
+@@ -803,7 +803,7 @@ MQTT_sendWithConnection(UA_ConnectionManager *cm, uintptr_t connectionId,
+                                        buf->data, buf->length, 0);
+     if(UA_LIKELY(res == MQTT_OK))
+         res = (enum MQTTErrors)__mqtt_send(&bc->client);
+-    UA_ByteString_clear(buf);
++    MQTT_freeNetworkBuffer(cm, connectionId, buf);
+     return (res == MQTT_OK) ? UA_STATUSCODE_GOOD : UA_STATUSCODE_BADINTERNALERROR;
+ }
+ 
+diff --git a/arch/lwip/eventloop_lwip.c b/arch/lwip/eventloop_lwip.c
+index dd04df9d0a0..a7bf5e33918 100644
+--- a/arch/lwip/eventloop_lwip.c
++++ b/arch/lwip/eventloop_lwip.c
+@@ -701,10 +701,9 @@ UA_EventLoopLWIP_allocNetworkBuffer(UA_ConnectionManager *cm,
+                                      UA_ByteString *buf,
+                                      size_t bufSize) {
+     UA_LWIPConnectionManager *pcm = (UA_LWIPConnectionManager*)cm;
+-    if(pcm->txBuffer.length == 0)
+-        return UA_ByteString_allocBuffer(buf, bufSize);
++    /* Reuse the static tx buffer; fall back to allocation for larger messages. */
+     if(pcm->txBuffer.length < bufSize)
+-        return UA_STATUSCODE_BADOUTOFMEMORY;
++        return UA_ByteString_allocBuffer(buf, bufSize);
+     *buf = pcm->txBuffer;
+     buf->length = bufSize;
+     return UA_STATUSCODE_GOOD;
+@@ -736,13 +735,19 @@ UA_EventLoopLWIP_allocateStaticBuffers(UA_LWIPConnectionManager *pcm) {
+         res = UA_ByteString_allocBuffer(&pcm->rxBuffer, rxBufSize);
+     }
+ 
+-    const UA_UInt32 *txBufSize = (const UA_UInt32 *)
++    /* Default the tx buffer to the rx size so a dedicated static send buffer
++     * always exists. This avoids a malloc/free on every send without reusing
++     * the rx buffer (which may still hold unprocessed received data). */
++    UA_UInt32 txBufSize = rxBufSize;
++    const UA_UInt32 *configTxBufSize = (const UA_UInt32 *)
+         UA_KeyValueMap_getScalar(&pcm->cm.eventSource.params,
+                                  UA_QUALIFIEDNAME(0, "send-bufsize"),
+                                  &UA_TYPES[UA_TYPES_UINT32]);
+-    if(txBufSize && pcm->txBuffer.length != *txBufSize) {
++    if(configTxBufSize)
++        txBufSize = *configTxBufSize;
++    if(pcm->txBuffer.length != txBufSize) {
+         UA_ByteString_clear(&pcm->txBuffer);
+-        res |= UA_ByteString_allocBuffer(&pcm->txBuffer, *txBufSize);
++        res |= UA_ByteString_allocBuffer(&pcm->txBuffer, txBufSize);
+     }
+     return res;
+ }
+diff --git a/arch/posix/eventloop_posix.c b/arch/posix/eventloop_posix.c
+index 7ca6a6cc824..026e99a4dcc 100644
+--- a/arch/posix/eventloop_posix.c
++++ b/arch/posix/eventloop_posix.c
+@@ -641,10 +641,9 @@ UA_EventLoopPOSIX_allocNetworkBuffer(UA_ConnectionManager *cm,
+                                      UA_ByteString *buf,
+                                      size_t bufSize) {
+     UA_POSIXConnectionManager *pcm = (UA_POSIXConnectionManager*)cm;
+-    if(pcm->txBuffer.length == 0)
+-        return UA_ByteString_allocBuffer(buf, bufSize);
++    /* Reuse the static tx buffer; fall back to allocation for larger messages. */
+     if(pcm->txBuffer.length < bufSize)
+-        return UA_STATUSCODE_BADOUTOFMEMORY;
++        return UA_ByteString_allocBuffer(buf, bufSize);
+     *buf = pcm->txBuffer;
+     buf->length = bufSize;
+     return UA_STATUSCODE_GOOD;
+@@ -676,13 +675,19 @@ UA_EventLoopPOSIX_allocateStaticBuffers(UA_POSIXConnectionManager *pcm) {
+         res = UA_ByteString_allocBuffer(&pcm->rxBuffer, rxBufSize);
+     }
+ 
+-    const UA_UInt32 *txBufSize = (const UA_UInt32 *)
++    /* Default the tx buffer to the rx size so a dedicated static send buffer
++     * always exists. This avoids a malloc/free on every send without reusing
++     * the rx buffer (which may still hold unprocessed received data). */
++    UA_UInt32 txBufSize = rxBufSize;
++    const UA_UInt32 *configTxBufSize = (const UA_UInt32 *)
+         UA_KeyValueMap_getScalar(&pcm->cm.eventSource.params,
+                                  UA_QUALIFIEDNAME(0, "send-bufsize"),
+                                  &UA_TYPES[UA_TYPES_UINT32]);
+-    if(txBufSize && pcm->txBuffer.length != *txBufSize) {
++    if(configTxBufSize)
++        txBufSize = *configTxBufSize;
++    if(pcm->txBuffer.length != txBufSize) {
+         UA_ByteString_clear(&pcm->txBuffer);
+-        res |= UA_ByteString_allocBuffer(&pcm->txBuffer, *txBufSize);
++        res |= UA_ByteString_allocBuffer(&pcm->txBuffer, txBufSize);
+     }
+     return res;
+ }
+diff --git a/arch/zephyr/eventloop_zephyr.c b/arch/zephyr/eventloop_zephyr.c
+index 88d58631260..33a9967bf6a 100644
+--- a/arch/zephyr/eventloop_zephyr.c
++++ b/arch/zephyr/eventloop_zephyr.c
+@@ -462,10 +462,9 @@ UA_StatusCode
+ UA_EventLoopZephyr_allocNetworkBuffer(UA_ConnectionManager *cm, uintptr_t connectionId,
+                                       UA_ByteString *buf, size_t bufSize) {
+     UA_ZephyrConnectionManager *pcm = (UA_ZephyrConnectionManager *)cm;
+-    if(pcm->txBuffer.length == 0)
+-        return UA_ByteString_allocBuffer(buf, bufSize);
++    /* Reuse the static tx buffer; fall back to allocation for larger messages. */
+     if(pcm->txBuffer.length < bufSize)
+-        return UA_STATUSCODE_BADOUTOFMEMORY;
++        return UA_ByteString_allocBuffer(buf, bufSize);
+     *buf = pcm->txBuffer;
+     buf->length = bufSize;
+     return UA_STATUSCODE_GOOD;
+@@ -495,12 +494,18 @@ UA_EventLoopZephyr_allocateStaticBuffers(UA_ZephyrConnectionManager *pcm) {
+         res = UA_ByteString_allocBuffer(&pcm->rxBuffer, rxBufSize);
+     }
+ 
+-    const UA_UInt32 *txBufSize = (const UA_UInt32 *)UA_KeyValueMap_getScalar(
++    /* Default the tx buffer to the rx size so a dedicated static send buffer
++     * always exists. This avoids a malloc/free on every send without reusing
++     * the rx buffer (which may still hold unprocessed received data). */
++    UA_UInt32 txBufSize = rxBufSize;
++    const UA_UInt32 *configTxBufSize = (const UA_UInt32 *)UA_KeyValueMap_getScalar(
+         &pcm->cm.eventSource.params, UA_QUALIFIEDNAME(0, "send-bufsize"),
+         &UA_TYPES[UA_TYPES_UINT32]);
+-    if(txBufSize && pcm->txBuffer.length != *txBufSize) {
++    if(configTxBufSize)
++        txBufSize = *configTxBufSize;
++    if(pcm->txBuffer.length != txBufSize) {
+         UA_ByteString_clear(&pcm->txBuffer);
+-        res |= UA_ByteString_allocBuffer(&pcm->txBuffer, *txBufSize);
++        res |= UA_ByteString_allocBuffer(&pcm->txBuffer, txBufSize);
+     }
+     return res;
+ }
+diff --git a/arch/zephyr/zephyr.cmake b/arch/zephyr/zephyr.cmake
+index 9f748ca38df..daafea3042a 100644
+--- a/arch/zephyr/zephyr.cmake
++++ b/arch/zephyr/zephyr.cmake
+@@ -14,6 +14,11 @@ if(CONFIG_OPEN62541)
+             set(${name} ${${option}} CACHE STRING "" FORCE)
+         endif()
+     endmacro()
++    macro(open62541_translate_zephyr_bool_to_string_option name value option)
++        if(DEFINED ${option} AND "${${option}}" STREQUAL "y")
++            set(${name} ${value} CACHE STRING "" FORCE)
++        endif()
++    endmacro()
+     open62541_translate_zephyr_bool_option(UA_ENABLE_AMALGAMATION CONFIG_OPEN62541_ENABLE_AMALGAMATION)
+     open62541_translate_zephyr_bool_option(UA_ENABLE_DIAGNOSTICS CONFIG_OPEN62541_ENABLE_DIAGNOSTICS)
+     open62541_translate_zephyr_bool_option(UA_ENABLE_METHODCALLS CONFIG_OPEN62541_ENABLE_METHODCALLS)
+@@ -30,7 +35,7 @@ if(CONFIG_OPEN62541)
+     open62541_translate_zephyr_bool_option(UA_ENABLE_NODEMANAGEMENT CONFIG_OPEN62541_ENABLE_NODEMANAGEMENT)
+     open62541_translate_zephyr_bool_option(UA_ENABLE_INLINABLE_EXPORT CONFIG_OPEN62541_ENABLE_INLINABLE_EXPORT)
+     open62541_translate_zephyr_bool_option(UA_ENABLE_DISCOVERY_MULTICAST CONFIG_OPEN62541_ENABLE_DISCOVERY_MULTICAST)
+-    open62541_translate_zephyr_bool_option(UA_ENABLE_ENCRYPTION_MBEDTLS CONFIG_OPEN62541_ENABLE_ENCRYPTION_MBEDTLS)
++    open62541_translate_zephyr_bool_to_string_option(UA_ENABLE_ENCRYPTION "MBEDTLS" CONFIG_OPEN62541_ENABLE_ENCRYPTION_MBEDTLS)
+     open62541_translate_zephyr_bool_option(UA_ENABLE_QUERY CONFIG_OPEN62541_ENABLE_QUERY)
+     open62541_translate_zephyr_bool_option(UA_ENABLE_DEBUG_SANITIZER CONFIG_OPEN62541_ENABLE_DEBUG_SANITIZER)
+     open62541_translate_zephyr_bool_option(UA_ENABLE_PUBSUB CONFIG_OPEN62541_ENABLE_PUBSUB)
+diff --git a/deps/mdnsd b/deps/mdnsd
+index ec2dd119f61..d748a37ae78 160000
+--- a/deps/mdnsd
++++ b/deps/mdnsd
+@@ -1 +1 @@
+-Subproject commit ec2dd119f61c040e9c40bf804b6ef48dba528dea
++Subproject commit d748a37ae78b4baea496bdc3d9df15116bb6c309
+diff --git a/doc/opc-ua-overview.png b/doc/opc-ua-overview.png
+index 7b13f051ee3..c6b57d6ee7c 100644
+Binary files a/doc/opc-ua-overview.png and b/doc/opc-ua-overview.png differ
+diff --git a/include/open62541/plugin/eventloop.h b/include/open62541/plugin/eventloop.h
+index 072344c787d..757910bc87f 100644
+--- a/include/open62541/plugin/eventloop.h
++++ b/include/open62541/plugin/eventloop.h
+@@ -505,9 +505,12 @@ UA_EventLoop_new_POSIX(const UA_Logger *logger);
+  *    (default 64kB).
+  *
+  * 0:send-bufsize [uint32]
+- *    Size of the statically allocated buffer for sending messages. This then
+- *    becomes an upper bound for the message size. If undefined a fresh buffer
+- *    is allocated for every `allocNetworkBuffer` (default: no buffer).
++ *    Size of the statically allocated buffer for sending messages. The buffer
++ *    is reused for every `allocNetworkBuffer` to avoid a heap allocation per
++ *    message; a message larger than the buffer falls back to a fresh
++ *    allocation. A dedicated send buffer is used (never the recv buffer), so
++ *    sending while received data is still being processed is safe. If
++ *    undefined, the send buffer defaults to the recv-bufsize.
+  *
+  * **Open Connection Parameters:**
+  *
+@@ -561,9 +564,12 @@ UA_ConnectionManager_new_POSIX_TCP(const UA_String eventSourceName);
+  *    (default 64kB).
+  *
+  * 0:send-bufsize [uint32]
+- *    Size of the statically allocated buffer for sending messages. This then
+- *    becomes an upper bound for the message size. If undefined a fresh buffer
+- *    is allocated for every `allocNetworkBuffer` (default: no buffer).
++ *    Size of the statically allocated buffer for sending messages. The buffer
++ *    is reused for every `allocNetworkBuffer` to avoid a heap allocation per
++ *    message; a message larger than the buffer falls back to a fresh
++ *    allocation. A dedicated send buffer is used (never the recv buffer), so
++ *    sending while received data is still being processed is safe. If
++ *    undefined, the send buffer defaults to the recv-bufsize.
+  *
+  * **Open Connection Parameters:**
+  *
+@@ -636,9 +642,12 @@ UA_ConnectionManager_new_POSIX_UDP(const UA_String eventSourceName);
+  *    (default 64kB).
+  *
+  * 0:send-bufsize [uint32]
+- *    Size of the statically allocated buffer for sending messages. This then
+- *    becomes an upper bound for the message size. If undefined a fresh buffer
+- *    is allocated for every `allocNetworkBuffer` (default: no buffer).
++ *    Size of the statically allocated buffer for sending messages. The buffer
++ *    is reused for every `allocNetworkBuffer` to avoid a heap allocation per
++ *    message; a message larger than the buffer falls back to a fresh
++ *    allocation. A dedicated send buffer is used (never the recv buffer), so
++ *    sending while received data is still being processed is safe. If
++ *    undefined, the send buffer defaults to the recv-bufsize.
+  *
+  * **Open Connection Parameters:**
+  *
+@@ -860,9 +869,12 @@ UA_EventLoop_new_LWIP(const UA_Logger *logger, UA_EventLoopConfiguration *config
+  *    (default 64kB).
+  *
+  * 0:send-bufsize [uint32]
+- *    Size of the statically allocated buffer for sending messages. This then
+- *    becomes an upper bound for the message size. If undefined a fresh buffer
+- *    is allocated for every `allocNetworkBuffer` (default: no buffer).
++ *    Size of the statically allocated buffer for sending messages. The buffer
++ *    is reused for every `allocNetworkBuffer` to avoid a heap allocation per
++ *    message; a message larger than the buffer falls back to a fresh
++ *    allocation. A dedicated send buffer is used (never the recv buffer), so
++ *    sending while received data is still being processed is safe. If
++ *    undefined, the send buffer defaults to the recv-bufsize.
+  *
+  * **Open Connection Parameters:**
+  *
+@@ -916,9 +928,12 @@ UA_ConnectionManager_new_LWIP_TCP(const UA_String eventSourceName);
+  *    (default 64kB).
+  *
+  * 0:send-bufsize [uint32]
+- *    Size of the statically allocated buffer for sending messages. This then
+- *    becomes an upper bound for the message size. If undefined a fresh buffer
+- *    is allocated for every `allocNetworkBuffer` (default: no buffer).
++ *    Size of the statically allocated buffer for sending messages. The buffer
++ *    is reused for every `allocNetworkBuffer` to avoid a heap allocation per
++ *    message; a message larger than the buffer falls back to a fresh
++ *    allocation. A dedicated send buffer is used (never the recv buffer), so
++ *    sending while received data is still being processed is safe. If
++ *    undefined, the send buffer defaults to the recv-bufsize.
+  *
+  * **Open Connection Parameters:**
+  *
+diff --git a/plugins/crypto/ua_certificategroup_filestore.c b/plugins/crypto/ua_certificategroup_filestore.c
+index 776c1827f28..c74d529f23d 100644
+--- a/plugins/crypto/ua_certificategroup_filestore.c
++++ b/plugins/crypto/ua_certificategroup_filestore.c
+@@ -15,13 +15,21 @@
+ 
+ #ifdef UA_ENABLE_ENCRYPTION
+ 
+-#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
++#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__) || defined(__OpenBSD__)
+ 
+ #ifdef __linux__
+ #define EVENT_SIZE (sizeof(struct inotify_event))
+ #define BUF_LEN (1024 * ( EVENT_SIZE + 16 ))
+ #endif /* __linux__ */
+ 
++static size_t
++UA_strnlen(const char *s, size_t maxlen) {
++	    size_t len = 0;
++	        while(len < maxlen && s[len] != '\0')
++			        len++;
++		    return len;
++}
++
+ typedef struct {
+     /* Memory cert store as a base */
+     UA_CertificateGroup *store;
+@@ -45,10 +53,11 @@ mkpath(char *dir, UA_MODE mode) {
+     if(dir == NULL)
+         return 1;
+ 
+-    char *path = (char*)UA_malloc(strlen(dir) + 1);
++    size_t dirLen = strlen(dir);
++    char *path = (char*)UA_malloc(dirLen + 1);
+     if(!path)
+         return 1;
+-    strcpy(path, dir);
++    memcpy(path, dir, dirLen + 1);
+ 
+     char *pos = path;
+     if(pos[0] == '/')
+@@ -436,7 +445,7 @@ FileCertStore_createPkiDirectory(UA_CertificateGroup *certGroup, const UA_String
+         return UA_STATUSCODE_BADINTERNALERROR;
+ 
+     memcpy(rootDirectory, directory.data, directory.length);
+-    rootDirectorySize = strnlen(rootDirectory, UA_PATH_MAX);
++    rootDirectorySize = UA_strnlen(rootDirectory, UA_PATH_MAX);
+ 
+     /* Add Certificate Group Id */
+     UA_NodeId applCertGroup =
+@@ -459,7 +468,7 @@ FileCertStore_createPkiDirectory(UA_CertificateGroup *certGroup, const UA_String
+         strncpy(&rootDirectory[rootDirectorySize], (char *)nodeIdStr.data, UA_PATH_MAX - rootDirectorySize);
+         UA_String_clear(&nodeIdStr);
+     }
+-    rootDirectorySize = strnlen(rootDirectory, UA_PATH_MAX);
++    rootDirectorySize = UA_strnlen(rootDirectory, UA_PATH_MAX);
+ 
+     context->rootFolder = UA_STRING_ALLOC(rootDirectory);
+ 
+diff --git a/plugins/include/open62541/plugin/certificategroup_default.h b/plugins/include/open62541/plugin/certificategroup_default.h
+index 92cb5f93474..d69cff411ab 100644
+--- a/plugins/include/open62541/plugin/certificategroup_default.h
++++ b/plugins/include/open62541/plugin/certificategroup_default.h
+@@ -39,7 +39,7 @@ UA_CertificateGroup_Memorystore(UA_CertificateGroup *certGroup,
+                                 const UA_Logger *logger,
+                                 const UA_KeyValueMap *params);
+ 
+-#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
++#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__) || defined(__OpenBSD__)
+ /*
+  * Initialises and configures a certificate group with a filestore backend.
+  *
+diff --git a/plugins/ua_accesscontrol_default.c b/plugins/ua_accesscontrol_default.c
+index 08edeb44c9d..049fefeef24 100644
+--- a/plugins/ua_accesscontrol_default.c
++++ b/plugins/ua_accesscontrol_default.c
+@@ -73,6 +73,15 @@ activateSession_default(UA_Server *server, UA_AccessControl *ac,
+         /* Anonymous login */
+         if(!context->allowAnonymous)
+             return UA_STATUSCODE_BADIDENTITYTOKENINVALID;
++        if(context->loginCallback) {
++            UA_StatusCode res =
++                context->loginCallback(&UA_STRING_NULL, &UA_BYTESTRING_NULL,
++                                       context->usernamePasswordLoginSize,
++                                       context->usernamePasswordLogin,
++                                       sessionContext, context->loginContext);
++            if(res != UA_STATUSCODE_GOOD)
++                return UA_STATUSCODE_BADUSERACCESSDENIED;
++        }
+     } else if(tokenType == &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN]) {
+         /* Username and password */
+         const UA_UserNameIdentityToken *userToken = (UA_UserNameIdentityToken*)
+diff --git a/plugins/ua_config_json.c b/plugins/ua_config_json.c
+index eea74bdf17a..70ca54a3697 100644
+--- a/plugins/ua_config_json.c
++++ b/plugins/ua_config_json.c
+@@ -962,7 +962,7 @@ PARSE_JSON(SecurityPkiField) {
+     if(retval != UA_STATUSCODE_GOOD)
+         return retval;
+ 
+-#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
++#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__) || defined(__OpenBSD__)
+     /* Set up the parameters for the filestore certificate store */
+     UA_KeyValuePair params[2];
+     size_t paramsSize = 2;
+diff --git a/src/server/ua_discovery_mdns.c b/src/server/ua_discovery_mdns.c
+index 85b642f85eb..2b8af6f2c73 100644
+--- a/src/server/ua_discovery_mdns.c
++++ b/src/server/ua_discovery_mdns.c
+@@ -11,6 +11,7 @@
+ #include "ua_server_internal.h"
+ #include <stdlib.h>
+ #include "mdnsd.h"
++#include "inet.h"
+ #ifdef UA_ENABLE_DISCOVERY_MULTICAST_MDNSD
+ 
+ #ifndef UA_ENABLE_AMALGAMATION
+@@ -862,16 +863,7 @@ MulticastDiscoveryCallback(UA_ConnectionManager *cm, uintptr_t connectionId,
+         return;
+ 
+     char portStr[16];
+-    UA_UInt16 myPort = *port;
+-    for(size_t i = 0; i < 16; i++) {
+-        if(myPort == 0) {
+-            portStr[i] = 0;
+-            break;
+-        }
+-        unsigned char rem = (unsigned char)(myPort % 10);
+-        portStr[i] = (char)(rem + 48); /* to ascii */
+-        myPort = myPort / 10;
+-    }
++    snprintf(portStr, sizeof(portStr), "%u", (unsigned)*port);
+ 
+     struct addrinfo *infoptr;
+     int res = getaddrinfo((const char*)address->data, portStr, NULL, &infoptr);
+@@ -883,8 +875,10 @@ MulticastDiscoveryCallback(UA_ConnectionManager *cm, uintptr_t connectionId,
+     memset(&mm, 0, sizeof(struct message));
+     int rr = message_parse(&mm, (unsigned char*)msg.data);
+     if(rr == 0) { /* 0 = success in new mdnsd API */
+-        struct sockaddr_in *sa = (struct sockaddr_in*)infoptr->ai_addr;
+-        mdnsd_in(mdnsPrivateData.mdnsDaemon, &mm, sa->sin_addr, sa->sin_port);
++        inet_addr_t from;
++        memset(&from, 0, sizeof(from));
++        memcpy(&from, infoptr->ai_addr, infoptr->ai_addrlen);
++        mdnsd_in(mdnsPrivateData.mdnsDaemon, &mm, &from);
+     }
+     freeaddrinfo(infoptr);
+ }
+@@ -895,14 +889,13 @@ UA_DiscoveryManager_sendMulticastMessages(UA_DiscoveryManager *dm) {
+     if(!dm->cm || mdnsPrivateData.mdnsSendConnection == 0)
+         return;
+ 
+-    struct in_addr ip;
+-    memset(&ip, 0, sizeof(struct in_addr));
++    inet_addr_t to;
++    memset(&to, 0, sizeof(to));
+ 
+     struct message mm;
+     memset(&mm, 0, sizeof(struct message));
+ 
+-    unsigned short sport = 0;
+-    while(mdnsd_out(mdnsPrivateData.mdnsDaemon, &mm, &ip, &sport) > 0) {
++    while(mdnsd_out(mdnsPrivateData.mdnsDaemon, &mm, &to) > 0) {
+         int len = message_packet_len(&mm);
+         char* buf = (char*)message_packet(&mm);
+         if(len <= 0)
+@@ -1418,7 +1411,7 @@ UA_Discovery_addRecord(UA_DiscoveryManager *dm, const UA_String servername,
+     size_t maxHostnameLen = UA_MIN(hostname.length, 63);
+     char localDomain[71];
+     memcpy(localDomain, hostname.data, maxHostnameLen);
+-    strcpy(localDomain + maxHostnameLen, ".local.");
++    memcpy(localDomain + maxHostnameLen, ".local.", sizeof(".local."));
+ 
+     /* [servername]-[hostname]._opcua-tcp._tcp.local. 86400 IN SRV 0 5 port [hostname].local. */
+     r = mdnsd_unique(mdnsPrivateData.mdnsDaemon, fullServiceDomainBuf,
+diff --git a/src/ua_types_encoding_json.c b/src/ua_types_encoding_json.c
+index e50f36eb678..9d8d93ec52f 100644
+--- a/src/ua_types_encoding_json.c
++++ b/src/ua_types_encoding_json.c
+@@ -358,18 +358,14 @@ ENCODE_JSON(Int64) {
+ ENCODE_JSON(Float) {
+     char buffer[32];
+     size_t len;
+-    if(*src != *src) {
+-        strcpy(buffer, "\"NaN\"");
+-        len = strlen(buffer);
+-    } else if(*src == INFINITY) {
+-        strcpy(buffer, "\"Infinity\"");
+-        len = strlen(buffer);
+-    } else if(*src == -INFINITY) {
+-        strcpy(buffer, "\"-Infinity\"");
+-        len = strlen(buffer);
+-    } else {
+-        len = dtoa((UA_Double)*src, buffer);
+-    }
++    if(*src != *src)
++        return writeChars(ctx, "\"NaN\"", 5);
++    if(*src == INFINITY)
++        return writeChars(ctx, "\"Infinity\"", 10);
++    if(*src == -INFINITY)
++        return writeChars(ctx, "\"-Infinity\"", 11);
++
++    len = dtoa((UA_Double)*src, buffer);
+ 
+     if(ctx->pos + len > ctx->end)
+         return UA_STATUSCODE_BADENCODINGLIMITSEXCEEDED;
+@@ -383,18 +379,14 @@ ENCODE_JSON(Float) {
+ ENCODE_JSON(Double) {
+     char buffer[32];
+     size_t len;
+-    if(*src != *src) {
+-        strcpy(buffer, "\"NaN\"");
+-        len = strlen(buffer);
+-    } else if(*src == INFINITY) {
+-        strcpy(buffer, "\"Infinity\"");
+-        len = strlen(buffer);
+-    } else if(*src == -INFINITY) {
+-        strcpy(buffer, "\"-Infinity\"");
+-        len = strlen(buffer);
+-    } else {
+-        len = dtoa(*src, buffer);
+-    }
++    if(*src != *src)
++        return writeChars(ctx, "\"NaN\"", 5);
++    if(*src == INFINITY)
++        return writeChars(ctx, "\"Infinity\"", 10);
++    if(*src == -INFINITY)
++        return writeChars(ctx, "\"-Infinity\"", 11);
++
++    len = dtoa(*src, buffer);
+ 
+     if(ctx->pos + len > ctx->end)
+         return UA_STATUSCODE_BADENCODINGLIMITSEXCEEDED;
+diff --git a/src/ua_types_encoding_xml.c b/src/ua_types_encoding_xml.c
+index 4cd50ad184d..3860e249ba3 100644
+--- a/src/ua_types_encoding_xml.c
++++ b/src/ua_types_encoding_xml.c
+@@ -300,18 +300,14 @@ ENCODE_XML(UInt64) {
+ ENCODE_XML(Float) {
+     char buffer[32];
+     size_t len;
+-    if(*src != *src) {
+-        strcpy(buffer, "NaN");
+-        len = strlen(buffer);
+-    } else if(*src == INFINITY) {
+-        strcpy(buffer, "INF");
+-        len = strlen(buffer);
+-    } else if(*src == -INFINITY) {
+-        strcpy(buffer, "-INF");
+-        len = strlen(buffer);
+-    } else {
+-        len = dtoa((UA_Double)*src, buffer);
+-    }
++    if(*src != *src)
++        return xmlEncodeWriteChars(ctx, "NaN", 3);
++    if(*src == INFINITY)
++        return xmlEncodeWriteChars(ctx, "INF", 3);
++    if(*src == -INFINITY)
++        return xmlEncodeWriteChars(ctx, "-INF", 4);
++
++    len = dtoa((UA_Double)*src, buffer);
+     return xmlEncodeWriteChars(ctx, buffer, len);
+ }
+ 
+@@ -319,18 +315,14 @@ ENCODE_XML(Float) {
+ ENCODE_XML(Double) {
+     char buffer[32];
+     size_t len;
+-    if(*src != *src) {
+-        strcpy(buffer, "NaN");
+-        len = strlen(buffer);
+-    } else if(*src == INFINITY) {
+-        strcpy(buffer, "INF");
+-        len = strlen(buffer);
+-    } else if(*src == -INFINITY) {
+-        strcpy(buffer, "-INF");
+-        len = strlen(buffer);
+-    } else {
+-        len = dtoa(*src, buffer);
+-    }
++    if(*src != *src)
++        return xmlEncodeWriteChars(ctx, "NaN", 3);
++    if(*src == INFINITY)
++        return xmlEncodeWriteChars(ctx, "INF", 3);
++    if(*src == -INFINITY)
++        return xmlEncodeWriteChars(ctx, "-INF", 4);
++
++    len = dtoa(*src, buffer);
+     return xmlEncodeWriteChars(ctx, buffer, len);
+ }
+ 
+diff --git a/src/util/ua_eventfilter_parser.c b/src/util/ua_eventfilter_parser.c
+index 51aaae97798..2aeaa6b5250 100644
+--- a/src/util/ua_eventfilter_parser.c
++++ b/src/util/ua_eventfilter_parser.c
+@@ -98,8 +98,9 @@ void append_select(EFParseContext *ctx, Operand *on) {
+ 
+ char *
+ save_string(char *str) {
+-    char *local_str = (char*) UA_calloc(strlen(str)+1, sizeof(char));
+-    strcpy(local_str, str);
++    size_t strLen = strlen(str);
++    char *local_str = (char*) UA_calloc(strLen + 1, sizeof(char));
++    memcpy(local_str, str, strLen + 1);
+     return local_str;
+ }
+ 
+diff --git a/tests/check_eventloop_tcp.c b/tests/check_eventloop_tcp.c
+index 600b13667d4..3dfc7a7c452 100644
+--- a/tests/check_eventloop_tcp.c
++++ b/tests/check_eventloop_tcp.c
+@@ -231,11 +231,64 @@ START_TEST(connectTCP) {
+     el = NULL;
+ } END_TEST
+ 
++/* The connection manager keeps a static send buffer (defaulting to the
++ * recv-bufsize). allocNetworkBuffer reuses it instead of allocating per send,
++ * and falls back to a fresh allocation for messages larger than the buffer. */
++START_TEST(staticSendBuffer) {
++    setupEL();
++
++    /* Configure a small static send buffer */
++    UA_UInt32 sendBufSize = 16;
++    UA_KeyValueMap_setScalar(&cm->eventSource.params, UA_QUALIFIEDNAME(0, "send-bufsize"),
++                             &sendBufSize, &UA_TYPES[UA_TYPES_UINT32]);
++
++    el->start(el);
++    /* Run once so the ConnectionManager eventSource starts its static buffers */
++    el->run(el, 1);
++
++    /* A message that fits is served from the static send buffer */
++    UA_ByteString a = UA_BYTESTRING_NULL;
++    UA_StatusCode retval = cm->allocNetworkBuffer(cm, 0, &a, sendBufSize);
++    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
++    ck_assert_uint_eq(a.length, sendBufSize);
++    UA_Byte *reused = a.data;
++    cm->freeNetworkBuffer(cm, 0, &a);
++
++    /* The next fitting allocation reuses the same static buffer (no per-send
++     * allocation) */
++    UA_ByteString b = UA_BYTESTRING_NULL;
++    retval = cm->allocNetworkBuffer(cm, 0, &b, sendBufSize);
++    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
++    ck_assert_ptr_eq(b.data, reused);
++    cm->freeNetworkBuffer(cm, 0, &b);
++
++    /* A message larger than the static buffer falls back to a fresh allocation
++     * instead of failing with BadOutOfMemory */
++    UA_ByteString big = UA_BYTESTRING_NULL;
++    retval = cm->allocNetworkBuffer(cm, 0, &big, sendBufSize * 64);
++    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
++    ck_assert_uint_eq(big.length, sendBufSize * 64);
++    cm->freeNetworkBuffer(cm, 0, &big);
++
++    /* Stop the EventLoop */
++    int iteration = 0;
++    el->stop(el);
++    while(el->state != UA_EVENTLOOPSTATE_STOPPED && iteration < 10) {
++        UA_DateTime next = el->run(el, 1);
++        UA_fakeSleep((UA_UInt32)((next - UA_DateTime_now()) / UA_DATETIME_MSEC));
++        iteration++;
++    }
++    ck_assert(el->state == UA_EVENTLOOPSTATE_STOPPED);
++    el->free(el);
++    el = NULL;
++} END_TEST
++
+ int main(void) {
+     Suite *s  = suite_create("Test TCP EventLoop");
+     TCase *tc = tcase_create("test cases");
+     tcase_add_test(tc, listenTCP);
+     tcase_add_test(tc, connectTCP);
++    tcase_add_test(tc, staticSendBuffer);
+     suite_add_tcase(s, tc);
+ 
+     SRunner *sr = srunner_create(s);
+diff --git a/tests/client/check_client_subscriptions.c b/tests/client/check_client_subscriptions.c
+index 0ea4780f8ae..24187d5ddb3 100644
+--- a/tests/client/check_client_subscriptions.c
++++ b/tests/client/check_client_subscriptions.c
+@@ -89,6 +89,17 @@ dataChangeHandler(UA_Client *client, UA_UInt32 subId, void *subContext,
+     countNotificationReceived++;
+ }
+ 
++static void
++iterateUntilNotification(UA_Client *client, UA_UInt32 maxIterations) {
++    UA_StatusCode retval = UA_STATUSCODE_GOOD;
++    for(UA_UInt32 i = 0; i < maxIterations && !notificationReceived; ++i) {
++        UA_Server_run_iterate(server, false);
++        retval = UA_Client_run_iterate(client, 0);
++        ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
++        UA_fakeSleep(1);
++    }
++}
++
+ static void
+ createSubscriptionCallback(UA_Client *client, void *userdata, UA_UInt32 requestId,
+                            UA_CreateSubscriptionResponse *r) {
+@@ -582,11 +593,7 @@ START_TEST(Client_subscription_modifyMonitoredItem) {
+     UA_Server_run_iterate(server, false);
+     retval = UA_Client_run_iterate(client, 0);
+     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+-    for(size_t i = 0; i < 10 && !notificationReceived; ++i) {
+-        UA_Server_run_iterate(server, false);
+-        retval = UA_Client_run_iterate(client, 0);
+-        ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+-    }
++    iterateUntilNotification(client, 100);
+     ck_assert_uint_eq(notificationReceived, true);
+     ck_assert_uint_eq(countNotificationReceived, 1);
+ 
+diff --git a/tests/fuzz/fuzz_mdns_message.cc b/tests/fuzz/fuzz_mdns_message.cc
+index c565212ab79..1fb4c617baf 100644
+--- a/tests/fuzz/fuzz_mdns_message.cc
++++ b/tests/fuzz/fuzz_mdns_message.cc
+@@ -13,6 +13,7 @@
+ 
+ extern "C" {
+ #include "mdnsd.h"
++#include "inet.h"
+ }
+ 
+ unsigned char message_buf[MAX_PACKET_LEN];
+@@ -37,8 +38,9 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+ 
+     mdns_daemon_t *d = mdnsd_new(QCLASS_IN, 1000);
+ 
+-    struct in_addr addr = {};
+-    mdnsd_in(d, &m, addr, 2000);
++    inet_addr_t from = {};
++    inet_anyaddr(AF_INET, 2000, &from);
++    mdnsd_in(d, &m, &from);
+     mdnsd_free(d);
+ 
+     return 0;
+diff --git a/tests/server/check_monitoreditem_filter.c b/tests/server/check_monitoreditem_filter.c
+index 3b76369a3cd..cc1cb593551 100644
+--- a/tests/server/check_monitoreditem_filter.c
++++ b/tests/server/check_monitoreditem_filter.c
+@@ -195,10 +195,17 @@ waitForNotification(UA_UInt32 notifications) {
+ #define MAXWAIT_TRIES 100
+     for(UA_UInt32 i = 0; i < MAXWAIT_TRIES; ++i) {
+         UA_fakeSleep((UA_UInt32)publishingInterval + 100);
+-        UA_Server_run_iterate(server, false);
+-        retval = UA_Client_run_iterate(client, 0);
+-        if(retval != UA_STATUSCODE_GOOD)
+-            break;
++        for(UA_UInt32 j = 0; j < MAXWAIT_TRIES; ++j) {
++            UA_Server_run_iterate(server, false);
++            retval = UA_Client_run_iterate(client, 0);
++            if(retval != UA_STATUSCODE_GOOD)
++                break;
++            if(countNotificationReceived >= notifications &&
++               (notifications == 0 ||
++                countNotificationReceived != initialNotifications ||
++                notificationReceived))
++                break;
++        }
+         if(countNotificationReceived >= notifications &&
+            (notifications == 0 ||
+             countNotificationReceived != initialNotifications ||
+diff --git a/tests/server/check_server_reverseconnect.c b/tests/server/check_server_reverseconnect.c
+index aac16ab1c84..470aba3f43f 100644
+--- a/tests/server/check_server_reverseconnect.c
++++ b/tests/server/check_server_reverseconnect.c
+@@ -31,7 +31,7 @@ static UA_UInt16 nextReverseListenPort = 4841;
+ static char reverseConnectUrl[64];
+ 
+ static int numServerCallbackCalled = 0;
+-static UA_SecureChannelState serverCallbackStates[10];
++static UA_SecureChannelState serverCallbackStates[64];
+ static UA_UInt64 reverseConnectHandle = 0;
+ 
+ static int numClientCallbackCalled = 0;
+@@ -100,6 +100,8 @@ static void teardown(void) {
+ static void serverStateCallback(UA_Server *s, UA_UInt64 handle,
+                           UA_SecureChannelState state,
+                           void *context) {
++    ck_assert(numServerCallbackCalled <
++              (int)(sizeof(serverCallbackStates) / sizeof(UA_SecureChannelState)));
+     serverCallbackStates[numServerCallbackCalled++] = state;
+ 
+     ck_assert_ptr_eq(server, s);
+@@ -162,6 +164,30 @@ iterateServerUntilCallbacks(int serverCallbacks, UA_UInt32 fakeSleep) {
+     }
+ }
+ 
++static UA_Boolean
++serverStatesContainSequence(size_t start, const UA_SecureChannelState *states,
++                            size_t statesSize) {
++    size_t match = 0;
++    for(size_t i = start; i < (size_t)numServerCallbackCalled; ++i) {
++        if(serverCallbackStates[i] == states[match]) {
++            ++match;
++            if(match == statesSize)
++                return true;
++        }
++    }
++    return false;
++}
++
++static void
++iterateClientServerUntilServerSequence(size_t start,
++                                       const UA_SecureChannelState *states,
++                                       size_t statesSize,
++                                       UA_UInt32 fakeSleep) {
++    for(size_t i = 0; i < REVERSECONNECT_MAX_ITERATIONS &&
++        !serverStatesContainSequence(start, states, statesSize); ++i)
++        iterateClientServer(fakeSleep);
++}
++
+ START_TEST(listenAndTeardown) {
+     UA_StatusCode ret = UA_STATUSCODE_BADINTERNALERROR;
+ 
+@@ -198,7 +224,7 @@ START_TEST(noListenWhileConnected) {
+ 
+     UA_Client_connect(client, "opc.tcp://127.0.0.1");
+ 
+-    ck_assert_int_gt(numClientCallbackCalled, 5);
++    ck_assert_int_ge(numClientCallbackCalled, 5);
+     ck_assert_int_eq(clientCallbackStates[3], UA_SECURECHANNELSTATE_OPEN);
+ 
+     const UA_String listenHost = UA_STRING("127.0.0.1");
+@@ -239,7 +265,7 @@ START_TEST(addBeforeStart) {
+     ck_assert_int_eq(serverCallbackStates[3], UA_SECURECHANNELSTATE_OPEN);
+     ck_assert_int_eq(serverCallbackStates[4], UA_SECURECHANNELSTATE_CLOSED);
+ 
+-    ck_assert_int_gt(numClientCallbackCalled, 5);
++    ck_assert_int_ge(numClientCallbackCalled, 5);
+     ck_assert_int_eq(clientCallbackStates[0], UA_SECURECHANNELSTATE_REVERSE_LISTENING);
+     ck_assert_int_eq(clientCallbackStates[1], UA_SECURECHANNELSTATE_REVERSE_CONNECTED);
+     ck_assert_int_eq(clientCallbackStates[2], UA_SECURECHANNELSTATE_HEL_SENT);
+@@ -298,53 +324,55 @@ START_TEST(checkReconnect) {
+     ret = UA_Server_run_startup(server);
+     ck_assert_uint_eq(ret, UA_STATUSCODE_GOOD);
+ 
+-    for(size_t i = 0; i < REVERSECONNECT_MAX_ITERATIONS; ++i) {
+-        iterateClientServer(1);
+-
+-        if(numServerCallbackCalled == 4) {
+-            ck_assert_int_eq(numServerCallbackCalled, 4);
+-            ck_assert_int_eq(serverCallbackStates[0], UA_SECURECHANNELSTATE_CONNECTING);
+-            ck_assert_int_eq(serverCallbackStates[1], UA_SECURECHANNELSTATE_RHE_SENT);
+-            ck_assert_int_eq(serverCallbackStates[2], UA_SECURECHANNELSTATE_ACK_SENT);
+-            ck_assert_int_eq(serverCallbackStates[3], UA_SECURECHANNELSTATE_OPEN);
++    const UA_SecureChannelState openSequence[] = {
++        UA_SECURECHANNELSTATE_CONNECTING,
++        UA_SECURECHANNELSTATE_RHE_SENT,
++        UA_SECURECHANNELSTATE_ACK_SENT,
++        UA_SECURECHANNELSTATE_OPEN
++    };
++    iterateClientServerUntilServerSequence(0, openSequence, 4, 1);
++    ck_assert(serverStatesContainSequence(0, openSequence, 4));
+ 
+-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_APPLICATION,
+-                        "Stop listening and wait for reconnect");
+-
+-            ret = UA_Client_disconnectAsync(client);
+-            ck_assert_uint_eq(ret, UA_STATUSCODE_GOOD);
+-
+-            iterateClientServerUntilCallbacks(
+-                6, 0, UA_Server_getConfig(server)->reverseReconnectInterval + 1);
+-
+-            ck_assert_int_eq(numServerCallbackCalled, 6);
+-            ck_assert_int_eq(serverCallbackStates[4], UA_SECURECHANNELSTATE_CLOSING);
+-            ck_assert_int_eq(serverCallbackStates[5], UA_SECURECHANNELSTATE_CONNECTING);
++    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_APPLICATION,
++                "Stop listening and wait for reconnect");
+ 
+-            listenForReverseConnect();
++    size_t reconnectStart = (size_t)numServerCallbackCalled;
++    ret = UA_Client_disconnectAsync(client);
++    ck_assert_uint_eq(ret, UA_STATUSCODE_GOOD);
+ 
+-            UA_fakeSleep(UA_Server_getConfig(server)->reverseReconnectInterval + 1);
++    const UA_SecureChannelState reconnectSequence[] = {
++        UA_SECURECHANNELSTATE_CONNECTING
++    };
++    iterateClientServerUntilServerSequence(
++        reconnectStart, reconnectSequence, 1,
++        UA_Server_getConfig(server)->reverseReconnectInterval + 1);
++    ck_assert(serverStatesContainSequence(reconnectStart, reconnectSequence, 1));
+ 
+-            iterateClientServerUntilCallbacks(9, 0, 1);
++    listenForReverseConnect();
+ 
+-            ck_assert_int_eq(numServerCallbackCalled, 9);
+-            ck_assert_int_eq(serverCallbackStates[6], UA_SECURECHANNELSTATE_RHE_SENT);
+-            ck_assert_int_eq(serverCallbackStates[7], UA_SECURECHANNELSTATE_ACK_SENT);
+-            ck_assert_int_eq(serverCallbackStates[8], UA_SECURECHANNELSTATE_OPEN);
+-            break;
++    UA_fakeSleep(UA_Server_getConfig(server)->reverseReconnectInterval + 1);
+ 
+-        }
+-    }
++    size_t reopenStart = (size_t)numServerCallbackCalled;
++    const UA_SecureChannelState reopenSequence[] = {
++        UA_SECURECHANNELSTATE_RHE_SENT,
++        UA_SECURECHANNELSTATE_ACK_SENT,
++        UA_SECURECHANNELSTATE_OPEN
++    };
++    iterateClientServerUntilServerSequence(reopenStart, reopenSequence, 3, 1);
++    ck_assert(serverStatesContainSequence(reopenStart, reopenSequence, 3));
+ 
++    size_t removeStart = (size_t)numServerCallbackCalled;
+     UA_Server_removeReverseConnect(server, reverseConnectHandle);
+ 
+-    iterateClientServerUntilCallbacks(10, 0, 1);
++    const UA_SecureChannelState closeSequence[] = {
++        UA_SECURECHANNELSTATE_CLOSED
++    };
++    iterateClientServerUntilServerSequence(removeStart, closeSequence, 1, 1);
+ 
+     ret = UA_Server_run_shutdown(server);
+     ck_assert_uint_eq(ret, UA_STATUSCODE_GOOD);
+ 
+-    ck_assert_int_eq(numServerCallbackCalled, 10);
+-    ck_assert_int_eq(serverCallbackStates[9], UA_SECURECHANNELSTATE_CLOSED);
++    ck_assert(serverStatesContainSequence(removeStart, closeSequence, 1));
+ } END_TEST
+ 
+ START_TEST(removeOnShutdownWithConnection) {

@@ -1,0 +1,315 @@
+--- a/openhands/controller/agent_controller.py
++++ b/openhands/controller/agent_controller.py
+@@ -104,6 +104,7 @@
+ REASONING_OBSERVER_POLICY_MARKER = '[Reasoning Observer]'
+ CONSTRUCTION_SUPPORT_POLICY_MARKER = '[Construction Support Policy]'
+ HARNESS_FSM_POLICY_MARKER = '[Harness FSM]'
++EVALUATION_PROBE_MARKER = '[Evaluation Probe]'
+ 
+ 
+ class AgentController:
+@@ -414,6 +415,10 @@
+         elif isinstance(event, Observation):
+             await self._handle_observation(event)
+ 
++        if isinstance(event, Observation) and self._maybe_start_probe_after_observation(event):
++            # The injected probe message schedules the next step. Do not also
++            # schedule a normal post-observation exploration step.
++            return
+ 
+         if self.should_step(event):
+             self.step()
+@@ -437,9 +442,15 @@
+             return
+ 
+         elif isinstance(action, AgentFinishAction):
+-            self.state.outputs = action.outputs
+-            self.state.metrics.merge(self.state.local_metrics)
+-            await self.set_agent_state_to(AgentState.FINISHED)
++            if self._evaluation_probe_answering():
++                response = action.final_thought or action.thought or json.dumps(
++                    action.outputs, ensure_ascii=False
++                )
++                await self._complete_evaluation_probe(response)
++            elif not self._start_evaluation_probe('agent_finished'):
++                self.state.outputs = action.outputs
++                self.state.metrics.merge(self.state.local_metrics)
++                await self.set_agent_state_to(AgentState.FINISHED)
+         elif isinstance(action, AgentRejectAction):
+             self.state.outputs = action.outputs
+             self.state.metrics.merge(self.state.local_metrics)
+@@ -640,6 +651,12 @@
+                 str(action),
+                 extra={'msg_type': 'ACTION', 'event_source': EventSource.USER},
+             )
++            if EVALUATION_PROBE_MARKER in action.content:
++                # Do not schedule RecallAction/microagent retrieval for the probe.
++                # The existing conversation history is the only allowed context.
++                if self.get_agent_state() != AgentState.RUNNING:
++                    await self.set_agent_state_to(AgentState.RUNNING)
++                return
+             if HARNESS_FSM_POLICY_MARKER in action.content:
+                 if self.get_agent_state() != AgentState.RUNNING:
+                     await self.set_agent_state_to(AgentState.RUNNING)
+@@ -681,6 +698,9 @@
+                 await self.set_agent_state_to(AgentState.RUNNING)
+ 
+         elif action.source == EventSource.AGENT:
++            if self._evaluation_probe_answering():
++                await self._complete_evaluation_probe(action.content)
++                return
+             # If the agent is waiting for a response, set the appropriate state
+             if action.wait_for_response:
+                 await self.set_agent_state_to(AgentState.AWAITING_USER_INPUT)
+@@ -910,12 +930,15 @@
+             extra={'msg_type': 'STEP'},
+         )
+ 
++        probe_answering = self._evaluation_probe_answering()
+         stop_step = False
+-        if self.state.iteration >= self.state.max_iterations:
++        if not probe_answering and self.state.iteration >= self.state.max_iterations:
++            if self._start_evaluation_probe('iteration_limit'):
++                return
+             stop_step = await self._handle_traffic_control(
+                 'iteration', self.state.iteration, self.state.max_iterations
+             )
+-        if self.max_budget_per_task is not None:
++        if not probe_answering and self.max_budget_per_task is not None:
+             current_cost = self.state.metrics.accumulated_cost
+             if current_cost > self.max_budget_per_task:
+                 stop_step = await self._handle_traffic_control(
+@@ -925,22 +948,22 @@
+             logger.warning('Stopping agent due to traffic control')
+             return
+ 
+-        if self._is_stuck():
++        if not probe_answering and self._is_stuck():
+             await self._react_to_exception(
+                 AgentStuckInLoopError('Agent got stuck in a loop')
+             )
+             return
+ 
+-        if self._maybe_emit_construction_support_reminder():
++        if not probe_answering and self._maybe_emit_construction_support_reminder():
+             return
+ 
+-        if self._maybe_emit_enhancement_stage_transition():
++        if not probe_answering and self._maybe_emit_enhancement_stage_transition():
+             return
+ 
+-        if self._maybe_emit_reasoning_recorder_reminder():
++        if not probe_answering and self._maybe_emit_reasoning_recorder_reminder():
+             return
+ 
+-        if self._maybe_auto_submit_discovered_candidate():
++        if not probe_answering and self._maybe_auto_submit_discovered_candidate():
+             return
+ 
+         self.update_state_before_step()
+@@ -990,6 +1013,13 @@
+                 else:
+                     raise e
+ 
++        if self._evaluation_probe_answering() and not isinstance(
++            action, (MessageAction, AgentFinishAction, CondensationAction)
++        ):
++            # Defense in depth for agent implementations other than CodeActAgent:
++            # never hand a runnable action to the runtime after freeze.
++            await self._complete_evaluation_probe(str(action))
++            return
+ 
+         if self._maybe_block_until_reasoning_recorded(action):
+             return
+@@ -1047,7 +1077,105 @@
+ 
+     def _harness_mode(self) -> str:
+         return os.environ.get('OPENHANDS_HARNESS_MODE', 'evaluation')
++
++    def _evaluation_probe_answering(self) -> bool:
++        probe = self.state.extra_data.get('evaluation_probe')
++        return isinstance(probe, dict) and probe.get('status') == 'answering'
++
++    def _evaluation_probing_enabled(self) -> bool:
++        return (
++            self._harness_mode() == 'evaluation'
++            and os.environ.get('OPENHANDS_EVAL_PROBING', '0') == '1'
++            and bool(os.environ.get('OPENHANDS_EVAL_PROBES_PATH'))
++        )
++
++    def _start_evaluation_probe(self, trigger: str) -> bool:
++        if not self._evaluation_probing_enabled():
++            return False
++        current = self.state.extra_data.get('evaluation_probe')
++        if isinstance(current, dict) and current.get('status') in {'answering', 'completed'}:
++            return False
++        try:
++            from evaluation_mode.reasoning.session import (
++                build_probe_prompt,
++                load_public_probes,
++            )
++
++            probes_path = Path(os.environ['OPENHANDS_EVAL_PROBES_PATH'])
++            probes = load_public_probes(probes_path)
++        except Exception as exc:
++            logger.warning('Could not load evaluation probes: %s', exc)
++            return False
++        if not probes:
++            logger.warning('Evaluation probe bundle contains no public questions')
++            return False
+ 
++        self._pending_action = None
++        self._clear_agent_pending_actions()
++        self.state.extra_data['evaluation_probe'] = {
++            'status': 'answering',
++            'trigger': trigger,
++            'probe_ids': [item['id'] for item in probes],
++            'probes': probes,
++            'tool_access': 'disabled',
++            'started_iteration': self.state.iteration,
++        }
++        prompt = build_probe_prompt(probes, trigger)
++        self.event_stream.add_event(
++            MessageAction(content=prompt, wait_for_response=False),
++            EventSource.USER,
++        )
++        return True
++
++    def _maybe_start_probe_after_observation(self, observation: Observation) -> bool:
++        if not self._evaluation_probing_enabled() or self._evaluation_probe_answering():
++            return False
++        cause = observation.cause
++        if cause is None:
++            return False
++        for event in reversed(self.state.history):
++            if getattr(event, 'id', None) != cause:
++                continue
++            if self._is_direct_submit_command(event):
++                return self._start_evaluation_probe('poc_submitted')
++            return False
++        return False
++
++    async def _complete_evaluation_probe(self, response: str) -> None:
++        probe = self.state.extra_data.get('evaluation_probe')
++        if not isinstance(probe, dict) or probe.get('status') != 'answering':
++            return
++        try:
++            from evaluation_mode.reasoning.session import write_probe_response
++
++            default_root = Path(os.environ.get('LOG_DIR') or '.')
++            output = Path(
++                os.environ.get('OPENHANDS_EVAL_PROBE_OUTPUT')
++                or default_root / 'probe_answers.json'
++            )
++            payload = write_probe_response(
++                output,
++                trigger=str(probe.get('trigger') or ''),
++                probes=list(probe.get('probes') or []),
++                response=response,
++                oracle_path=Path(os.environ['OPENHANDS_EVAL_PROBES_PATH']),
++            )
++            probe['output'] = str(output)
++            probe['parse_valid'] = payload['parse_valid']
++            probe['score'] = (payload.get('grade') or {}).get('score')
++        except Exception as exc:
++            logger.warning('Could not persist evaluation probe response: %s', exc)
++            probe['error'] = f'{type(exc).__name__}: {exc}'
++        probe['status'] = 'completed'
++        probe.pop('probes', None)
++        probe['completed_iteration'] = self.state.iteration
++        self.state.outputs = {
++            **self.state.outputs,
++            'evaluation_probe': probe,
++        }
++        self.state.metrics.merge(self.state.local_metrics)
++        await self.set_agent_state_to(AgentState.FINISHED)
++
+     def _harness_enhance_mode(self) -> bool:
+         return self._harness_mode() == 'enhance'
+ 
+--- a/openhands/agenthub/codeact_agent/codeact_agent.py
++++ b/openhands/agenthub/codeact_agent/codeact_agent.py
+@@ -112,6 +112,12 @@
+         - MessageAction(content) - Message action to run (e.g. ask for clarification)
+         - AgentFinishAction() - end the interaction
+         """
++        probe_answering = self._evaluation_probe_answering(state)
++        if probe_answering:
++            # A pre-freeze model response may have queued several actions. None of
++            # them may survive into the tool-free answering phase.
++            self.pending_actions.clear()
++
+         # Continue with pending actions if any
+         if self.pending_actions:
+             if self._reasoning_state_complete(state):
+@@ -144,12 +150,13 @@
+         reasoning_complete = self._reasoning_state_complete(state)
+         params: dict = {
+             'messages': self.llm.format_messages_for_llm(messages),
+-            'tools': self._available_tools_for_reasoning_state(
+-                self.tools, reasoning_complete=reasoning_complete
+-            ),
+         }
++        if not probe_answering:
++            params['tools'] = self._available_tools_for_reasoning_state(
++                self.tools, reasoning_complete=reasoning_complete
++            )
+ 
+-        if self.mcp_tools:
++        if self.mcp_tools and not probe_answering:
+             # Only add tools with unique names
+             existing_names = {tool['function']['name'] for tool in params['tools']}
+             unique_mcp_tools = [
+@@ -162,8 +169,12 @@
+                 )
+             ]
+             params['tools'] += unique_mcp_tools
+-        force_reasoning_record = self._reasoning_record_required(state)
+-        forced_harness_tool = self._harness_fsm_forced_tool(state)
++        force_reasoning_record = (
++            False if probe_answering else self._reasoning_record_required(state)
++        )
++        forced_harness_tool = (
++            '' if probe_answering else self._harness_fsm_forced_tool(state)
++        )
+         if force_reasoning_record:
+             messages.append(
+                 Message(
+@@ -257,7 +268,9 @@
+         response = self.llm.completion(**params)
+         logger.debug(f'Response from LLM: {response}')
+         actions = codeact_function_calling.response_to_actions(response)
+-        if force_reasoning_record:
++        if probe_answering:
++            actions = self._tool_free_probe_actions(actions, response)
++        elif force_reasoning_record:
+             actions = self._first_reasoning_record_action_only(actions)
+         elif reasoning_complete:
+             actions = self._without_reasoning_record_actions(actions)
+@@ -268,6 +281,26 @@
+             self.pending_actions.append(action)
+         return self.pending_actions.popleft()
+ 
++    def _evaluation_probe_answering(self, state: State) -> bool:
++        probe = state.extra_data.get('evaluation_probe')
++        return isinstance(probe, dict) and probe.get('status') == 'answering'
++
++    def _tool_free_probe_actions(self, actions: list[Action], response) -> list[Action]:
++        """Permit only a textual answer after the environment is frozen."""
++        safe = [
++            action
++            for action in actions
++            if isinstance(action, (MessageAction, AgentFinishAction))
++        ]
++        if safe:
++            return safe[:1]
++        content = ''
++        try:
++            content = str(response.choices[0].message.content or '')
++        except Exception:
++            pass
++        return [MessageAction(content=content or '{"answers":[]}')]
++
+     def _reasoning_record_required(self, state: State) -> bool:
+         required_markers = (
+             '[Reasoning Recorder Policy] Structured reasoning is required',

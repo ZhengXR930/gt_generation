@@ -1,2 +1,142 @@
-Patch not materialized locally. Fix reference: https://github.com/openthread/openthread/commit/3e7528e4e9cc992166dba8db471d063443d60710
-Fix commit: 3e7528e4e9cc992166dba8db471d063443d60710
+From 3e7528e4e9cc992166dba8db471d063443d60710 Mon Sep 17 00:00:00 2001
+From: Abtin Keshavarzian <abtink@google.com>
+Date: Wed, 23 Apr 2025 16:40:56 -0700
+Subject: [PATCH] [dns-client] use `DecompressRecordData()` for broader record
+ type support (#11412)
+
+This commit updates the DNS client to use `DecompressRecordData()`
+helper method when processing `QueryRecord()` responses for
+arbitrary record types.
+
+This enables decompression of embedded DNS names within the received
+record data for a wider range of record types. In particular, name
+decompression is now supported for PTR, CNAME, DNAME, NS, SRV, SOA,
+MX, RP, AFSDB, RT, PX, KX, and NSEC records.
+---
+ include/openthread/dns_client.h | 12 ++++-----
+ include/openthread/instance.h   |  2 +-
+ src/core/net/dns_client.cpp     | 48 ++++++---------------------------
+ 3 files changed, 15 insertions(+), 47 deletions(-)
+
+diff --git a/include/openthread/dns_client.h b/include/openthread/dns_client.h
+index c0d94492c43..8833e0dffca 100644
+--- a/include/openthread/dns_client.h
++++ b/include/openthread/dns_client.h
+@@ -760,11 +760,11 @@ otError otDnsRecordResponseGetQueryName(const otDnsRecordResponse *aResponse,
+  * - The data is copied into `mDataBuffer` (if not `NULL`) up to its capacity specified by `mDataBufferSize`.
+  * - `mDataBufferSize` is then updated to reflect the number of bytes actually written into `mDataBuffer`.
+  *
+- * If the retrieved record type is PTR (12), CNAME (5), DNAME (39), NS (2), or SRV (33), the record data in the
+- * received response contains a DNS name which may use DNS name compression. For these specific record types, the
+- * record data is first decompressed such that it contains the full uncompressed DNS name. This decompressed data is
+- * then provided in `mDataBuffer`, and `mRecordDataLength` will indicate the length of this decompressed data. For all
+- * other record types, the record data is read and provided as it appears in the received response message.
++ * If the retrieved record type is NS, CNAME, SOA, PTR, MX, RP, AFSDB, RT, PX, SRV, KX, DNAME, or NSEC, the record
++ * data in the received response contains a DNS name which may use DNS name compression. For these specific record
++ * types, the record data is first decompressed such that it contains the full uncompressed DNS name. This decompressed
++ * data is then provided in `mDataBuffer`, and `mRecordDataLength` will indicate the length of this decompressed data.
++ * For all other record types, the record data is read and provided as it appears in the received response message.
+  *
+  * @param[in]  aResponse       A pointer to the response.
+  * @param[in]  aIndex          The record index to retrieve.
+@@ -774,7 +774,7 @@ otError otDnsRecordResponseGetQueryName(const otDnsRecordResponse *aResponse,
+  * @retval OT_ERROR_NOT_FOUND  No record in @p aResponse at @p aIndex.
+  * @retval OT_ERROR_PARSE      Could not parse the records in the @p aResponse.
+  * @retval OT_ERROR_NO_BUFS    The record name does not fit in the provided `mNameBufferSize` in @p aRecordInfo, or
+- *                             failed to allocate buffer to decompress a compressed DNS name (PTR, SRV, CNAME).
++ *                             failed to allocate buffer to decompress a compressed DNS name.
+  */
+ otError otDnsRecordResponseGetRecordInfo(const otDnsRecordResponse *aResponse,
+                                          uint16_t                   aIndex,
+diff --git a/include/openthread/instance.h b/include/openthread/instance.h
+index 8bc9a1a0f63..818cf517523 100644
+--- a/include/openthread/instance.h
++++ b/include/openthread/instance.h
+@@ -52,7 +52,7 @@ extern "C" {
+  *
+  * @note This number versions both OpenThread platform and user APIs.
+  */
+-#define OPENTHREAD_API_VERSION (501)
++#define OPENTHREAD_API_VERSION (502)
+ 
+ /**
+  * @addtogroup api-instance
+diff --git a/src/core/net/dns_client.cpp b/src/core/net/dns_client.cpp
+index 22aa5d3f89b..d5a242e814f 100644
+--- a/src/core/net/dns_client.cpp
++++ b/src/core/net/dns_client.cpp
+@@ -378,10 +378,10 @@ Error Client::Response::ReadTxtRecord(Section aSection, const Name &aName, Servi
+ 
+ Error Client::Response::ReadRecordInfo(uint16_t aIndex, RecordInfo &aRecordInfo) const
+ {
+-    Error          error;
+-    uint16_t       offset;
+-    ResourceRecord record;
+-    Message       *decompressedData = nullptr;
++    Error             error;
++    uint16_t          offset;
++    ResourceRecord    record;
++    OwnedPtr<Message> decompressedData;
+ 
+     if (aIndex < mAnswerRecordCount)
+     {
+@@ -406,43 +406,12 @@ Error Client::Response::ReadRecordInfo(uint16_t aIndex, RecordInfo &aRecordInfo)
+     SuccessOrExit(error = Name::ReadName(*mMessage, offset, aRecordInfo.mNameBuffer, aRecordInfo.mNameBufferSize));
+ 
+     SuccessOrExit(error = mMessage->Read(offset, record));
+-    VerifyOrExit(offset + record.GetSize() <= mMessage->GetLength(), error = kErrorParse);
+-    offset += sizeof(record);
+ 
+-    aRecordInfo.mRecordType = record.GetType();
+-    aRecordInfo.mTtl        = record.GetTtl();
+-
+-    // We may need to translate the record data for PTR, CNAME, DNAME, NS
+-    // and SRV record since the data format contains a DNS name which
+-    // may use compression.
+-
+-    switch (record.GetType())
+-    {
+-    case ResourceRecord::kTypePtr:
+-    case ResourceRecord::kTypeCname:
+-    case ResourceRecord::kTypeDname:
+-    case ResourceRecord::kTypeNs:
+-    case ResourceRecord::kTypeSrv:
+-        decompressedData = mMessage->Get<MessagePool>().Allocate(Message::kTypeOther);
+-        VerifyOrExit(decompressedData != nullptr, error = kErrorNoBufs);
+-
+-        if (record.GetType() == ResourceRecord::kTypeSrv)
+-        {
+-            uint16_t srvMinLength = sizeof(SrvRecord) - sizeof(ResourceRecord);
+-
+-            VerifyOrExit(record.GetLength() > srvMinLength, error = kErrorParse);
+-            SuccessOrExit(error = decompressedData->AppendBytesFromMessage(*mMessage, offset, srvMinLength));
+-            offset += srvMinLength;
+-        }
+-
+-        SuccessOrExit(error = Name(*mMessage, offset).AppendTo(*decompressedData));
+-        break;
+-
+-    default:
+-        break;
+-    }
++    SuccessOrExit(error = ResourceRecord::DecompressRecordData(*mMessage, offset, decompressedData));
+ 
++    aRecordInfo.mRecordType   = record.GetType();
+     aRecordInfo.mRecordLength = (decompressedData != nullptr) ? decompressedData->GetLength() : record.GetLength();
++    aRecordInfo.mTtl          = record.GetTtl();
+ 
+     if (aRecordInfo.mDataBuffer == nullptr)
+     {
+@@ -458,11 +427,10 @@ Error Client::Response::ReadRecordInfo(uint16_t aIndex, RecordInfo &aRecordInfo)
+     }
+     else
+     {
+-        mMessage->ReadBytes(offset, aRecordInfo.mDataBuffer, aRecordInfo.mDataBufferSize);
++        mMessage->ReadBytes(offset + sizeof(ResourceRecord), aRecordInfo.mDataBuffer, aRecordInfo.mDataBufferSize);
+     }
+ 
+ exit:
+-    FreeMessage(decompressedData);
+     return error;
+ }
+ 

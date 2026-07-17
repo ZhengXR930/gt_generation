@@ -1,198 +1,35 @@
---- a/libjxl/lib/jxl/dec_frame.cc
-+++ b/libjxl/lib/jxl/dec_frame.cc
-@@ -288,7 +288,7 @@
+commit f134b5a31da90e743af41fb6cc227af06b91bcc2
+Author: Alex Deymo <deymo@google.com>
+Date:   Tue Jul 27 18:27:37 2021 +0200
+
+    Fuzz: Update the nb_meta_channels in squeeze when applying. (#370)
+    
+    MetaSqueeze() started updating the nb_meta_channels value in #331, but
+    we also need to update the value back when applying the transform. This
+    was leading to the transforms getting out of sync with when
+    meta-applying versus inverse applying them later.
+
+diff --git a/lib/jxl/modular/transform/squeeze.cc b/lib/jxl/modular/transform/squeeze.cc
+index fd8867b7..947bcda7 100644
+--- a/lib/jxl/modular/transform/squeeze.cc
++++ b/lib/jxl/modular/transform/squeeze.cc
+@@ -279,38 +279,44 @@ Status MetaSqueeze(Image &image, std::vector<SqueezeParams> *parameters) {
+ Status InvSqueeze(Image &input, std::vector<SqueezeParams> parameters,
+                   ThreadPool *pool) {
+   if (parameters.empty()) {
+     DefaultSqueezeParameters(&parameters, input);
    }
-   JXL_RETURN_IF_ERROR(
-       InitializePassesSharedState(frame_header_, &dec_state_->shared_storage));
--  dec_state_->Init();
-+  JXL_RETURN_IF_ERROR(dec_state_->Init());
-   modular_frame_decoder_.Init(frame_dim_);
  
-   if (decoded->IsJPEG()) {
-@@ -434,11 +434,16 @@
-       dec_state_->extra_channels.emplace_back(
-           DivCeil(frame_dim_.xsize_upsampled_padded, ecups),
-           DivCeil(frame_dim_.ysize_upsampled_padded, ecups));
--#if MEMORY_SANITIZER
-+#if JXL_MEMORY_SANITIZER
-       // Avoid errors due to loading vectors on the outermost padding.
-+      // Upsample of extra channels requires this padding to be initialized.
-+      // TODO(deymo): Remove this and use rects up to {x,y}size_upsampled
-+      // instead of the padded one.
-       for (size_t y = 0; y < DivCeil(frame_dim_.ysize_upsampled_padded, ecups);
-            y++) {
--        for (size_t x = DivCeil(frame_dim_.xsize_upsampled, ecups);
-+        for (size_t x = (y < DivCeil(frame_dim_.ysize_upsampled, ecups)
-+                             ? DivCeil(frame_dim_.xsize_upsampled, ecups)
-+                             : 0);
-              x < DivCeil(frame_dim_.xsize_upsampled_padded, ecups); x++) {
-           dec_state_->extra_channels.back().Row(y)[x] =
-               msan::kSanitizerSentinel;
---- a/libjxl/lib/jxl/dec_modular.cc
-+++ b/libjxl/lib/jxl/dec_modular.cc
-@@ -51,6 +51,7 @@
-                    const pixel_type* const JXL_RESTRICT row_in,
-                    const float factor, Image3F* decoded, size_t /*c*/, size_t y,
-                    Rect& rect) {
-+  JXL_DASSERT(xsize <= rect.xsize());
-   const HWY_FULL(float) df;
-   const Rebind<pixel_type, HWY_FULL(float)> di;  // assumes pixel_type <= float
- 
-@@ -73,6 +74,7 @@
-                       const pixel_type* const JXL_RESTRICT row_in,
-                       const float factor, Image3F* decoded, size_t c, size_t y,
-                       Rect& rect) {
-+  JXL_DASSERT(xsize <= rect.xsize());
-   const HWY_FULL(float) df;
-   const Rebind<pixel_type, HWY_FULL(float)> di;  // assumes pixel_type <= float
- 
-@@ -272,44 +274,36 @@
-     Rect r(rect.x0() >> fc.hshift, rect.y0() >> fc.vshift,
-            rect.xsize() >> fc.hshift, rect.ysize() >> fc.vshift, fc.w, fc.h);
-     if (r.xsize() == 0 || r.ysize() == 0) continue;
--    Channel gc(r.xsize(), r.ysize());
--    gc.hshift = fc.hshift;
--    gc.vshift = fc.vshift;
--    gi.channel.emplace_back(std::move(gc));
--  }
--  if (zerofill) {
--    int gic = 0;
--    for (c = beginc; c < full_image.channel.size(); c++) {
--      Channel& fc = full_image.channel[c];
--      int shift = std::min(fc.hshift, fc.vshift);
--      if (shift > maxShift) continue;
--      if (shift < minShift) continue;
--      Rect r(rect.x0() >> fc.hshift, rect.y0() >> fc.vshift,
--             rect.xsize() >> fc.hshift, rect.ysize() >> fc.vshift, fc.w, fc.h);
--      if (r.xsize() == 0 || r.ysize() == 0) continue;
-+    if (zerofill && use_full_image) {
-       for (size_t y = 0; y < r.ysize(); ++y) {
-         pixel_type* const JXL_RESTRICT row_out = r.Row(&fc.plane, y);
-         memset(row_out, 0, r.xsize() * sizeof(*row_out));
-       }
--      gic++;
--    }
--    return true;
--  }
-+    } else {
-+      Channel gc(r.xsize(), r.ysize());
-+      if (zerofill) ZeroFillImage(&gc.plane);
-+      gc.hshift = fc.hshift;
-+      gc.vshift = fc.vshift;
-+      gi.channel.emplace_back(std::move(gc));
-+    }
-+  }
-+  if (zerofill && use_full_image) return true;
-   ModularOptions options;
--  if (!ModularGenericDecompress(
--          reader, gi, /*header=*/nullptr, stream.ID(frame_dim), &options,
--          /*undo_transforms=*/-1, &tree, &code, &context_map))
--    return JXL_FAILURE("Failed to decode modular group");
--  if (minShift == 0) {
--    // Undo global transforms that have been pushed to the group level
-+  if (!zerofill) {
-+    if (!ModularGenericDecompress(
-+            reader, gi, /*header=*/nullptr, stream.ID(frame_dim), &options,
-+            /*undo_transforms=*/-1, &tree, &code, &context_map)) {
-+      return JXL_FAILURE("Failed to decode modular group");
-+    }
-+  }
-+  // Undo global transforms that have been pushed to the group level
-+  if (!use_full_image) {
-     for (auto t : global_transform) {
-       JXL_RETURN_IF_ERROR(t.Inverse(gi, global_header.wp_header));
-     }
--    if (!use_full_image) {
--      JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
--          gi, dec_state, nullptr, output, rect.Crop(*output)));
--      return true;
--    }
-+    JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
-+        gi, dec_state, nullptr, output, rect.Crop(dec_state->decoded)));
-+    return true;
-   }
-   int gic = 0;
-   for (c = beginc; c < full_image.channel.size(); c++) {
-@@ -320,13 +314,10 @@
-     Rect r(rect.x0() >> fc.hshift, rect.y0() >> fc.vshift,
-            rect.xsize() >> fc.hshift, rect.ysize() >> fc.vshift, fc.w, fc.h);
-     if (r.xsize() == 0 || r.ysize() == 0) continue;
--    for (size_t y = 0; y < r.ysize(); ++y) {
--      pixel_type* const JXL_RESTRICT row_out = r.Row(&fc.plane, y);
--      const pixel_type* const JXL_RESTRICT row_in = gi.channel[gic].Row(y);
--      for (size_t x = 0; x < r.xsize(); ++x) {
--        row_out[x] = row_in[x];
--      }
--    }
-+    JXL_ASSERT(use_full_image);
-+    CopyImageTo(/*rect_from=*/Rect(0, 0, r.xsize(), r.ysize()),
-+                /*from=*/gi.channel[gic].plane,
-+                /*rect_to=*/r, /*to=*/&fc.plane);
-     gic++;
-   }
-   return true;
-@@ -459,6 +450,10 @@
-   const auto* metadata = frame_header.nonserialized_metadata;
-   size_t xsize = rect.xsize();
-   size_t ysize = rect.ysize();
-+  if (!xsize || !ysize) {
-+    return true;
-+  }
-+  JXL_DASSERT(rect.IsInside(decoded));
- 
-   int c = 0;
-   if (do_color) {
-@@ -557,9 +552,15 @@
-     const size_t ec_xsize = DivCeil(frame_dim.xsize_upsampled, ecups);
-     const size_t ec_ysize = DivCeil(frame_dim.ysize_upsampled, ecups);
-     Channel& ch_in = gi.channel[c];
-+    // For x0, y0 there's no need to do a DivCeil().
-+    JXL_DASSERT(rect.x0() % (1ul << ch_in.hshift) == 0);
-+    JXL_DASSERT(rect.y0() % (1ul << ch_in.vshift) == 0);
-     Rect r(rect.x0() >> ch_in.hshift, rect.y0() >> ch_in.vshift,
--           rect.xsize() >> ch_in.hshift, rect.ysize() >> ch_in.vshift, ec_xsize,
--           ec_ysize);
-+           DivCeil(rect.xsize(), 1lu << ch_in.hshift),
-+           DivCeil(rect.ysize(), 1lu << ch_in.vshift), ec_xsize, ec_ysize);
-+
-+    JXL_DASSERT(r.IsInside(dec_state->extra_channels[ec]));
-+    JXL_DASSERT(Rect(0, 0, r.xsize(), r.ysize()).IsInside(ch_in.plane));
-     for (size_t y = 0; y < r.ysize(); ++y) {
-       float* const JXL_RESTRICT row_out =
-           r.Row(&dec_state->extra_channels[ec], y);
-@@ -572,6 +573,7 @@
-         }
-       }
-     }
-+    JXL_CHECK_IMAGE_INITIALIZED(dec_state->extra_channels[ec], r);
-   }
-   return true;
- }
---- a/libjxl/lib/jxl/modular/transform/squeeze.cc
-+++ b/libjxl/lib/jxl/modular/transform/squeeze.cc
-@@ -14,7 +14,9 @@
- 
- namespace jxl {
- 
--void InvHSqueeze(Image &input, int c, int rc, ThreadPool *pool) {
-+void InvHSqueeze(Image &input, uint32_t c, uint32_t rc, ThreadPool *pool) {
-+  JXL_ASSERT(c < input.channel.size());
-+  JXL_ASSERT(rc < input.channel.size());
-   const Channel &chin = input.channel[c];
-   const Channel &chin_residual = input.channel[rc];
-   // These must be valid since we ran MetaApply already.
-@@ -78,7 +80,9 @@
-   input.channel[c] = std::move(chout);
- }
- 
--void InvVSqueeze(Image &input, int c, int rc, ThreadPool *pool) {
-+void InvVSqueeze(Image &input, uint32_t c, uint32_t rc, ThreadPool *pool) {
-+  JXL_ASSERT(c < input.channel.size());
-+  JXL_ASSERT(rc < input.channel.size());
-   const Channel &chin = input.channel[c];
-   const Channel &chin_residual = input.channel[rc];
-   // These must be valid since we ran MetaApply already.
-@@ -295,8 +299,17 @@
+   for (int i = parameters.size() - 1; i >= 0; i--) {
+     JXL_RETURN_IF_ERROR(
+         CheckMetaSqueezeParams(parameters[i], input.channel.size()));
+     bool horizontal = parameters[i].horizontal;
+     bool in_place = parameters[i].in_place;
+     uint32_t beginc = parameters[i].begin_c;
+     uint32_t endc = parameters[i].begin_c + parameters[i].num_c - 1;
+     uint32_t offset;
+     if (in_place) {
+       offset = endc + 1;
      } else {
        offset = input.channel.size() + beginc - endc - 1;
      }
@@ -204,32 +41,20 @@
 +
      for (uint32_t c = beginc; c <= endc; c++) {
        uint32_t rc = offset + c - beginc;
-+      // MetaApply should imply that `rc` is within range, otherwise there's a
-+      // programming bug.
-+      JXL_ASSERT(rc < input.channel.size());
        if ((input.channel[c].w < input.channel[rc].w) ||
            (input.channel[c].h < input.channel[rc].h)) {
          return JXL_FAILURE("Corrupted squeeze transform");
---- a/libjxl/lib/jxl/modular/transform/transform.cc
-+++ b/libjxl/lib/jxl/modular/transform/transform.cc
-@@ -81,6 +81,9 @@
-         "Invalid channel range: %u..%u (there are only %zu channels)", c1, c2,
-         image.channel.size());
+       }
+       if (horizontal) {
+         InvHSqueeze(input, c, rc, pool);
+       } else {
+         InvVSqueeze(input, c, rc, pool);
+       }
+     }
+     input.channel.erase(input.channel.begin() + offset,
+                         input.channel.begin() + offset + (endc - beginc + 1));
    }
-+  if (c1 < image.nb_meta_channels && c2 >= image.nb_meta_channels) {
-+    return JXL_FAILURE("Invalid: transforming mix of meta and nonmeta");
-+  }
-   const auto &ch1 = image.channel[c1];
-   for (size_t c = c1 + 1; c <= c2; c++) {
-     const auto &ch2 = image.channel[c];
---- a/libjxl/tools/djxl_fuzzer.cc
-+++ b/libjxl/tools/djxl_fuzzer.cc
-@@ -493,7 +493,7 @@
-   size_t max_pixels = 1 << 21;
+   return true;
+ }
  
-   const auto targets = hwy::SupportedAndGeneratedTargets();
--  hwy::SetSupportedTargetsForTest(getFlag(targets.size() - 1));
-+  hwy::SetSupportedTargetsForTest(targets[getFlag(targets.size() - 1)]);
-   DecodeJpegXl(data, size, max_pixels, spec, &pixels, &jpeg, &xsize, &ysize,
-                &icc);
-   hwy::SetSupportedTargetsForTest(0);
+ }  // namespace jxl

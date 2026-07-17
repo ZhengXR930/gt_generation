@@ -1,6 +1,1 @@
-#!/usr/bin/env bash
-set -euo pipefail
-docker run --rm \
-  -v "$PWD/poc:/tmp/poc:ro" \
-  n132/arvo:10318-vul \
-  arvo
+docker run --rm --entrypoint /bin/bash n132/arvo:10318-vul -c '/bin/arvo run'

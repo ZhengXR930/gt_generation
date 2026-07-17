@@ -1,2 +1,556 @@
-Patch not materialized locally. Fix reference: https://github.com/libical/libical/commit/0d3735426835aff0bd8151a0203e0720b157315f
-Fix commit: 0d3735426835aff0bd8151a0203e0720b157315f
+From 0d3735426835aff0bd8151a0203e0720b157315f Mon Sep 17 00:00:00 2001
+From: Allen Winter <winter@kde.org>
+Date: Tue, 24 Feb 2026 10:22:31 -0500
+Subject: [PATCH] Start adding fuzzer testing for the vcard library (#1225)
+
+* Start adding fuzzer testing for the vcard library
+
+* vcardstructured.c: return from new_from_string early for empty string
+
+* vcardstructuredimpl.h: use dynamically sized array for fields
+
+The vcardstructured_impl struct used a fixed-size array to store
+fields but it did not impose a limit on the maximum number of fields.
+Now, it dynamically manages the field array and reallocates the
+buffer if required.
+
+* vcardparser.c: reject BEGIN/END content lines with no TEXT value
+
+* initialize the errbuf so we don't write a null pointer
+
+If there's a parsing error, _parse_error calls
+
+    buf_vprintf(&state->errbuf, fmt, ap);
+
+which attempts vsnprintf(buf->s... and buf->s is 0x0.
+
+This fixes:
+
+    The following tests FAILED:
+        108 - vcfuzz1test480258833 (SEGFAULT)
+        111 - vcfuzz1test485932113 (SEGFAULT)
+
+when compiled with:
+
+  cmake -B build --warn-uninitialized -Werror=dev -G Ninja -DLIBICAL_DEVMODE_MEMORY_CONSISTENCY=True -DCMAKE_BUILD_TYPE=Debug -DLIBICAL_DEVMODE=True -DLIBICAL_ENABLE_BUILTIN_TZDATA=True  -DLIBICAL_GLIB_BUILD_DOCS=False -DLIBICAL_GLIB=False -DLIBICAL_GOBJECT_INTROSPECTION=False -DLIBICAL_GLIB_VAPI=False -DLIBICAL_BUILD_TESTING_BIGFUZZ=True
+
+* vcardcomponent_fuzz1.c: free memory at end of test to avoid ASAN error
+
+* vcardparser.c: reset 'version' property in case of error
+
+* [pre-commit.ci] auto fixes from pre-commit.com hooks
+
+for more information, see https://pre-commit.ci
+
+* src/test/libicalvcard/CMakeLists.txt - temporarily remove 485932113
+
+we'll work 485932113 in a separate patch
+
+---------
+
+Co-authored-by: Robert Stepanek <rsto@fastmailteam.com>
+Co-authored-by: Matthew Horsfall <wolfsage@gmail.com>
+Co-authored-by: pre-commit-ci[bot] <66853113+pre-commit-ci[bot]@users.noreply.github.com>
+---
+ CMakeLists.txt                               |   1 +
+ src/libicalvcard/vcardparser.c               |  14 ++++
+ src/libicalvcard/vcardstructured.c           |  50 ++++++++++--
+ src/libicalvcard/vcardstructuredimpl.h       |   5 +-
+ src/test/CMakeLists.txt                      |   1 -
+ src/test/libicalvcard/CMakeLists.txt         |  29 ++++++-
+ src/test/libicalvcard/vcardcomponent_fuzz1.c |  80 +++++++++++++++++++
+ test-data/vcardfuzz479881583                 |   1 +
+ test-data/vcardfuzz479882034                 |   1 +
+ test-data/vcardfuzz480258833                 | Bin 0 -> 1195 bytes
+ test-data/vcardfuzz481458325                 |   9 +++
+ test-data/vcardfuzz485387226                 |   1 +
+ test-data/vcardfuzz485932113                 |  67 ++++++++++++++++
+ 13 files changed, 246 insertions(+), 13 deletions(-)
+ create mode 100644 src/test/libicalvcard/vcardcomponent_fuzz1.c
+ create mode 100644 test-data/vcardfuzz479881583
+ create mode 100644 test-data/vcardfuzz479882034
+ create mode 100644 test-data/vcardfuzz480258833
+ create mode 100644 test-data/vcardfuzz481458325
+ create mode 100644 test-data/vcardfuzz485387226
+ create mode 100644 test-data/vcardfuzz485932113
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4b3a469bf..928810ad1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -984,6 +984,7 @@ libical_option(LIBICAL_BUILD_TESTING "Build tests." False)
+ if(LIBICAL_DEVMODE)
+   set(LIBICAL_BUILD_TESTING True)
+ endif()
++libical_option(LIBICAL_BUILD_TESTING_BIGFUZZ "Build fuzzer tests" False)
+ libical_option(LIBICAL_BUILD_EXAMPLES "Build examples." True)
+ 
+ ########### Configure pkg-config variables #########
+diff --git a/src/libicalvcard/vcardparser.c b/src/libicalvcard/vcardparser.c
+index dfe8f0b28..b3e9206b8 100644
+--- a/src/libicalvcard/vcardparser.c
++++ b/src/libicalvcard/vcardparser.c
+@@ -490,6 +490,7 @@ static void _parse_error(struct vcardparser_state *state,
+     if (state->prop) {
+         vcardproperty_free(state->prop);
+     }
++    state->version = NULL;
+ 
+     /* coverity[resource_leak] */
+     vcardparameter *errParam = vcardparameter_new_xlicerrortype(type);
+@@ -850,6 +851,12 @@ static int _parse_vcard(struct vcardparser_state *state,
+         _parse_prop(state);
+ 
+         if (vcardproperty_isa(state->prop) == VCARD_BEGIN_PROPERTY) {
++            if (vcardvalue_isa(vcardproperty_get_value(state->prop)) !=
++                VCARD_TEXT_VALUE) {
++                r = PE_VALUE_INVALID;
++                break;
++            }
++
+             const char *val =
+                 vcardvalue_get_text(vcardproperty_get_value(state->prop));
+             vcardcomponent_kind kind = vcardcomponent_string_to_kind(val);
+@@ -875,6 +882,12 @@ static int _parse_vcard(struct vcardparser_state *state,
+             r = PE_MISMATCHED_CARD;
+             break;
+         } else if (vcardproperty_isa(state->prop) == VCARD_END_PROPERTY) {
++            if (vcardvalue_isa(vcardproperty_get_value(state->prop)) !=
++                VCARD_TEXT_VALUE) {
++                r = PE_VALUE_INVALID;
++                break;
++            }
++
+             const char *val =
+                 vcardvalue_get_text(vcardproperty_get_value(state->prop));
+             vcardcomponent_kind kind = vcardcomponent_string_to_kind(val);
+@@ -912,6 +925,7 @@ static int vcardparser_parse(struct vcardparser_state *state, int only_one)
+     state->p = state->base;
+ 
+     buf_init(&state->buf, BUF_GROW);
++    buf_init(&state->errbuf, BUF_GROW);
+ 
+     /* don't parse trailing non-whitespace */
+     return _parse_vcard(state, state->root, only_one);
+diff --git a/src/libicalvcard/vcardstructured.c b/src/libicalvcard/vcardstructured.c
+index f526ee701..f5123a284 100644
+--- a/src/libicalvcard/vcardstructured.c
++++ b/src/libicalvcard/vcardstructured.c
+@@ -20,7 +20,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-static vcardstructuredtype *vcardstructured_alloc(void)
++static vcardstructuredtype *vcardstructured_alloc(size_t num_fields)
+ {
+     struct vcardstructuredtype_impl *st;
+ 
+@@ -31,6 +31,17 @@ static vcardstructuredtype *vcardstructured_alloc(void)
+     }
+     memset(st, 0, sizeof(struct vcardstructuredtype_impl));
+ 
++    if (num_fields > 0) {
++        st->field = (vcardstrarray **)icalmemory_new_buffer(num_fields * sizeof(vcardstrarray *));
++        if (!st->field) {
++            icalmemory_free_buffer(st);
++            icalerror_set_errno(ICAL_NEWFAILED_ERROR);
++            return NULL;
++        }
++        memset((void *)st->field, 0, num_fields * sizeof(vcardstrarray *));
++        st->num_alloc = num_fields;
++    }
++
+     return st;
+ }
+ 
+@@ -41,12 +52,13 @@ static void vcardstructured_free(vcardstructuredtype *st)
+             vcardstrarray_free(st->field[i]);
+         }
+     }
++    icalmemory_free_buffer((void *)st->field);
+     icalmemory_free_buffer((void *)st);
+ }
+ 
+ vcardstructuredtype *vcardstructured_new(size_t num_fields)
+ {
+-    struct vcardstructuredtype_impl *st = vcardstructured_alloc();
++    struct vcardstructuredtype_impl *st = vcardstructured_alloc(num_fields);
+     if (!st) {
+         return st;
+     }
+@@ -58,14 +70,18 @@ vcardstructuredtype *vcardstructured_new(size_t num_fields)
+ 
+ vcardstructuredtype *vcardstructured_new_from_string(const char *str)
+ {
+-    struct vcardstructuredtype_impl *st = vcardstructured_alloc();
++    struct vcardstructuredtype_impl *st = vcardstructured_alloc(0);
+     if (!st) {
+         return st;
+     }
+     vcardstructured_ref(st);
+ 
++    if (!*str) {
++        return st;
++    }
++
+     vcardstrarray *field = vcardstrarray_new(2);
+-    st->field[st->num_fields++] = field;
++    vcardstructured_set_field_at(st, st->num_fields, field);
+ 
+     do {
+         char *dequoted_str = vcardvalue_strdup_and_dequote_text(&str, ",;");
+@@ -78,7 +94,7 @@ vcardstructuredtype *vcardstructured_new_from_string(const char *str)
+         if (*str == ';') {
+             /* end of field */
+             field = vcardstrarray_new(2);
+-            st->field[st->num_fields++] = field;
++            vcardstructured_set_field_at(st, st->num_fields, field);
+         }
+ 
+     } while (*str++ != '\0');
+@@ -111,14 +127,13 @@ vcardstructuredtype *vcardstructured_clone(const vcardstructuredtype *st)
+ {
+     icalerror_check_arg_rz((st != NULL), "st");
+ 
+-    struct vcardstructuredtype_impl *clone_st = vcardstructured_alloc();
++    struct vcardstructuredtype_impl *clone_st = vcardstructured_alloc(st->num_fields);
+     if (!clone_st) {
+         return NULL;
+     }
+     vcardstructured_ref(clone_st);
+ 
+     clone_st->num_fields = st->num_fields;
+-
+     for (size_t i = 0; i < st->num_fields; i++) {
+         clone_st->field[i] = vcardstrarray_clone(st->field[i]);
+     }
+@@ -137,8 +152,26 @@ void vcardstructured_set_num_fields(vcardstructuredtype *st,
+ {
+     icalerror_check_arg_rv((st != NULL), "st");
+ 
++    if (num_fields > st->num_alloc) {
++        size_t new_alloc = ((num_fields + 7) / 8) * 8;
++        vcardstrarray **new_field = (vcardstrarray **)icalmemory_new_buffer(new_alloc * sizeof(vcardstrarray *));
++        if (!new_field) {
++            icalerror_set_errno(ICAL_NEWFAILED_ERROR);
++            return;
++        }
++
++        memcpy((void *)new_field, st->field, st->num_fields * sizeof(vcardstrarray *));
++        memset((void *)(new_field + st->num_alloc), 0,
++               (new_alloc - st->num_alloc) * sizeof(vcardstrarray *));
++
++        icalmemory_free_buffer(st->field);
++        st->field = new_field;
++        st->num_alloc = new_alloc;
++    }
++
+     for (size_t i = num_fields; i < st->num_fields; i++) {
+         vcardstrarray_free(st->field[i]);
++        st->field[i] = NULL;
+     }
+ 
+     st->num_fields = num_fields;
+@@ -161,6 +194,9 @@ void vcardstructured_set_field_at(vcardstructuredtype *st,
+ 
+     if (position >= st->num_fields) {
+         vcardstructured_set_num_fields(st, position + 1);
++        if (icalerrno == ICAL_NEWFAILED_ERROR) {
++            return;
++        }
+     }
+ 
+     vcardstrarray_free(st->field[position]);
+diff --git a/src/libicalvcard/vcardstructuredimpl.h b/src/libicalvcard/vcardstructuredimpl.h
+index 2d8761112..b9658409c 100644
+--- a/src/libicalvcard/vcardstructuredimpl.h
++++ b/src/libicalvcard/vcardstructuredimpl.h
+@@ -11,14 +11,13 @@
+ 
+ #include "vcardstrarray.h"
+ 
+-#define VCARD_MAX_STRUCTURED_FIELDS 20 // Extended ADR currently uses 18
+-
+ struct vcardstructuredtype_impl {
+     /* Reference count */
+     unsigned refcount;
+ 
+     size_t num_fields;
+-    vcardstrarray *field[VCARD_MAX_STRUCTURED_FIELDS];
++    size_t num_alloc;
++    vcardstrarray **field;
+ };
+ 
+ #endif /* VCARDSTRUCTUREDIMPL_H */
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 24c82c907..2999937fb 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -294,7 +294,6 @@ testme(icaltime_fuzz icaltime_fuzz.c)
+ testme(icalcomponent_timefuzz icalcomponent_timefuzz.c)
+ testme(icaltimezone_fuzz icaltimezone_fuzz.c)
+ 
+-libical_option(LIBICAL_BUILD_TESTING_BIGFUZZ "Build fuzzer tests" False)
+ if(LIBICAL_BUILD_TESTING_BIGFUZZ)
+   foreach(
+     fuzztest
+diff --git a/src/test/libicalvcard/CMakeLists.txt b/src/test/libicalvcard/CMakeLists.txt
+index 1681cd52c..633eba0b1 100644
+--- a/src/test/libicalvcard/CMakeLists.txt
++++ b/src/test/libicalvcard/CMakeLists.txt
+@@ -11,14 +11,39 @@ include_directories(
+   ${PROJECT_BINARY_DIR}/src/libicalvcard
+ )
+ 
+-# Build the test and add the test, making sure the test properties are set
+-macro(vctestme _name _srcs)
++#macro to build (but do not create a test)
++macro(vcbuildme _name _srcs)
+   add_executable(${_name} ${_srcs})
+   add_dependencies(${_name} icalvcard)
+   target_link_libraries(${_name} icalvcard)
++endmacro()
++
++# Build the test and add the test, making sure the test properties are set
++macro(vctestme _name _srcs)
++  vcbuildme(${_name} "${_srcs}")
+   add_test(NAME ${_name} COMMAND ${_name})
+   setprops(${_name})
+ endmacro()
+ 
+ vctestme(vcard_construct vcard_test.c)
+ vctestme(vcard_encode vcard_test_encode.c)
++
++vcbuildme(vcardcomponent_fuzz1 vcardcomponent_fuzz1.c)
++if(LIBICAL_BUILD_TESTING_BIGFUZZ)
++  foreach(
++    fuzztest
++    479882034 # MSAN abrt
++    479881583 # ASAN cpu timeout exceeds 60s
++    480258833 # MSAN floating-point exception
++    481458325 # MSAN Use-of-uninitialized value
++    485387226 # Null-dereference READ
++    # TODO: 485932113 # ASAN Heap-use-after-free
++  )
++    add_test(
++      NAME vcfuzz1test${fuzztest}
++      COMMAND
++        vcardcomponent_fuzz1 "${PROJECT_SOURCE_DIR}/test-data/vcardfuzz${fuzztest}"
++    )
++    setprops(vcfuzz1test${fuzztest})
++  endforeach()
++endif()
+diff --git a/src/test/libicalvcard/vcardcomponent_fuzz1.c b/src/test/libicalvcard/vcardcomponent_fuzz1.c
+new file mode 100644
+index 000000000..b6a7b5f84
+--- /dev/null
++++ b/src/test/libicalvcard/vcardcomponent_fuzz1.c
+@@ -0,0 +1,80 @@
++/*======================================================================
++ *
++ * SPDX-FileCopyrightText: Allen Winter <winter@kde.org>
++ * SPDX-License-Identifier: LGPL-2.1-only OR MPL-2.0
++ *
++ * Based on the original code by Gabe Sherman in
++ * https://github.com/libical/libical/issues/678
++ * ======================================================================*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#if defined(NDEBUG)
++#undef NDEBUG
++#endif
++
++#include <stdlib.h>
++
++#include "libicalvcard/vcard.h"
++
++int main(int argc, const char *argv[])
++{
++    FILE *fp;
++    int fd, r;
++    const char *fname;
++#if defined(HAVE__FSTAT64)
++    struct _stat64 sbuf;
++#else
++    struct stat sbuf;
++#endif
++    size_t filesize;
++    void *data = NULL;
++    vcardcomponent *card;
++
++    if (argc != 2) {
++        fprintf(stderr, "Error: must supply a test file name\n");
++        return 1;
++    } else {
++        fname = argv[1];
++    }
++
++    fp = fopen(fname, "rb");
++    if (fp == (FILE *)NULL) {
++        fprintf(stderr, "Error: unable to open %s\n", fname);
++        return 1;
++    }
++
++    fd = fileno(fp);
++    if (fstat(fd, &sbuf) != 0) {
++        fprintf(stderr, "Error: unable to fstat %s\n", fname);
++        fclose(fp);
++        return 1;
++    }
++    filesize = (size_t)sbuf.st_size;
++    data = malloc(filesize + 1);
++    if (!data) {
++        fprintf(stderr, "Error: unable to allocate memory\n");
++        free(data);
++        fclose(fp);
++        return 1;
++    }
++    memset(data, 0, filesize + 1);
++
++    r = read(fd, data, filesize);
++    fclose(fp);
++
++    if (r < 0) {
++        fprintf(stderr, "Error: Failed to read data\n");
++        free(data);
++        return 1;
++    }
++
++    card = vcardparser_parse_string(data);
++
++    vcardcomponent_free(card);
++
++    free(data);
++    return 0;
++}
+diff --git a/test-data/vcardfuzz479881583 b/test-data/vcardfuzz479881583
+new file mode 100644
+index 000000000..6e50cd219
+--- /dev/null
++++ b/test-data/vcardfuzz479881583
+@@ -0,0 +1 @@
++X:ž'ž\
+\ No newline at end of file
+diff --git a/test-data/vcardfuzz479882034 b/test-data/vcardfuzz479882034
+new file mode 100644
+index 000000000..dd571bd98
+--- /dev/null
++++ b/test-data/vcardfuzz479882034
+@@ -0,0 +1 @@
++N:;:;;;;:;;;;;;;;;;;:;;;;
+\ No newline at end of file
+diff --git a/test-data/vcardfuzz480258833 b/test-data/vcardfuzz480258833
+new file mode 100644
+index 0000000000000000000000000000000000000000..e353a07a5bf8ef358aebed9018809166e5963719
+GIT binary patch
+literal 1195
+zcma#x^0NwwT5AmiOmnQ&<>#ncheQE6Ypt0ESSG?c#@f~@!phd(8p!msim+AUBvy=$
+zu6Nbp4+wH?K!E?a073~S%hgTC!`~OfEKG$+B27qa5L0*xm=wkUXzE~GL|`7+jW2|E
+zA{2sS;`4&W<s`)hR6mp=7>!t6gH@39gn{N2WN*NwaHl&9U|J-c5(mbg4GlzR6|6pm
+zr3x@@jlu(S&{G>wFw8Y5*po{^fdhznpfre$9mm8Yhc+lEf$qSbtrZkF;l>z%jAQ5k
+G7DfP>=Wm_>
+
+literal 0
+HcmV?d00001
+
+diff --git a/test-data/vcardfuzz481458325 b/test-data/vcardfuzz481458325
+new file mode 100644
+index 000000000..dc401a6c5
+--- /dev/null
++++ b/test-data/vcardfuzz481458325
+@@ -0,0 +1,9 @@
++X;TYPE==T8513-0256ÿ#þX5;CREATED=T8513-259ÿ#;CR=ATED=T66ÿ;CRE=TMEMT63-259ÿ#;CR=ATED=T66ÿ;CREATMEMT66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-0ÿ#þX6;BILLINGCREATED=T8513-0256ÿ#þX5;CREATED=T8513-259ÿ#;CR=ATED=T66ÿ;CREATED=T1701411834604692317316873037158X;ÿOX;JSCOMPS=Ä=",,½XDAPAPD°ÔX;0;;84105728ÿ;CREATEDX;CREATED=T66;CREATED=T851ATEDX;CREATED=T66;CREATED=T8513-0256ÿ#þX6;CREATED=T8513-0256ÿ#þX9223372036854775808;CREATED=T8513-259ÿ#;CR=ATED=T195ÿ;CREATED=T66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-02568513-0256ÿ#þX6;CREATED=T851ED=T66ÿ;CREATED=TATED=T66ÿ;CRE=TMEMT63-259ÿ#;CR=ATED=T66ÿ;CREATMEMT66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-0ÿ#þX6;BILLINGCREATED=T8513-0256ÿ#þX5;CREATED=T8513-259ÿ#;CR=ATED=T66ÿ;CREATED=T170141183460469231731687303715884105728ÿ;CREATEDX;CREATED=T66;CREATED=T851ATEDX;CREATED=T6 YV
++ T
++ 	/Ã :3………AUURL’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’,,,-,,,,,,,,,X-ºCOMPAR^Ž^^EN=\n1;X-LIC-COMPA^^§2\Á$^2^ENTkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkAkkkkkkkkkkkkkk’’’’’’’’’’’’’no’’’’’’’’’’’’,,,-,,,,,,,,,X-ºCOMPAR^Ž^^EN=\n1;X-LIC-COMPA^^§¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¼¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬REATED=T66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-02568513-0256ÿ#þX6;CREATED=T851ED=T66ÿ;CREATED=T170141183460469231731687303715884111458ÿ;CREATEDX;CREATED=T66;CREATED=T8513-0256ÿ#þX6;CREATED=T8259ÿTY@,A½®UN*EEE=––––––––––––––––––––––––––;;,¸I	R»½XDAPAP&TED=T8513-0ÿ#þX6;BILLINGCREATED=T8513-0256ÿ#þX5;CREATED=T8513-259ÿ#;CR=ATED=T66ÿ;CREATED=T1701411834604692317316873037158X;ÿOX;JSCOMPS=Ä=",,½XDAPAPD°ÔX;0;;84105728ÿ;CREATEDX;CREATED=T66;CREATED=T851ATEDX;CREATED=T66;CREATED=T8513-0256ÿ#þX6;CREATED=T8513-0256ÿ#þX9223372036854775808;CREATED=T8513-259ÿ#;CR=ATED=T195ÿ;CREATED=T66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-02568513-0256ÿ#þX6;CREATED=T851ED=T66ÿ;CREATED=TATED=T66ÿ;CRE=TMEMT63-259ÿ#;CR=ATED=T66ÿ;CREATMEMT66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-0ÿ#þX6;BILLINGCREATED=T8513-0256ÿ#þX5;CREATED=T8513-259ÿ#;CR=ATED=T66ÿ;CREATED=T170141183460469231731687303715884105728ÿ;CREATEDX;CREATED=T66;CREATED=T851ATEDX;CREATED=T6 YV
++ T
++ 	/Ã :3………AUURL’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’,,,-,,,,,,,,,X-ºCOMPAR^Ž^^EN=\n1;X-LIC-COMPA^^§2\Á$^2^ENTkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkAkkkkkkkkkkkkkk’’’’’’’’’’’’’no’’’’’’’’’’’’,,,-,,,,,,,,,X-ºCOMPAR^Ž^^EN=\n1;X-LIC-COMPA^^§¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¼¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬REATED=T66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-02568513-0256ÿ#þX6;CREATED=T851ED=T66ÿ;CREATED=T170141183460469231731687303715884111458ÿ;CREATEDX;CREATED=T66;CREATED=T8513-0256ÿ#þX6;CREATED=T8259ÿTY@,A½®UN*EEE=––––––––––––––––––––––––––;;,¸I	R»½XDAPAP&zzY\f\çã.X=\D°ÔX;0;;;;,¸I	R»¯.n1^^^^^^$^ YV
++ T
++ 	/Ã :3………AUURL’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’,,,-,,,,,,,,,X-ºCOMPAR^Ž^^EN=\n1;X-LIC-COMPA^^§2\Á$^2^ENTkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkAkkkkkkkkkkkkkk’’’’.’’’’’’’’’no’’’’’’’’’’’’,,,-,,,,,,,,,X-ºCOMPAR^Ž^^EN=\n1;X-LIC-COMPA^^§¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¼¬¬¬¬¬¬¬¬j¬¬¬¬¬¬¬¬¬¬¬¬REATED=T66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-02568513-0256ÿ#zzY\f\çã.X=\D°ÔX;0;;;;,¸I	R»¯.n1^^^^^^$^ YV
++ T
++ 	/Ã :3………AUURL’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’,,,-,,,,,,,,,X-ºCOMPAR^Ž^^EN=\n1;X-LIC-COMPA^^§2\Á$^2^ENTkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkAkkkkkkkkkkkkkk’’’’.’’’’’’’’’no’’’’’’’’’’’’,,,-,,,,,,,,,X-ºCOMPAR^Ž^^EN=\n1;X-LIC-COMPA^^§¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¼¬¬¬¬¬¬¬¬j¬¬¬¬¬¬¬¬¬¬¬¬REATED=T66ÿ;CREATEDX;CREATED=T66;CREATED=T8513-02568513-0256ÿ#þX6;CREATED=T851ED=T6T6ÿ;CREATED=T170141183460469231731687303715884111458ÿ;CREATEDX;CREATED=T66;CREATED=T8513-0256ÿ#þX6;CREATED=T8259ÿTY@,A½®UN*EEE=–––––––––––––––––––––––––––––––––TY@,A½®UN*EELÿART;
+\ No newline at end of file
+diff --git a/test-data/vcardfuzz485387226 b/test-data/vcardfuzz485387226
+new file mode 100644
+index 000000000..6535b389f
+--- /dev/null
++++ b/test-data/vcardfuzz485387226
+@@ -0,0 +1 @@
++BEGIN;õX;VALUE=INteGER:54-1d+
+\ No newline at end of file
+diff --git a/test-data/vcardfuzz485932113 b/test-data/vcardfuzz485932113
+new file mode 100644
+index 000000000..e0328d562
+--- /dev/null
++++ b/test-data/vcardfuzz485932113
+@@ -0,0 +1,67 @@
++X^^^^^^^^YPE=m(,,5+^^^^^Ø^^^^!^^^^^^^^^X;LEVEL=LðVERSION:ALUE=DATE-TIME:-882-80ÿ
++X;VALUE=DATE-TIME:-882-80ÿ
++X;VALUE=DATE-TIM=DA0ÿ
++X;VALUE=DATE-TIME:-88^^^^^^^^^2-80ÿ
++X;VALUE=DATIETM-E:-882-80ÿ
++X;VALUE=DATE-TIME:-882-80ÿ
++X^2-80ÿ
++X;VALUE=DATIETM-E:-882-80ÿ
++X;VALUE=DATE-TIME:-882-80ÿ
++X;VALUE=DATE-TIME:-882-80ÿ
++X;VALUE=DATE-TIME:-88^^ÿ"^^^^^^^^^^^^^^^^^N^^^^^^^^^^^^^^^^^^^^^^^^^^^;TYPE=m(,,0+^^^^^^^^^YPE=m(,,5+^^^^^^^^^^!^^^^^^^^^^^^^^^^^^^^"6^^^^^^^^^^^^^^^^N^^^^^^2-80ÿ
++X;VALUE=DATE-TIME:-882-80ÿ
++X;VALUE=DATE-TIME:-882-80ÿ
++X;VALUE
++
++
++
++
++
++
++
++
++X;C
++REV:42949999T999499
++
++
++:N:
++VRSJON:
++VERSION;VALUE=DATE-TIME:-882-80ÿ
++X;VALUE=DATE-TIME:-88^^ÿ"^^^^^^^^^^^^^^^^^N^^^^^^^^^^^^^^^^^^^^^^^^^^^;TYPE=m(,,0+^^^^^^^^^YPE=m(,,5+^^^^^^^^^^!^^^^^^^^^^^^^^^^^^^^"6^^^^^^^^^^^^^^^^N^^^^^^2-80ÿ
++X;VALUE=DATE-TIME:-882-80ÿ
++X;VALUE=DATE-TIME:-882-80ÿ
++X;VALUE
++
++
++
++
++
++
++
++
++X;C
++REV:42949999T999499
++
++
++:N:
++VRSJON:
++VERSION:
++VERSION:X:¨¨X:¨	
++	
++	
++	
++	
++	
++	
++	
++	
++	
++	
++	
++	
++	
++	
++;X^^^^^^^^^^^^*^^^^^^^^^^-^
++	
++	
++	;º
+\ No newline at end of file

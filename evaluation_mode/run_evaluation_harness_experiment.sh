@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
+bash "${ROOT_DIR}/evaluation_mode/reasoning/openhands/apply_zero_tool_probe_patch.sh"
 
 if [[ -f "${ROOT_DIR}/config.txt" ]]; then
   set -a
@@ -36,14 +37,18 @@ PY
 RUN_TAG="${RUN_TAG:-evaluation_harness_$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/openhands_cybergym_runs/${RUN_TAG}}"
 SERVER_DIR="${OUT_DIR}/cybergym_server"
+PROBE_ROOT="${PROBE_ROOT:-${ROOT_DIR}/probe_results}"
 mkdir -p "${SERVER_DIR}"
 
-export PYTHONPATH="${ROOT_DIR}/shared:${ROOT_DIR}/evaluation_mode:${ROOT_DIR}/external/cybergym/src${PYTHONPATH:+:${PYTHONPATH}}"
-. "${ROOT_DIR}/shared/harness_mode_env.sh" evaluation
+export PYTHONPATH="${ROOT_DIR}/evaluation_mode:${ROOT_DIR}/external/cybergym/src${PYTHONPATH:+:${PYTHONPATH}}"
+export OPENHANDS_HARNESS_MODE=evaluation
+export OPENHANDS_EVAL_PROBING="${OPENHANDS_EVAL_PROBING:-1}"
+export CYBERGYM_PREEXTRACT_REPO_TAR="${CYBERGYM_PREEXTRACT_REPO_TAR:-1}"
+export OPENHANDS_RUNTIME_CONTAINER_IMAGE="${OPENHANDS_RUNTIME_CONTAINER_IMAGE:-cybergym-openhands-runtime:0.33-skip-root-chown}"
+export OPENHANDS_NATIVE_TOOL_CALLING="${OPENHANDS_NATIVE_TOOL_CALLING:-true}"
 export MODEL="${MODEL:-deepseek/deepseek-chat}"
 export MAX_ITER="${MAX_ITER:-100}"
 export TIMEOUT="${TIMEOUT:-1800}"
-export ENABLE_EXTERNAL_INTERPRETER="${ENABLE_EXTERNAL_INTERPRETER:-1}"
 export KEEP_TMP="${KEEP_TMP:-0}"
 export OUT_DIR
 export SERVER_IP="${SERVER_CLIENT_HOST}"
@@ -85,8 +90,63 @@ SUMMARY="${OUT_DIR}/evaluation_harness_summary.jsonl"
 
 for task_id in "${TASKS[@]}"; do
   echo "[run] ${task_id}"
+  task_slug="${task_id//:/_}"
+  probe_dir="${PROBE_ROOT}/${task_slug}"
+  probe_path="${probe_dir}/assertion_probes.json"
+  gt_dir="${ROOT_DIR}/gt_results/${task_slug}"
+  assertions_path="${gt_dir}/verified_assertions.json"
+  invariants_path="${gt_dir}/verified_invariants.json"
+  ground_truth_path="${gt_dir}/ground_truth.json"
+  reachability_path="${gt_dir}/reachability_report.json"
+  sample_info_path="${gt_dir}/sample_info.json"
+  default_crash_trace_path="${gt_dir}/default_crash_trace.txt"
+  probe_inputs=(
+    "${assertions_path}"
+    "${invariants_path}"
+    "${ground_truth_path}"
+    "${reachability_path}"
+    "${sample_info_path}"
+    "${default_crash_trace_path}"
+  )
+  probes_stale=0
+  probe_inputs_ready=1
+  for probe_input in "${probe_inputs[@]}"; do
+    if [[ ! -f "${probe_input}" ]]; then
+      probe_inputs_ready=0
+    elif [[ -f "${probe_path}" && "${probe_input}" -nt "${probe_path}" ]]; then
+      probes_stale=1
+    fi
+  done
+  if [[ -n "${QUESTIONING_AGENT_COMMAND:-}" && "${probe_inputs_ready}" -eq 1 ]]; then
+    echo "[questioning-agent] ${task_id}"
+    mkdir -p "${probe_dir}"
+    "${PYTHON_BIN}" -m reasoning.questions \
+      --assertions "${assertions_path}" \
+      --invariants "${invariants_path}" \
+      --ground-truth "${ground_truth_path}" \
+      --reachability "${reachability_path}" \
+      --sample-info "${sample_info_path}" \
+      --default-crash-trace "${default_crash_trace_path}" \
+      --agent-command "${QUESTIONING_AGENT_COMMAND}" \
+      --role-file "${ROOT_DIR}/evaluation_mode/reasoning/questioning_agent.md" \
+      --out "${probe_path}"
+    probes_stale=0
+  fi
+  if [[ -f "${probe_path}" && "${probes_stale}" -eq 0 && "${probe_inputs_ready}" -eq 1 ]]; then
+    export OPENHANDS_EVAL_PROBING=1
+    export OPENHANDS_EVAL_PROBES_PATH="${probe_path}"
+  else
+    unset OPENHANDS_EVAL_PROBES_PATH
+    if [[ "${probes_stale}" -eq 1 ]]; then
+      echo "[probe] disabled ${task_id}: verified assertions are newer than ${probe_path}"
+    elif [[ "${probe_inputs_ready}" -eq 0 ]]; then
+      echo "[probe] disabled ${task_id}: completed GT package or public crash context is missing"
+    else
+      echo "[probe] disabled ${task_id}: provide QUESTIONING_AGENT_COMMAND to render ${probe_path}"
+    fi
+  fi
   set +e
-  TASK_ID="${task_id}" shared/run_cybergym_openhands_deepseek.sh
+  TASK_ID="${task_id}" evaluation_mode/run_subject_agent.sh
   rc=$?
   set -e
   "${PYTHON_BIN}" - <<PY
@@ -103,27 +163,6 @@ with open("${SUMMARY}", "a", encoding="utf-8") as f:
     f.write(json.dumps(record, ensure_ascii=False) + "\\n")
 print(json.dumps(record, indent=2, ensure_ascii=False))
 PY
-  if [[ "${ENABLE_EXTERNAL_INTERPRETER}" == "1" ]]; then
-    task_slug="${task_id//:/_}"
-    latest_log_dir="$(find "${OUT_DIR}/logs" -maxdepth 1 -type d -name "${task_slug}-*" -print 2>/dev/null | sort | tail -n 1 || true)"
-    trajectory="${latest_log_dir}/trajectory"
-    if [[ -n "${latest_log_dir}" && -f "${trajectory}" ]]; then
-      sample_id="${task_slug}"
-      gt_path="${ROOT_DIR}/gt_results/${sample_id}/ground_truth.json"
-      interpreter_args=(
-        --trajectory "${trajectory}"
-        --out-dir "${latest_log_dir}/external_interpreter"
-      )
-      if [[ -f "${gt_path}" ]]; then
-        interpreter_args+=(--gt "${gt_path}")
-      fi
-      echo "[external-interpreter] ${task_id}"
-      PYTHONPATH="${ROOT_DIR}/evaluation_mode:${ROOT_DIR}/shared:${PYTHONPATH:-}" "${PYTHON_BIN}" -m external_interpreter.cli "${interpreter_args[@]}" \
-        > "${latest_log_dir}/external_interpreter_stdout.json"
-    else
-      echo "[external-interpreter] skipped ${task_id}: trajectory not found"
-    fi
-  fi
   find "${OUT_DIR}/tmp" -type d -name .git -prune -exec rm -rf {} + 2>/dev/null || true
 done
 

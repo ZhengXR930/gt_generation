@@ -1,2 +1,948 @@
-Patch not materialized locally. Fix reference: https://github.com/Cisco-Talos/clamav/commit/e86919789fa7550445bdac9dc5357168cfba4754
-Fix commit: e86919789fa7550445bdac9dc5357168cfba4754
+From e1e3d4c64d0587fa7026e07b0f838d95681ac46d Mon Sep 17 00:00:00 2001
+From: John Humlick <15677335+jhumlick@users.noreply.github.com>
+Date: Mon, 7 Apr 2025 16:50:09 -0700
+Subject: [PATCH 1/2] libclamav: Add URI scanning support to PDF parser
+
+Threat Research requests scanning URIs in PDF files and adding them to
+the json report file.
+
+This change adds URI scanning support to the PDF parser, including
+support for object references to URIs in PDF files.
+
+Jira: CLAM-2588
+
+Fix out-of-order references and other minor improvements.
+
+CLAM-2588, CLAM-2757
+---
+ clamscan/clamscan.c                           |   6 +-
+ clamscan/manager.c                            |   8 +-
+ common/optparser.c                            |   3 +-
+ etc/clamd.conf.sample                         |  12 +-
+ libclamav/bytecode_api.h                      |   3 +-
+ libclamav/clamav.h                            |   8 +-
+ libclamav/others.h                            |   3 +-
+ libclamav/pdf.c                               | 275 +++++++++++++-----
+ libclamav/scanners.c                          |  16 +-
+ ...ml_urls_test.py => save_html_uris_test.py} |  11 +-
+ unit_tests/clamscan/save_pdf_uris_test.py     |  85 ++++++
+ .../other_scanfiles/pdf/out-of-order.pdf      | Bin 0 -> 831 bytes
+ .../input/other_scanfiles/pdf/uri-and-ref.pdf | Bin 0 -> 831 bytes
+ win32/conf_examples/clamd.conf.sample         |  12 +-
+ 14 files changed, 346 insertions(+), 96 deletions(-)
+ rename unit_tests/clamscan/{save_html_urls_test.py => save_html_uris_test.py} (88%)
+ create mode 100644 unit_tests/clamscan/save_pdf_uris_test.py
+ create mode 100644 unit_tests/input/other_scanfiles/pdf/out-of-order.pdf
+ create mode 100644 unit_tests/input/other_scanfiles/pdf/uri-and-ref.pdf
+
+diff --git a/clamscan/clamscan.c b/clamscan/clamscan.c
+index 9bfd93587e..83abe0fb86 100644
+--- a/clamscan/clamscan.c
++++ b/clamscan/clamscan.c
+@@ -254,8 +254,10 @@ void help(void)
+     mprintf(LOGG_INFO, "    --gen-json[=yes/no(*)]               Generate JSON metadata for the scanned file(s). For testing & development use ONLY.\n");
+     mprintf(LOGG_INFO, "                                         JSON will be printed if --debug is enabled.\n");
+     mprintf(LOGG_INFO, "                                         A JSON file will dropped to the temp directory if --leave-temps is enabled.\n");
+-    mprintf(LOGG_INFO, "    --json-store-html-urls[=yes(*)/no]   Store html URLs in metadata.\n");
+-    mprintf(LOGG_INFO, "                                         URLs will be written to the metadata.json file in an array called 'HTMLUrls'\n");
++    mprintf(LOGG_INFO, "    --json-store-html-uris[=yes(*)/no]   Store html URIs in metadata.\n");
++    mprintf(LOGG_INFO, "                                         URLs will be written to the metadata.json file in an array called 'URIs'\n");
++    mprintf(LOGG_INFO, "    --json-store-pdf-uris[=yes(*)/no]   Store pdf URIs in metadata.\n");
++    mprintf(LOGG_INFO, "                                         URLs will be written to the metadata.json file in an array called 'URIs'\n");
+     mprintf(LOGG_INFO, "    --database=FILE/DIR   -d FILE/DIR    Load virus database from FILE or load all supported db files from DIR\n");
+     mprintf(LOGG_INFO, "    --official-db-only[=yes/no(*)]       Only load official signatures\n");
+     mprintf(LOGG_INFO, "    --fail-if-cvd-older-than=days        Return with a nonzero error code if virus database outdated.\n");
+diff --git a/clamscan/manager.c b/clamscan/manager.c
+index d6b38a66d0..d861ec88e7 100644
+--- a/clamscan/manager.c
++++ b/clamscan/manager.c
+@@ -1574,8 +1574,12 @@ int scanmanager(const struct optstruct *opts)
+         options.general |= CL_SCAN_GENERAL_HEURISTICS;
+     }
+ 
+-    if (optget(opts, "json-store-html-urls")->enabled) {
+-        options.general |= CL_SCAN_GENERAL_STORE_HTML_URLS;
++    if (optget(opts, "json-store-html-uris")->enabled) {
++        options.general |= CL_SCAN_GENERAL_STORE_HTML_URIS;
++    }
++
++    if (optget(opts, "json-store-pdf-uris")->enabled) {
++        options.general |= CL_SCAN_GENERAL_STORE_PDF_URIS;
+     }
+ 
+     /* TODO: Remove deprecated option in a future feature release */
+diff --git a/common/optparser.c b/common/optparser.c
+index 5014f9e885..717011c531 100644
+--- a/common/optparser.c
++++ b/common/optparser.c
+@@ -389,7 +389,8 @@ const struct clam_option __clam_options[] = {
+     {"PhishingScanURLs", "phishing-scan-urls", 0, CLOPT_TYPE_BOOL, MATCH_BOOL, 1, NULL, 0, OPT_CLAMD | OPT_CLAMSCAN, "Scan URLs found in mails for phishing attempts using heuristics.", "yes"},
+ 
+     {"HeuristicAlerts", "heuristic-alerts", 0, CLOPT_TYPE_BOOL, MATCH_BOOL, 1, NULL, 0, OPT_CLAMD | OPT_CLAMSCAN, "In some cases (eg. complex malware, exploits in graphic files, and others),\nClamAV uses special algorithms to provide accurate detection. This option\ncontrols the algorithmic detection.", "yes"},
+-    {"JsonStoreHTMLUrls", "json-store-html-urls", 0, CLOPT_TYPE_BOOL, MATCH_BOOL, 1, NULL, 0, OPT_CLAMD | OPT_CLAMSCAN, "Store URLs found in HTML <form and <a tags.", "yes"},
++    {"JsonStoreHTMLURIs", "json-store-html-uris", 0, CLOPT_TYPE_BOOL, MATCH_BOOL, 1, NULL, 0, OPT_CLAMD | OPT_CLAMSCAN, "Store URLs found in HTML <form and <a tags.", "yes"},
++    {"JsonStorePDFURIs", "json-store-pdf-uris", 0, CLOPT_TYPE_BOOL, MATCH_BOOL, 1, NULL, 0, OPT_CLAMD | OPT_CLAMSCAN, "Store URLs found in PDF /URI tags.", "yes"},
+ 
+     {"HeuristicScanPrecedence", "heuristic-scan-precedence", 0, CLOPT_TYPE_BOOL, MATCH_BOOL, 0, NULL, 0, OPT_CLAMD | OPT_CLAMSCAN, "Allow heuristic match to take precedence.\nWhen enabled, if a heuristic scan (such as phishingScan) detects\na possible virus/phish it will stop scan immediately. Recommended, saves CPU\nscan-time.\nWhen disabled, virus/phish detected by heuristic scans will be reported only\nat the end of a scan. If an archive contains both a heuristically detected\nvirus/phish, and a real malware, the real malware will be reported.\nKeep this disabled if you intend to handle \"Heuristics.*\" viruses\ndifferently from \"real\" malware.\nIf a non-heuristically-detected virus (signature-based) is found first,\nthe scan is interrupted immediately, regardless of this config option.", "yes"},
+ 
+diff --git a/etc/clamd.conf.sample b/etc/clamd.conf.sample
+index 9e68942a0d..8712415543 100644
+--- a/etc/clamd.conf.sample
++++ b/etc/clamd.conf.sample
+@@ -254,11 +254,17 @@ Example
+ # Default: no
+ #GenerateMetadataJson yes
+ 
+-# Store URLs found in html files to the json metadata.
+-# URLs will be stored in an array with the tag 'HTMLUrls'
++# Store URIs found in html files to the json metadata.
++# URIs will be stored in an array with the tag 'URIs'
+ # GenerateMetadataJson is required for this feature.
+ # Default: yes (if GenerateMetadataJson is used)
+-#JsonStoreHTMLUrls no
++#JsonStoreHTMLURIs no
++
++# Store URIs found in pdf files to the json metadata.
++# URIs will be stored in an array with the tag 'URIs'
++# GenerateMetadataJson is required for this feature.
++# Default: yes (if GenerateMetadataJson is used)
++#JsonStorePDFURIs no
+ 
+ # Permit use of the ALLMATCHSCAN command. If set to no, clamd will reject
+ # any ALLMATCHSCAN command as invalid.
+diff --git a/libclamav/bytecode_api.h b/libclamav/bytecode_api.h
+index 3729fb34f3..2800df23f9 100644
+--- a/libclamav/bytecode_api.h
++++ b/libclamav/bytecode_api.h
+@@ -263,7 +263,8 @@ enum pdf_objflags {
+     OBJ_FILTER_STANDARD, /* */
+     OBJ_LAUNCHACTION,    /* */
+     OBJ_PAGE,            /* */
+-    OBJ_CONTENTS         /* */
++    OBJ_CONTENTS,        /* */
++    OBJ_URI              /* */
+ };
+ 
+ /**
+diff --git a/libclamav/clamav.h b/libclamav/clamav.h
+index 9de86c0d0e..26ea12b969 100644
+--- a/libclamav/clamav.h
++++ b/libclamav/clamav.h
+@@ -61,6 +61,11 @@
+ 
+ #endif
+ 
++/* Apple does not define __pid_t */
++#ifdef __APPLE__
++typedef pid_t __pid_t;
++#endif
++
+ #define UNUSEDPARAM(x) (void)(x)
+ 
+ #include <sys/types.h>
+@@ -168,7 +173,8 @@ struct cl_scan_options {
+ #define CL_SCAN_GENERAL_HEURISTICS                  0x4  /* option to enable heuristic alerts */
+ #define CL_SCAN_GENERAL_HEURISTIC_PRECEDENCE        0x8  /* allow heuristic match to take precedence. */
+ #define CL_SCAN_GENERAL_UNPRIVILEGED                0x10 /* scanner will not have read access to files. */
+-#define CL_SCAN_GENERAL_STORE_HTML_URLS             0x20 /* Store urls found in html <a and <form tags when recording JSON metadata */
++#define CL_SCAN_GENERAL_STORE_HTML_URIS             0x20 /* Store uris found in html <a and <form tags when recording JSON metadata */
++#define CL_SCAN_GENERAL_STORE_PDF_URIS              0x40 /* Store uris found in pdf /URI tags when recording JSON metadata */
+ 
+ /* parsing capabilities options */
+ #define CL_SCAN_PARSE_ARCHIVE                       0x1
+diff --git a/libclamav/others.h b/libclamav/others.h
+index 4ebd16336e..c668370ae5 100644
+--- a/libclamav/others.h
++++ b/libclamav/others.h
+@@ -552,7 +552,8 @@ extern LIBCLAMAV_EXPORT int have_rar;
+ #define SCAN_HEURISTICS (ctx->options->general & CL_SCAN_GENERAL_HEURISTICS)
+ #define SCAN_HEURISTIC_PRECEDENCE (ctx->options->general & CL_SCAN_GENERAL_HEURISTIC_PRECEDENCE)
+ #define SCAN_UNPRIVILEGED (ctx->options->general & CL_SCAN_GENERAL_UNPRIVILEGED)
+-#define SCAN_STORE_HTML_URLS (ctx->options->general & CL_SCAN_GENERAL_STORE_HTML_URLS)
++#define SCAN_STORE_HTML_URIS (ctx->options->general & CL_SCAN_GENERAL_STORE_HTML_URIS)
++#define SCAN_STORE_PDF_URIS (ctx->options->general & CL_SCAN_GENERAL_STORE_PDF_URIS)
+ 
+ #define SCAN_PARSE_ARCHIVE (ctx->options->parse & CL_SCAN_PARSE_ARCHIVE)
+ #define SCAN_PARSE_ELF (ctx->options->parse & CL_SCAN_PARSE_ELF)
+diff --git a/libclamav/pdf.c b/libclamav/pdf.c
+index 1edf273e79..adcc423517 100644
+--- a/libclamav/pdf.c
++++ b/libclamav/pdf.c
+@@ -116,6 +116,7 @@ static void Colors_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfnam
+ static void RichMedia_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act);
+ static void AcroForm_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act);
+ static void XFA_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act);
++static void URI_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act);
+ 
+ /* End PDF statistics callbacks and related */
+ 
+@@ -1446,22 +1447,28 @@ static int pdf_scan_contents(int fd, struct pdf_struct *pdf, struct pdf_obj *obj
+ 
+ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t flags)
+ {
++    cl_error_t status = CL_SUCCESS;
++    cl_error_t ret;
++
+     char fullname[PATH_MAX + 1];
+-    int fout      = -1;
+-    size_t sum    = 0;
+-    cl_error_t rc = CL_SUCCESS;
+-    int dump      = 1;
++    bool extracted_an_object = false;
++    int fout                 = -1;
++    size_t sum               = 0;
++    bool dump                = true;
++    struct pdf_dict *dparams = NULL;
+ 
+     cli_dbgmsg("pdf_extract_obj: obj %u %u\n", obj->id >> 8, obj->id & 0xff);
+ 
+     if (PDF_OBJECT_RECURSION_LIMIT < pdf->parse_recursion_depth) {
+         cli_dbgmsg("pdf_extract_obj: Recursion limit reached.\n");
+-        return CL_SUCCESS;
++        status = CL_SUCCESS;
++        goto done;
+     }
+ 
+     if (obj->extracted) {
+         // Should not attempt to extract the same object more than once.
+-        return CL_SUCCESS;
++        status = CL_SUCCESS;
++        goto done;
+     }
+     // We're not done yet, but this is enough to say we've tried.
+     // Trying again won't help any.
+@@ -1471,28 +1478,38 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+         cli_dbgmsg("pdf_extract_obj: extracting obj found in objstm.\n");
+         if (obj->objstm->streambuf == NULL) {
+             cli_warnmsg("pdf_extract_obj: object in object stream has null stream buffer!\n");
+-            return CL_EFORMAT;
++            status = CL_EFORMAT;
++            goto done;
+         }
+     }
+ 
++    /* Check to see if this is a URI referenced from a prior URI object */
++    if (obj->flags & (1 << OBJ_URI)) {
++        URI_cb(pdf, obj, NULL);
++        status = CL_SUCCESS;
++        goto done;
++    }
++
+     /* TODO: call bytecode hook here, allow override dumpability */
+     if ((!(obj->flags & (1 << OBJ_STREAM)) || (obj->flags & (1 << OBJ_HASFILTERS))) && !(obj->flags & DUMP_MASK)) {
+         /* don't dump all streams */
+-        dump = 0;
++        dump = false;
+     }
+ 
+     if ((obj->flags & (1 << OBJ_IMAGE)) && !(obj->flags & (1 << OBJ_FILTER_DCT))) {
+         /* don't dump / scan non-JPG images */
+-        dump = 0;
++        dump = false;
+     }
+ 
+     if (obj->flags & (1 << OBJ_FORCEDUMP)) {
+         /* bytecode can force dump by setting this flag */
+-        dump = 1;
++        dump = true;
+     }
+ 
+-    if (!dump)
+-        return CL_CLEAN;
++    if (!dump) {
++        status = CL_SUCCESS;
++        goto done;
++    }
+ 
+     cli_dbgmsg("pdf_extract_obj: dumping obj %u %u\n", obj->id >> 8, obj->id & 0xff);
+ 
+@@ -1501,11 +1518,17 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+     if (fout < 0) {
+         char err[128];
+         cli_errmsg("pdf_extract_obj: can't create temporary file %s: %s\n", fullname, cli_strerror(errno, err, sizeof(err)));
+-
+-        return CL_ETMPFILE;
++        status = CL_ETMPFILE;
++        goto done;
+     }
+ 
++    extracted_an_object = true;
++
+     if (!(flags & PDF_EXTRACT_OBJ_SCAN)) {
++        /*
++         * When PDF_EXTRACT_OBJ_SCAN is not set, this function is used to extract the object to a temp file
++         * and so we need to save off the path in obj->path for the caller to use.
++         */
+         if (NULL != obj->path) {
+             obj->path = strdup(fullname);
+         }
+@@ -1525,7 +1548,6 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+         int dict_len = obj->stream - start; /* Dictionary should end where the stream begins */
+ 
+         const char *pstr;
+-        struct pdf_dict *dparams     = NULL;
+         struct objstm_struct *objstm = NULL;
+         int xref                     = 0;
+ 
+@@ -1582,7 +1604,10 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+             length = obj->stream_size;
+             if (0 == length) {
+                 cli_dbgmsg("pdf_extract_obj: Alleged or calculated stream length and stream buffer size both 0\n");
+-                goto done; /* Empty stream, nothing to scan */
++
++                /* Empty stream, nothing to scan */
++                status = CL_SUCCESS;
++                goto done;
+             }
+         }
+ 
+@@ -1647,15 +1672,15 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+                 pdf->objstms = cli_max_realloc_or_free(pdf->objstms, sizeof(struct objstm_struct *) * pdf->nobjstms);
+                 if (!pdf->objstms) {
+                     cli_warnmsg("pdf_extract_obj: out of memory parsing object stream (%u)\n", pdf->nobjstms);
+-                    pdf_free_dict(dparams);
+-                    return CL_EMEM;
++                    status = CL_EMEM;
++                    goto done;
+                 }
+ 
+                 objstm = malloc(sizeof(struct objstm_struct));
+                 if (!objstm) {
+                     cli_warnmsg("pdf_extract_obj: out of memory parsing object stream (%u)\n", pdf->nobjstms);
+-                    pdf_free_dict(dparams);
+-                    return CL_EMEM;
++                    status = CL_EMEM;
++                    goto done;
+                 }
+                 pdf->objstms[pdf->nobjstms - 1] = objstm;
+ 
+@@ -1673,18 +1698,18 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+             }
+         }
+ 
+-        sum = pdf_decodestream(pdf, obj, dparams, obj->stream, (uint32_t)length, xref, fout, &rc, objstm);
+-        if ((CL_SUCCESS != rc) && (CL_VIRUS != rc)) {
+-            cli_dbgmsg("Error decoding stream! Error code: %d\n", rc);
++        sum = pdf_decodestream(pdf, obj, dparams, obj->stream, (uint32_t)length, xref, fout, &status, objstm);
++        if ((CL_SUCCESS != status) && (CL_VIRUS != status)) {
++            cli_dbgmsg("Error decoding stream! Error code: %d\n", status);
+ 
+             /* It's ok if we couldn't decode the stream,
+              *   make a best effort to keep parsing...
+              *   Unless we were unable to allocate memory.*/
+-            if (CL_EMEM == rc) {
+-                goto really_done;
++            if (CL_EMEM == status) {
++                goto done;
+             }
+-            if (CL_EPARSE == rc) {
+-                rc = CL_SUCCESS;
++            if (CL_EPARSE == status) {
++                status = CL_SUCCESS;
+             }
+ 
+             if (NULL != objstm) {
+@@ -1713,7 +1738,8 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+ 
+                             if (!pdf->objstms) {
+                                 cli_warnmsg("pdf_extract_obj: out of memory when shrinking down objstm array\n");
+-                                return CL_EMEM;
++                                status = CL_EMEM;
++                                goto done;
+                             }
+                         }
+                     } else {
+@@ -1724,11 +1750,13 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+             }
+         }
+ 
+-        if (dparams)
++        if (dparams) {
+             pdf_free_dict(dparams);
++            dparams = NULL;
++        }
+ 
+-        if (rc == CL_VIRUS) {
+-            sum = 0; /* prevents post-filter scan */
++        if (status == CL_VIRUS) {
++            /* skip post-filter scan */
+             goto done;
+         }
+ 
+@@ -1741,7 +1769,7 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+         off_t bytesleft = obj->size;
+ 
+         if (bytesleft < 0) {
+-            goto done;
++            goto scan_extracted_objects;
+         }
+ 
+         do {
+@@ -1789,7 +1817,7 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+                 pdf->stats.njs++;
+ 
+                 if (filter_writen(pdf, obj, fout, out, js_len, (size_t *)&sum) != js_len) {
+-                    rc = CL_EWRITE;
++                    status = CL_EWRITE;
+                     free(js);
+                     break;
+                 }
+@@ -1824,64 +1852,81 @@ cl_error_t pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t
+         off_t bytesleft = obj->size;
+ 
+         if (bytesleft < 0)
+-            rc = CL_EFORMAT;
++            status = CL_EFORMAT;
+         else {
+             if (obj->objstm) {
+-                if (filter_writen(pdf, obj, fout, obj->objstm->streambuf + obj->start, bytesleft, (size_t *)&sum) != (size_t)bytesleft)
+-                    rc = CL_EWRITE;
++                if (filter_writen(pdf, obj, fout, obj->objstm->streambuf + obj->start, bytesleft, (size_t *)&sum) != (size_t)bytesleft) {
++                    status = CL_EWRITE;
++                }
+             } else {
+-                if (filter_writen(pdf, obj, fout, pdf->map + obj->start, bytesleft, (size_t *)&sum) != (size_t)bytesleft)
+-                    rc = CL_EWRITE;
++                if (filter_writen(pdf, obj, fout, pdf->map + obj->start, bytesleft, (size_t *)&sum) != (size_t)bytesleft) {
++                    status = CL_EWRITE;
++                }
+             }
+         }
+     }
+ 
+-done:
++scan_extracted_objects:
+ 
+     cli_dbgmsg("pdf_extract_obj: extracted %td bytes %u %u obj\n", sum, obj->id >> 8, obj->id & 0xff);
+     cli_dbgmsg("pdf_extract_obj:         ... to %s\n", fullname);
+ 
+-    if (flags & PDF_EXTRACT_OBJ_SCAN && sum) {
+-        int rc2;
++    if ((flags & PDF_EXTRACT_OBJ_SCAN) && (sum > 0)) {
++        /*
++         * Scan the extracted objects for potential threats.
++         * PDF_EXTRACT_OBJ_SCAN is used when the extracted object should be scanned and then deleted.
++         */
+ 
+         /* TODO: invoke bytecode on this pdf obj with metainformation associated */
+         lseek(fout, 0, SEEK_SET);
+-        rc2 = cli_magic_scan_desc(fout, fullname, pdf->ctx, NULL, LAYER_ATTRIBUTES_NONE);
+-        if (rc2 != CL_SUCCESS) {
+-            rc = rc2;
+-            goto really_done;
++        ret = cli_magic_scan_desc(fout, fullname, pdf->ctx, NULL, LAYER_ATTRIBUTES_NONE);
++        if (ret != CL_SUCCESS) {
++            status = ret;
++            goto done;
+         }
+ 
+-        if ((rc == CL_CLEAN) || (rc == CL_VIRUS)) {
+-            rc2 = run_pdf_hooks(pdf, PDF_PHASE_POSTDUMP, fout);
+-            if (rc2 == CL_VIRUS) {
+-                rc = rc2;
+-                goto really_done;
++        if ((status == CL_CLEAN) || (status == CL_VIRUS)) {
++            ret = run_pdf_hooks(pdf, PDF_PHASE_POSTDUMP, fout);
++            if (ret == CL_VIRUS) {
++                status = ret;
++                goto done;
+             }
+         }
+ 
+-        if (((rc == CL_CLEAN) || (rc == CL_VIRUS)) && (obj->flags & (1 << OBJ_CONTENTS))) {
++        if (((status == CL_CLEAN) || (status == CL_VIRUS)) && (obj->flags & (1 << OBJ_CONTENTS))) {
+             lseek(fout, 0, SEEK_SET);
+             cli_dbgmsg("pdf_extract_obj: dumping contents from obj %u %u\n", obj->id >> 8, obj->id & 0xff);
+ 
+-            rc2 = pdf_scan_contents(fout, pdf, obj);
+-            if (rc2 != CL_SUCCESS) {
+-                rc = rc2;
+-                goto really_done;
++            ret = pdf_scan_contents(fout, pdf, obj);
++            if (ret != CL_SUCCESS) {
++                status = ret;
++                goto done;
+             }
+         }
+     }
+ 
+-really_done:
+-    close(fout);
++done:
+ 
+-    if (CL_EMEM != rc) {
+-        if (flags & PDF_EXTRACT_OBJ_SCAN && !pdf->ctx->engine->keeptmp)
+-            if (cli_unlink(fullname) && rc != CL_VIRUS)
+-                rc = CL_EUNLINK;
++    if (NULL != dparams) {
++        pdf_free_dict(dparams);
+     }
+ 
+-    return rc;
++    if (-1 != fout) {
++        close(fout);
++    }
++
++    if (extracted_an_object && (flags & PDF_EXTRACT_OBJ_SCAN) && !pdf->ctx->engine->keeptmp) {
++        /*
++         * When PDF_EXTRACT_OBJ_SCAN is set, the goal is to extract, scan, and delete it.
++         * If it was not set, we would keep it and the path is passed back obj->path for the caller to use.
++         * That's why we wouldn't unlink it here.
++         */
++        if (cli_unlink(fullname) && status != CL_VIRUS) {
++            status = CL_EUNLINK;
++        }
++    }
++
++    return status;
+ }
+ 
+ enum objstate {
+@@ -1893,6 +1938,7 @@ enum objstate {
+     STATE_LINEARIZED,
+     STATE_LAUNCHACTION,
+     STATE_CONTENTS,
++    STATE_URI,
+     STATE_ANY /* for actions table below */
+ };
+ 
+@@ -1954,7 +2000,8 @@ static struct pdfname_action pdfname_actions[] = {
+     {"Colors", OBJ_DICT, STATE_NONE, STATE_NONE, NAMEFLAG_NONE, Colors_cb},
+     {"RichMedia", OBJ_DICT, STATE_NONE, STATE_NONE, NAMEFLAG_NONE, RichMedia_cb},
+     {"AcroForm", OBJ_DICT, STATE_NONE, STATE_NONE, NAMEFLAG_NONE, AcroForm_cb},
+-    {"XFA", OBJ_DICT, STATE_NONE, STATE_NONE, NAMEFLAG_NONE, XFA_cb}};
++    {"XFA", OBJ_DICT, STATE_NONE, STATE_NONE, NAMEFLAG_NONE, XFA_cb},
++    {"URI", OBJ_DICT, STATE_NONE, STATE_URI, NAMEFLAG_NONE, URI_cb}};
+ 
+ #define KNOWN_FILTERS ((1 << OBJ_FILTER_AH) | (1 << OBJ_FILTER_RL) | (1 << OBJ_FILTER_A85) | (1 << OBJ_FILTER_FLATE) | (1 << OBJ_FILTER_LZW) | (1 << OBJ_FILTER_FAX) | (1 << OBJ_FILTER_DCT) | (1 << OBJ_FILTER_JPX) | (1 << OBJ_FILTER_CRYPT))
+ 
+@@ -1963,12 +2010,24 @@ static void handle_pdfname(struct pdf_struct *pdf, struct pdf_obj *obj, const ch
+     struct pdfname_action *act = NULL;
+     unsigned j;
+ 
++    // If we process STATE_S we will get duplicate URIs from the prior STATE_NONE
++    if (!strcmp(pdfname, "URI") && *state == STATE_S) {
++        *state = STATE_NONE;
++        return;
++    }
++
+     obj->statsflags |= OBJ_FLAG_PDFNAME_DONE;
+ 
+-    for (j = 0; j < sizeof(pdfname_actions) / sizeof(pdfname_actions[0]); j++) {
+-        if (!strcmp(pdfname, pdfname_actions[j].pdfname)) {
+-            act = &pdfname_actions[j];
+-            break;
++    // Check to see if this object was observed to be a reference to a URI
++    if (obj->flags & (1 << OBJ_URI)) {
++        act = &(struct pdfname_action){"URI", OBJ_DICT, STATE_ANY, STATE_URI, NAMEFLAG_NONE, URI_cb};
++    }
++    if (!act) {
++        for (j = 0; j < sizeof(pdfname_actions) / sizeof(pdfname_actions[0]); j++) {
++            if (!strcmp(pdfname, pdfname_actions[j].pdfname)) {
++                act = &pdfname_actions[j];
++                break;
++            }
+         }
+     }
+ 
+@@ -2101,7 +2160,7 @@ static void pdf_parse_trailer(struct pdf_struct *pdf, const char *s, long length
+ void pdf_parseobj(struct pdf_struct *pdf, struct pdf_obj *obj)
+ {
+     /* enough to hold common pdf names, we don't need all the names */
+-    char pdfname[64];
++    char pdfname[64] = {0};
+     const char *q2, *q3;
+     const char *nextobj = NULL, *nextopen = NULL, *nextclose = NULL;
+     const char *q    = NULL;
+@@ -2382,7 +2441,10 @@ void pdf_parseobj(struct pdf_struct *pdf, struct pdf_obj *obj)
+ 
+         if (objstate == STATE_LAUNCHACTION)
+             pdfobj_flag(pdf, obj, HAS_LAUNCHACTION);
+-        if (dict_length > 0 && (objstate == STATE_JAVASCRIPT || objstate == STATE_OPENACTION || objstate == STATE_CONTENTS)) {
++        if (dict_length > 0 && (objstate == STATE_JAVASCRIPT ||
++                                objstate == STATE_OPENACTION ||
++                                objstate == STATE_CONTENTS ||
++                                objstate == STATE_URI)) {
+             off_t dict_remaining = dict_length;
+ 
+             if (objstate == STATE_OPENACTION)
+@@ -2447,6 +2509,9 @@ void pdf_parseobj(struct pdf_struct *pdf, struct pdf_obj *obj)
+                                 case STATE_CONTENTS:
+                                     flag = OBJ_CONTENTS;
+                                     break;
++                                case STATE_URI:
++                                    flag = OBJ_URI;
++                                    break;
+                                 default:
+                                     cli_dbgmsg("pdf_parseobj: Unexpected object type\n");
+                                     return;
+@@ -4669,6 +4734,78 @@ static void Colors_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfnam
+     cli_jsonint_array(colorsobj, obj->id >> 8);
+ }
+ 
++static void URI_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
++{
++    cli_ctx *ctx         = NULL;
++    off_t bytesleft      = 0;
++    char *uri_start      = NULL;
++    char *uri_heap       = NULL;
++    const char *objstart = NULL;
++    json_object *uriarr  = NULL;
++
++    UNUSEDPARAM(act);
++
++    if (!(pdf) || !(pdf->ctx) || !(pdf->ctx->wrkproperty) || !obj) {
++        return;
++    }
++
++    objstart = (obj->objstm) ? (const char *)(obj->start + obj->objstm->streambuf)
++                             : (const char *)(obj->start + pdf->map);
++    ctx      = pdf->ctx;
++
++    if (!(SCAN_COLLECT_METADATA) || !(SCAN_STORE_PDF_URIS)) {
++        return;
++    }
++
++    if (obj->size == 0) {
++        return;
++    }
++
++    if (obj->objstm) {
++        bytesleft = MIN(obj->size, obj->objstm->streambuf_len - obj->start);
++    } else {
++        bytesleft = MIN(obj->size, pdf->size - obj->start);
++    }
++
++    // Advance forward to the first '(' character
++    size_t start = 0;
++    while (bytesleft > 0 && objstart[start] != '(') {
++        start++;
++        bytesleft--;
++    }
++    if (bytesleft == 0) {
++        return;
++    }
++    // The first character past '(' is the start of the URI
++    uri_start = (char *)(objstart + start + 1);
++    bytesleft--;
++
++    // Advance forward to the first ')' character
++    size_t end = 0;
++    while (bytesleft > 0 && uri_start[end] != ')') {
++        end++;
++        bytesleft--;
++    }
++    if (uri_start[end] != ')') {
++        return;
++    }
++
++    // Create a new string containing only the URI
++    CLI_MAX_MALLOC_OR_GOTO_DONE(uri_heap, end + 1,
++                                cli_errmsg("cli_pdf: malloc() failed (URI)\n"));
++    strncpy(uri_heap, uri_start, end);
++    uri_heap[end] = '\0';
++
++    uriarr = cli_jsonarray(pdf->ctx->wrkproperty, "URIs");
++    if (!uriarr) {
++        cli_errmsg("cli_pdf: malloc() failed (URI array)\n");
++        goto done;
++    }
++    cli_jsonstr(uriarr, NULL, uri_heap);
++done:
++    free(uri_heap);
++}
++
+ static void pdf_free_stats(struct pdf_struct *pdf)
+ {
+ 
+diff --git a/libclamav/scanners.c b/libclamav/scanners.c
+index b32eeeca0a..44bccdc16a 100644
+--- a/libclamav/scanners.c
++++ b/libclamav/scanners.c
+@@ -2082,7 +2082,7 @@ static cl_error_t cli_ole2_tempdir_scan_for_xlm_and_images(const char *dir, cli_
+     return ret;
+ }
+ 
+-const char *const HTML_URLS_JSON_KEY = "HTMLUrls";
++const char *const HTML_URIS_JSON_KEY = "URIs";
+ /* https://www.iana.org/assignments/uri-schemes/uri-schemes.xhtml  */
+ const char *URI_LIST[] = {
+     "aaa://",
+@@ -2495,7 +2495,7 @@ static void save_urls(cli_ctx *ctx, tag_arguments_t *hrefs, form_data_t *form_da
+         return;
+     }
+ 
+-    if (!(SCAN_STORE_HTML_URLS && SCAN_COLLECT_METADATA && (ctx->wrkproperty != NULL))) {
++    if (!(SCAN_STORE_HTML_URIS && SCAN_COLLECT_METADATA && (ctx->wrkproperty != NULL))) {
+         return;
+     }
+ 
+@@ -2503,9 +2503,9 @@ static void save_urls(cli_ctx *ctx, tag_arguments_t *hrefs, form_data_t *form_da
+     for (i = 0; i < hrefs->count; i++) {
+         if (is_url((const char *)hrefs->value[i], strlen((const char *)hrefs->value[i]))) {
+             if (NULL == ary) {
+-                ary = cli_jsonarray(ctx->wrkproperty, HTML_URLS_JSON_KEY);
++                ary = cli_jsonarray(ctx->wrkproperty, HTML_URIS_JSON_KEY);
+                 if (!ary) {
+-                    cli_dbgmsg("[cli_scanhtml] Failed to add \"%s\" entry JSON array\n", HTML_URLS_JSON_KEY);
++                    cli_dbgmsg("[cli_scanhtml] Failed to add \"%s\" entry JSON array\n", HTML_URIS_JSON_KEY);
+                     return;
+                 }
+             }
+@@ -2517,9 +2517,9 @@ static void save_urls(cli_ctx *ctx, tag_arguments_t *hrefs, form_data_t *form_da
+     for (i = 0; i < (int)form_data->count; i++) {
+         if (is_url((const char *)form_data->urls[i], strlen((const char *)form_data->urls[i]))) {
+             if (NULL == ary) {
+-                ary = cli_jsonarray(ctx->wrkproperty, HTML_URLS_JSON_KEY);
++                ary = cli_jsonarray(ctx->wrkproperty, HTML_URIS_JSON_KEY);
+                 if (!ary) {
+-                    cli_dbgmsg("[cli_scanhtml] Failed to add \"%s\" entry JSON array\n", HTML_URLS_JSON_KEY);
++                    cli_dbgmsg("[cli_scanhtml] Failed to add \"%s\" entry JSON array\n", HTML_URIS_JSON_KEY);
+                     return;
+                 }
+             }
+@@ -2560,7 +2560,7 @@ static cl_error_t cli_scanhtml(cli_ctx *ctx)
+     cli_dbgmsg("cli_scanhtml: using tempdir %s\n", tempname);
+ 
+     /* Output JSON Summary Information */
+-    if (SCAN_STORE_HTML_URLS && SCAN_COLLECT_METADATA && (ctx->wrkproperty != NULL)) {
++    if (SCAN_STORE_HTML_URIS && SCAN_COLLECT_METADATA && (ctx->wrkproperty != NULL)) {
+         tag_arguments_t hrefs = {0};
+         hrefs.scanContents    = 1;
+         form_data_t form_data = {0};
+@@ -4311,7 +4311,7 @@ static cl_error_t scanraw(cli_ctx *ctx, cli_file_t type, uint8_t typercg, cli_fi
+                         free_duplicate_fmap(new_map);
+                     }
+                 } // end check for embedded files
+-            }     // end if (fpt->offset > 0)
++            } // end if (fpt->offset > 0)
+ 
+             if ((nret == CL_EMEM) ||
+                 (ctx->abort_scan) ||
+diff --git a/unit_tests/clamscan/save_html_urls_test.py b/unit_tests/clamscan/save_html_uris_test.py
+similarity index 88%
+rename from unit_tests/clamscan/save_html_urls_test.py
+rename to unit_tests/clamscan/save_html_uris_test.py
+index d7e0993bf4..6ffeddd099 100644
+--- a/unit_tests/clamscan/save_html_urls_test.py
++++ b/unit_tests/clamscan/save_html_uris_test.py
+@@ -39,7 +39,7 @@ def test_save_links(self):
+ 
+         tempdir=self.path_tmp / "TD"
+         if not os.path.isdir(tempdir):
+-            os.makedirs(tempdir);
++            os.makedirs(tempdir)
+ 
+         testfile = TC.path_source / 'unit_tests' / 'input' / 'other_scanfiles' / 'html' / 'index.html'
+         command = '{valgrind} {valgrind_args} {clamscan} -d {path_db} --gen-json --leave-temps --tempdir={tempdir} {testfile}'.format(
+@@ -52,8 +52,9 @@ def test_save_links(self):
+ 
+         assert output.ec == 0  # clean
+ 
+-        expected_strings = [ 'HTMLUrls'
+-                , '"https://www.clamav.net/reports/malware"'
+-                , '"http://www.google.com"'
+-                ]
++        expected_strings = [
++            'URIs',
++            '"https://www.clamav.net/reports/malware"',
++            '"http://www.google.com"'
++        ]
+         self.verify_metadata_json(tempdir, expected_strings)
+diff --git a/unit_tests/clamscan/save_pdf_uris_test.py b/unit_tests/clamscan/save_pdf_uris_test.py
+new file mode 100644
+index 0000000000..df6466fe25
+--- /dev/null
++++ b/unit_tests/clamscan/save_pdf_uris_test.py
+@@ -0,0 +1,85 @@
++# Copyright (C) 2020-2025 Cisco Systems, Inc. and/or its affiliates. All rights reserved.
++
++"""
++Run clamscan tests.
++"""
++
++import sys
++import os
++import re
++import shutil
++
++sys.path.append('../unit_tests')
++import testcase
++
++
++class TC(testcase.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        super(TC, cls).setUpClass()
++
++    @classmethod
++    def tearDownClass(cls):
++        super(TC, cls).tearDownClass()
++
++    def setUp(self):
++        super(TC, self).setUp()
++
++    def tearDown(self):
++        super(TC, self).tearDown()
++
++        # Remove scan temps directory between tests
++        if (self.path_tmp / "TD").exists():
++            shutil.rmtree(self.path_tmp / "TD")
++
++        self.verify_valgrind_log()
++
++    def test_save_links(self):
++        self.step_name('Extract Links')
++
++        tempdir=self.path_tmp / "TD"
++        if not os.path.isdir(tempdir):
++            os.makedirs(tempdir)
++
++        testfile = TC.path_source / 'unit_tests' / 'input' / 'other_scanfiles' / 'pdf' / 'uri-and-ref.pdf'
++        command = '{valgrind} {valgrind_args} {clamscan} -d {path_db} --gen-json --leave-temps --tempdir={tempdir} {testfile}'.format(
++            valgrind=TC.valgrind, valgrind_args=TC.valgrind_args, clamscan=TC.clamscan,
++            path_db=TC.path_source / 'unit_tests' / 'input' / 'other_sigs' / 'Clamav-Unit-Test-Signature.ndb',
++            tempdir=tempdir,
++            testfile=testfile,
++        )
++        output = self.execute_command(command)
++
++        assert output.ec == 0  # clean
++
++        expected_strings = [
++            'URIs',
++            '"https://docs.clamav.net/manual/Development.html"',
++            '"https://docs.clamav.net/"'
++        ]
++        self.verify_metadata_json(tempdir, expected_strings)
++
++    def test_out_of_order_links(self):
++        self.step_name('Out-of-Order Links')
++
++        tempdir=self.path_tmp / "TD"
++        if not os.path.isdir(tempdir):
++            os.makedirs(tempdir)
++
++        testfile = TC.path_source / 'unit_tests' / 'input' / 'other_scanfiles' / 'pdf' / 'out-of-order.pdf'
++        command = '{valgrind} {valgrind_args} {clamscan} -d {path_db} --gen-json --leave-temps --tempdir={tempdir} {testfile}'.format(
++            valgrind=TC.valgrind, valgrind_args=TC.valgrind_args, clamscan=TC.clamscan,
++            path_db=TC.path_source / 'unit_tests' / 'input' / 'other_sigs' / 'Clamav-Unit-Test-Signature.ndb',
++            tempdir=tempdir,
++            testfile=testfile,
++        )
++        output = self.execute_command(command)
++
++        assert output.ec == 0  # clean
++
++        expected_strings = [
++            'URIs',
++            '"https://docs.clamav.net/manual/Development.html"',
++            '"https://docs.clamav.net/"'
++        ]
++        self.verify_metadata_json(tempdir, expected_strings)
+diff --git a/unit_tests/input/other_scanfiles/pdf/out-of-order.pdf b/unit_tests/input/other_scanfiles/pdf/out-of-order.pdf
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a1317a03101a2de368fb32c0e6b519dc58d7191
+GIT binary patch
+literal 831
+zcmZ`&O;5ux487-9_%ewdSlX`L2SSs8F$n=;>fnSpgf47_HklF+0lyx*Tep>o^wQYx
+zJwH21YdW5shMic15P*Gs7w6|7AHP=`<ds5I*oBY}Yb<i3Jw${_g`BDdZMxNFG!oj(
+znaIh8Kur_!%B~GUAogG;H^3WFA#d}!hi8ac9A0W_ctGXUF_m38O;t9w<h`Ef>e7CZ
+zRzP1bjG#Y^Hi`xb=po@6LZ;f=wacg@Zhh)(Hq!__P68R;dyY89l~0z4D}N^C+-AO$
+z6{=L99ivgUce6M&`IO$kzm!s$wJPLTf9k@nN;1}2Vp+6>oPlKKL47vd?EE6b+#0B{
+z6``_OS>GPaA?;3^1umhRu&zg^RSA5Yr=@Zqxmkc+X{XRS55(R8>Za=UpJ__t35{~A
+z|K;?X2%s;5-GW|{Pz?&#YY5dJm|dt(Gvc)mh2aq@><|8;qTvy$J2=vcV><Sxd_17L
+t(F`RC4QCrdr}9F(>H*C1A59I()LI0787bcbkIG@yZ5#|lt9AV_`2{i5-D>~<
+
+literal 0
+HcmV?d00001
+
+diff --git a/unit_tests/input/other_scanfiles/pdf/uri-and-ref.pdf b/unit_tests/input/other_scanfiles/pdf/uri-and-ref.pdf
+new file mode 100644
+index 0000000000000000000000000000000000000000..739fe2c71b6a4b54bdae4fda8250ce62265f04c0
+GIT binary patch
+literal 831
+zcmZ`&-A}?W5P$DqaW5qDAl=5shcP57k{C6Rp-;w#Ix0-Jmb8aa|9bC+117P1*{;8@
+zyRNO-cybzcVi7_B_T^2SpM!k(T5FJ33RPj3LQXeW<VJgl2$KpqQ%m~jRv)90&}P9z
+z-fRfeG$F6-#vlY@4`y-$ycHGlHeYynf|$kOxu%8(RNgwKaw@0EWgAQ0>qV|E?I&pk
+z^z_0A`on0eXpn#&67~=>)!uGgMjdhMGiS58M(FV-P~d&$=+OBwy@8Vz;@Y1{xv-h<
+zWQ8i#N5^QCr7{~;$g%#=g<Y5A)>&a$w1u35Wafb=r)aiwkzsBP)Yys;?ef&q<^uEn
+z4biR-=Fs6zn<cKGn{Wh=POB35I8RIE-gC1AyVg#jbsorQ3#fH!$0wT7ctWH6jq>UA
+zs|cVkg582%l8^_L>otVx4a~08r*ZPym%{J}74`>zQPJ=S)g2sZ#W5XwQ$8NhztJou
+q2@U7Bgihs!cGU%#=iizdlBu-_d^1x14?HS|Rkv|45Utkrbn*kMSlw#?
+
+literal 0
+HcmV?d00001
+
+diff --git a/win32/conf_examples/clamd.conf.sample b/win32/conf_examples/clamd.conf.sample
+index 580afe0ea9..17a4a16258 100644
+--- a/win32/conf_examples/clamd.conf.sample
++++ b/win32/conf_examples/clamd.conf.sample
+@@ -226,11 +226,17 @@ TCPAddr localhost
+ # Default: no
+ #GenerateMetadataJson yes
+ 
+-# Store URLs found in html files to the json metadata.
+-# URLs will be stored in an array with the tag 'HTMLUrls'
++# Store URIs found in html files to the json metadata.
++# URIs will be stored in an array with the tag 'URIs'
+ # GenerateMetadataJson is required for this feature.
+ # Default: yes (if GenerateMetadataJson is used)
+-#JsonStoreHTMLUrls no
++#JsonStoreHTMLURIs no
++
++# Store URIs found in pdf files to the json metadata.
++# URIs will be stored in an array with the tag 'URIs'
++# GenerateMetadataJson is required for this feature.
++# Default: yes (if GenerateMetadataJson is used)
++#JsonStorePDFURIs no
+ 
+ # Permit use of the ALLMATCHSCAN command. If set to no, clamd will reject
+ # any ALLMATCHSCAN command as invalid.
+
+From f0289f0b905494a1de7a5974745b611d62cdd171 Mon Sep 17 00:00:00 2001
+From: John Humlick <15677335+jhumlick@users.noreply.github.com>
+Date: Fri, 30 May 2025 12:41:45 -0700
+Subject: [PATCH 2/2] libclamav: Fix compiler error on some Apple systems.
+
+clamav_dbload_fuzzer.cpp and clamav_scanfile_fuzzer.cpp use __pid_t, which some
+Apple systems do not define, and this causes a compilation error. This change
+defines __pid_t as pid_t, which does exist on those systems and allows clamav
+to build.
+---
+ fuzz/clamav_dbload_fuzzer.cpp   | 5 +++++
+ fuzz/clamav_scanfile_fuzzer.cpp | 5 +++++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/fuzz/clamav_dbload_fuzzer.cpp b/fuzz/clamav_dbload_fuzzer.cpp
+index 50ee7f4273..750df5951b 100644
+--- a/fuzz/clamav_dbload_fuzzer.cpp
++++ b/fuzz/clamav_dbload_fuzzer.cpp
+@@ -37,6 +37,11 @@
+ 
+ #include "clamav.h"
+ 
++/* Apple does not define __pid_t */
++#ifdef __APPLE__
++typedef pid_t __pid_t;
++#endif
++
+ void clamav_message_callback(enum cl_msg severity, const char* fullmsg,
+                              const char* msg, void* context)
+ {
+diff --git a/fuzz/clamav_scanfile_fuzzer.cpp b/fuzz/clamav_scanfile_fuzzer.cpp
+index 53a5f01955..86ba78ad36 100644
+--- a/fuzz/clamav_scanfile_fuzzer.cpp
++++ b/fuzz/clamav_scanfile_fuzzer.cpp
+@@ -38,6 +38,11 @@
+ 
+ #include "clamav.h"
+ 
++/* Apple does not define __pid_t */
++#ifdef __APPLE__
++typedef pid_t __pid_t;
++#endif
++
+ void clamav_message_callback(enum cl_msg severity, const char* fullmsg,
+                              const char* msg, void* context)
+ {

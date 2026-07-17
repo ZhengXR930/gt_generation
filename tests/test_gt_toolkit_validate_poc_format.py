@@ -32,8 +32,8 @@ def _base_gt() -> dict:
             "original_source": "test",
             "normalized": "normalized report",
         },
-        "source": loc,
-        "sink": loc,
+        "source": {**loc, "trace_step": 1},
+        "sink": {**loc, "trace_step": 2},
         "reachability_checkpoints": {
             "parser_admitted": {
                 "file": "parser.c",
@@ -52,7 +52,6 @@ def _base_gt() -> dict:
                 "step": 1,
                 "file": "parser.c",
                 "function": "parse",
-                "role": "sink",
                 "summary": "summary",
             }
         ],
@@ -62,7 +61,6 @@ def _base_gt() -> dict:
                 "file": "parser.c",
                 "function": "parse",
                 "line": 10,
-                "role": "source",
                 "var": "len",
                 "code": "len = input[0]",
                 "note": "note",
@@ -72,7 +70,6 @@ def _base_gt() -> dict:
                 "file": "parser.c",
                 "function": "parse",
                 "line": 10,
-                "role": "sink",
                 "var": "len",
                 "code": "buf[len]",
                 "note": "note",
@@ -80,6 +77,7 @@ def _base_gt() -> dict:
         ],
         "root_cause": {
             **loc,
+            "trace_step": 2,
             "description": "Missing bounds check before sink.",
         },
         "sanitizer_ground_truth": {
@@ -158,3 +156,15 @@ def test_poc_format_contract_is_required(tmp_path: Path) -> None:
 
     assert result["ok"] is False
     assert "poc.format missing contract" in result["errors"]
+
+
+def test_trace_semantic_labels_are_rejected(tmp_path: Path) -> None:
+    gt = _base_gt()
+    gt["coarse_trace"][0]["role"] = "source_and_parse"
+    gt["fine_trace"][0]["kind"] = "input_materialization"
+
+    result = _run_validate(gt, tmp_path)
+
+    assert result["ok"] is False
+    assert "coarse_trace[0] must not contain role or kind" in result["errors"]
+    assert "fine_trace[0] must not contain role or kind" in result["errors"]

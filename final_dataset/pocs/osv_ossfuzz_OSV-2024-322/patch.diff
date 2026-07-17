@@ -1,0 +1,168 @@
+diff --git a/src/common/http.cc b/src/common/http.cc
+index d4293605f..92ebab735 100644
+--- a/src/common/http.cc
++++ b/src/common/http.cc
+@@ -17,6 +17,7 @@
+ #include <pistache/peer.h>
+ #include <pistache/transport.h>
+ 
++#include <charconv>
+ #include <cstring>
+ #include <ctime>
+ #include <iomanip>
+@@ -288,9 +289,12 @@ namespace Pistache::Http
+             if (!match_until(' ', cursor))
+                 return State::Again;
+ 
+-            char* end;
+-            auto code = strtol(codeToken.rawText(), &end, 10);
+-            if (*end != ' ')
++            int code               = 0;
++            const char* beg        = codeToken.rawText();
++            const char* end        = codeToken.rawText() + codeToken.size();
++            const auto parseResult = std::from_chars(beg, end, code);
++
++            if (parseResult.ec != std::errc {} || *parseResult.ptr != ' ')
+                 raise("Failed to parse return code");
+             response->code_ = static_cast<Http::Code>(code);
+ 
+@@ -456,10 +460,13 @@ namespace Pistache::Http
+                     if (!cursor.advance(1))
+                         return Incomplete;
+ 
+-                char* end;
+-                const char* raw = chunkSize.rawText();
+-                auto sz         = std::strtol(raw, &end, 16);
+-                if (*end != '\r')
++                const char* raw { chunkSize.rawText() };
++                const auto* end { chunkSize.rawText() + chunkSize.size() };
++
++                size_t sz              = 0;
++                const auto parseResult = std::from_chars(raw, end, sz, 16);
++
++                if (parseResult.ec != std::errc {} || *parseResult.ptr != '\r')
+                     throw std::runtime_error("Invalid chunk size");
+ 
+                 // CRLF
+diff --git a/src/common/http_header.cc b/src/common/http_header.cc
+index 6282eb627..9e6aa21c8 100644
+--- a/src/common/http_header.cc
++++ b/src/common/http_header.cc
+@@ -18,6 +18,7 @@
+ #include <pistache/stream.h>
+ 
+ #include <algorithm>
++#include <charconv>
+ #include <cstring>
+ #include <iostream>
+ #include <iterator>
+@@ -221,13 +222,20 @@ namespace Pistache::Http::Header
+                                 "Invalid caching directive, missing delta-seconds");
+                         }
+ 
+-                        char* end;
+                         const char* beg = cursor.offset();
+-                        // @Security: if str is not \0 terminated, there might be a situation
+-                        // where strtol can overflow. Double-check that it's harmless and fix
+-                        // if not
+-                        auto secs = strtol(beg, &end, 10);
+-                        cursor.advance(end - beg);
++                        const char* end = cursor.offset() + cursor.remaining();
++
++                        std::uint64_t secs     = 0;
++                        const auto parseResult = std::from_chars(beg, end, secs);
++
++                        if (parseResult.ec != std::errc {})
++                        {
++                            throw std::runtime_error(
++                                "Invalid caching directive, malformated delta-seconds");
++                        }
++
++                        cursor.advance(parseResult.ptr - beg);
++
+                         if (!cursor.eof() && cursor.current() != ',')
+                         {
+                             throw std::runtime_error(
+diff --git a/tests/fuzzers/fuzz_parser.cpp b/tests/fuzzers/fuzz_parser.cpp
+index c3e984ee9..7bfd981c8 100644
+--- a/tests/fuzzers/fuzz_parser.cpp
++++ b/tests/fuzzers/fuzz_parser.cpp
+@@ -86,6 +86,21 @@ void fuzz_request_parser(const std::string& input)
+     }
+ }
+ 
++void fuzz_response_parser(const std::string& input)
++{
++    constexpr size_t maxDataSize = 4096;
++    Pistache::Http::ResponseParser rparser(maxDataSize);
++
++    if (rparser.feed(input.data(), input.size()))
++    {
++        auto state = Pistache::Http::Private::State::Done;
++        ignoreExceptions([&] { state = rparser.parse(); });
++
++        if (state == Pistache::Http::Private::State::Again)
++            ignoreExceptions([&] { rparser.parse(); });
++    }
++}
++
+ void fuzz_router(const std::string& input)
+ {
+     std::string path_input;
+@@ -152,6 +167,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
+     case 'R':
+         fuzz_request_parser(input);
+         break;
++    case 'A':
++        fuzz_response_parser(input);
++        break;
+     case 'S':
+         fuzz_router(input);
+         break;
+diff --git a/tests/headers_test.cc b/tests/headers_test.cc
+index a0849da5d..5825db083 100644
+--- a/tests/headers_test.cc
++++ b/tests/headers_test.cc
+@@ -17,6 +17,7 @@
+ 
+ using testing::ElementsAre;
+ using testing::SizeIs;
++using testing::ThrowsMessage;
+ using testing::UnorderedElementsAre;
+ 
+ TEST(headers_test, accept)
+@@ -240,6 +241,13 @@ TEST(headers_test, cache_control)
+         ASSERT_EQ(directives[0].delta(), std::chrono::seconds(delta));
+     };
+ 
++    auto testInvalid = [](std::string str, std::string error) {
++        Pistache::Http::Header::CacheControl cc;
++        ASSERT_THAT(
++            [&] { cc.parse(str); },
++            ThrowsMessage<std::runtime_error>("Invalid caching directive, " + error));
++    };
++
+     testTrivial("no-cache", Pistache::Http::CacheDirective::NoCache);
+     testTrivial("no-store", Pistache::Http::CacheDirective::NoStore);
+     testTrivial("no-transform", Pistache::Http::CacheDirective::NoTransform);
+@@ -251,6 +259,13 @@ TEST(headers_test, cache_control)
+     testTimed("max-stale=12345", Pistache::Http::CacheDirective::MaxStale, 12345);
+     testTimed("min-fresh=48", Pistache::Http::CacheDirective::MinFresh, 48);
+ 
++    testInvalid("max-age", "missing delta-seconds");
++    testInvalid("max-age=", "malformated delta-seconds");
++    testInvalid("max-age=abc", "malformated delta-seconds");
++    testInvalid("max-age=12345678987654321123324688", "malformated delta-seconds");
++    testInvalid("max-age=-42", "malformated delta-seconds");
++    testInvalid("max-age=42abc", "malformated delta-seconds");
++
+     Pistache::Http::Header::CacheControl cc1;
+     cc1.parse("private, max-age=600");
+     auto d1 = cc1.directives();
+diff --git a/version.txt b/version.txt
+index 31ae0f328..313ca67fc 100644
+--- a/version.txt
++++ b/version.txt
+@@ -1 +1 @@
+-0.4.10.20241017
++0.4.11.20241018

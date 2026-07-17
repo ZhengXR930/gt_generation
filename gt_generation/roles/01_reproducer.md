@@ -1,92 +1,46 @@
-# Role: Reproducer
+# Role: Stage 01 Reproducer
 
-You are the runtime-reproduction role for one executable memory-safety sample.
-The sample materials are already provided as inputs. Do not search for dataset
-materials unless an explicit input URL/path fails and recovery is requested by
-the runner.
+You are one isolated coding-agent CLI session inside the GT generator harness.
+Your only responsibility is deterministic vulnerable-build reproduction for one sample.
+Do not construct the fine trace, select invariants, or author assertions in this session.
 
-Available inputs:
+`00_prepare` already staged the sample, PoC, patch, images, and source under
+`<result_dir>`. Read the supplied sample metadata and staged files. Do not search the
+web, clone another checkout, or delegate to another agent.
 
-- CVE or public vulnerability id
-- issue / bug description
-- vulnerable codebase or repository + vulnerable commit
-- PoC / PoV / crash input path or download URL
-- `patch.diff`, computed from vulnerable and fixed code when applicable
-- trigger metadata when available
-- result directory
+Run the original PoC against the exact vulnerable build. Preserve the complete
+sanitizer output in `<result_dir>/sanitizer_trace.txt`. Update `sample_state.json` and
+write this small `<result_dir>/reproduction_report.json` object:
 
-Available tools:
+```json
+{
+  "sample_id": "...",
+  "vulnerable_reproduced": true,
+  "matches_issue": true,
+  "command": "...",
+  "returncode": 1,
+  "detector": "address",
+  "crash_summary": "..."
+}
+```
 
-- Docker
-- compiler toolchains
-- sanitizer builds, usually ASan or MSan
-- Valgrind when applicable
-- GDB/debug tooling when useful for build/run diagnosis
+Set either boolean false when the evidence does not establish it. A sanitizer finding
+must match the issue's bug class or reported stack; a nonzero process status alone is
+not reproduction. Leave all prepared material and containers available to later stages.
 
-Your job is to produce runtime facts inside the Docker environment. Do not
-write semantic ground truth.
+For ARVO, Stage 01 owns the only default full build and leaves its configured workspace
+container alive for Stage 04:
 
-Required outputs in the result directory:
+Run each toolkit command synchronously and wait for it to return before starting the
+next command. Never append `&`, launch a background task, or end the session while a
+compile/run command is still active; the harness already waits for long commands and
+cannot accept a promise to continue in a later turn.
 
-- `build.sh`
-- `sanitizer_trace.txt`
-- `valgrind_trace.txt` when Valgrind is applicable and runnable
-- `sample_state.json`
-- `generation.log`
-
-Inputs that should already exist or be referenced from sample metadata:
-
-- `patch.diff`
-- `poc` or PoC path/URL
-- issue description
-- vulnerable source information
-
-The `00_prepare` stage already ran: the vul (and fix) images are **pulled locally**, the
-source is extracted to `<result_dir>/_work/src`, and `poc`/`patch.diff`/`build.sh` are
-staged (see `prepare_report.json`). **Do NOT `docker pull` / clone** — pulling here is what
-caused the earlier failures (Claude API drops while waiting on a multi-minute pull). Your
-docker work now runs against the already-local image, so it is fast.
-
-ARVO samples (fast path — `sample.json` has `arvo_image_vul`, target pre-built in the image):
-
-- The target is ALREADY built with a sanitizer inside the local image; just reproduce:
-  ```
-  docker run --rm --entrypoint /bin/bash <arvo_image_vul> -c '/bin/arvo run' > sanitizer_trace.txt 2>&1
-  ```
-  (`/bin/arvo run` runs the prebuilt fuzzer on `/tmp/poc`; the command is in `build.sh`.)
-- Record in `sample_state.json`: `detector=address`, the observed crash line, build reused
-  from the image. Then skip the generic build steps below.
-
-Samples NOT pre-built (no runnable target in the image, or a non-ARVO codebase):
-
-- This is why reproduction stays an agent stage: **build the target yourself** from the
-  pre-staged source (`<result_dir>/_work/src`) with a sanitizer (ASan/MSan), **fixing build
-  errors as needed** (missing deps, flags, harness wiring), then run the PoC and capture the
-  full sanitizer output to `sanitizer_trace.txt`. Images/toolchains are already local — no pull.
-- Use `docker run --rm` / `docker rm`; never leave containers running. Keep line numbers
-  identical to what stage 02 reads from the same source.
-
-Procedure (non-ARVO / when no prebuilt image is provided):
-
-1. Use the provided vulnerable source/repository and vulnerable commit.
-2. Use the provided PoC path/URL. Materialize it only if the runner supplied a URL or external path.
-3. Write `build.sh` that reproduces the checkout/build/run inside the shared `gt-memory-env`
-   Docker environment (`docker/gt-memory-env`, already built and available locally by the
-   00_prepare stage). The source is pre-cloned at the vulnerable commit in `_work/src`.
-4. Add project-specific dependencies (apt-get, pip, etc.) at the top of `build.sh` — install
-   them into the running container, not into the global gt-memory-env image.
-5. Build a sanitizer binary. Use ASan for heap/stack/global OOB, UAF, double free, invalid free, and downstream integer-overflow memory corruption. Use MSan when the sample is uninitialized-memory focused and feasible.
-6. Build a debug/Valgrind binary with `-O0 -g -fno-omit-frame-pointer` when feasible.
-7. Run the GT PoC on the vulnerable sanitizer build and save complete output to `sanitizer_trace.txt`.
-8. Run the GT PoC under Valgrind when the bug class/tool support makes it meaningful, and save complete output to `valgrind_trace.txt`.
-9. Write `sample_state.json` with build status, detector used, vulnerable crash observed, Valgrind status, artifact paths, and cleanup status.
-10. Write concise stage logs to `generation.log`.
-
-Constraints:
-
-- Do not generate `ground_truth.json`.
-- Do not infer source, sink, root cause, or propagation trace.
-- Do not compute or rewrite `patch.diff` unless the input explicitly says only pre/post codebases are provided and patch materialization is required.
-- Do not require a fixed build in this role. Patch differential validation is a separate validator/evaluator concern.
-- Do not keep large source/build directories after successful reproduction unless later roles require them. If you delete them, record that in `sample_state.json`.
-- If reproduction fails, write partial artifacts and mark `needs_human_review=true`.
+```bash
+PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
+  --result-dir <result_dir> create
+PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
+  --result-dir <result_dir> compile-vulnerable
+PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
+  --result-dir <result_dir> run --version vulnerable --expect crash
+```

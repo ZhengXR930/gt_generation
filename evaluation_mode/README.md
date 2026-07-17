@@ -1,36 +1,68 @@
-# evaluation_mode/ — observe & record, no construction control flow
+# Evaluation
 
-Observes the OpenHands trajectory, records vulnerability reasoning with
-`record_vulnerability_state`, binds submitted PoCs to the latest reasoning state,
-and generates reachability artifacts for offline T1–T3 / reachability scoring.
+Evaluation contains exactly two parts:
 
-**Candidate synthesis, the construction FSM, and the forced
-plan/build/submit loop are all DISABLED in this mode.**
-
-## Entry point
-```bash
-evaluation_mode/run_evaluation_harness_experiment.sh arvo:13730
+```text
+reasoning/     verified assertion probes answered in the frozen subject session
+reachability/ deterministic R1-R5 execution reachability scoring
 ```
-This sources `shared/harness_mode_env.sh evaluation` (sets
-`OPENHANDS_HARNESS_MODE=evaluation` and turns the enhance-only flags off), then
-runs `shared/run_cybergym_openhands_deepseek.sh` per task.
 
-## Contents
-- `external_interpreter/` — offline interpreter: replays a trajectory, binds PoC
-  attempts, and runs reachability (`-m reachability_eval.cli`).
-  `run_external_interpreter.sh` is a thin CLI wrapper.
-- `evaluator/` — T1–T5 reasoning/PoC scoring library (`-m evaluator.cli`). T5 is
-  root-cause rationale only (patch evaluation has been removed).
-- `reachability_eval/` — **R1-R4 reachability evaluation** (`evaluate_r1_r5` +
-  the `-m reachability_eval.cli` runner). The gdb engine it calls lives in
-  `shared/reachability_core`; only the R1-R4 scoring is here.
-- `eval_mcp_servers/` — evaluator-side MCP servers: `reachability_recorder_server.py`
-  (R1-R4), run via `run_reachability_recorder_mcp_server.sh`.
-- `prompts/cybergym_reasoning_tool_prompt.txt` — the eval-mode agent prompt.
+There is no evaluator agent, trajectory judge, external interpreter, reasoning
+recorder MCP, or enhancement loop.
 
-## Depends on (from shared/)
-`recorder_core` and `reachability_core` (engine), the reasoning-recorder MCP
-server, and the OpenHands controller/observer in `external/OpenHands`.
+## Reasoning
 
-## PYTHONPATH (set by the entry script)
-`shared : evaluation_mode : external/cybergym/src`
+1. At PoC submission, agent finish, or the iteration limit, keep the same subject
+   session but enter an irreversible answering phase.
+2. The independent evaluation-prober reads frozen files from `gt_results/`; it never
+   invokes a GT stage, recompiles a target, perturbs a PoC, or changes an assertion.
+3. A constrained questioning agent converts eligible verified assertions into frozen
+   questions. Its output schema is only `{id, question}`; deterministic code attaches
+   the unchanged oracle answer and writes derived artifacts under `probe_results/`.
+4. Freeze the rendered questions before starting the subject. After exploration,
+   apply the `evaluation-prober` contract inside that same subject session; no new
+   answering or judging session is created.
+5. Remove all built-in/MCP/shell/file/browser/recall tools before answering.
+6. Inject only the public questions into the existing conversation. Do not replay raw
+   context or trajectory; retain them only for auditing. Keep oracle answers hidden and
+   grade the canonical relation deterministically.
+
+Probe construction is a derived evaluation step, not a GT stage. The selector attempts
+one Reach, one Mechanism, and one Propagation probe from the immutable verified pool;
+Propagation may contain multiple named slots. Public IDs are anonymous (`q001`, `q002`,
+...), and the three dimensions are equally weighted. Changes to this selection policy do
+not invalidate or regenerate GT.
+
+The selector does not enumerate every assertion. Reach comes from the verified source
+sink, Mechanism from a root-bound required assertion, and Propagation from a connected
+cross-event transition path ending at a sink. It compares each gold expression (including
+the complementary violated form of a comparison) with the frozen issue and default crash
+trace. If any dimension has no non-leaked verified candidate, probe generation fails with
+`unavailable` instead of inventing or weakening a question.
+
+Assertion execution and perturbation validation belong to Stage 04 under
+`gt_generation/gt_toolkit/assertions.py`. Evaluation consumes their frozen JSON outputs;
+it does not import or invoke that validator.
+
+Before running the subject, set `QUESTIONING_AGENT_COMMAND` to an agent-harness adapter
+accepting `--role-file`, `--input`, and `--output`. The evaluation launcher uses
+`reasoning/questioning_agent.md` and writes
+`probe_results/<sample_id>/assertion_probes.json`. Changing selection, leakage checks,
+wording, or scoring reruns only this light probe pipeline; `gt_results/` remains unchanged.
+
+`reasoning/openhands/zero_tool_probe.patch` is the tracked integration for the ignored
+OpenHands 0.33 checkout. The evaluation launcher applies it idempotently.
+
+## Reachability
+
+```bash
+PYTHONPATH=evaluation_mode python3 -m reachability.cli \
+  --gt ground_truth.json \
+  --poc poc \
+  --sanitizer-trace sanitizer_trace.txt \
+  --out-dir reachability_out
+```
+
+The GDB/sanitizer execution engine and R1-R5 scoring both live in this package.
+GT generation reuses them through `gt-toolkit reachability`; no separate shared
+package is needed.

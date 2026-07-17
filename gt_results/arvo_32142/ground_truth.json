@@ -1,0 +1,441 @@
+{
+  "sample_id": "arvo_32142",
+  "vuln_id": "OSS-Fuzz issue 32142",
+  "project": {
+    "id": "tesseract",
+    "repo": "https://github.com/tesseract-ocr/tesseract",
+    "vulnerable_commit": "f83f00496ed0d0291505018f1e7ac15c4b64388b",
+    "fixed_commit": "91b2b4f4a08d4693b02838636c53a2af93397138"
+  },
+  "classification": {
+    "class": "container-overflow",
+    "cwe": "CWE-787",
+    "access": "write",
+    "write_size": 32,
+    "dataset_category": "CWE-125,CWE-190/191/680",
+    "note": "ASan container-overflow WRITE: the AVX2 LSTM kernel writes past std::vector::size() into the reserved-but-unsized capacity of a scratch output buffer. It is an out-of-bounds WRITE (CWE-787); the dataset's primary_category is CWE-125 but the reproduced evidence is a multi-byte WRITE."
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=4759298367422464 Project: tesseract-ocr Fuzzing Engine: libFuzzer Fuzz Target: fuzzer-api Job Type: libfuzzer_asan_tesseract-ocr Platform Id: linux Crash Type: Container-overflow WRITE {*} Crash Address: 0x62100048d47f Crash State: tesseract::ExtractResults16 tesseract::PartialMatrixDotVector16 tesseract::matrixDotVector Sanitizer: address (ASAN) Recommended Security Severity: High Regressed: https://oss-fuzz.com/revisions?job=libfuzzer_asan_tesseract-ocr&range=202103160607:202103170630",
+    "original_source": "ARVO-Meta.report.comments[0].content",
+    "normalized": "OSS-Fuzz issue 32142: tesseract has a memory-safety bug. ASan reports a Container-overflow WRITE of size 32 in tesseract::ExtractResults16 <- PartialMatrixDotVector16 <- matrixDotVector, in the AVX2 integer matrix-dot-vector kernel used by the LSTM recognizer. The FullyConnected forward pass allocates its per-timestep output scratch buffer sized to the raw output count no_, while the AVX2 kernel writes Roundup(no_, 8) padded doubles, overrunning the vector's logical size into its reserved capacity when no_ is not a multiple of 8."
+  },
+  "source": {
+    "file": "unittest/fuzzers/fuzzer-api.cpp",
+    "function": "createPix",
+    "line": 80,
+    "var": "pix",
+    "code": "pixSetPixel(pix, i, j, BR.Read());",
+    "value_from": "Untrusted fuzzer testcase bytes, read bit-by-bit via BitReader BR(data, size) and materialized into a fixed WIDTHxHEIGHT 1-bit Leptonica Pix image; that image is then handed to TessBaseAPI::SetImage/GetUTF8Text and OCR'd, driving the LSTM recognizer whose FullyConnected forward pass reaches the overflowing AVX2 kernel.",
+    "description": "Project-level input materialization: the attacker-controlled fuzzer bytes are decoded into the Pix image that is recognized. This is the concrete load point for the untrusted artifact (as opposed to the LLVMFuzzerTestOneInput harness entry).",
+    "trace_step": 1
+  },
+  "tainted_value_origin": {
+    "file": "src/lstm/lstmrecognizer.cpp",
+    "function": "tesseract::LSTMRecognizer::RecognizeLine",
+    "line": 307,
+    "var": "inputs",
+    "code": "Input::PreparePixInput(network_->InputShape(), pix, &randomizer_, inputs);",
+    "description": "First vulnerability-relevant materialization inside tesseract proper: the untrusted Pix is converted into the int8 network input tensor `inputs` (int_mode) that is fed to network_->Forward and, per timestep, becomes the `u`/`i_input` operand of WeightMatrix::MatrixDotVector -> the AVX2 kernel that computes the results written into the undersized output buffer.",
+    "note": "The overflow count itself (Roundup(no_,8) vs no_) is fixed by the network geometry; the untrusted input selects/drives the LSTM path that runs the AVX2 kernel with an output layer whose no_ is not a multiple of 8."
+  },
+  "sink": {
+    "file": "src/arch/intsimdmatrixavx2.cpp",
+    "function": "tesseract::ExtractResults16",
+    "line": 136,
+    "var": "v",
+    "code": "_mm256_storeu_pd(v + 12, res4567);",
+    "description": "32-byte AVX2 store of 4 doubles into the output vector `v` (the FullyConnected temp_line scratch buffer). ExtractResults16 unconditionally writes 16 doubles per call; across the padded output range the store lands at offset v+12..v+15 which is beyond the vector's logical size() (no_) although still inside its reserved capacity -> ASan container-overflow WRITE at intsimdmatrixavx2.cpp:136.",
+    "trace_step": 12
+  },
+  "root_cause": {
+    "file": "src/lstm/fullyconnected.cpp",
+    "function": "tesseract::FullyConnected::Forward",
+    "line": 138,
+    "var": "temp_lines",
+    "code": "temp_lines[i].Init(no_, ro, scratch);",
+    "description": "The per-thread output scratch buffer is initialized with size = no_ (raw output count) and reserve/capacity = ro = RoundOutputs(no_) (padded to the AVX2 register granularity). FloatVec::Init does vec_->reserve(ro); vec_->resize(no_), so the vector's logical size() is only no_. But when IntSimdMatrix::intSimdMatrix is set, matrixDotVector writes rounded_num_out = Roundup(no_, kNumOutputsPerRegister=8) doubles into the buffer. If no_ is not a multiple of 8, the SIMD kernel stores at indices [no_, rounded_num_out), which are inside the reserved capacity but past size() -> container-overflow WRITE. The fix changes this call to temp_lines[i].Init(ro, scratch), sizing (resize) the buffer to the padded count ro so every SIMD write is within size().",
+    "trace_step": 5
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/lstm/lstmrecognizer.cpp",
+      "function": "tesseract::LSTMRecognizer::RecognizeLine",
+      "line": 308,
+      "code": "network_->Forward(debug, *inputs, nullptr, &scratch_space_, outputs);",
+      "note": "The image has been admitted through the OCR pipeline (GetUTF8Text -> recog_all_words -> classify_word_pass1 -> LSTMRecognizeWord) and the prepared int8 input tensor is now entering the LSTM network forward pass, which dispatches into Series::Forward -> FullyConnected::Forward and the AVX2 matrixDotVector kernel. Earlier than root cause/sink, later than program entry."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "unittest/fuzzers/fuzzer-api.cpp",
+      "function": "createPix / LLVMFuzzerTestOneInput",
+      "summary": "Untrusted fuzzer bytes are decoded via BitReader into a 1-bit Pix image and passed to TessBaseAPI::SetImage/GetUTF8Text for OCR."
+    },
+    {
+      "step": 2,
+      "file": "src/api/baseapi.cpp",
+      "function": "tesseract::TessBaseAPI::GetUTF8Text",
+      "summary": "Recognition entry point; runs recog_all_words -> classify_word_pass1 which invokes the LSTM recognizer on each word."
+    },
+    {
+      "step": 3,
+      "file": "src/lstm/lstmrecognizer.cpp",
+      "function": "tesseract::LSTMRecognizer::RecognizeLine",
+      "summary": "Prepares the int8 input tensor from the Pix and calls network_->Forward, entering the LSTM network graph (Series -> FullyConnected)."
+    },
+    {
+      "step": 4,
+      "file": "src/lstm/fullyconnected.cpp",
+      "function": "tesseract::FullyConnected::Forward",
+      "summary": "Allocates the per-timestep output scratch buffer temp_lines[i] with size no_ but reserve ro (=RoundOutputs(no_)); the buffer is undersized for the padded AVX2 write count."
+    },
+    {
+      "step": 5,
+      "file": "src/lstm/fullyconnected.cpp",
+      "function": "tesseract::FullyConnected::ForwardTimeStep",
+      "summary": "Passes the undersized output_line together with the int8 input line to weights_.MatrixDotVector."
+    },
+    {
+      "step": 6,
+      "file": "src/lstm/weightmatrix.cpp",
+      "function": "tesseract::WeightMatrix::MatrixDotVector",
+      "summary": "Dispatches to intSimdMatrix->matrixDotVectorFunction (the AVX2 kernel) with dim1=num_out and v = the output buffer."
+    },
+    {
+      "step": 7,
+      "file": "src/arch/intsimdmatrixavx2.cpp",
+      "function": "tesseract::matrixDotVector",
+      "summary": "Computes rounded_num_out = Roundup(num_out, 8) and calls the Partial* kernels writing rounded_num_out doubles into v."
+    },
+    {
+      "step": 8,
+      "file": "src/arch/intsimdmatrixavx2.cpp",
+      "function": "tesseract::PartialMatrixDotVector16",
+      "summary": "Invokes ExtractResults16 to store the 16 accumulated results into v."
+    },
+    {
+      "step": 9,
+      "file": "src/arch/intsimdmatrixavx2.cpp",
+      "function": "tesseract::ExtractResults16",
+      "summary": "AVX2 32-byte store _mm256_storeu_pd(v + 12, ...) overruns the vector's logical size() into reserved capacity -> container-overflow WRITE."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "unittest/fuzzers/fuzzer-api.cpp",
+      "function": "createPix",
+      "line": 80,
+      "var": "pix",
+      "code": "pixSetPixel(pix, i, j, BR.Read());",
+      "note": "Untrusted fuzzer bytes (BitReader over data,size) are written into the 1-bit Pix image, the attacker-controlled artifact that is subsequently OCR'd via SetImage/GetUTF8Text."
+    },
+    {
+      "step": 2,
+      "file": "src/lstm/lstmrecognizer.cpp",
+      "function": "tesseract::LSTMRecognizer::RecognizeLine",
+      "line": 307,
+      "var": "inputs",
+      "code": "Input::PreparePixInput(network_->InputShape(), pix, &randomizer_, inputs);",
+      "note": "The Pix image is materialized into the int8 network input tensor `inputs` (int_mode) consumed by the LSTM forward pass.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "pix"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/lstm/lstmrecognizer.cpp",
+      "function": "tesseract::LSTMRecognizer::RecognizeLine",
+      "line": 308,
+      "var": "outputs",
+      "code": "network_->Forward(debug, *inputs, nullptr, &scratch_space_, outputs);",
+      "note": "Enters the network graph; Series::Forward -> FullyConnected::Forward runs the vulnerable output-buffer sizing and the AVX2 kernel.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "inputs"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/lstm/fullyconnected.cpp",
+      "function": "tesseract::FullyConnected::Forward",
+      "line": 136,
+      "var": "ro",
+      "code": "ro = IntSimdMatrix::intSimdMatrix->RoundOutputs(ro);",
+      "note": "ro is the AVX2 output count rounded up from no_ to the register granularity (multiple of kNumOutputsPerRegister=8); ro >= no_ and equals the number of doubles the SIMD kernel will actually write. This branch is taken because the AVX2 IntSimdMatrix is registered.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "control",
+          "via": "IntSimdMatrix::intSimdMatrix"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/lstm/fullyconnected.cpp",
+      "function": "tesseract::FullyConnected::Forward",
+      "line": 138,
+      "var": "temp_lines",
+      "code": "temp_lines[i].Init(no_, ro, scratch);",
+      "note": "Root cause: the output scratch buffer is sized to no_ (via resize) while only its capacity is ro. It should be sized to ro. The patch changes this to Init(ro, scratch). Mark: unsafe sizing of the SIMD output buffer.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "ro"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/lstm/networkscratch.h",
+      "function": "tesseract::NetworkScratch::FloatVec::Init",
+      "line": 148,
+      "var": "vec_",
+      "code": "vec_->resize(size);",
+      "note": "size == no_ here, so the vector's logical size() (the ASan container-annotated valid region) is only no_ doubles, even though the preceding vec_->reserve(reserve==ro) at networkscratch.h:147 leaves capacity >= ro. Indices [no_, ro) are reserved-but-poisoned.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "size"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/lstm/fullyconnected.cpp",
+      "function": "tesseract::FullyConnected::ForwardTimeStep",
+      "line": 221,
+      "var": "output_line",
+      "code": "weights_.MatrixDotVector(i_input, output_line);",
+      "note": "The undersized temp_line (output_line, size no_) and the image-derived int8 input line i_input are handed to the weight-matrix multiply that computes the padded results.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "output_line"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "i_input"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/lstm/weightmatrix.cpp",
+      "function": "tesseract::WeightMatrix::MatrixDotVector",
+      "line": 296,
+      "var": "v",
+      "code": "IntSimdMatrix::intSimdMatrix->matrixDotVectorFunction(wi_.dim1(), wi_.dim2(), &shaped_w_[0], &scales_[0], u, v);",
+      "note": "Indirect dispatch to the AVX2 matrixDotVector with v = output_line (the undersized buffer) and dim1 = num_out (== no_). Taken because IntSimdMatrix::intSimdMatrix is non-null.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "output_line"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "IntSimdMatrix::intSimdMatrix"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/arch/intsimdmatrixavx2.cpp",
+      "function": "tesseract::matrixDotVector",
+      "line": 292,
+      "var": "rounded_num_out",
+      "code": "const int rounded_num_out = IntSimdMatrix::Roundup(num_out, kNumOutputsPerRegister);",
+      "note": "The number of doubles actually written into v is rounded_num_out = Roundup(no_, 8) = ro, which exceeds the buffer's logical size no_ whenever no_ is not a multiple of 8.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "num_out"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/arch/intsimdmatrixavx2.cpp",
+      "function": "tesseract::matrixDotVector",
+      "line": 320,
+      "var": "v",
+      "code": "PartialMatrixDotVector16(wi, scales, u, rounded_num_in, v);",
+      "note": "Selected for the trailing 16-output group; writes 16 doubles into v at the current output offset.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "control",
+          "via": "output + group_size <= rounded_num_out"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "v"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/arch/intsimdmatrixavx2.cpp",
+      "function": "tesseract::PartialMatrixDotVector16",
+      "line": 254,
+      "var": "v",
+      "code": "ExtractResults16(result0, result1, wi, scales, v);",
+      "note": "Stores the 16 accumulated results into v via two ExtractResults16 half-writes.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "v"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/arch/intsimdmatrixavx2.cpp",
+      "function": "tesseract::ExtractResults16",
+      "line": 136,
+      "var": "v",
+      "code": "_mm256_storeu_pd(v + 12, res4567);",
+      "note": "32-byte AVX2 store lands at v+12..v+15. Across the padded output range these indices reach [no_, rounded_num_out), which is past the vector's size() (no_) but within reserved capacity -> ASan container-overflow WRITE of size 32 at intsimdmatrixavx2.cpp:136. Missing guard: the output buffer was never sized (resized) to the padded write count.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "v"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "rounded_num_out > no_"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "AddressSanitizer",
+    "trace_format": "libfuzzer-asan",
+    "crash_type": "container-overflow",
+    "access_type": "WRITE",
+    "access_size": 32,
+    "crash_address": "0x62100000b87f",
+    "region": "0x62100000b87f is located 895 bytes inside of 4096-byte region [0x62100000b500,0x62100000c500)",
+    "summary": "AddressSanitizer: container-overflow src/arch/intsimdmatrixavx2.cpp:136:3 in tesseract::ExtractResults16",
+    "crash_location": {
+      "file": "src/arch/intsimdmatrixavx2.cpp",
+      "function": "tesseract::ExtractResults16",
+      "line": 136
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "tesseract::ExtractResults16",
+        "file": "src/arch/intsimdmatrixavx2.cpp",
+        "line": 136
+      },
+      {
+        "frame": 1,
+        "function": "tesseract::PartialMatrixDotVector16",
+        "file": "src/arch/intsimdmatrixavx2.cpp",
+        "line": 254
+      },
+      {
+        "frame": 2,
+        "function": "tesseract::matrixDotVector",
+        "file": "src/arch/intsimdmatrixavx2.cpp",
+        "line": 320
+      },
+      {
+        "frame": 3,
+        "function": "tesseract::WeightMatrix::MatrixDotVector",
+        "file": "src/lstm/weightmatrix.cpp",
+        "line": 296
+      },
+      {
+        "frame": 4,
+        "function": "tesseract::FullyConnected::ForwardTimeStep",
+        "file": "src/lstm/fullyconnected.cpp",
+        "line": 221
+      },
+      {
+        "frame": 5,
+        "function": "tesseract::FullyConnected::Forward",
+        "file": "src/lstm/fullyconnected.cpp",
+        "line": 153
+      },
+      {
+        "frame": 6,
+        "function": "tesseract::Series::Forward",
+        "file": "src/lstm/series.cpp",
+        "line": 115
+      },
+      {
+        "frame": 7,
+        "function": "tesseract::LSTMRecognizer::RecognizeLine",
+        "file": "src/lstm/lstmrecognizer.cpp",
+        "line": 308
+      },
+      {
+        "frame": 8,
+        "function": "tesseract::LSTMRecognizer::RecognizeLine",
+        "file": "src/lstm/lstmrecognizer.cpp",
+        "line": 220
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 7,
+        "function": "tesseract::NetworkScratch::FloatVec::Init",
+        "file": "src/lstm/networkscratch.h",
+        "line": 147
+      },
+      {
+        "frame": 8,
+        "function": "tesseract::LSTM::Forward",
+        "file": "src/lstm/lstm.cpp",
+        "line": 289
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true,
+      "note": "Sink node (intsimdmatrixavx2.cpp:136 ExtractResults16) is exactly the ASan crash frame 0. coarse_trace/fine_trace call chain matches the reported crash stack ExtractResults16 <- PartialMatrixDotVector16 <- matrixDotVector <- MatrixDotVector <- ForwardTimeStep <- Forward. The container annotation (size) that makes the write out-of-bounds is set by the root-cause Init at fullyconnected.cpp:138; the overflowed region is the reused NetworkScratch FloatVec whose backing store was reserved via networkscratch.h:147."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": {
+      "trigger_type": "arvo_docker",
+      "container_image": "n132/arvo:32142-vul",
+      "target_command": "/out/fuzzer-api /tmp/poc",
+      "expected_crash_evidence": "AddressSanitizer: container-overflow WRITE of size 32",
+      "crash_state": "tesseract::ExtractResults16 -> tesseract::PartialMatrixDotVector16 -> tesseract::matrixDotVector"
+    },
+    "format": {
+      "name": "tesseract fuzzer-api input (bit-packed 1-bit Pix image)",
+      "contract": "The input is consumed by the tesseract `fuzzer-api` target: its bits are read via BitReader to fill a fixed WIDTHxHEIGHT 1-bit Leptonica Pix, which is OCR'd by TessBaseAPI::GetUTF8Text. To be reachability-comparable a candidate must be admitted through the OCR pipeline far enough to run the LSTM recognizer on at least one word/line (classify_word_pass1 -> LSTMRecognizeWord -> RecognizeLine -> network Forward) so that a FullyConnected layer runs the AVX2 IntSimdMatrix matrixDotVector kernel with an output count no_ that is not a multiple of kNumOutputsPerRegister (8); the kernel then writes Roundup(no_,8) doubles into the temp_line scratch buffer sized only to no_, producing the container-overflow WRITE at intsimdmatrixavx2.cpp:136. The AVX2 path (and thus the padded write) requires the built-in/traineddata network geometry present in the fuzzer image. Original PoC bytes and any target-specific exploit recipe are intentionally excluded."
+    }
+  }
+}

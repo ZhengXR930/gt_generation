@@ -22,11 +22,22 @@ ROLES_DIR = REPO_ROOT / "roles"
 
 # Role file stem -> (skill name, one-line description trigger).
 SKILLS = {
-    "00_materialize": ("gt-materialize", "Resolve one vulnerability id into a self-contained sample workspace (repo, commit, PoC, patch.diff, sample_state.json) before GT generation."),
-    "01_reproducer": ("gt-reproduce", "Build sanitizer/debug variants in Docker and reproduce a memory-safety crash, capturing sanitizer_trace.txt and valgrind_trace.txt."),
-    "02_gt_generator": ("gt-generate", "Author fine-grained ground_truth.json (source, sink, root cause, coarse/fine trace, sanitizer_ground_truth, poc) for a reproduced memory-safety bug."),
-    "03_static_review": ("gt-static-review", "Static review of a ground_truth.json (merged source audit + semantic faithfulness) emitting static_review.json."),
-    "04_runtime_validator": ("gt-runtime-validate", "Dynamically verify a GT's invariants: read the GT to select the invariant points + root_cause criterion, then instrument+reproduce to emit verified_invariants.json + reachability_report.json."),
+    "01_reproducer": (
+        "gt-stage-01-reproducer",
+        "Reproduce one prepared memory-safety sample in an isolated CLI session and preserve its sanitizer evidence.",
+    ),
+    "02_fine_trace": (
+        "gt-stage-02-fine-trace",
+        "Author or repair a source-grounded fine-grained vulnerability trace in an isolated CLI session.",
+    ),
+    "03_trace_review": (
+        "gt-stage-03-trace-review",
+        "Review a fine-grained vulnerability trace and emit actionable feedback without editing it.",
+    ),
+    "04_assertion_validator": (
+        "gt-stage-04-assertion-validator",
+        "Compile source-derived invariants into frozen assertions and validate them on vulnerable and fixed executions.",
+    ),
 }
 
 TOOLKIT_NOTE = (

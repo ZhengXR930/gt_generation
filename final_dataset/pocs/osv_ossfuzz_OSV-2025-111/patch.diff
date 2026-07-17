@@ -1,2 +1,149 @@
-Patch not materialized locally. Fix reference: https://github.com/google/bloaty/commit/4b35125c645737aaa86bb7d02c1a4e7ecedd97af
-Fix commit: 4b35125c645737aaa86bb7d02c1a4e7ecedd97af
+From 4b35125c645737aaa86bb7d02c1a4e7ecedd97af Mon Sep 17 00:00:00 2001
+From: Ryan Mansfield <ryan_mansfield@apple.com>
+Date: Tue, 28 Oct 2025 12:50:47 -0400
+Subject: [PATCH] Do two-pass attribute parsing in ReadTopLevelDIE() to ensure
+ base addresses are set before parsing attributes that depend on them.
+
+In DWARF v5, DW_AT_name can use the DW_FORM_strx form, which requires
+DW_AT_str_offsets_base to be parsed first. Previously, all attributes
+were parsed in a single pass, which meant that if DW_AT_name appeared
+before DW_AT_str_offsets_base in the DIE, parsing would fail with
+"premature EOF reading variable-length DWARF data".
+---
+ src/dwarf/debug_info.cc                  | 20 ++++--
+ tests/dwarf/debug_info/dw_form_strx.test | 85 ++++++++++++++++++++++++
+ 2 files changed, 100 insertions(+), 5 deletions(-)
+ create mode 100644 tests/dwarf/debug_info/dw_form_strx.test
+
+diff --git a/src/dwarf/debug_info.cc b/src/dwarf/debug_info.cc
+index 0cf8ff39..51c8ed53 100644
+--- a/src/dwarf/debug_info.cc
++++ b/src/dwarf/debug_info.cc
+@@ -199,14 +199,13 @@ void CU::ReadTopLevelDIE(InfoReader& reader) {
+   const auto* abbrev = die_reader.ReadCode(*this);
+   absl::optional<uint64_t> stmt_list;
+   unit_name_.clear();
++
++  // First pass: Parse base addresses that other attributes may depend on.
++  // Specifically, DW_AT_str_offsets_base must be parsed before DW_AT_name
++  // if DW_AT_name uses DW_FORM_strx form.
+   die_reader.ReadAttributes(
+       *this, abbrev, [this, &stmt_list](uint16_t tag, dwarf::AttrValue value) {
+         switch (tag) {
+-          case DW_AT_name:
+-            if (value.IsString()) {
+-              unit_name_ = std::string(value.GetString(*this));
+-            }
+-            break;
+           case DW_AT_stmt_list:
+             if (value.form() == DW_FORM_sec_offset) {
+               stmt_list = value.GetUint(*this);
+@@ -232,6 +231,17 @@ void CU::ReadTopLevelDIE(InfoReader& reader) {
+             if (value.IsUint()) {
+               dwo_id_ = value.GetUint(*this);
+             }
++            break;
++        }
++      });
++
++  // Second pass: Parse DW_AT_name after base addresses are set.
++  die_reader = GetDIEReader();
++  abbrev = die_reader.ReadCode(*this);
++  die_reader.ReadAttributes(
++      *this, abbrev, [this](uint16_t tag, dwarf::AttrValue value) {
++        if (tag == DW_AT_name && value.IsString()) {
++          unit_name_ = std::string(value.GetString(*this));
+         }
+       });
+ 
+diff --git a/tests/dwarf/debug_info/dw_form_strx.test b/tests/dwarf/debug_info/dw_form_strx.test
+new file mode 100644
+index 00000000..5b965ccb
+--- /dev/null
++++ b/tests/dwarf/debug_info/dw_form_strx.test
+@@ -0,0 +1,85 @@
++# Test that we correctly parse DW_AT_name using DW_FORM_strx when it appears
++# before DW_AT_str_offsets_base in the attribute list.
++#
++# This tests the two-pass attribute parsing fix where base addresses must be
++# parsed before attributes that depend on them.
++
++# RUN: %yaml2obj %s -o %t.obj
++# RUN: %bloaty %t.obj -d compileunits --raw-map --domain=vm | %FileCheck %s
++
++--- !ELF
++FileHeader:
++  Class:           ELFCLASS64
++  Data:            ELFDATA2LSB
++  Type:            ET_EXEC
++  Machine:         EM_X86_64
++ProgramHeaders:
++  - Type:            PT_LOAD
++    Flags:           [ PF_X, PF_R ]
++    FirstSec:        .text
++    LastSec:         .text
++    VAddr:           0x1000
++    Align:           0x1000
++Sections:
++  - Name:            .text
++    Type:            SHT_PROGBITS
++    Flags:           [ SHF_ALLOC, SHF_EXECINSTR ]
++    Address:         0x1000
++    AddressAlign:    0x10
++    Size:            0x10
++DWARF:
++  debug_str:
++    - foo.c
++  debug_str_offsets:
++    - Offsets:
++        - 0x0  # Offset to "foo.c" in debug_str
++  debug_abbrev:
++    - ID:              0
++      Table:
++        # Compilation unit with DW_AT_name (using DW_FORM_strx) appearing
++        # BEFORE DW_AT_str_offsets_base. This tests that we parse base
++        # addresses in a first pass before parsing DW_AT_name.
++        - Code:            0x1
++          Tag:             DW_TAG_compile_unit
++          Children:        DW_CHILDREN_yes
++          Attributes:
++            - Attribute:       DW_AT_name
++              Form:            DW_FORM_strx
++            - Attribute:       DW_AT_str_offsets_base
++              Form:            DW_FORM_sec_offset
++        - Code:            0x2
++          Tag:             DW_TAG_subprogram
++          Children:        DW_CHILDREN_no
++          Attributes:
++            - Attribute:       DW_AT_low_pc
++              Form:            DW_FORM_addr
++            - Attribute:       DW_AT_high_pc
++              Form:            DW_FORM_data4
++  debug_info:
++    # DW_TAG_compile_unit
++    #   DW_AT_name [DW_FORM_strx] (indexed string 0 => "foo.c")
++    #   DW_AT_str_offsets_base [DW_FORM_sec_offset] (0x00000008)
++    #
++    # DW_TAG_subprogram
++    #   DW_AT_low_pc [DW_FORM_addr] (0x0000000000001000)
++    #   DW_AT_high_pc [DW_FORM_data4] (0x00000010)
++    - Version:         5
++      UnitType:        0x01 # DW_UT_compile
++      AbbrevTableID:   0
++      AbbrOffset:      0x0
++      AddrSize:        8
++      Entries:
++        - AbbrCode:        0x1
++          Values:
++            - Value:           0x0  # String index 0
++            - Value:           0x8  # str_offsets_base (points past header)
++        - AbbrCode:        0x2
++          Values:
++            - Value:           0x1000
++            - Value:           0x10
++        - AbbrCode:        0x0
++...
++
++# CHECK: VM MAP:
++# CHECK: 0000-1000              4096             [-- Nothing mapped --]
++# CHECK: 1000-1010                16             foo.c

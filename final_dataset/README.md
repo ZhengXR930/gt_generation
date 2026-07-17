@@ -2,6 +2,50 @@
 
 This dataset stores reproducible memory-safety vulnerability samples and the artifacts needed to generate fine-grained ground truth.
 
+## Selected 1,000-sample corpus
+
+`selected_1000.json` is the canonical manifest. Its composition is fixed:
+
+- `base`: 800 samples from ARVO (683) and SEC-bench (117).
+- `new_diverse`: 200 unique public vulnerability IDs from NIST NVD, OSV/OSS-Fuzz, OSV Git, and GitHub Advisory Database. This group excludes ARVO and SEC-bench and is checked against the local CyberGym task catalog.
+
+Every selected record has a non-empty issue description and a local patch that produces a non-empty result with `git apply --numstat`. Every non-ARVO record also has a non-empty local PoC/evidence asset. `poc_runnable` distinguishes a locally normalized runnable trigger from a public reproducer or dataset testcase asset; asset presence alone must not be interpreted as successful local reproduction. ARVO PoC availability relies on the ARVO dataset contract, as requested, and is not re-downloaded here.
+
+Frozen dataset files:
+
+- `selected_1000.json`: all selected samples and asset paths.
+- `selection_summary.json`: aggregate composition and coverage.
+- `selection_audit.json`: exclusions, failures, and qualification checks.
+- `arvo/<id>/patch.diff`: patches for all 683 selected ARVO samples.
+- `pocs/<sample_id>/`: one patch and one PoC/evidence asset for each of the 317 non-ARVO samples.
+
+## Sample Admission Rules
+
+Selection never compiles a project and never pulls an image. Two independent rules bound the local build cost:
+
+- **Static project exclusion.** These projects are excluded outright on known source/dependency/build footprint, regardless of image size: `arrow`, `binutils`, `binutils-gdb`, `cryptofuzz`, `dawn`, `duckdb`, `envoy`, `ffmpeg`, `firebase-ios-sdk`, `gdal`, `grpc`, `gstreamer`, `icu`, `imagemagick`, `libjxl`, `mongo`, `opencv`, `openimageio`, `pcl`, `perfetto`, `postgis`, `qemu`, `serenity`, `skia`, `tesseract`, `wasmedge`, `wireshark`.
+- **Image size proxy.** The local expanded budget is 10 GiB. Because expanded size is unknown before a pull, Docker Hub's compressed `full_size` for `n132/arvo:<id>-vul` must be `<= 4 GiB`. This is deliberately conservative: `arvo_11291` measures ~5.33 GB compressed against ~14.6 GB expanded. In practice only 14 of 1810 sized candidates exceeded the cap, so the static list does most of the filtering.
+
+ARVO replacement samples additionally require a public sanitizer crash output, a patch that touches non-test source files, and a vulnerable commit resolvable as the fix commit's first parent, with at most 10 replacements per project.
+
+## Sanitizer Trace Difficulty
+
+`trace_difficulty` and `trace_unique_depth` record how demanding a sample's public sanitizer trace is, so the corpus is not silently dominated by shallow crashes.
+
+- The metric is the number of **distinct project functions** on the primary crash stack, taken from ARVO's public `crash_output` (`arvo.db` v3.0.0).
+- libfuzzer/LLVM/compiler-rt/libc frames and `LLVMFuzzerTestOneInput` are excluded, matching the unscored-harness-boundary rule used for `source` above.
+- Frames are counted as distinct symbol+file pairs, so recursion does not inflate depth. One `moddable` case reaches 498 raw frames across only 2 files and scores as its 24 distinct functions.
+- Buckets: `easy` `<=3`, `medium` `4-8`, `hard` `>=9`. `unknown` means no public crash output exists for that record; it does not mean easy.
+
+ARVO records: 211 hard, 203 medium, 55 easy, 214 unknown. `new_diverse` and SEC-bench records have no ARVO crash output and are all `unknown`. When heavy projects were excluded, the removed samples skewed hard (55% hard), so their replacements were selected to match that mix rather than by smallest image, which would have made the corpus easier.
+
+## Commit Provenance
+
+`vulnerable_commit` is the fix commit's first parent. 991 of 1000 records carry a complete commit pair; the resolution was cross-validated against the GitHub API. The remaining 9 ARVO records are listed in `selection_audit.json` under `commit_provenance.unresolved`: ARVO metadata names a fix commit that does not exist in the stated repository, or the host refuses fetch-by-SHA. Their patch diffs are still valid.
+
+The designated 200 new samples are the records in `selected_1000.json` whose `selection_group` is `new_diverse`; a second duplicate manifest is intentionally not stored.
+Candidate pools and the one-off selection script are intentionally omitted now that the corpus is frozen.
+
 ## Ground Truth Semantics
 
 Ground-truth JSON files use shared trace semantics across all samples, so individual `ground_truth.json` files do not repeat this policy.

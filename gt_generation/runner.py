@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the multi-role GT generation workflow (L3 orchestration).
+"""Run the isolated-session GT generation workflow.
 
 CLI-agnostic: a stage can invoke Codex CLI, Claude Code CLI, a shell script, or
 a deterministic Python command as long as the command is expressed as a template
@@ -12,6 +12,8 @@ Improvements over the original:
   make a failing stage look successful.
 - Retries: `retries` per stage (or `default_retries` in config).
 - Resume: `--resume` skips stages already recorded ok in the prior state file.
+- Review feedback loop: a review stage may name `feedback_to`; a failed review
+  launches a fresh producer CLI session and then a fresh review CLI session.
 - Deterministic GT gate: a stage may set `validate_gt: true` to run
   `gt-toolkit validate` on the produced ground_truth.json as part of its success.
 """
@@ -19,6 +21,8 @@ Improvements over the original:
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import subprocess
@@ -44,6 +48,7 @@ class StageResult:
     stderr_path: str
     required_outputs_ok: bool
     success_check_ok: bool
+    duration_seconds: float = 0.0
     attempts: int = 1
     skipped: bool = False
     dry_run: bool = False
@@ -56,6 +61,7 @@ class StageResult:
 
 
 def main() -> None:
+    run_started_monotonic = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", required=True, type=Path, help="Sample metadata JSON.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Workflow config JSON.")
@@ -82,10 +88,22 @@ def main() -> None:
     if not result_dir.is_absolute():
         result_dir = repo_root / result_dir
     result_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir = result_dir / "role_logs"
+    timing_path = result_dir / "generation_timing.json"
+    prior_timing = load_json(timing_path) if timing_path.is_file() else {}
+    lock_path = result_dir / ".gt_generation.lock"
+    lock_handle = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(
+            f"Another GT runner is already active for {sample_id}: {lock_path}"
+        )
+    lock_handle.write(f"pid={os.getpid()}\nstarted_at={now()}\n")
+    lock_handle.flush()
+    logs_dir = generation_logs_path(result_dir, dry_run=args.dry_run)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    state_path = result_dir / "gt_generation_state.json"
+    state_path = generation_state_path(result_dir, dry_run=args.dry_run)
     prior_ok = prior_ok_stages(state_path) if args.resume else set()
 
     state = {
@@ -113,7 +131,7 @@ def main() -> None:
             append_stage(state_path, skipped_result(name))
             continue
 
-        result = run_stage_with_retries(
+        stage_kwargs = dict(
             stage=stage,
             config=config,
             sample=sample,
@@ -125,7 +143,16 @@ def main() -> None:
             logs_dir=logs_dir,
             dry_run=args.dry_run,
         )
+        result = run_stage_with_retries(**stage_kwargs)
         append_stage(state_path, result)
+        if not result.ok and stage.get("feedback_to") and not args.dry_run:
+            result = run_feedback_loop(
+                review_stage=stage,
+                initial_result=result,
+                stages=stages,
+                state_path=state_path,
+                stage_kwargs=stage_kwargs,
+            )
         if not result.ok:
             failed = True
             if not args.keep_going:
@@ -133,8 +160,48 @@ def main() -> None:
 
     final_state = load_json(state_path)
     final_state["ended_at"] = now()
+    final_state["total_duration_seconds"] = round(
+        time.monotonic() - run_started_monotonic, 3
+    )
     final_state["status"] = "failed" if failed else "completed"
     write_json(state_path, final_state)
+    current_stage_timings = [
+        {
+            "name": item.get("name"),
+            "attempts": item.get("attempts", 1),
+            "duration_seconds": item.get("duration_seconds", 0.0),
+            "ok": item.get("ok"),
+        }
+        for item in final_state.get("stages", [])
+        if not item.get("skipped")
+    ]
+    merged_stage_timings = merge_stage_timings(
+        prior_timing.get("stages", []), current_stage_timings
+    )
+    write_json(
+        timing_path,
+        {
+            "sample_id": sample_id,
+            "started_at": final_state["started_at"],
+            "ended_at": final_state["ended_at"],
+            "status": final_state["status"],
+            "latest_run_duration_seconds": final_state["total_duration_seconds"],
+            "total_duration_seconds": round(
+                sum(float(item.get("duration_seconds") or 0.0)
+                    for item in merged_stage_timings),
+                3,
+            ),
+            "stages": merged_stage_timings,
+        },
+    )
+    if not failed and config.get("compact_on_success"):
+        from gt_generation.gt_toolkit.compact_result import compact_result
+
+        compact_report = compact_result(result_dir)
+        if not compact_report["ok"]:
+            final_state["status"] = "failed"
+            final_state["compaction"] = compact_report
+            failed = True
     print(json.dumps(final_state, indent=2, ensure_ascii=False))
     if failed:
         raise SystemExit(1)
@@ -153,6 +220,130 @@ def run_stage_with_retries(**kwargs: Any) -> StageResult:
     return result
 
 
+def run_feedback_loop(
+    *,
+    review_stage: dict[str, Any],
+    initial_result: StageResult,
+    stages: list[dict[str, Any]],
+    state_path: Path,
+    stage_kwargs: dict[str, Any],
+) -> StageResult:
+    """Repair with a delta review, then require a fresh final full review.
+
+    The reviewer writes its normal review artifact plus a feedback artifact in the
+    result directory. The producer role is responsible for reading that feedback on
+    its next isolated invocation. A delta reviewer may confirm the repair direction,
+    but only a new full reviewer can accept the resulting GT. No conversational state
+    crosses the boundary.
+    """
+    producer_name = str(review_stage.get("feedback_to") or "")
+    producer = next(
+        (item for item in stages if str(item.get("name") or "") == producer_name),
+        None,
+    )
+    if producer is None:
+        return initial_result
+    rounds = int(review_stage.get("feedback_rounds", 1))
+    incremental_role = str(review_stage.get("incremental_role") or "").strip()
+    result_dir = Path(stage_kwargs["result_dir"])
+    logs_dir = Path(stage_kwargs["logs_dir"])
+    result = initial_result
+    for round_number in range(1, rounds + 1):
+        baseline_path = logs_dir / f"ground_truth.before_feedback_{round_number}.json"
+        current_gt = result_dir / "ground_truth.json"
+        if current_gt.exists():
+            baseline_path.write_bytes(current_gt.read_bytes())
+
+        producer_retry = {**producer, "_log_suffix": f"feedback_{round_number}"}
+        producer_result = run_stage_with_retries(
+            **{**stage_kwargs, "stage": producer_retry}
+        )
+        append_stage(state_path, producer_result)
+        if not producer_result.ok:
+            return producer_result
+
+        if baseline_path.exists() and current_gt.exists():
+            write_review_delta(
+                baseline_path,
+                current_gt,
+                logs_dir / f"ground_truth.delta_feedback_{round_number}.json",
+            )
+
+        if incremental_role:
+            incremental_review = {
+                **review_stage,
+                "role": incremental_role,
+                "_log_suffix": f"incremental_feedback_{round_number}",
+            }
+            result = run_stage_with_retries(
+                **{**stage_kwargs, "stage": incremental_review}
+            )
+            append_stage(state_path, result)
+            if not result.ok:
+                continue
+
+            final_review = {
+                **review_stage,
+                "_log_suffix": f"final_feedback_{round_number}",
+            }
+            result = run_stage_with_retries(
+                **{**stage_kwargs, "stage": final_review}
+            )
+            append_stage(state_path, result)
+            if result.ok:
+                return result
+            continue
+
+        review_retry = {**review_stage, "_log_suffix": f"feedback_{round_number}"}
+        result = run_stage_with_retries(**{**stage_kwargs, "stage": review_retry})
+        append_stage(state_path, result)
+        if result.ok:
+            return result
+    return result
+
+
+def write_review_delta(baseline: Path, current: Path, out: Path) -> None:
+    before = load_json(baseline)
+    after = load_json(current)
+    changed_paths: list[str] = []
+    collect_changed_json_paths(before, after, "$", changed_paths)
+    write_json(
+        out,
+        {
+            "baseline": str(baseline),
+            "current": str(current),
+            "baseline_sha256": hashlib.sha256(baseline.read_bytes()).hexdigest(),
+            "current_sha256": hashlib.sha256(current.read_bytes()).hexdigest(),
+            "changed_count": len(changed_paths),
+            "changed_paths": changed_paths,
+        },
+    )
+
+
+def collect_changed_json_paths(
+    before: Any, after: Any, path: str, changed: list[str]
+) -> None:
+    if type(before) is not type(after):
+        changed.append(path)
+        return
+    if isinstance(before, dict):
+        for key in sorted(set(before) | set(after)):
+            child = f"{path}.{key}"
+            if key not in before or key not in after:
+                changed.append(child)
+            else:
+                collect_changed_json_paths(before[key], after[key], child, changed)
+        return
+    if isinstance(before, list):
+        if len(before) != len(after):
+            changed.append(f"{path}.length")
+        for index, (left, right) in enumerate(zip(before, after)):
+            collect_changed_json_paths(left, right, f"{path}[{index}]", changed)
+        return
+    if before != after:
+        changed.append(path)
+
+
 def run_stage(
     *,
     stage: dict[str, Any],
@@ -169,8 +360,11 @@ def run_stage(
     name = str(stage["name"])
     started_at = now()
     started_ts = time.time()
-    stdout_path = logs_dir / f"{name}.stdout.txt"
-    stderr_path = logs_dir / f"{name}.stderr.txt"
+    started_monotonic = time.monotonic()
+    log_suffix = str(stage.get("_log_suffix") or "").strip()
+    log_stem = name + (f".{log_suffix}" if log_suffix else "")
+    stdout_path = logs_dir / f"{log_stem}.stdout.txt"
+    stderr_path = logs_dir / f"{log_stem}.stderr.txt"
     variables = build_variables(
         stage=stage, config=config, sample=sample, sample_path=sample_path,
         sample_id=sample_id, repo_root=repo_root, code_root=code_root, result_dir=result_dir,
@@ -184,6 +378,7 @@ def run_stage(
             name=name, command=command, returncode=None, started_at=started_at,
             ended_at=now(), stdout_path=str(stdout_path), stderr_path=str(stderr_path),
             required_outputs_ok=True, success_check_ok=True, dry_run=True,
+            duration_seconds=round(time.monotonic() - started_monotonic, 3),
         )
 
     proc = subprocess.run(
@@ -206,6 +401,7 @@ def run_stage(
         name=name, command=command, returncode=proc.returncode, started_at=started_at,
         ended_at=now(), stdout_path=str(stdout_path), stderr_path=str(stderr_path),
         required_outputs_ok=required_outputs_ok, success_check_ok=success_check_ok,
+        duration_seconds=round(time.monotonic() - started_monotonic, 3),
     )
 
 
@@ -255,7 +451,13 @@ def build_variables(
         "sample_state": str(result_dir / "sample_state.json"),
         "gt_path": str(result_dir / "ground_truth.json"),
         "static_review_path": str(result_dir / "static_review.json"),
+        "trace_feedback_path": str(result_dir / "trace_feedback.json"),
+        "reproduction_report_path": str(result_dir / "reproduction_report.json"),
         "verified_invariants_path": str(result_dir / "verified_invariants.json"),
+        "candidate_assertions_path": str(result_dir / "candidate_assertions.json"),
+        "assertion_results_path": str(result_dir / "assertion_results.json"),
+        "perturbation_results_path": str(result_dir / "perturbation_results.json"),
+        "verified_assertions_path": str(result_dir / "verified_assertions.json"),
         "reachability_report_path": str(result_dir / "reachability_report.json"),
     }
     for key, value in (config.get("vars") or {}).items():
@@ -301,11 +503,23 @@ def check_success(stage: dict[str, Any], variables: dict[str, str]) -> bool:
     check = stage.get("success_check") or {}
     if not check:
         return True
-    path_text = str(check.get("path") or "")
-    field = str(check.get("field") or "")
-    expected = check.get("equals", True)
+    clauses = check.get("all")
+    if isinstance(clauses, list):
+        return bool(clauses) and all(
+            _json_condition_matches(clause, variables, check.get("path"))
+            for clause in clauses if isinstance(clause, dict)
+        )
+    return _json_condition_matches(check, variables)
+
+
+def _json_condition_matches(
+    condition: dict[str, Any], variables: dict[str, str], default_path: Any = ""
+) -> bool:
+    path_text = str(condition.get("path") or default_path or "")
+    field = str(condition.get("field") or "")
+    expected = condition.get("equals", True)
     if not path_text or not field:
-        return True
+        return False
     path = Path(render(path_text, variables).strip("'"))
     if not path.exists():
         return False
@@ -360,6 +574,18 @@ def prior_ok_stages(state_path: Path) -> set[str]:
     return {str(s.get("name")) for s in prior.get("stages", []) if s.get("ok")}
 
 
+def generation_state_path(result_dir: Path, *, dry_run: bool) -> Path:
+    """Keep rendered-command dry runs separate from executed workflow state."""
+    filename = "gt_generation_state.dry_run.json" if dry_run else "gt_generation_state.json"
+    return result_dir / filename
+
+
+def generation_logs_path(result_dir: Path, *, dry_run: bool) -> Path:
+    """Keep rendered commands from replacing evidence from executed sessions."""
+    dirname = "role_logs_dry_run" if dry_run else "role_logs"
+    return result_dir / dirname
+
+
 def skipped_result(name: str) -> StageResult:
     return StageResult(
         name=name, command="", returncode=None, started_at=now(), ended_at=now(),
@@ -393,6 +619,22 @@ def string_env(raw: dict[str, Any]) -> dict[str, str]:
 
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def merge_stage_timings(
+    prior: list[dict[str, Any]], current: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Keep the latest measured duration for each stage across partial reruns."""
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for item in [*prior, *current]:
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        if name not in merged:
+            order.append(name)
+        merged[name] = dict(item)
+    return [merged[name] for name in order]
 
 
 if __name__ == "__main__":
