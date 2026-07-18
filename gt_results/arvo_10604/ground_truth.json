@@ -1,0 +1,252 @@
+{
+  "sample_id": "arvo_10604",
+  "vuln_id": "OSS-Fuzz-10604",
+  "project": {
+    "id": "open62541",
+    "repo": "https://github.com/open62541/open62541",
+    "vulnerable_commit": "454b81b3ae282d93c2cbfad3530568a0ff358dd9",
+    "fixed_commit": "27dc05196fc43036a2efcea060ae3711b3209cf2"
+  },
+  "classification": {
+    "class": "Use-of-Uninitialized-Value",
+    "cwe": "CWE-457"
+  },
+  "bug_description": {
+    "original": "Use-of-uninitialized-value in UA_WorkQueue_manuallyProcessDelayed called from UA_WorkQueue_cleanup <- UA_Server_delete. Uninitialized value created by heap deallocation (cfree) inside UA_WorkQueue_manuallyProcessDelayed called from UA_WorkQueue_cleanup <- UA_Server_run_shutdown.",
+    "original_source": "ARVO-Meta / OSS-Fuzz issue 10604",
+    "normalized": "When a SecureChannel is closed during message processing, removeSecureChannel defers ALL of UA_SecureChannel_deleteMembersCleanup (including connection detachment, session unlinking, and channel state update) to a delayed work queue callback. During server shutdown, UA_WorkQueue_manuallyProcessDelayed processes the deferred callback and UA_free(dc) frees the channel_entry (since the embedded cleanupCallback is the first field of channel_entry, UA_free(&entry->cleanupCallback) frees the entire struct). A subsequent call to UA_WorkQueue_manuallyProcessDelayed from UA_Server_delete reads from the freed memory, triggering a use-of-uninitialized-value. The fix splits deleteMembersCleanup into close() (synchronous: state=CLOSED, detach connection, unlink sessions) and deleteMembers() (deferrable: free certificates, nonces, tokens, messages)."
+  },
+  "source": {
+    "file": "src/server/ua_server_binary.c",
+    "function": "processCompleteChunkWithoutChannel",
+    "line": 690,
+    "code": "UA_TcpMessageHeader_decodeBinary(message, &offset, &tcpMessageHeader)",
+    "var": "tcpMessageHeader",
+    "description": "First project-code statement that reads fuzzed binary data into a structured message header whose type field (OPN) dispatches into channel creation and the vulnerable deferred-cleanup path.",
+    "value_from": "untrusted fuzz input (data, size) passed via UA_Server_processBinaryMessage",
+    "note": "Decodes the message type from fuzzed data. The messageTypeAndChunkType field dispatches to OPN handling, which creates a secure channel and processes the message — entering the vulnerable deferred-cleanup path.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "src/server/ua_securechannel_manager.c",
+    "function": "removeSecureChannel",
+    "line": 58,
+    "code": "UA_WorkQueue_enqueueDelayed(&cm->server->workQueue, &entry->cleanupCallback)",
+    "var": "entry->cleanupCallback",
+    "description": "Defers entire SecureChannel cleanup to a delayed callback, including state update, connection detachment, and session unlinking that must happen synchronously. Without immediate close, the freed callback memory is later read during a second work queue drain.",
+    "note": "Defers ALL channel cleanup — including setting channel state to CLOSED, detaching the connection, and unlinking sessions — to a delayed callback. The fix calls UA_SecureChannel_close() immediately here (which sets state=CLOSED, detaches connection, unlinks sessions) and defers only UA_SecureChannel_deleteMembers(). Without the synchronous close, the work queue inherits a dangling callback whose host allocation (channel_entry) is freed during shutdown processing and then re-read.",
+    "trace_step": 5
+  },
+  "sink": {
+    "file": "src/ua_workqueue.c",
+    "function": "UA_WorkQueue_manuallyProcessDelayed",
+    "line": 252,
+    "code": "SIMPLEQ_REMOVE_HEAD(&wq->delayedCallbacks, next)",
+    "var": "dc",
+    "description": "Reads the next linked-list pointer from heap memory freed during a prior UA_WorkQueue_manuallyProcessDelayed invocation. MSan detects use-of-uninitialized-value.",
+    "note": "During the second call to UA_WorkQueue_manuallyProcessDelayed (from UA_Server_delete → UA_WorkQueue_cleanup), the linked list iteration reads the next field from memory that was freed by UA_free(dc) at line 255 during the first call (from UA_Server_run_shutdown). MSan reports use-of-uninitialized-value because the freed heap memory is poisoned.",
+    "trace_step": 8
+  },
+  "tainted_value_origin": {
+    "file": "src/server/ua_server_binary.c",
+    "function": "processCompleteChunkWithoutChannel",
+    "line": 690,
+    "code": "UA_TcpMessageHeader_decodeBinary(message, &offset, &tcpMessageHeader)",
+    "var": "tcpMessageHeader.messageTypeAndChunkType",
+    "note": "The fuzzed binary data is decoded into a message header; the message type (OPN) determines the code path that creates a secure channel and triggers the vulnerable deferred-cleanup flow."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/server/ua_server_binary.c",
+      "function": "processCompleteChunkWithoutChannel",
+      "line": 696,
+      "code": "switch(tcpMessageHeader.messageTypeAndChunkType & 0x00ffffff)"
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processCompleteChunkWithoutChannel",
+      "summary": "Decode message type from fuzzed data, dispatch to OPN handler which creates a secure channel and processes the message."
+    },
+    {
+      "step": 2,
+      "file": "src/server/ua_securechannel_manager.c",
+      "function": "UA_SecureChannelManager_create",
+      "summary": "Allocate channel_entry (with embedded cleanupCallback as first field) and initialize the secure channel."
+    },
+    {
+      "step": 3,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processSecureChannelMessage",
+      "summary": "Process the decoded message; if processing fails, call Service_CloseSecureChannel which invokes removeSecureChannel."
+    },
+    {
+      "step": 4,
+      "file": "src/server/ua_securechannel_manager.c",
+      "function": "removeSecureChannel",
+      "summary": "Remove entry from channel list and defer ALL cleanup (including state update, connection detach, session unlink) to a delayed work queue callback."
+    },
+    {
+      "step": 5,
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "summary": "During UA_Server_run_shutdown, process the deferred cleanup callback — deleteMembersCleanup runs, then UA_free(dc) frees the channel_entry. During UA_Server_delete, a second iteration reads from the freed memory: use-of-uninitialized-value."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processCompleteChunkWithoutChannel",
+      "line": 690,
+      "var": "tcpMessageHeader",
+      "code": "UA_StatusCode retval = UA_TcpMessageHeader_decodeBinary(message, &offset, &tcpMessageHeader);",
+      "note": "Decodes message header from the fuzzed binary data. The messageTypeAndChunkType field yields UA_MESSAGETYPE_OPN, dispatching into the OPN handler that creates a secure channel.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/server/ua_securechannel_manager.c",
+      "function": "UA_SecureChannelManager_create",
+      "line": 112,
+      "var": "entry",
+      "code": "channel_entry *entry = (channel_entry *)UA_malloc(sizeof(channel_entry));",
+      "note": "Allocates the channel_entry struct. The first field is UA_DelayedCallback cleanupCallback, so &entry->cleanupCallback == entry. This allocation will later be freed by UA_free(dc) in the work queue processor.",
+      "depends_on": [
+        {"on": 1, "type": "control", "via": "tcpMessageHeader.messageTypeAndChunkType == UA_MESSAGETYPE_OPN"}
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processCompleteChunkWithoutChannel",
+      "line": 727,
+      "var": "connection->channel",
+      "code": "retval = UA_SecureChannel_decryptAddChunk(connection->channel, message, UA_FALSE);",
+      "note": "Decrypts and adds the OPN chunk to the newly created channel. On success, the message is queued for processing.",
+      "depends_on": [
+        {"on": 2, "type": "data", "via": "entry->channel"},
+        {"on": 1, "type": "data", "via": "message"}
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processSecureChannelMessage",
+      "line": 643,
+      "var": "channel",
+      "code": "Service_CloseSecureChannel(server, channel);",
+      "note": "Message processing fails (retval != GOOD). processSecureChannelMessage calls Service_CloseSecureChannel, which calls UA_SecureChannelManager_close → removeSecureChannel.",
+      "depends_on": [
+        {"on": 3, "type": "control", "via": "retval != UA_STATUSCODE_GOOD"}
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/server/ua_securechannel_manager.c",
+      "function": "removeSecureChannel",
+      "line": 58,
+      "var": "entry->cleanupCallback",
+      "code": "UA_WorkQueue_enqueueDelayed(&cm->server->workQueue, &entry->cleanupCallback);",
+      "note": "Enqueues the embedded cleanupCallback (= removeSecureChannelCallback → UA_SecureChannel_deleteMembersCleanup) as a delayed work queue callback. The channel state is NOT set to CLOSED, the connection is NOT detached, and sessions are NOT unlinked at this point. The fix adds UA_SecureChannel_close(&entry->channel) before this call, which synchronously sets state=CLOSED, detaches the connection, and unlinks sessions.",
+      "depends_on": [
+        {"on": 4, "type": "data", "via": "channel->securityToken.channelId"},
+        {"on": 2, "type": "data", "via": "entry"}
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/server/ua_server_binary.c",
+      "function": "UA_Server_processBinaryMessage",
+      "line": 789,
+      "var": "connection->channel",
+      "code": "UA_SecureChannel_persistIncompleteMessages(connection->channel);",
+      "note": "After message processing returns, UA_Server_processBinaryMessage continues to use connection->channel because the connection was not detached (cleanup was deferred). The fix adds a check: if(channel->state == UA_SECURECHANNELSTATE_CLOSED) return; before this call.",
+      "depends_on": [
+        {"on": 5, "type": "control", "via": "channel->state != UA_SECURECHANNELSTATE_CLOSED"}
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "line": 255,
+      "var": "dc",
+      "code": "UA_free(dc);",
+      "note": "During UA_Server_run_shutdown → UA_WorkQueue_cleanup (ua_server.c:553), the deferred callback is processed: removeSecureChannelCallback runs UA_SecureChannel_deleteMembersCleanup, then UA_free(dc) frees the channel_entry (dc == &entry->cleanupCallback == entry). This heap deallocation makes the memory uninitialized under MSan.",
+      "depends_on": [
+        {"on": 5, "type": "data", "via": "entry->cleanupCallback"},
+        {"on": 6, "type": "order", "via": "free_before_use"}
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "line": 252,
+      "var": "dc",
+      "code": "SIMPLEQ_REMOVE_HEAD(&wq->delayedCallbacks, next);",
+      "note": "During UA_Server_delete → UA_WorkQueue_cleanup (ua_server.c:218), the SIMPLEQ linked list iteration reads the next field from memory freed at step 7. MSan reports use-of-uninitialized-value. The uninitialized value was created by cfree at ua_workqueue.c:255.",
+      "depends_on": [
+        {"on": 7, "type": "order", "via": "use_before_init"}
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "MSan",
+    "trace_format": "MemorySanitizer",
+    "sanitizer": "memory",
+    "crash_type": "use-of-uninitialized-value",
+    "access_type": "read",
+    "access_size": null,
+    "crash_location": {
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "line": 252
+    },
+    "runtime_crash_location": {
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "line": 252
+    },
+    "allocation_context": null,
+    "free_context": {
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "line": 255
+    },
+    "crash_stack": [
+      {"frame": 0, "function": "UA_WorkQueue_manuallyProcessDelayed", "file": "src/ua_workqueue.c", "line": 252},
+      {"frame": 1, "function": "UA_WorkQueue_cleanup", "file": "src/ua_workqueue.c", "line": 61},
+      {"frame": 2, "function": "UA_Server_delete", "file": "src/server/ua_server.c", "line": 218},
+      {"frame": 3, "function": "LLVMFuzzerTestOneInput", "file": "tests/fuzz/fuzz_binary_message.cc", "line": 37}
+    ],
+    "free_stack": [
+      {"frame": 0, "function": "cfree", "file": "msan_interceptors.cc", "line": 228},
+      {"frame": 1, "function": "UA_WorkQueue_manuallyProcessDelayed", "file": "src/ua_workqueue.c", "line": 255},
+      {"frame": 2, "function": "UA_WorkQueue_cleanup", "file": "src/ua_workqueue.c", "line": 61},
+      {"frame": 3, "function": "UA_Server_run_shutdown", "file": "src/server/ua_server.c", "line": 553},
+      {"frame": 4, "function": "LLVMFuzzerTestOneInput", "file": "tests/fuzz/fuzz_binary_message.cc", "line": 36}
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "N/A — CWE-457 uninitialized value from heap deallocation, not an allocation-site bug",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "The PoC binary is processed by UA_Server_processBinaryMessage as an OPC UA message. It triggers secure channel creation (OPN) followed by a message processing error that closes the channel via removeSecureChannel, deferring ALL cleanup to a work queue callback. During server shutdown and deletion, the deferred callback runs (freeing the channel_entry), then a second work queue cleanup reads from the freed memory.",
+    "format": {
+      "name": "OPC UA binary protocol message",
+      "contract": "A binary blob interpretable as an OPC UA wire protocol message (starting with a TcpMessageHeader) that triggers OPN channel creation and a subsequent processing error leading to Service_CloseSecureChannel. The exact content encodes an OPN message header followed by payload that causes processOPN or processSecureChannelMessage to fail."
+    }
+  }
+}

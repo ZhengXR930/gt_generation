@@ -123,7 +123,10 @@ def _stage_default_crash_trace(
                 local_candidate = source_sample_path.parent / candidate
                 candidate = local_candidate if local_candidate.is_file() else repo_root / candidate
             if candidate.is_file() and candidate.stat().st_size:
-                shutil.copy2(candidate, destination)
+                # shutil.copy (not copy2) so the staged trace gets this run's mtime;
+                # copy2 preserves the source error.txt's old mtime, which trips the
+                # runner's required-output freshness gate and fails Stage 00.
+                shutil.copy(candidate, destination)
                 source = str(candidate)
                 break
     if not destination.is_file() or not destination.stat().st_size:

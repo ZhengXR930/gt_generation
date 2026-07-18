@@ -92,6 +92,22 @@ vulnerable program relative to its existing checks. Do not replace it with an eq
 predicate over an instrumentation-only derived value; runtime evidence validates the
 missing source obligation, not a newly invented formulation of it.
 
+Derive the root obligation from `patch.diff`, not from a relation that merely happens to
+hold at the sink. Read the patch and identify the exact condition the fix introduces —
+a new guard, a length/bounds test, a type/algorithm/format validation, an
+initialization, an ownership or state check — and anchor the required assertion at the
+source location where that fix acts, with the fixed version as one operand of the
+before/after evidence. When the fix acts upstream of the sink (it rejects or corrects the
+input before the unsafe operation), the required obligation lives at the fix site: the
+vulnerable version violates it there (or reaches the unsafe operation with it unmet)
+while the fixed version satisfies it, or per step 5 the fixed original is `guarded`/
+`not_exercised` and needs a genuine-witness perturbation. Do not phrase the obligation as
+a derived relation measured at the sink (for example `buf_len >= read_len`) when the fix
+never changes those operands at that point: such an obligation is violated identically in
+the vulnerable and fixed runs, distinguishes nothing, and cannot verify. If the vulnerable
+and fixed measurements of a required assertion are equal, the obligation is anchored at the
+wrong point — re-anchor it at what the patch actually changed.
+
 Each transition must verify the semantic relation named by its invariant. For mutation,
 compare the same source value immediately before and after the responsible operation.
 For propagation or aliasing, compare the actual carried values (private pointer values
