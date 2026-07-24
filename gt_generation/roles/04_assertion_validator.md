@@ -142,6 +142,57 @@ Checks are `[op, left, right]` with `eq`, `ne`, `lt`, `le`, `gt`, or `ge`; `$fie
 reads an `ASSERT_EVT` field. Do not duplicate prompts, answers, provenance, expected
 matrices, or reciprocal assertion IDs.
 
+## Field bindings (required)
+
+Every `$event.field` name you use must be a semantic view over a real, concrete
+expression in the *vulnerable* original's own source -- the one you inserted (or
+identified) an `ASSERT_EVT` marker next to to capture it. That real expression is
+known at the moment you place the marker; it must not be discarded once verification
+finishes. Write it to `<result_dir>/field_bindings.json`:
+
+```json
+{
+  "schema_version": "field-bindings-v1",
+  "sample_id": "<sample_id>",
+  "bindings": {
+    "<event>.<field>": "<exact vulnerable-original source expression, e.g. asn1_com_prkey_attr[0].parm>"
+  }
+}
+```
+
+One entry per distinct `$event.field` referenced anywhere in `assertions`. Use the
+vulnerable original's expression -- that is the code the evaluated agent actually
+reads, so its own account of the bug refers to those names. This file is consumed
+downstream to recover what each `$event.field` really is in the source, so a
+subject's description of the vulnerability can be matched against these assertions;
+without it only the opaque semantic name (e.g. "free_argument") is available, which
+no real source-level account would ever use.
+
+## Event locations (required)
+
+Every event-point ID you invent for the assertion graph (the `at`/`from`/`to`
+values, e.g. `enqueue_deferred`, `cleanup_free`) is a synthetic node name --
+it never exists as a real symbol in the project's source. To locate each
+invariant in real code downstream (e.g. to check whether a subject's account of
+the vulnerability reaches the right function), record each event ID's real,
+locatable position. Write it to `<result_dir>/event_locations.json`:
+
+```json
+{
+  "schema_version": "event-locations-v1",
+  "sample_id": "<sample_id>",
+  "locations": {
+    "<event_id>": {"function": "<real function name>", "file": "<path relative to the vulnerable repo root>", "line": <int, for audit only>}
+  }
+}
+```
+
+One entry per distinct event ID referenced anywhere in `assertions`' `at`/`from`/`to`
+fields, using the vulnerable original's function/file (the code the evaluated agent
+reads). `line` is stored for audit/cross-checking only. Most event IDs coincide with
+`ground_truth.json`'s own `root_cause`, `sink`, or one of the `fine_trace` steps --
+reuse that file's `function`/`file`/`line` rather than re-deriving them.
+
 Finally run:
 
 ```bash

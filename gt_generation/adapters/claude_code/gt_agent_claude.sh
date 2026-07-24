@@ -62,10 +62,10 @@ CLAUDE_ARGS=(
   --no-session-persistence
   --output-format json
 )
-MODEL="${GT_CLAUDE_MODEL:-sonnet}"
-case "$(basename "${ROLE_FILE%.md}")" in
-  02_*|03_*|04_*) MODEL="${GT_CLAUDE_COMPLEX_MODEL:-claude-opus-4-6}" ;;
-esac
+# One model for every stage -- no per-stage escalation (see gt_plugin.py). Prefer
+# the generic GT_AGENT_MODEL; fall back to the older GT_CLAUDE_MODEL for callers
+# that still set it, then to sonnet.
+MODEL="${GT_AGENT_MODEL:-${GT_CLAUDE_MODEL:-sonnet}}"
 CLAUDE_ARGS+=(--model "$MODEL")
 if [[ -n "${GT_CLAUDE_EFFORT:-}" ]]; then
   CLAUDE_ARGS+=(--effort "$GT_CLAUDE_EFFORT")

@@ -5,7 +5,7 @@ give it one vulnerability's information, get a validated `ground_truth.json`.
 Any coding-agent CLI (Codex, Claude Code, or your own shim) can drive it.
 
 All of this lives in `gt_generation/`. Data and the reproduction engine stay at
-the repo root (`gt_results/`, `final_dataset/`, `evaluation_mode/`,
+the repo root (`gt_results/`, `dataset/`, `evaluator/`,
 `docker/`); `runner.py` knows the split (code_root = `gt_generation/`,
 repo_root = its parent).
 
@@ -27,7 +27,7 @@ gt_generation/
 
 <repo root>
   L1  docker/gt-memory-env/    the reproducible build/repro/debug environment
-      evaluation_mode/reachability/  engine used by gt_toolkit reachability
+      evaluator/reachability/  engine used by gt_toolkit reachability
 ```
 
 Principle: **content lives once in L2** (roles + schema + tools). L3 projects it
@@ -42,7 +42,7 @@ Stages 01–04 are fresh external coding-agent CLI sessions. They share only fil
 sample result directory. When Stage 03 rejects completeness, the runner launches a new
 Stage 02 session with `trace_feedback.json`, then a new Stage 03 session, for at most the
 configured feedback rounds. `05_validate` is deterministic. Evaluation later uses the
-separate `evaluation-prober` under `evaluation_mode/reasoning/skill/`.
+separate `evaluation-prober` under `evaluator/reasoning/skill/`.
 
 The Claude adapter uses Sonnet for Stage 01 reproduction and pins the reasoning-heavy
 Stage 02 trace, Stage 03 review, and Stage 04 assertion validation sessions to

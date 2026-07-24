@@ -444,7 +444,7 @@ def _check_poc(data: dict, report: Report) -> None:
     if re.match(r"^work[/\\]", path) or "/work/" in path:
         report.warn(
             "poc.path points into a disposable work/ dir; it will dangle after cleanup "
-            "(prefer final_dataset/pocs/<id>/poc or gt_results/<id>/poc)"
+            "(prefer dataset/pocs/<id>/poc or gt_results/<id>/poc)"
         )
 
 

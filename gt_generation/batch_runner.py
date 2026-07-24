@@ -56,7 +56,7 @@ def _current_stage(result_dir: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--selection", type=Path, default=ROOT / "final_dataset" / "selected_1000.json")
+    parser.add_argument("--selection", type=Path, default=ROOT / "dataset" / "selected_1000.json")
     parser.add_argument("--sample-id", action="append", required=True)
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--model", default="sonnet")

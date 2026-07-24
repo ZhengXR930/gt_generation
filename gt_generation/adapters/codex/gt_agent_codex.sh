@@ -33,8 +33,12 @@ and staged artifacts explicitly; no conversational state from another stage exis
 Write the role's required artifacts into the result directory. Do not delegate. When
 complete, report which deterministic gates passed and any evidence limitations."
 
-exec codex exec \
-  --cd "$REPO_ROOT" \
-  --dangerously-bypass-approvals-and-sandbox \
-  --ephemeral \
-  "$PROMPT"
+# One model for every stage via the generic GT_AGENT_MODEL (see gt_plugin.py);
+# omit -m to let codex use its own default when unset.
+CODEX_ARGS=(exec --cd "$REPO_ROOT" --dangerously-bypass-approvals-and-sandbox --ephemeral)
+if [[ -n "${GT_AGENT_MODEL:-}" ]]; then
+  CODEX_ARGS+=(-m "$GT_AGENT_MODEL")
+fi
+CODEX_ARGS+=("$PROMPT")
+
+exec codex "${CODEX_ARGS[@]}"

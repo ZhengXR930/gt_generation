@@ -186,6 +186,41 @@ def validate_invariant_bindings(
                 covered.add(invariant_id)
     for invariant_id in sorted(selected - covered):
         errors.append(f"invariant {invariant_id} has no assertion")
+
+    # Root-cause criterion gate. The Mechanism dimension is built from the
+    # required assertion bound to root_cause_criterion, so the criterion must
+    # be present and either (a) bound to a required assertion, or (b) an
+    # explicitly declared missing-operation criterion (an omitted op -- e.g.
+    # a buffer never initialized, a pointer never null-terminated -- has no
+    # comparison relation to assert, but is still a real, probeable mechanism).
+    # Audit basis: arvo_19723 shipped with a null criterion despite a ready
+    # required assertion (REQ_ihbytes_valid) that was simply never linked;
+    # arvo_42470156 shipped a criterion with no required assertion and an
+    # undeclared type. Both slipped through and were only patched downstream.
+    # This gate forces Stage 04 to resolve them at generation time instead.
+    if not isinstance(criterion, dict) or not str(criterion.get("invariant_id") or "").strip():
+        errors.append(
+            "root_cause_criterion is null/missing: Stage 04 must identify the root-cause "
+            "invariant (populate root_cause_criterion with the invariant_id that its "
+            "required assertion covers)"
+        )
+    else:
+        criterion_id = str(criterion.get("invariant_id") or "").strip()
+        linked = [
+            str(assertion.get("id"))
+            for assertion in spec.get("assertions", [])
+            if assertion.get("kind") == "required"
+            and criterion_id in {str(x) for x in assertion.get("invariants", [])}
+        ]
+        is_missing_op = str(criterion.get("type") or "").startswith("missing_")
+        if not linked and not is_missing_op:
+            errors.append(
+                f"root_cause_criterion {criterion_id!r} has no required assertion bound to it "
+                "and does not declare a missing-operation type: either bind a required assertion "
+                "to this invariant, or (if the bug is an omitted operation with no comparison to "
+                "assert) set its type to a missing_* value such as missing_initialization or "
+                "missing_null_termination"
+            )
     if strict_edges:
         for invariant_id, assertion_ids in sorted(edge_transition_coverage.items()):
             if len(assertion_ids) != 1:
@@ -198,6 +233,81 @@ def validate_invariant_bindings(
         "invariant_count": len(selected),
         "assertion_count": len(spec.get("assertions", [])),
         "errors": errors,
+    }
+
+
+# `$event.field` suffixes that resolve to a compile-time literal (NULL/0/etc.)
+# and therefore never need a field_bindings entry -- mirrors the downstream
+# probe builder's literal set so this gate stays consistent with it.
+_LITERAL_FIELD_SUFFIXES = {"null_literal", "zero_literal", "true_literal", "false_literal"}
+
+
+def validate_binding_coverage(
+    spec: dict[str, Any],
+    field_bindings: dict[str, Any] | None,
+    event_locations: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Check that the two Stage-04 side maps actually cover what the verified
+    assertions reference.
+
+    event_locations (ERROR): every event id used as an assertion `at`/`from`
+    must resolve to a real (function, file). Without it the probe question
+    splices the synthetic event id into its text -- unanswerable by
+    construction (a subject greps for `enqueue_deferred`, finds nothing). This
+    is a hard error: empirically every current sample already covers 100% of
+    its events, so requiring it only guards against regression.
+
+    field_bindings (WARNING): every `$event.field` operand that is not a
+    compile-time literal should map to its real vulnerable-version source
+    expression. Left as a warning, not an error, because the downstream builder
+    degrades gracefully for a few operand shapes (an operand whose field is the
+    root variable itself, a runtime-captured value with no better name than its
+    line) -- so an unbound operand is a quality gap to review, not a structural
+    break.
+    """
+    field_bindings = field_bindings or {}
+    event_locations = event_locations or {}
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    referenced_events: set[str] = set()
+    referenced_operands: set[str] = set()
+    for assertion in spec.get("assertions", []):
+        if not isinstance(assertion, dict):
+            continue
+        for key in ("at", "from"):
+            ev = assertion.get(key)
+            if ev:
+                referenced_events.add(str(ev))
+        check = assertion.get("check")
+        if isinstance(check, list) and len(check) == 3:
+            for side in (check[1], check[2]):
+                if isinstance(side, str) and side.startswith("$"):
+                    referenced_operands.add(side[1:])
+
+    for event in sorted(referenced_events):
+        loc = event_locations.get(event)
+        if not isinstance(loc, dict) or not loc.get("function") or not loc.get("file"):
+            errors.append(
+                f"event_locations missing (function,file) for event id {event!r} "
+                "referenced by an assertion at/from"
+            )
+
+    for operand in sorted(referenced_operands):
+        if operand.rsplit(".", 1)[-1] in _LITERAL_FIELD_SUFFIXES:
+            continue
+        if operand not in field_bindings:
+            warnings.append(
+                f"field_bindings has no real source expression for operand {operand!r} "
+                "(probe builder will fall back to an anonymized/positional label)"
+            )
+
+    return {
+        "valid": not errors,
+        "event_count": len(referenced_events),
+        "operand_count": len(referenced_operands),
+        "errors": errors,
+        "warnings": warnings,
     }
 
 
@@ -564,6 +674,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verified-assertions-out", type=Path)
     parser.add_argument("--perturbation-results-out", type=Path)
     parser.add_argument("--check-bindings-only", action="store_true")
+    parser.add_argument("--field-bindings", type=Path, help="field_bindings.json for the binding-coverage gate")
+    parser.add_argument("--event-locations", type=Path, help="event_locations.json for the binding-coverage gate")
     parser.add_argument("--freeze-only", action="store_true")
     parser.add_argument("--freeze-marker", type=Path)
     args = parser.parse_args(argv)
@@ -580,8 +692,25 @@ def main(argv: list[str] | None = None) -> int:
         binding = validate_invariant_bindings(
             json.loads(args.verified_invariants.read_text(encoding="utf-8")), spec
         )
-        print(json.dumps(binding, indent=2))
-        if not binding["valid"]:
+        report: dict[str, Any] = {"invariant_binding": binding}
+        ok = binding["valid"]
+        # Binding-coverage gate over the Stage-04 side maps, when provided.
+        if args.field_bindings or args.event_locations:
+            def _load_map(path: Path | None, key: str) -> dict[str, Any]:
+                if not path or not path.exists():
+                    return {}
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data.get(key, {}) if isinstance(data, dict) else {}
+
+            coverage = validate_binding_coverage(
+                spec,
+                _load_map(args.field_bindings, "bindings"),
+                _load_map(args.event_locations, "locations"),
+            )
+            report["binding_coverage"] = coverage
+            ok = ok and coverage["valid"]
+        print(json.dumps(report, indent=2))
+        if not ok:
             raise SystemExit(1)
         return 0
     if not args.vulnerable_trace or not args.fixed_trace or not args.results_out:

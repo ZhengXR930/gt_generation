@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 CODE_ROOT = Path(__file__).resolve().parent          # gt_generation/ (roles, workflow, gt_toolkit)
-REPO_ROOT = CODE_ROOT.parent                          # repo root (gt_results, final_dataset, evaluation_mode)
+REPO_ROOT = CODE_ROOT.parent                          # repo root (gt_results, dataset, evaluator)
 DEFAULT_CONFIG = CODE_ROOT / "workflow.json"
 
 

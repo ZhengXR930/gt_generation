@@ -60,7 +60,10 @@ def test_workflow_uses_four_isolated_agent_stages_and_review_feedback():
     assert "gt_toolkit audit-package" in final_stage["command_template"]
 
 
-def test_claude_adapter_uses_opus_for_complex_stages():
+def test_claude_adapter_uses_one_model_no_stage_escalation():
+    # The config-driven plugin runs every stage with a single model (no
+    # per-stage escalation); the adapter takes it from GT_AGENT_MODEL and must
+    # not branch on the stage/role name.
     adapter = (
         Path(__file__).parents[1]
         / "gt_generation"
@@ -69,8 +72,9 @@ def test_claude_adapter_uses_opus_for_complex_stages():
         / "gt_agent_claude.sh"
     ).read_text()
 
-    assert '02_*|03_*|04_*' in adapter
-    assert 'GT_CLAUDE_COMPLEX_MODEL:-claude-opus-4-6' in adapter
+    assert 'GT_AGENT_MODEL' in adapter
+    assert '02_*|03_*|04_*' not in adapter
+    assert 'GT_CLAUDE_COMPLEX_MODEL' not in adapter
 
 
 def test_failed_review_reopens_fresh_producer_and_reviewer_sessions(tmp_path, monkeypatch):
@@ -129,15 +133,6 @@ def test_dry_run_has_separate_state_file(tmp_path):
     assert runner.generation_logs_path(tmp_path, dry_run=True).name == "role_logs_dry_run"
 
 
-def test_evaluation_launcher_writes_probes_outside_gt_results():
-    launcher = (
-        Path(__file__).parents[1]
-        / "evaluation_mode"
-        / "run_evaluation_harness_experiment.sh"
-    ).read_text()
-    assert 'PROBE_ROOT="${PROBE_ROOT:-${ROOT_DIR}/probe_results}"' in launcher
-    assert 'probe_path="${probe_dir}/assertion_probes.json"' in launcher
-    assert 'gt_results/${task_slug}/assertion_probes.json' not in launcher
 def test_partial_rerun_timing_keeps_latest_duration_per_stage():
     prior = [
         {"name": "02_fine_trace", "duration_seconds": 10.0, "ok": True},

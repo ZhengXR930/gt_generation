@@ -1,6 +1,6 @@
 """Thin, portable wrapper over the repo's reachability engine.
 
-Roles call `python3 -m reachability.cli`, which resolves with `evaluation_mode/`
+Roles call `python3 -m reachability.cli`, which resolves with `evaluator/`
 on PYTHONPATH. This wrapper finds it relative to the repo root and delegates, so
 any coding-agent CLI can just call
 `python3 -m gt_toolkit reachability ...` from anywhere in the tree.
@@ -19,23 +19,23 @@ def _repo_root() -> Path:
     """Find the repo root by walking up until the evaluation engine is present.
 
     gt_toolkit/ lives at gt_generation/gt_toolkit/, while the reachability engine
-    evaluation_mode/ lives at the actual repo root one level above, so
+    evaluator/ lives at the actual repo root one level above, so
     a fixed parents[] index is fragile — search instead.
     """
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / "evaluation_mode" / "reachability").exists():
+        if (parent / "evaluator" / "reachability").exists():
             return parent
     # Fall back to the repo root (parent of gt_generation/).
     return here.parents[2]
 
 
 def _engine_env(root: Path) -> dict[str, str]:
-    eval_dir = root / "evaluation_mode"
+    eval_dir = root / "evaluator"
     missing = [str(eval_dir)] if not (eval_dir / "reachability").exists() else []
     if missing:
         raise FileNotFoundError(
-            "reachability engine not found; expected evaluation_mode/reachability under "
+            "reachability engine not found; expected evaluator/reachability under "
             f"{root} (missing: {', '.join(missing)})"
         )
     env = dict(os.environ)

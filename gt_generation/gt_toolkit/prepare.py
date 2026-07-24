@@ -50,8 +50,22 @@ def _arvo_id(sample: dict[str, Any]) -> str:
 
 
 def _is_arvo(sample: dict[str, Any]) -> bool:
-    return bool(sample.get("arvo_image_vul")
-                or str(sample.get("source_dataset", "")).upper().startswith("ARVO"))
+    """True for any ARVO-sourced sample -> use the prebuilt n132/arvo:<id> images.
+
+    `source_family == "arvo"` is the reliable signal: it covers both ARVO-Meta
+    samples and CyberGym samples (CyberGym repackages ARVO under the same
+    benchmark ids, so those also resolve to n132/arvo:<benchmark_id>). The older
+    checks (arvo_image_vul, an ARVO source_dataset prefix, an arvo_ sample_id)
+    are kept as fallbacks for entries that predate source_family. Everything
+    else (osv / secbench / nvd / ghsa) takes the gt-memory-env repo track.
+    """
+    if str(sample.get("source_family", "")).strip().lower() == "arvo":
+        return True
+    if sample.get("arvo_image_vul"):
+        return True
+    if str(sample.get("source_dataset", "")).upper().startswith("ARVO"):
+        return True
+    return str(sample.get("sample_id", "")).startswith("arvo_")
 
 
 def prepare(sample_path: str, result_dir: str) -> dict[str, Any]:
@@ -264,8 +278,8 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
             (d / "patch.diff").write_text(diff.stdout)
     if not (d / "patch.diff").exists():
         _stage_patch(sample, d, sid)
-    # poc from final_dataset/pocs/<sample_id>/
-    pocdir = Path(f"final_dataset/pocs/{sid}")
+    # poc from dataset/pocs/<sample_id>/
+    pocdir = Path(f"dataset/pocs/{sid}")
     if pocdir.is_dir():
         files = [f for f in pocdir.iterdir() if f.is_file() and f.name != "patch.diff"]
         if files:
@@ -286,9 +300,9 @@ def _stage_patch(sample: dict[str, Any], d: Path, sid: str) -> None:
         sample.get("patch_diff_path"),
         sample.get("patch_path"),
         f"arvo_patches/{sid}.diff",
-        f"final_dataset/arvo_patches/{sid}.diff",
-        f"final_dataset/arvo/{sid}/patch.diff",
-        f"final_dataset/pocs/{sid}/patch.diff",
+        f"dataset/arvo_patches/{sid}.diff",
+        f"dataset/arvo/{sid}/patch.diff",
+        f"dataset/pocs/{sid}/patch.diff",
     )
     for raw in raw_candidates:
         if not raw:
@@ -296,7 +310,7 @@ def _stage_patch(sample: dict[str, Any], d: Path, sid: str) -> None:
         candidate = Path(str(raw))
         candidates = [candidate]
         if not candidate.is_absolute():
-            candidates.extend((repo_root / candidate, repo_root / "final_dataset" / candidate))
+            candidates.extend((repo_root / candidate, repo_root / "dataset" / candidate))
         for resolved in candidates:
             if resolved.is_file():
                 # Required-output freshness is part of the runner's stale-file gate;
