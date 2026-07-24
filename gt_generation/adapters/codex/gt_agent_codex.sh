@@ -23,6 +23,15 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 mkdir -p "$RESULT_DIR"
 
+# Auth: a collaborator only needs to put their official OpenAI API key in the
+# repo-root config.txt as OPENAI_API_KEY_OFFICIAL=... . codex reads OPENAI_API_KEY
+# from the env, so load it here (env wins if already set). The codex "custom"
+# provider has no base_url override, so this routes to the official OpenAI API.
+if [[ -z "${OPENAI_API_KEY:-}" && -f "$REPO_ROOT/config.txt" ]]; then
+  key="$(grep -E '^OPENAI_API_KEY_OFFICIAL=' "$REPO_ROOT/config.txt" | head -1 | cut -d= -f2- | tr -d '"' | tr -d '[:space:]')"
+  [[ -n "$key" ]] && export OPENAI_API_KEY="$key"
+fi
+
 PROMPT="$(<"$ROLE_FILE")
 
 Sample metadata file: $SAMPLE

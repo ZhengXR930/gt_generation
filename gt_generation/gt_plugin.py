@@ -214,6 +214,21 @@ def main(argv: list[str] | None = None) -> int:
     if missing:
         raise SystemExit(f"sample ids absent from selection {cfg['selection_path']}: {missing}")
 
+    # Refresh GT_STATUS.md and skip samples already complete, so a collaborator
+    # never re-runs finished work (and can see the up-to-date coverage doc).
+    import gt_status
+    gt_status.write_status_doc(
+        gt_status.scan(gt_status._load_sample_ids(cfg["selection_path"])),
+        len(selection), cfg["selection_path"],
+    )
+    already_done = [s for s in cfg["samples"] if gt_status.classify(s)[0] == "complete"]
+    if already_done:
+        print(f"skipping {len(already_done)} already-complete sample(s): {sorted(already_done)}", flush=True)
+    cfg["samples"] = [s for s in cfg["samples"] if s not in already_done]
+    if not cfg["samples"]:
+        print("nothing to run -- all requested samples are already complete. See GT_STATUS.md", flush=True)
+        return 0
+
     batch_dir = Path("/tmp") / f"gt_batch_{args.batch_name}"
     inputs_dir = batch_dir / "inputs"
     logs_dir = batch_dir / "logs"

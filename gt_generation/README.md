@@ -9,6 +9,80 @@ the repo root (`gt_results/`, `dataset/`, `evaluator/`,
 `docker/`); `runner.py` knows the split (code_root = `gt_generation/`,
 repo_root = its parent).
 
+## Running a batch (config-driven — start here)
+
+`gt_plugin.py` generates GT for a whole list of samples from one JSON config.
+This is the entry point a collaborator should use; it needs only an API key and
+a config file.
+
+**1. Put an API key in the repo-root `config.txt`** (one `KEY=value` per line;
+`config.txt` is gitignored, so each person keeps their own):
+
+```
+DEEPSEEK_API_KEY=<key>            # for OpenHands + a base model
+OPENAI_API_KEY_OFFICIAL=<sk-...>  # official OpenAI key, used by the codex CLI
+```
+
+The `codex` adapter auto-loads `OPENAI_API_KEY_OFFICIAL` from `config.txt` (an
+`OPENAI_API_KEY` already in the environment wins). No other setup is needed for
+codex to use the official OpenAI API.
+
+**2. Copy the example config and edit it:**
+
+```bash
+cp gt_generation/gt_config.example.json gt_generation/gt_config.json
+```
+
+| field | meaning |
+|-------|---------|
+| `cli` | which agent CLI drives generation: `claude` \| `codex` \| `coco` (Trae). Each maps to `adapters/<cli>/`. |
+| `model` | **one** model id used for every stage (no per-stage switching). Must be valid for the CLI: `claude` → `sonnet`, `claude-opus-4-6`; `codex` → an official OpenAI model, e.g. `gpt-5.5`; `coco` → any id from `coco models` (e.g. `gpt-5.5`, `openrouter-3o`). |
+| `parallel_dockers` | how many samples to run at once (1–6); each holds one Docker workspace. |
+| `selection` | dataset metadata list (default `dataset/selected_1000.json`). |
+| `samples` | sample ids to generate, e.g. `["arvo_1304", "arvo_12595"]`. |
+
+**3. Run:**
+
+```bash
+python3 gt_generation/gt_plugin.py --config gt_generation/gt_config.json
+```
+
+Before running it refreshes `GT_STATUS.md` and **skips any sample already
+complete**, so finished work is never redone. Docker routing is automatic and
+printed up front: ARVO samples use the prebuilt `n132/arvo:<id>` images; every
+other source builds/clones in the shared `gt-memory-env` image.
+
+### Example — codex with the official GPT API, model GPT-5.5
+
+```jsonc
+// config.txt:  OPENAI_API_KEY_OFFICIAL=sk-...
+// gt_generation/gt_config.json:
+{
+  "cli": "codex",
+  "model": "gpt-5.5",
+  "parallel_dockers": 2,
+  "selection": "dataset/selected_1000.json",
+  "samples": ["arvo_1304", "arvo_12595"]
+}
+```
+```bash
+python3 gt_generation/gt_plugin.py --config gt_generation/gt_config.json
+```
+
+### Coverage status (`GT_STATUS.md`)
+
+`GT_STATUS.md` at the repo root (auto-generated, overwritten each run) lists
+which samples are **complete** (recorded — don't re-run), **incomplete** (a
+partial dir that should be re-run), and **remaining** (not started). Check it to
+see what is already done and what to run next; regenerate any time:
+
+```bash
+python3 gt_generation/gt_status.py
+```
+
+**Prerequisites:** Docker running, and the chosen CLI installed and on `PATH`
+(`claude`, `codex`, or `coco`).
+
 ## The three layers
 
 ```
@@ -44,9 +118,9 @@ Stage 02 session with `trace_feedback.json`, then a new Stage 03 session, for at
 configured feedback rounds. `05_validate` is deterministic. Evaluation later uses the
 separate `evaluation-prober` under `evaluator/reasoning/skill/`.
 
-The Claude adapter uses Sonnet for Stage 01 reproduction and pins the reasoning-heavy
-Stage 02 trace, Stage 03 review, and Stage 04 assertion validation sessions to
-`claude-opus-4-6` (override with `GT_CLAUDE_COMPLEX_MODEL` only when needed).
+Every stage runs with the single model from the config (`GT_AGENT_MODEL`); there is
+no per-stage model switching. Adapters read the model from `GT_AGENT_MODEL`
+(the Claude adapter falls back to the older `GT_CLAUDE_MODEL`, then `sonnet`).
 
 For ARVO, Stage 01 creates one sample workspace and performs the only default full
 vulnerable build. Stage 04 reuses it for instrumented target-level rebuilds, applies the
@@ -71,9 +145,11 @@ edge has one cross-event `transition` assertion. Stage 05 runs `audit-package`, 
 rejects legacy edge bindings, missing public context, unverified perturbations, and
 dangling evidence paths before a result can be used to generate probes.
 
-## Quick start
+## Low-level / single-sample use
 
-Run from the repo root. Put `gt_generation/` on `PYTHONPATH` (or `pip install -e
+The config-driven launcher above is the normal path. For one sample, the
+deterministic tools, or a custom CLI shim, drive `runner.py` directly. Run from
+the repo root; put `gt_generation/` on `PYTHONPATH` (or `pip install -e
 gt_generation` once, which gives you a global `gt-toolkit` command).
 
 ```bash
