@@ -127,16 +127,20 @@ vulnerable build. Stage 04 reuses it for instrumented target-level rebuilds, app
 official patch in place, and incrementally rebuilds the fixed target. The fixed image is
 pulled only as an explicit fallback; cleanup removes only that sample's workspace/images.
 
-Every result directory permanently retains the four reproducibility assets
-`sample_info.json`, `build.sh`, `poc`, and `patch.diff`. Runtime worktrees, containers,
-instrumentation patches, and role logs may be cleaned after validation; these four files
-must not be cleaned.
+Every result directory permanently retains the three reproducibility assets
+`sample_info.json`, `build.sh`, and `poc`. Runtime worktrees, containers,
+instrumentation patches, and role logs may be cleaned after validation; these three files
+must not be cleaned. `patch.diff` (the official fix commit) is **not** kept: for ARVO it
+is frequently an unrelated build/docs/version commit, so it is not a reliable fix oracle
+— the sanitizer trace is authoritative for the root cause and the prebuilt `-fix` image
+for "the crash disappears". It may still be produced transiently during generation but is
+stripped from the stored package.
 
-After Stage 05 succeeds, the runner compacts the result to those four assets plus the
+After Stage 05 succeeds, the runner compacts the result to those three assets plus the
 default/reproduced crash traces, `ground_truth.json`, verified invariants/assertions,
-assertion/perturbation/reachability results, and generation timing. Candidate specs,
-instrumentation patches, raw assertion traces, reviewer state, role logs, and debugger
-scratch artifacts are retained only for failed runs.
+field/event bindings, assertion/perturbation/reachability results, and generation timing.
+Candidate specs, instrumentation patches, raw assertion traces, reviewer state, role logs,
+`patch.diff`, and debugger scratch artifacts are retained only for failed runs.
 
 Stage 00 also snapshots `default_crash_trace.txt`, the exact crash context initially
 visible to the evaluated agent. Stage 04 emits `assertion-spec-v3`: node states use

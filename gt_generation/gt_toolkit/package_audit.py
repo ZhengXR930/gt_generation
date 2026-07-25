@@ -19,7 +19,6 @@ REQUIRED_FILES = (
     "sample_info.json",
     "build.sh",
     "poc",
-    "patch.diff",
     "ground_truth.json",
     "verified_invariants.json",
     "verified_assertions.json",

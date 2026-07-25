@@ -15,7 +15,6 @@ KEEP_FILES = {
     "sample_info.json",
     "build.sh",
     "poc",
-    "patch.diff",
     "default_crash_trace.txt",
     "sanitizer_trace.txt",
     "ground_truth.json",
