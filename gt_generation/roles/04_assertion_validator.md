@@ -92,21 +92,35 @@ vulnerable program relative to its existing checks. Do not replace it with an eq
 predicate over an instrumentation-only derived value; runtime evidence validates the
 missing source obligation, not a newly invented formulation of it.
 
-Derive the root obligation from `patch.diff`, not from a relation that merely happens to
-hold at the sink. Read the patch and identify the exact condition the fix introduces —
-a new guard, a length/bounds test, a type/algorithm/format validation, an
-initialization, an ownership or state check — and anchor the required assertion at the
-source location where that fix acts, with the fixed version as one operand of the
-before/after evidence. When the fix acts upstream of the sink (it rejects or corrects the
-input before the unsafe operation), the required obligation lives at the fix site: the
-vulnerable version violates it there (or reaches the unsafe operation with it unmet)
-while the fixed version satisfies it, or per step 5 the fixed original is `guarded`/
-`not_exercised` and needs a genuine-witness perturbation. Do not phrase the obligation as
-a derived relation measured at the sink (for example `buf_len >= read_len`) when the fix
-never changes those operands at that point: such an obligation is violated identically in
-the vulnerable and fixed runs, distinguishes nothing, and cannot verify. If the vulnerable
-and fixed measurements of a required assertion are equal, the obligation is anchored at the
-wrong point — re-anchor it at what the patch actually changed.
+Derive the root obligation from the **sanitizer trace and the code**, not from a relation
+that merely happens to hold at the sink, and not from `patch.diff`. The official fix
+commit is unreliable for these samples — it is frequently an unrelated build, docs, or
+version-bump commit that does not touch the vulnerable code at all — so `patch.diff` is at
+most a corroborating hint and is **never** the authority. The trace is the authority:
+- frame `#0` of the report is the **sink** (the unsafe operation);
+- the sanitizer's origin section names the **root cause** directly. For MemorySanitizer,
+  `Uninitialized value was created by an allocation of '<var>' in the stack frame of
+  function '<fn>'` identifies the uninitialized object, and the obligation is that the
+  bytes of `<var>` consumed at the sink are initialized on every reaching path. For
+  AddressSanitizer, the `allocated by` (and, for use-after-free, `freed by`) stacks plus
+  the reported out-of-bounds offset identify the object whose bounds or lifetime the
+  missing check must enforce.
+
+Identify the exact condition a correct program would enforce — a new guard, a
+length/bounds test, a type/algorithm/format validation, an initialization, an ownership
+or state check — and anchor the required assertion at the root-cause site the trace
+points to (the allocation/declaration for an uninitialized-use, the length/bounds
+computation for an overflow, the free/ownership point for a use-after-free), with the
+fixed version as one operand of the before/after evidence. When the obligation is enforced
+upstream of the sink (input rejected or corrected before the unsafe operation), it lives
+at that upstream site: the vulnerable version violates it there (or reaches the unsafe
+operation with it unmet) while the fixed version satisfies it, or per step 5 the fixed
+original is `guarded`/`not_exercised` and needs a genuine-witness perturbation. Do not
+phrase the obligation as a derived relation measured at the sink (for example
+`buf_len >= read_len`) when it holds identically in the vulnerable and fixed runs: such an
+obligation distinguishes nothing and cannot verify. If the vulnerable and fixed
+measurements of a required assertion are equal, the obligation is anchored at the wrong
+point — re-anchor it at the root cause the trace identifies.
 
 Each transition must verify the semantic relation named by its invariant. For mutation,
 compare the same source value immediately before and after the responsible operation.
@@ -231,8 +245,9 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit reachability \
 For an ARVO sample, reuse the configured workspace container and full vulnerable build
 left by Stage 01. Generate vulnerable and fixed instrumentation as small git-apply
 patches rooted at the project checkout recorded as `source_root` in
-`<result_dir>/arvo_workspace.json`; the toolkit resolves it from the official patch, so
-do not assume a project-specific `/src/...` path. Then use:
+`<result_dir>/arvo_workspace.json`; the toolkit auto-detects that project git checkout
+under `/src` (independent of `patch.diff`), so do not assume a project-specific
+`/src/...` path. Then use:
 
 Never edit tracked container source directly. Every instrumentation change must exist in
 the persisted top-level `<result_dir>/vulnerable-instrumentation.patch` or
@@ -258,6 +273,14 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
 PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
   --result-dir <result_dir> run --version fixed --expect clean
 ```
+
+`switch-fixed --patch patch.diff` is **best-effort**: the official fix commit is often an
+unrelated commit that does not apply or does not remove the crash. The authoritative
+"the crash disappears in the real fixed program" oracle is the prebuilt **`-fix` image**,
+not the patched source. If `switch-fixed` fails to apply, or the patched `run --version
+fixed` still crashes, fall back to `compile-fixed --fallback-image` (which swaps to the
+`n132/arvo:<id>-fix` image and rebuilds the instrumented target there) and treat that as
+the fixed-side evidence. Do not fail the sample merely because `patch.diff` did not apply.
 
 Stage 01's vulnerable compile is the only default full build. Stage 04's
 `compile-target` and `compile-fixed` reuse that configured tree and rebuild only the

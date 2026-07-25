@@ -59,12 +59,57 @@ def _state_path(result_dir: Path) -> Path:
     return result_dir / "arvo_workspace.json"
 
 
+def _detect_source_root(result_dir: Path, context: dict[str, Any]) -> str:
+    """Find the project git checkout under /src without reading patch.diff.
+
+    ARVO images clone the project under /src/<name>. Enumerate the git checkouts there
+    and, when several exist (helper repos or submodules), prefer the one whose basename
+    matches the sample's project. Returns "" when it cannot be decided, so the caller
+    can fall back to the legacy patch-path resolution.
+    """
+    listing = _docker_exec(
+        context["container"],
+        "find /src -maxdepth 4 -type d -name .git 2>/dev/null "
+        '| while read g; do dirname "$g"; done',
+    )
+    tops: list[str] = []
+    for d in (ln.strip() for ln in listing.stdout.splitlines() if ln.strip()):
+        top = _docker_exec(
+            context["container"],
+            f"git -C {shlex.quote(d)} rev-parse --show-toplevel 2>/dev/null",
+        )
+        lines = top.stdout.strip().splitlines()
+        if top.returncode == 0 and lines:
+            tops.append(lines[-1])
+    tops = list(dict.fromkeys(tops))
+    if not tops:
+        return ""
+    if len(tops) == 1:
+        return tops[0]
+    project = ""
+    try:
+        project = str(
+            json.loads((result_dir / "sample_info.json").read_text(encoding="utf-8")).get("project") or ""
+        ).strip().lower()
+    except Exception:
+        project = ""
+    if project:
+        for t in tops:  # exact basename match first
+            if t.rstrip("/").rsplit("/", 1)[-1].lower() == project:
+                return t
+        for t in tops:  # then substring
+            if project in t.lower():
+                return t
+    return ""  # ambiguous -> let the patch-path fallback decide
+
+
 def _source_root(result_dir: Path) -> str:
     """Resolve the project checkout inside a generic ARVO image.
 
-    ARVO projects are not all mounted at the historical `/src/readstat` path.  Bind
-    the root deterministically from the first path in the official patch and persist
-    it so every Stage 04 operation uses the same checkout.
+    ARVO projects are not all mounted at the historical `/src/readstat` path.  Detect
+    the checkout under /src (patch-independent) and persist it so every Stage 04
+    operation uses the same root; fall back to the first path in patch.diff only if
+    detection cannot decide.
     """
     context = _context(result_dir)
     state_path = _state_path(result_dir)
@@ -72,12 +117,19 @@ def _source_root(result_dir: Path) -> str:
     persisted = str(state.get("source_root") or "").strip()
     if persisted:
         return persisted
+    # Prefer detecting the project checkout directly (independent of patch.diff, which
+    # for ARVO is often an unrelated commit). Fall back to the legacy patch-path scan.
+    detected = _detect_source_root(result_dir, context)
+    if detected:
+        _update_state(result_dir, context, source_root=detected)
+        return detected
     patch_text = (result_dir / "patch.diff").read_text(
         encoding="utf-8", errors="replace"
-    )
+    ) if (result_dir / "patch.diff").is_file() else ""
     match = re.search(r"^diff --git a/(.+?) b/", patch_text, re.MULTILINE)
     if not match:
-        raise RuntimeError("cannot resolve ARVO source root: patch has no diff path")
+        raise RuntimeError("cannot resolve ARVO source root: no /src git checkout found "
+                           "and patch.diff has no diff path")
     relative = match.group(1)
     command = (
         "find /src -type f -path "
