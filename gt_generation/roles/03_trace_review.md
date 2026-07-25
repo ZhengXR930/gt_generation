@@ -18,6 +18,20 @@ details not established by these inputs may remain private candidate evidence fo
 04; do not manufacture a Stage 02 revision merely to make Stage 03 dynamically prove
 them.
 
+**Bounded exception — runtime disambiguation.** If closing the global causal chain hinges
+on a single runtime fact the saved artifacts genuinely cannot establish — most often
+*which* of several polymorphic/dispatch arms executed for the crashing input (e.g.
+`CoverageFormat1::Iter::init` vs `CoverageFormat2::Iter::init`) — do not accept an
+ambiguous chain and do not guess an arm. Instead set `needs_runtime_disambiguation` true
+in `trace_feedback.json` and add an `observe` string naming the *exact* fact to capture.
+This authorizes the next Stage 02 session to take one targeted instrumentation measurement
+to resolve it. Use this only when the fact is **load-bearing** (the chain cannot be closed
+without it) and static analysis of the source has genuinely been exhausted; a runtime
+detail that is not required to close the chain still defers to Stage 04 as private
+candidate evidence and must NOT set this flag. This keeps the fast static path for the
+common case and pays the instrumentation cost only for the rare genuinely-ambiguous
+sample.
+
 Trace steps have no `role` or `kind`. Verify each top-level `source`, `root_cause`, and
 `sink` through its explicit `trace_step` link, including the linked node's source
 location and semantics. Review all other steps by their source operation and typed
@@ -84,10 +98,15 @@ Also write `<result_dir>/trace_feedback.json`:
 ```json
 {
   "needs_revision": false,
+  "needs_runtime_disambiguation": false,
+  "observe": "",
   "issues": []
 }
 ```
 
 When any review boolean is false, set `needs_revision` true and list only actionable
-objects with `location`, `problem`, and `required_change`. The harness will launch a
-new Stage 02 CLI session and then a new reviewer session; do not repair the GT yourself.
+objects with `location`, `problem`, and `required_change`. Set `needs_runtime_disambiguation`
+true (with a precise `observe`) only in the bounded exception above — when the sole
+remaining blocker is a load-bearing runtime fact static analysis cannot establish. The
+harness will launch a new Stage 02 CLI session and then a new reviewer session; do not
+repair the GT yourself.

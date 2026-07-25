@@ -15,6 +15,37 @@ or attempt vulnerable/fixed dynamic validation in Stage 02. Record source-level 
 and witnessed states; Stage 04 is solely responsible for executable assertions,
 perturbations, ABI/runtime measurements, and differential validation.
 
+**Bounded exception — runtime disambiguation (only when explicitly requested).** If the
+incoming `trace_feedback.json` has `needs_runtime_disambiguation` true, the reviewer
+determined the causal chain cannot be closed without one runtime fact the static
+artifacts cannot establish (named in `observe`, e.g. which polymorphic dispatch arm
+executed). Only then, and only for that one named fact, take a single targeted
+measurement in the ARVO workspace Stage 01 already built: add a minimal marker
+instrumentation at the candidate sites (a persisted `vulnerable-instrumentation.patch`),
+then
+
+```bash
+PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir <result_dir> \
+  apply-instrumentation --patch <result_dir>/vulnerable-instrumentation.patch
+PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir <result_dir> \
+  compile-target --version vulnerable
+PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir <result_dir> \
+  run --version vulnerable --expect crash
+```
+
+read which marker fired, record the observed arm/value in the trace, and close the chain
+with it — do not guess and do not generalize beyond what fired. Then restore the
+workspace to clean vulnerable source so Stage 04 starts from an unmodified tree:
+
+```bash
+PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir <result_dir> \
+  reset-source
+```
+
+Do not instrument for anything beyond the named `observe`, and never do this when the
+flag is absent. For a non-ARVO sample with no prebuilt workspace, keep the chain
+source-grounded and report the residual ambiguity rather than instrumenting.
+
 Write `<result_dir>/ground_truth.json` and run:
 
 ```bash

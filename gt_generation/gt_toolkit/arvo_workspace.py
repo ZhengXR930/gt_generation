@@ -316,6 +316,31 @@ def switch_fixed(result_dir: Path, patch: Path) -> int:
     return proc.returncode
 
 
+def reset_source(result_dir: Path) -> int:
+    """Reset the workspace project tree to clean vulnerable source.
+
+    Drops any throwaway instrumentation (e.g. a Stage 02 runtime-disambiguation marker)
+    so a later stage starts from an unmodified tree. Additive: no default flow calls this;
+    it exists for the bounded Stage 02 disambiguation escalation to hand a clean workspace
+    back to Stage 04.
+    """
+    context = _context(result_dir)
+    root = _source_root(result_dir)
+    proc = _docker_exec(
+        context["container"],
+        f"git -C {shlex.quote(root)} reset --hard HEAD && "
+        f"git -C {shlex.quote(root)} clean -fdq",
+    )
+    _write_log(result_dir, "reset_source.log", proc)
+    _update_state(
+        result_dir,
+        context,
+        phase="vulnerable_source_reset" if proc.returncode == 0 else "reset_failed",
+        instrumentation_source_sha256="",
+    )
+    return proc.returncode
+
+
 def compile_fixed(
     result_dir: Path,
     *,
@@ -495,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
     p_target.add_argument("--target", default="")
     p_switch = sub.add_parser("switch-fixed")
     p_switch.add_argument("--patch", required=True, type=Path)
+    sub.add_parser("reset-source")
     p_fixed = sub.add_parser("compile-fixed")
     p_fixed.add_argument("--target", default="")
     p_fixed.add_argument("--fallback-image", action="store_true")
@@ -517,6 +543,8 @@ def main(argv: list[str] | None = None) -> int:
         return compile_target(args.result_dir, version=args.version, target=args.target)
     if args.action == "switch-fixed":
         return switch_fixed(args.result_dir, args.patch)
+    if args.action == "reset-source":
+        return reset_source(args.result_dir)
     if args.action == "compile-fixed":
         return compile_fixed(
             args.result_dir,
