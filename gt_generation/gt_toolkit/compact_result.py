@@ -21,6 +21,8 @@ KEEP_FILES = {
     "ground_truth.json",
     "verified_invariants.json",
     "verified_assertions.json",
+    "field_bindings.json",
+    "event_locations.json",
     "assertion_results.json",
     "perturbation_results.json",
     "reachability_report.json",
