@@ -15,11 +15,15 @@ or attempt vulnerable/fixed dynamic validation in Stage 02. Record source-level 
 and witnessed states; Stage 04 is solely responsible for executable assertions,
 perturbations, ABI/runtime measurements, and differential validation.
 
-**Bounded exception — runtime disambiguation (only when explicitly requested).** If the
-incoming `trace_feedback.json` has `needs_runtime_disambiguation` true, the reviewer
-determined the causal chain cannot be closed without one runtime fact the static
-artifacts cannot establish (named in `observe`, e.g. which polymorphic dispatch arm
-executed). Only then, and only for that one named fact, take a single targeted
+**Bounded exception — runtime disambiguation (OFF by default).** This path is gated by
+`<result_dir>/run_flags.json`: only act on it when `runtime_disambiguation` is `true`
+there AND the incoming `trace_feedback.json` has `needs_runtime_disambiguation` true (the
+reviewer only sets that flag when the run enabled it). When the flag is off or absent,
+never instrument — keep the trace source-grounded and rely on the reviewer/skip path. When
+enabled and requested, the reviewer determined the causal chain cannot be closed without
+one runtime fact the static artifacts cannot establish (named in `observe`, e.g. which
+polymorphic dispatch arm executed). Only then, and only for that one named fact, take a
+single targeted
 measurement in the ARVO workspace Stage 01 already built: add a minimal marker
 instrumentation at the candidate sites (a persisted `vulnerable-instrumentation.patch`),
 then

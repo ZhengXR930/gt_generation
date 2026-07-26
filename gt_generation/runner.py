@@ -88,6 +88,12 @@ def main() -> None:
     if not result_dir.is_absolute():
         result_dir = repo_root / result_dir
     result_dir.mkdir(parents=True, exist_ok=True)
+    # Per-run flags the stage roles read. runtime_disambiguation gates the bounded
+    # Stage 02 instrumentation escalation; it is OFF by default so the common path stays
+    # short. Rewritten every run so a config change takes effect immediately.
+    write_json(result_dir / "run_flags.json", {
+        "runtime_disambiguation": bool(config.get("runtime_disambiguation", False)),
+    })
     timing_path = result_dir / "generation_timing.json"
     prior_timing = load_json(timing_path) if timing_path.is_file() else {}
     lock_path = result_dir / ".gt_generation.lock"

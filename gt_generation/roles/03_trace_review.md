@@ -18,19 +18,24 @@ details not established by these inputs may remain private candidate evidence fo
 04; do not manufacture a Stage 02 revision merely to make Stage 03 dynamically prove
 them.
 
-**Bounded exception — runtime disambiguation.** If closing the global causal chain hinges
-on a single runtime fact the saved artifacts genuinely cannot establish — most often
-*which* of several polymorphic/dispatch arms executed for the crashing input (e.g.
+**Bounded exception — runtime disambiguation (OFF by default).** This escalation is gated:
+first read `<result_dir>/run_flags.json`. It applies **only** when `runtime_disambiguation`
+is `true` there; when it is `false` or the file is absent (the default), never set
+`needs_runtime_disambiguation` — instead record the unresolved fact as a normal issue and
+leave the review incomplete, so the harness skips the sample rather than force-resolving
+or guessing it.
+
+When (and only when) the flag is enabled: if closing the global causal chain hinges on a
+single runtime fact the saved artifacts genuinely cannot establish — most often *which* of
+several polymorphic/dispatch arms executed for the crashing input (e.g.
 `CoverageFormat1::Iter::init` vs `CoverageFormat2::Iter::init`) — do not accept an
-ambiguous chain and do not guess an arm. Instead set `needs_runtime_disambiguation` true
-in `trace_feedback.json` and add an `observe` string naming the *exact* fact to capture.
-This authorizes the next Stage 02 session to take one targeted instrumentation measurement
-to resolve it. Use this only when the fact is **load-bearing** (the chain cannot be closed
+ambiguous chain and do not guess an arm. Set `needs_runtime_disambiguation` true in
+`trace_feedback.json` and add an `observe` string naming the *exact* fact to capture; this
+authorizes the next Stage 02 session to take one targeted instrumentation measurement to
+resolve it. Use it only when the fact is **load-bearing** (the chain cannot be closed
 without it) and static analysis of the source has genuinely been exhausted; a runtime
-detail that is not required to close the chain still defers to Stage 04 as private
-candidate evidence and must NOT set this flag. This keeps the fast static path for the
-common case and pays the instrumentation cost only for the rare genuinely-ambiguous
-sample.
+detail not required to close the chain still defers to Stage 04 as private candidate
+evidence and must NOT set this flag.
 
 Trace steps have no `role` or `kind`. Verify each top-level `source`, `root_cause`, and
 `sink` through its explicit `trace_step` link, including the linked node's source
