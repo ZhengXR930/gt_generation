@@ -215,6 +215,7 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit assertions \
   --vulnerable-trace <result_dir>/vulnerable_assertion_trace.txt \
   --fixed-trace <result_dir>/fixed_assertion_trace.txt \
   --verified-invariants <result_dir>/verified_invariants.json \
+  --sanitizer-trace <result_dir>/sanitizer_trace.txt \
   --results-out <result_dir>/assertion_results.json \
   --perturbation-results-out <result_dir>/perturbation_results.json \
   --verified-assertions-out <result_dir>/verified_assertions.json

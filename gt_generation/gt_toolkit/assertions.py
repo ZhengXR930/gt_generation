@@ -27,6 +27,29 @@ _OPS = {
 }
 _SYMBOLS = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 _MISSING = object()
+# MSAN prints the poison boundary as e.g.
+#   Uninitialized bytes in __interceptor_memcmp at offset 2 inside [0x7ffc.., 7)
+# offset N => bytes 0..N-1 of the read are defined, byte N is the first poisoned
+# one, so N is the sanitizer-authoritative initialized-prefix length; S is the
+# read/compare size.
+_MSAN_UNINIT_RE = re.compile(
+    r"[Uu]ninitialized bytes? in \S+ at offset (\d+) inside \[(?:0x)?[0-9a-fA-F]+,\s*(\d+)\)"
+)
+
+
+def parse_msan_uninit(sanitizer_text: str) -> dict[str, int] | None:
+    """Return the MSAN use-of-uninitialized-value boundary, or None.
+
+    {'init_prefix_len': N, 'access_size': S} where N is the sanitizer-authoritative
+    initialized-prefix length (first poisoned byte offset) and S the read size.
+    """
+    lowered = sanitizer_text.lower()
+    if "memorysanitizer" not in lowered and "use-of-uninitialized-value" not in lowered:
+        return None
+    match = _MSAN_UNINIT_RE.search(sanitizer_text)
+    if not match:
+        return None
+    return {"init_prefix_len": int(match.group(1)), "access_size": int(match.group(2))}
 
 
 def assertion_content_hash(spec: dict[str, Any]) -> str:
@@ -516,6 +539,8 @@ def validate_assertions(
     spec: dict[str, Any],
     vulnerable_cases: dict[str, dict[str, Any]],
     fixed_cases: dict[str, dict[str, Any]],
+    *,
+    differential_applicable: bool = True,
 ) -> dict[str, Any]:
     validate_frozen_spec(spec)
     original = spec.get("original_case", "original")
@@ -558,6 +583,16 @@ def validate_assertions(
             "verified": verified,
             "matrix": matrix,
         }
+        if verified:
+            # A `required` assertion is the only kind whose verification uses the
+            # vulnerable/fixed differential; observed/transition are established on
+            # the vulnerable side alone. Recording this keeps `all_verified` from
+            # reading as "differentially confirmed" when it is not.
+            item["verification"] = (
+                "differential"
+                if assertion["kind"] == "required"
+                else "vulnerable_side_only"
+            )
         if assertion.get("protects") and fixed_status == "guarded":
             item["genuine_witness_case"] = genuine_witness_case
             if genuine_witness_case is None:
@@ -566,6 +601,16 @@ def validate_assertions(
                     "protected event while the required predicate is true"
                 )
         results.append(item)
+    if not differential_applicable:
+        # e.g. an MSAN use-of-uninitialized-value bug: the safety property is
+        # per-byte definedness, which cannot be a vulnerable/fixed comparison of
+        # two source fields, so no differential is expected. The sanitizer is the
+        # authoritative oracle for these; see parse_msan_uninit / check_msan_offset.
+        differential_status = "not_applicable"
+    elif any(item["verified"] and item["kind"] == "required" for item in results):
+        differential_status = "confirmed"
+    else:
+        differential_status = "vulnerable_side_only"
     return {
         "schema_version": (
             "assertion-results-v3"
@@ -576,8 +621,54 @@ def validate_assertions(
         "candidate_content_hash": spec.get("content_hash"),
         "original_case": original,
         "all_verified": bool(results) and all(item["verified"] for item in results),
+        "differential_status": differential_status,
         "assertions": results,
     }
+
+
+def check_msan_offset(results: dict[str, Any], msan: dict[str, int]) -> dict[str, Any]:
+    """Cross-check the frozen assertions against MSAN's authoritative uninit boundary.
+
+    The sink comparison must witness the read size S as one operand and the
+    initialized-prefix length N as the other. A GT that records N off by one --
+    e.g. counting an unwritten NUL terminator as initialized (`len + 1` instead of
+    `len`) -- is refuted here at generation time instead of shipping a wrong length.
+    """
+    access_size = msan["access_size"]
+    init_prefix_len = msan["init_prefix_len"]
+    original = str(results.get("original_case") or "original")
+    sink_init_operands: dict[str, int] = {}
+    for item in results.get("assertions", []):
+        outcome = item.get("matrix", {}).get("vulnerable", {}).get(original, {})
+        left, right = outcome.get("left"), outcome.get("right")
+        if not (isinstance(left, int) and isinstance(right, int)):
+            continue
+        operands = {left, right}
+        if access_size in operands and len(operands) > 1:
+            sink_init_operands[str(item["id"])] = next(iter(operands - {access_size}))
+    matched = any(value == init_prefix_len for value in sink_init_operands.values())
+    check: dict[str, Any] = {
+        "applicable": True,
+        "init_prefix_len": init_prefix_len,
+        "access_size": access_size,
+        "sink_assertion_init_operands": sink_init_operands,
+        "matched": matched if sink_init_operands else None,
+    }
+    if not sink_init_operands:
+        check["warning"] = (
+            f"no assertion witnesses the MSAN read size {access_size}; the "
+            "initialized-prefix length was not cross-checked against the sanitizer"
+        )
+    elif not matched:
+        check["error"] = (
+            f"MSAN reports the initialized prefix as {init_prefix_len} bytes of a "
+            f"{access_size}-byte read (first uninitialized byte at offset {init_prefix_len}), "
+            f"but the sink assertion's initialized-length operand is "
+            f"{sorted(set(sink_init_operands.values()))}. Bind it to the sanitizer offset "
+            "(a common off-by-one is counting an unwritten NUL terminator as "
+            "initialized: use `len`, not `len + 1`)."
+        )
+    return check
 
 
 def build_verified_assertions(
@@ -664,6 +755,121 @@ def format_check(check: list[Any]) -> str:
     return f"{_format_operand(left)} {_SYMBOLS[op_name]} {_format_operand(right)}"
 
 
+_INEQUALITY_OPS = {"lt", "le", "gt", "ge"}
+
+
+def _resolve_operand_expr(value: Any, field_bindings: dict[str, Any]) -> str:
+    """Resolve an assertion operand to its real vulnerable-source expression."""
+    if not (isinstance(value, str) and value.startswith("$")):
+        return json.dumps(value, ensure_ascii=False)
+    stripped = value[1:]
+    return str(field_bindings.get(stripped, stripped))
+
+
+def _norm_expr(text: str) -> str:
+    return "".join(str(text).split())
+
+
+def annotate_scored_invariants(
+    verified_invariants: dict[str, Any],
+    verified_assertions: dict[str, Any],
+    field_bindings: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Classify verified invariants into reasoning scoring keys -- an EVAL-TIME
+    selection helper, NOT a GT stage.
+
+    The GT (verified_invariants.json) is left untouched: which invariants are worth
+    scoring is a selection policy, so it is decided at evaluation time (call this on
+    an in-memory copy) and never persisted into GT -- changing the policy must not
+    invalidate or regenerate ground truth. Every input it needs already lives in the
+    frozen GT artifacts (verified_invariants + verified_assertions + field_bindings),
+    so no information is lost by not marking the files. Returns the same dict with
+    per-item `scored`/`scored_role` added.
+
+      edge -> `scored` / `scored_role`:
+        a DATA edge whose `eq` operands resolve (via field_bindings) to the SAME
+        source expression is pure connectivity -- e.g. `oid == oid`, the buffer read
+        is the buffer used at the sink -- and carries no reasoning content, so
+        scored=false, scored_role="connectivity". Everything else is a real step:
+        scored=true, scored_role="reasoning". Crucially this is type-gated: an
+        `order` edge (free_before_use / double_free) or a `control` edge is NEVER
+        demoted even when its check is an eq on one object, because the happens-before
+        / missing-guard IS the reasoning for temporal and control bugs. An `eq`
+        between two DIFFERENT expressions (aliasing, e.g. `cur->name == id->name`)
+        also stays reasoning.
+      node -> `scored` / `scored_role` / `relation`:
+        a node whose verifying assertion is an OBSERVED inequality carries the
+        quantitative mechanism -- for an uninitialized-read bug, read length >
+        initialized length -- so scored=true, scored_role="mechanism". This is the
+        discriminative fact a subject must recover, distinct from the connectivity
+        edges and from the narrative root cause.
+    """
+    field_bindings = field_bindings or {}
+    by_id: dict[str, dict[str, Any]] = {}
+    by_invariant: dict[str, dict[str, Any]] = {}
+    for assertion in verified_assertions.get("assertions", []):
+        if not isinstance(assertion, dict):
+            continue
+        if assertion.get("id"):
+            by_id[str(assertion["id"])] = assertion
+        for invariant_id in assertion.get("invariants", []):
+            by_invariant.setdefault(str(invariant_id), assertion)
+
+    def _assertion_for(item: dict[str, Any]) -> dict[str, Any] | None:
+        verified_by = str(item.get("verified_by") or "")
+        if verified_by in by_id:
+            return by_id[verified_by]
+        return by_invariant.get(str(item.get("invariant_id") or ""))
+
+    for edge in verified_invariants.get("edges", []):
+        if not isinstance(edge, dict):
+            continue
+        assertion = _assertion_for(edge)
+        check = assertion.get("check") if assertion else None
+        if not isinstance(check, list) or len(check) != 3:
+            continue
+        op, left, right = check
+        # Only a DATA edge can be pure connectivity. An order/control edge encodes
+        # happens-before or a missing guard -- reasoning -- even when its check is an
+        # eq on a single object (e.g. free-before-free of the same pointer).
+        edge_type = str(edge.get("type") or "data").lower()
+        left_expr = _resolve_operand_expr(left, field_bindings)
+        right_expr = _resolve_operand_expr(right, field_bindings)
+        is_identity_flow = (
+            op == "eq"
+            and edge_type == "data"
+            and _norm_expr(left_expr) == _norm_expr(right_expr)
+        )
+        if is_identity_flow:
+            edge["scored"] = False
+            edge["scored_role"] = "connectivity"
+            edge["scored_reason"] = (
+                f"eq identity flow on a data edge: both operands resolve to "
+                f"`{left_expr}` (connectivity, not a reasoning step)"
+            )
+        else:
+            edge["scored"] = True
+            edge["scored_role"] = "reasoning"
+
+    for node in verified_invariants.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        assertion = _assertion_for(node)
+        if not assertion or assertion.get("kind") != "observed":
+            continue
+        check = assertion.get("check")
+        if not isinstance(check, list) or len(check) != 3 or check[0] not in _INEQUALITY_OPS:
+            continue
+        op, left, right = check
+        node["scored"] = True
+        node["scored_role"] = "mechanism"
+        node["relation"] = (
+            f"{_resolve_operand_expr(left, field_bindings)} {_SYMBOLS[op]} "
+            f"{_resolve_operand_expr(right, field_bindings)}"
+        )
+    return verified_invariants
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", type=Path, required=True)
@@ -676,6 +882,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check-bindings-only", action="store_true")
     parser.add_argument("--field-bindings", type=Path, help="field_bindings.json for the binding-coverage gate")
     parser.add_argument("--event-locations", type=Path, help="event_locations.json for the binding-coverage gate")
+    parser.add_argument(
+        "--sanitizer-trace",
+        type=Path,
+        help="sanitizer_trace.txt; when it is an MSAN uninitialized-value trace, sets "
+        "differential_status=not_applicable and runs the offset-checksum gate",
+    )
     parser.add_argument("--freeze-only", action="store_true")
     parser.add_argument("--freeze-marker", type=Path)
     args = parser.parse_args(argv)
@@ -717,11 +929,19 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "validation requires --vulnerable-trace, --fixed-trace, and --results-out"
         )
+    msan = None
+    if args.sanitizer_trace and args.sanitizer_trace.exists():
+        msan = parse_msan_uninit(
+            args.sanitizer_trace.read_text(encoding="utf-8", errors="replace")
+        )
     results = validate_assertions(
         spec,
         parse_trace_matrix(args.vulnerable_trace.read_text(encoding="utf-8")),
         parse_trace_matrix(args.fixed_trace.read_text(encoding="utf-8")),
+        differential_applicable=not bool(msan),
     )
+    if msan:
+        results["msan_offset_check"] = check_msan_offset(results, msan)
     if args.verified_invariants:
         results["invariant_binding"] = validate_invariant_bindings(
             json.loads(args.verified_invariants.read_text(encoding="utf-8")), spec
@@ -739,7 +959,8 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(build_perturbation_results(spec, results), indent=2) + "\n",
             encoding="utf-8",
         )
-    if not results["all_verified"]:
+    offset_error = bool(results.get("msan_offset_check", {}).get("error"))
+    if not results["all_verified"] or offset_error:
         raise SystemExit(1)
     return 0
 

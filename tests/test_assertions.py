@@ -6,11 +6,14 @@ import pytest
 from gt_generation.gt_toolkit import assertions as assertions_module
 
 from gt_generation.gt_toolkit.assertions import (
+    annotate_scored_invariants,
     assertion_content_hash,
     build_perturbation_results,
     build_verified_assertions,
+    check_msan_offset,
     evaluate_assertion,
     freeze_spec,
+    parse_msan_uninit,
     parse_trace_matrix,
     validate_assertions,
     validate_frozen_spec,
@@ -139,6 +142,202 @@ def test_frozen_hash_detects_post_execution_rewrite():
     spec["assertions"][0]["check"] = ["ne", "$stored_count", "$source_count"]
     with pytest.raises(ValueError, match="content hash mismatch"):
         validate_frozen_spec(spec)
+
+
+def test_differential_status_confirmed_when_a_required_assertion_verifies():
+    spec, vulnerable, fixed = _inputs()
+    results = validate_assertions(spec, vulnerable, fixed)
+    assert results["differential_status"] == "confirmed"
+    required = next(item for item in results["assertions"] if item["kind"] == "required")
+    assert required["verification"] == "differential"
+    observed = next(item for item in results["assertions"] if item["kind"] == "observed")
+    assert observed["verification"] == "vulnerable_side_only"
+
+
+def test_differential_status_not_applicable_for_uninitialized_bugs():
+    # An MSAN use-of-uninitialized-value bug cannot express its safety property as a
+    # vulnerable/fixed field comparison, so the caller marks the differential N/A and
+    # all_verified no longer reads as "differentially confirmed".
+    spec, vulnerable, fixed = _inputs()
+    results = validate_assertions(spec, vulnerable, fixed, differential_applicable=False)
+    assert results["all_verified"] is True
+    assert results["differential_status"] == "not_applicable"
+
+
+def test_parse_msan_uninit_reads_offset_and_size():
+    text = (
+        "==7==WARNING: MemorySanitizer: use-of-uninitialized-value\n"
+        "Uninitialized bytes in __interceptor_memcmp at offset 2 inside [0x7ffca5175600, 7)\n"
+    )
+    assert parse_msan_uninit(text) == {"init_prefix_len": 2, "access_size": 7}
+    assert parse_msan_uninit("==1==ERROR: AddressSanitizer: heap-buffer-overflow") is None
+
+
+def test_msan_offset_gate_passes_when_init_operand_matches_offset():
+    # arvo_10131 shape: sink compares read_len 7 vs init_len 2; MSAN offset 2.
+    results = {
+        "original_case": "original",
+        "assertions": [
+            {"id": "A-SINK", "matrix": {"vulnerable": {"original": {"left": 7, "right": 2}}}},
+        ],
+    }
+    check = check_msan_offset(results, {"init_prefix_len": 2, "access_size": 7})
+    assert check["matched"] is True
+    assert "error" not in check
+
+
+def test_msan_offset_gate_flags_off_by_one_initialized_length():
+    # arvo_10136 shape: sink compares cmp_bytes 21 vs bytes_written 5, but MSAN's
+    # first uninitialized byte is at offset 4 -- the `len + 1` binding counted the
+    # unwritten NUL terminator as initialized.
+    results = {
+        "original_case": "original",
+        "assertions": [
+            {"id": "A-SINK", "matrix": {"vulnerable": {"original": {"left": 21, "right": 5}}}},
+        ],
+    }
+    check = check_msan_offset(results, {"init_prefix_len": 4, "access_size": 21})
+    assert check["matched"] is False
+    assert "off-by-one" in check["error"]
+
+
+def test_msan_offset_gate_warns_when_read_size_not_witnessed():
+    results = {
+        "original_case": "original",
+        "assertions": [
+            {"id": "A", "matrix": {"vulnerable": {"original": {"left": 128, "right": 5}}}},
+        ],
+    }
+    check = check_msan_offset(results, {"init_prefix_len": 4, "access_size": 21})
+    assert check["matched"] is None
+    assert "warning" in check and "error" not in check
+
+
+def _uninit_invariants():
+    """arvo_10136-shape: one reasoning edge, one eq identity-flow edge, one sink node."""
+    verified_invariants = {
+        "nodes": [
+            {"invariant_id": "I-SINK", "verified_by": "A-SINK"},
+        ],
+        "edges": [
+            {"invariant_id": "I-DECL-TO-READ", "verified_by": "A-DECL-TO-READ"},
+            {"invariant_id": "I-READ-TO-DISPATCH", "verified_by": "A-READ-TO-DISPATCH"},
+        ],
+    }
+    verified_assertions = {
+        "assertions": [
+            {"id": "A-SINK", "kind": "observed",
+             "check": ["gt", "$oid_dispatch.cmp_bytes", "$oid_dispatch.oid_bytes_written"]},
+            {"id": "A-DECL-TO-READ", "kind": "transition",
+             "check": ["gt", "$oid_decl.sizeof_oid", "$oid_read.oid_bytes_written"]},
+            {"id": "A-READ-TO-DISPATCH", "kind": "transition",
+             "check": ["eq", "$oid_read.oid_ptr", "$oid_dispatch.oid_ptr"]},
+        ]
+    }
+    field_bindings = {
+        "oid_dispatch.cmp_bytes": "sizeof(DATA_OID)",
+        "oid_dispatch.oid_bytes_written": "len + 1",
+        "oid_decl.sizeof_oid": "sizeof(oid)",
+        "oid_read.oid_bytes_written": "len + 1",
+        "oid_read.oid_ptr": "oid",
+        "oid_dispatch.oid_ptr": "oid",
+    }
+    return verified_invariants, verified_assertions, field_bindings
+
+
+def test_annotate_marks_eq_identity_flow_as_connectivity_not_scored():
+    vi, va, fb = _uninit_invariants()
+    annotate_scored_invariants(vi, va, fb)
+    edges = {e["invariant_id"]: e for e in vi["edges"]}
+    # oid == oid is pure connectivity -> not a scored reasoning key
+    assert edges["I-READ-TO-DISPATCH"]["scored"] is False
+    assert edges["I-READ-TO-DISPATCH"]["scored_role"] == "connectivity"
+    # sizeof(oid) > len + 1 is a real relation -> scored reasoning
+    assert edges["I-DECL-TO-READ"]["scored"] is True
+    assert edges["I-DECL-TO-READ"]["scored_role"] == "reasoning"
+
+
+def test_annotate_marks_observed_sink_inequality_as_mechanism():
+    vi, va, fb = _uninit_invariants()
+    annotate_scored_invariants(vi, va, fb)
+    sink = vi["nodes"][0]
+    assert sink["scored"] is True
+    assert sink["scored_role"] == "mechanism"
+    # the discriminative read-length > initialized-length relation, in source terms
+    assert sink["relation"] == "sizeof(DATA_OID) > len + 1"
+
+
+def test_annotate_keeps_aliasing_eq_between_different_expressions_as_reasoning():
+    # double-free: the two frees name the SAME object under DIFFERENT expressions;
+    # asserting they alias is a real reasoning step, not connectivity.
+    vi = {"nodes": [], "edges": [{"invariant_id": "E-ALIAS", "type": "data", "verified_by": "A-ALIAS"}]}
+    va = {"assertions": [
+        {"id": "A-ALIAS", "kind": "transition",
+         "check": ["eq", "$first_free.free_argument", "$second_free.free_argument"]},
+    ]}
+    fb = {"first_free.free_argument": "cur->name", "second_free.free_argument": "id->name"}
+    annotate_scored_invariants(vi, va, fb)
+    assert vi["edges"][0]["scored"] is True
+    assert vi["edges"][0]["scored_role"] == "reasoning"
+
+
+def test_annotate_never_demotes_an_order_edge_even_on_a_single_object():
+    # free-before-free of the SAME expression: the happens-before is the reasoning,
+    # so an order edge is never collapsed to connectivity.
+    vi = {"nodes": [], "edges": [{"invariant_id": "E-ORDER", "type": "order", "verified_by": "A-ORDER"}]}
+    va = {"assertions": [
+        {"id": "A-ORDER", "kind": "transition",
+         "check": ["eq", "$first_free.ptr", "$second_free.ptr"]},
+    ]}
+    fb = {"first_free.ptr": "p", "second_free.ptr": "p"}
+    annotate_scored_invariants(vi, va, fb)
+    assert vi["edges"][0]["scored"] is True
+    assert vi["edges"][0]["scored_role"] == "reasoning"
+
+
+def test_assertion_cli_fails_generation_on_msan_offset_off_by_one(tmp_path, monkeypatch):
+    # End-to-end: a uninitialized-value sample whose sink asserts read_len(7) > init_len(3)
+    # while MSAN says the initialized prefix is only 2 bytes must fail generation.
+    spec = {
+        "schema_version": "assertion-spec-v3",
+        "sample_id": "msan_sample",
+        "original_case": "orig",
+        "assertions": [
+            {
+                "id": "A-SINK",
+                "kind": "observed",
+                "at": "sink",
+                "check": ["gt", "$sink.read_len", "$sink.init_len"],
+                "invariants": ["I-SINK"],
+            }
+        ],
+    }
+    spec["content_hash"] = assertion_content_hash(spec)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec))
+    trace = "CASE name=orig rc=1 result=crash\nASSERT_EVT point=sink read_len=7 init_len=3\nENDCASE\n"
+    (tmp_path / "vul.txt").write_text(trace)
+    (tmp_path / "fix.txt").write_text(trace)
+    (tmp_path / "san.txt").write_text(
+        "==7==WARNING: MemorySanitizer: use-of-uninitialized-value\n"
+        "Uninitialized bytes in __interceptor_memcmp at offset 2 inside [0x7ffff000, 7)\n"
+    )
+    results_path = tmp_path / "results.json"
+    monkeypatch.setattr(sys, "argv", [
+        "assertions",
+        "--spec", str(spec_path),
+        "--vulnerable-trace", str(tmp_path / "vul.txt"),
+        "--fixed-trace", str(tmp_path / "fix.txt"),
+        "--sanitizer-trace", str(tmp_path / "san.txt"),
+        "--results-out", str(results_path),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        assertions_module.main()
+    assert exc.value.code == 1
+    written = json.loads(results_path.read_text())
+    assert written["differential_status"] == "not_applicable"
+    assert written["msan_offset_check"]["matched"] is False
+    assert "off-by-one" in written["msan_offset_check"]["error"]
 
 
 def test_freeze_marker_commits_exact_spec_bytes(tmp_path):

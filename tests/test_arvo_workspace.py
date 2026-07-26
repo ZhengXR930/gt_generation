@@ -41,9 +41,11 @@ def test_detect_arvo_target_reads_run_command(monkeypatch):
     assert prepare._detect_arvo_target("image") == "fuzz_format_sav"
 
 
-def test_source_root_is_resolved_from_official_patch(tmp_path, monkeypatch):
+def test_source_root_is_detected_from_src_git_checkout(tmp_path, monkeypatch):
+    # ARVO patch.diff is often an unrelated commit, so the source root is resolved from
+    # the project's own /src git checkout, independent of patch.diff.
     (tmp_path / "patch.diff").write_text(
-        "diff --git a/fuzz/Fuzz.h b/fuzz/Fuzz.h\n", encoding="utf-8"
+        "diff --git a/unrelated/other.c b/unrelated/other.c\n", encoding="utf-8"
     )
     context = {"container": "workspace"}
     commands = []
@@ -51,14 +53,16 @@ def test_source_root_is_resolved_from_official_patch(tmp_path, monkeypatch):
 
     def fake_exec(container, command, timeout=3600):
         commands.append(command)
-        if command.startswith("find /src"):
-            return _proc(stdout="/src/skia/fuzz/Fuzz.h\n")
-        return _proc(stdout="/src/skia\n")
+        if "-name .git" in command:
+            return _proc(stdout="/src/skia\n")
+        if command.startswith("git -C"):
+            return _proc(stdout="/src/skia\n")
+        return _proc()
 
     monkeypatch.setattr(arvo_workspace, "_docker_exec", fake_exec)
 
     assert arvo_workspace._source_root(tmp_path) == "/src/skia"
-    assert "*/fuzz/Fuzz.h" in commands[0]
+    assert any("-name .git" in command for command in commands)
     assert json.loads((tmp_path / "arvo_workspace.json").read_text())["source_root"] == "/src/skia"
 
 
