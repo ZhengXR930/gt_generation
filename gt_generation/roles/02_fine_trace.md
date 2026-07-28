@@ -120,7 +120,17 @@ carried as edge evidence.
 For bounds bugs include the tainted value, transformations, present and missing guard,
 derived index/size, destination extent, unsafe memory operation, and resulting sink.
 For lifetime bugs include allocation, aliases/ownership, invalidation, stale path, and
-use/second free. Use exact vulnerable-source file, function, line, code, and variables.
+use/second free. For stale-pointer/use-after-free chains through a container (list, map,
+array, object field, or other retained registry), keep the container-retained dangling
+pointer and the later reload from that container as explicit source-level steps when the
+sink dereferences a local pointer obtained from the container. Do not collapse "container
+still stores freed object" and "local pointer is reloaded/dereferenced" into one sink step.
+When a patch fixes the same stale-alias/ownership obligation in multiple cleanup branches,
+do not anchor the root cause or PoC contract to one branch unless the staged source and
+runtime artifacts exclude the alternatives. Either provide the source-grounded exclusion,
+or describe the common branch-agnostic obligation and include the alternative patched
+cleanup sites as evidence without claiming which one handled the crashing object.
+Use exact vulnerable-source file, function, line, code, and variables.
 Patch text supports the missing obligation but never substitutes for vulnerable flow.
 
 Keep `poc.format.contract` as narrow as the verified trigger semantics. Do not generalize

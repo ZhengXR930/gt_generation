@@ -45,8 +45,14 @@ complete, report which deterministic gates passed and any evidence limitations."
 # One model for every stage via the generic GT_AGENT_MODEL (see gt_plugin.py);
 # omit -m to let codex use its own default when unset.
 CODEX_ARGS=(exec --cd "$REPO_ROOT" --dangerously-bypass-approvals-and-sandbox --ephemeral)
+if [[ "${GT_CODEX_STRICT_CONFIG:-1}" == "1" ]]; then
+  CODEX_ARGS+=(--strict-config)
+fi
 if [[ -n "${GT_AGENT_MODEL:-}" ]]; then
   CODEX_ARGS+=(-m "$GT_AGENT_MODEL")
+fi
+if [[ -n "${GT_AGENT_REASONING_EFFORT:-}" ]]; then
+  CODEX_ARGS+=(-c "model_reasoning_effort=\"${GT_AGENT_REASONING_EFFORT}\"")
 fi
 CODEX_ARGS+=("$PROMPT")
 

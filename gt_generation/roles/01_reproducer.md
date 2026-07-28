@@ -44,3 +44,15 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
 PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
   --result-dir <result_dir> run --version vulnerable --expect crash
 ```
+
+For every non-ARVO sample, `00_prepare` writes the configured image and build context
+to `prepare_report.json` and creates `<result_dir>/build.sh`. Run all project builds,
+dependency-sensitive commands, and PoC reproduction inside that Docker environment:
+
+```bash
+<result_dir>/build.sh '<project-specific sanitizer build command>'
+<result_dir>/build.sh '<project-specific vulnerable target command> <result_dir>/poc'
+```
+
+Do not compile or execute the target directly on the host. The result directory is
+mounted at `/gt`, its source checkout is `/gt/_work/src`, and the PoC is `/gt/poc`.

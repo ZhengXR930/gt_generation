@@ -26,6 +26,7 @@ KEEP_FILES = {
     "perturbation_results.json",
     "reachability_report.json",
     "generation_timing.json",
+    "generation_provenance.json",
 }
 
 

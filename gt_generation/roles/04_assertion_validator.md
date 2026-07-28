@@ -296,3 +296,13 @@ this sample; the later probe generator consumes the persisted JSON and needs no 
 PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
   --result-dir <result_dir> cleanup --remove-images
 ```
+
+## Non-ARVO execution lifecycle
+
+For non-ARVO samples, keep every instrumented build and vulnerable/fixed execution in
+the Docker environment recorded by `prepare_report.json`. Use
+`<result_dir>/build.sh '<command>'`; it mounts the result directory at `/gt` and runs
+from `/gt/_work/src`. Do not compile or execute an instrumented target directly on the
+host. Apply and persist the vulnerable/fixed instrumentation patches in the mounted
+checkout, and use the same configured image for both versions so the differential
+evidence does not mix environments.

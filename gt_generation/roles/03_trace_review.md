@@ -62,6 +62,14 @@ trace that merges across an intermediate source-level value used by a later pred
 arithmetic operation, memory operation, or sink. Reject sanitizer addresses presented
 as program pointer values unless instrumentation proves that value.
 
+For lifetime bugs, apply the same multi-branch stale-alias rule as Stage 02. When a
+patch fixes the same stale-alias or ownership obligation in multiple cleanup/refetch
+branches, do not require the GT to anchor the root cause or PoC contract to exactly
+one patched branch unless the staged vulnerable source and saved runtime artifacts
+exclude the alternatives. Accept a branch-agnostic missing obligation when it is
+source-grounded, includes the concrete patched sites as evidence, and does not claim
+which branch handled the crashing object beyond what the saved artifacts prove.
+
 Also reject unnecessary steps. Function entry/exit, callback binding, successful
 admission, dispatch, rewind/progress bookkeeping, repeated return checks, and unrelated
 prior loop iterations belong in notes or reachability evidence unless they introduce a

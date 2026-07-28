@@ -37,7 +37,11 @@ cp gt_generation/gt_config.example.json gt_generation/gt_config.json
 |-------|---------|
 | `cli` | which agent CLI drives generation: `claude` \| `codex` \| `coco` (Trae). Each maps to `adapters/<cli>/`. |
 | `model` | **one** model id used for every stage (no per-stage switching). Must be valid for the CLI: `claude` → `sonnet`, `claude-opus-4-6`; `codex` → an official OpenAI model, e.g. `gpt-5.5`; `coco` → any id from `coco models` (e.g. `gpt-5.5`, `openrouter-3o`). |
+| `reasoning_effort` | Codex reasoning effort used for every agent stage: `minimal`, `low`, `medium`, `high`, or `xhigh` (default `high`). |
+| `strict_config` | Pass `--strict-config` to Codex so unknown config keys fail immediately (default `true`). |
 | `parallel_dockers` | how many samples to run at once (1–6); each holds one Docker workspace. |
+| `repo_docker_image` | Image tag used for non-ARVO samples (default `gt-memory-env:latest`). |
+| `repo_docker_context` | Build context used for non-ARVO samples (default `docker/gt-memory-env`). |
 | `selection` | dataset metadata list (default `dataset/selected_1000.json`). |
 | `samples` | sample ids to generate, e.g. `["arvo_1304", "arvo_12595"]`. |
 
@@ -60,7 +64,11 @@ other source builds/clones in the shared `gt-memory-env` image.
 {
   "cli": "codex",
   "model": "gpt-5.5",
+  "reasoning_effort": "high",
+  "strict_config": true,
   "parallel_dockers": 2,
+  "repo_docker_image": "gt-memory-env:latest",
+  "repo_docker_context": "docker/gt-memory-env",
   "selection": "dataset/selected_1000.json",
   "samples": ["arvo_1304", "arvo_12595"]
 }
@@ -121,6 +129,9 @@ separate `evaluation-prober` under `evaluator/reasoning/skill/`.
 Every stage runs with the single model from the config (`GT_AGENT_MODEL`); there is
 no per-stage model switching. Adapters read the model from `GT_AGENT_MODEL`
 (the Claude adapter falls back to the older `GT_CLAUDE_MODEL`, then `sonnet`).
+Codex also receives the configured reasoning effort and strict-config check. Each
+sample records the effective CLI, model, adapter hash, authentication method, and
+non-ARVO Docker settings in `generation_provenance.json`.
 
 For ARVO, Stage 01 creates one sample workspace and performs the only default full
 vulnerable build. Stage 04 reuses it for instrumented target-level rebuilds, applies the

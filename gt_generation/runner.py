@@ -200,8 +200,8 @@ def main() -> None:
             "stages": merged_stage_timings,
         },
     )
-    if not failed and config.get("compact_on_success"):
-        from gt_generation.gt_toolkit.compact_result import compact_result
+    if not failed and config.get("compact_on_success") and not args.dry_run:
+        from gt_toolkit.compact_result import compact_result
 
         compact_report = compact_result(result_dir)
         if not compact_report["ok"]:

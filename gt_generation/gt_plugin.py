@@ -18,6 +18,7 @@ touches Docker itself; it only makes the routing decision visible up front.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -41,6 +42,7 @@ ADAPTERS = {
     "coco": CODE_ROOT / "adapters" / "coco" / "gt_agent_coco.sh",
 }
 MAX_PARALLEL = 6  # local Docker budget ceiling
+CODEX_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 
 
 # --------------------------------------------------------------------------- #
@@ -63,6 +65,23 @@ def load_config(path: Path) -> dict[str, Any]:
     if not model:
         raise SystemExit("config.model is required (one model id for every stage)")
 
+    reasoning_effort = str(raw.get("reasoning_effort") or "high").strip().lower()
+    if cli == "codex" and reasoning_effort not in CODEX_REASONING_EFFORTS:
+        raise SystemExit(
+            "config.reasoning_effort must be one of "
+            f"{sorted(CODEX_REASONING_EFFORTS)} for codex; got {reasoning_effort!r}"
+        )
+    strict_config = bool(raw.get("strict_config", True))
+
+    repo_docker_image = str(raw.get("repo_docker_image") or "gt-memory-env:latest").strip()
+    repo_docker_context = Path(
+        str(raw.get("repo_docker_context") or "docker/gt-memory-env")
+    )
+    if not repo_docker_context.is_absolute():
+        repo_docker_context = REPO_ROOT / repo_docker_context
+    if not repo_docker_context.is_dir():
+        raise SystemExit(f"config.repo_docker_context is not a directory: {repo_docker_context}")
+
     parallel = int(raw.get("parallel_dockers") or 1)
     if not 1 <= parallel <= MAX_PARALLEL:
         raise SystemExit(f"config.parallel_dockers must be between 1 and {MAX_PARALLEL}")
@@ -82,6 +101,10 @@ def load_config(path: Path) -> dict[str, Any]:
         "cli": cli,
         "adapter": adapter,
         "model": model,
+        "reasoning_effort": reasoning_effort,
+        "strict_config": strict_config,
+        "repo_docker_image": repo_docker_image,
+        "repo_docker_context": repo_docker_context,
         "parallel_dockers": parallel,
         "samples": samples,
         "selection_path": selection_path,
@@ -136,6 +159,38 @@ def current_stage(result_dir: Path) -> str:
     return str(state.get("current_stage") or "starting")
 
 
+def _command_output(command: list[str]) -> str:
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    return (completed.stdout or completed.stderr).strip() or "unknown"
+
+
+def write_provenance(result_dir: Path, cfg: dict[str, Any], track: str) -> None:
+    """Persist the exact agent/Docker configuration used for this sample."""
+    adapter = Path(cfg["adapter"])
+    data = {
+        "schema_version": "gt-generation-provenance-v1",
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "cli": cfg["cli"],
+        "model": cfg["model"],
+        "reasoning_effort": cfg["reasoning_effort"],
+        "strict_config": cfg["strict_config"],
+        "adapter": str(adapter),
+        "adapter_sha256": hashlib.sha256(adapter.read_bytes()).hexdigest(),
+        "docker_track": track,
+        "repo_docker_image": cfg["repo_docker_image"],
+        "repo_docker_context": str(cfg["repo_docker_context"]),
+    }
+    if cfg["cli"] == "codex":
+        data["cli_version"] = _command_output(["codex", "--version"])
+        data["authentication"] = _command_output(["codex", "login", "status"])
+    (result_dir / "generation_provenance.json").write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Run                                                                          #
 # --------------------------------------------------------------------------- #
@@ -146,6 +201,9 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
     input_path.write_text(json.dumps(sample, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     result_dir = REPO_ROOT / "gt_results" / sample_id
     log_path = logs_dir / f"{sample_id}.log"
+    track = docker_track(sample)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    write_provenance(result_dir, cfg, track)
 
     started = time.monotonic()
     with running_lock:
@@ -159,6 +217,10 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
         ),
         "GT_AGENT_COMMAND": str(cfg["adapter"]),
         "GT_AGENT_MODEL": cfg["model"],
+        "GT_AGENT_REASONING_EFFORT": cfg["reasoning_effort"],
+        "GT_CODEX_STRICT_CONFIG": "1" if cfg["strict_config"] else "0",
+        "GT_REPO_DOCKER_IMAGE": cfg["repo_docker_image"],
+        "GT_REPO_DOCKER_CONTEXT": str(cfg["repo_docker_context"]),
     }
     command = [
         sys.executable, str(RUNNER),
@@ -168,7 +230,7 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
     with log_path.open("w", encoding="utf-8") as stream:
         completed = subprocess.run(command, cwd=REPO_ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT)
 
-    if docker_track(sample) == "arvo":
+    if track == "arvo":
         cleanup_arvo(sample_id)
 
     with running_lock:
@@ -186,7 +248,7 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
 
     result = {
         "sample_id": sample_id,
-        "track": docker_track(sample),
+        "track": track,
         "project": sample.get("project"),
         "returncode": completed.returncode,
         "audit_ok": audit_ok,
@@ -241,6 +303,10 @@ def main(argv: list[str] | None = None) -> int:
         "batch": args.batch_name,
         "cli": cfg["cli"],
         "model": cfg["model"],
+        "reasoning_effort": cfg["reasoning_effort"],
+        "strict_config": cfg["strict_config"],
+        "repo_docker_image": cfg["repo_docker_image"],
+        "repo_docker_context": str(cfg["repo_docker_context"]),
         "parallel_dockers": cfg["parallel_dockers"],
         "samples": len(cfg["samples"]),
         "docker_routing": {

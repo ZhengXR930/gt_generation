@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
+import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -27,6 +30,15 @@ _CRASH_MARKERS = (
     "ERROR: AddressSanitizer", "ERROR: LeakSanitizer", "SUMMARY: ", "runtime error:",
     "MemorySanitizer", "use-of-uninitialized-value", "SEGV on unknown", "attempting double-free",
     "heap-use-after-free", "heap-buffer-overflow", "stack-buffer-overflow",
+)
+_CRASH_MARKER_RE = re.compile(
+    r"(==\d+==\s*)?ERROR: (AddressSanitizer|MemorySanitizer|LeakSanitizer|UndefinedBehaviorSanitizer)"
+    r"|AddressSanitizer:DEADLYSIGNAL"
+    r"|SUMMARY: (AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer)"
+    r"|runtime error:"
+    r"|use-of-uninitialized-value"
+    r"|heap-use-after-free|heap-buffer-overflow|stack-buffer-overflow",
+    re.IGNORECASE,
 )
 
 
@@ -80,7 +92,10 @@ def prepare(sample_path: str, result_dir: str) -> dict[str, Any]:
     (d / "_work").mkdir(parents=True, exist_ok=True)
     sample_info_path = d / "sample_info.json"
     if source_sample_path.resolve() != sample_info_path.resolve():
-        shutil.copy2(source_sample_path, sample_info_path)
+        # Required-output freshness is part of runner.py's stale-file gate.
+        # Preserve the public JSON contents, but refresh the staged copy's mtime
+        # so Stage 00 can prove it materialized this run.
+        shutil.copy(source_sample_path, sample_info_path)
     else:
         # The result-local asset may also be used as the next run's immutable input.
         # Refresh only its timestamp so the runner's stale-output gate can distinguish
@@ -144,6 +159,12 @@ def _stage_default_crash_trace(
                 source = str(candidate)
                 break
     if not destination.is_file() or not destination.stat().st_size:
+        public_poc = _stage_default_crash_trace_from_public_poc(
+            sample, source_sample_path, result_dir
+        )
+        if public_poc.get("default_crash_trace_staged"):
+            return public_poc
+    if not destination.is_file() or not destination.stat().st_size:
         return {"default_crash_trace_staged": False}
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
     return {
@@ -151,6 +172,126 @@ def _stage_default_crash_trace(
         "source": source,
         "sha256": f"sha256:{digest}",
     }
+
+
+def _stage_default_crash_trace_from_public_poc(
+    sample: dict[str, Any], source_sample_path: Path, result_dir: Path
+) -> dict[str, Any]:
+    """Infer public crash context from local public PoC/bug-report artifacts.
+
+    SEC-bench-style samples often store the public issue/report text as the PoC
+    artifact; many include fenced sanitizer output. Use this only when a real
+    sanitizer marker is present, so samples with binary inputs or command-only
+    PoCs still fail the Stage 00 public-context gate instead of getting a
+    synthetic placeholder.
+    """
+    destination = result_dir / "default_crash_trace.txt"
+    for candidate in _public_poc_trace_candidates(sample, source_sample_path):
+        if not candidate.is_file():
+            continue
+        try:
+            raw = candidate.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw[:4096]:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        trace = _extract_sanitizer_trace_text(text)
+        if not trace:
+            continue
+        destination.write_text(trace, encoding="utf-8")
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        return {
+            "default_crash_trace_staged": True,
+            "source": str(candidate),
+            "source_kind": "public_poc_sanitizer_report",
+            "sha256": f"sha256:{digest}",
+        }
+    return {"default_crash_trace_staged": False}
+
+
+def _public_poc_trace_candidates(
+    sample: dict[str, Any], source_sample_path: Path
+) -> list[Path]:
+    repo_root = Path(__file__).resolve().parents[2]
+    sid = str(sample.get("sample_id") or "")
+    candidates: list[Path] = []
+    raw_paths = [sample.get("poc_path")]
+    if sid:
+        poc_dir = repo_root / "dataset" / "pocs" / sid
+        if poc_dir.is_dir():
+            raw_paths.extend(
+                sorted(
+                    (path for path in poc_dir.iterdir()
+                     if path.is_file() and path.name != "patch.diff"),
+                    key=lambda path: (path.name != "poc", path.name),
+                )
+            )
+    for raw in raw_paths:
+        if not raw:
+            continue
+        path = raw if isinstance(raw, Path) else Path(str(raw)).expanduser()
+        path_candidates = [path]
+        if not path.is_absolute():
+            path_candidates.extend((source_sample_path.parent / path, repo_root / path, repo_root / "dataset" / path))
+        for resolved in path_candidates:
+            if resolved not in candidates:
+                candidates.append(resolved)
+    return candidates
+
+
+def _extract_sanitizer_trace_text(text: str) -> str:
+    """Return a sanitizer crash block from plain text or saved GitHub HTML."""
+    for candidate in _possible_trace_texts(text):
+        normalized = _normalize_trace_text(candidate)
+        match = _CRASH_MARKER_RE.search(normalized)
+        if not match:
+            continue
+        start = normalized.rfind("\n", 0, match.start()) + 1
+        previous = normalized.rfind("\n", 0, max(0, start - 1))
+        if previous >= 0:
+            previous_line = normalized[previous + 1:start].strip()
+            if previous_line and set(previous_line) <= {"="}:
+                start = previous + 1
+        end = len(normalized)
+        for marker in ("==ABORTING", "ABORTING"):
+            pos = normalized.find(marker, match.end())
+            if pos >= 0:
+                end = normalized.find("\n", pos)
+                end = len(normalized) if end < 0 else end + 1
+                break
+        trace = normalized[start:end].strip()
+        if _CRASH_MARKER_RE.search(trace):
+            return trace + "\n"
+    return ""
+
+
+def _possible_trace_texts(text: str) -> list[str]:
+    """Prefer explicit GitHub clipboard snippets before the whole saved page."""
+    values: list[str] = []
+    for match in re.finditer(r'data-snippet-clipboard-copy-content="([^"]*)"', text, re.DOTALL):
+        snippet = html.unescape(match.group(1))
+        try:
+            snippet = bytes(snippet, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            pass
+        if _CRASH_MARKER_RE.search(snippet):
+            values.append(snippet)
+    values.append(text)
+    return values
+
+
+def _normalize_trace_text(text: str) -> str:
+    decoded = html.unescape(text)
+    if "\\n" in decoded and decoded.count("\\n") > decoded.count("\n"):
+        try:
+            decoded = bytes(decoded, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            pass
+    if "<" in decoded and ">" in decoded:
+        decoded = re.sub(r"<[^>]+>", "", decoded)
+        decoded = html.unescape(decoded)
+    return decoded.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _capture_arvo_default_crash_trace(
@@ -247,10 +388,16 @@ def _detect_arvo_target(image: str) -> str:
     return match.group(1) if match else ""
 
 
-def _ensure_memory_env(tag: str = "gt-memory-env:latest") -> bool:
+def _ensure_memory_env(tag: str | None = None, context: str | Path | None = None) -> bool:
+    tag = tag or os.environ.get("GT_REPO_DOCKER_IMAGE", "gt-memory-env:latest")
+    context = Path(
+        context
+        or os.environ.get("GT_REPO_DOCKER_CONTEXT", "")
+        or Path(__file__).resolve().parents[2] / "docker" / "gt-memory-env"
+    ).resolve()
     if _sh(["docker", "images", "-q", tag]).stdout.strip():
         return True
-    return _sh(["docker", "build", "-t", tag, "docker/gt-memory-env"], timeout=3000).returncode == 0
+    return _sh(["docker", "build", "-t", tag, str(context)], timeout=3000).returncode == 0
 
 
 def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
@@ -263,7 +410,12 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     vcommit = sample.get("vulnerable_commit")
     if not repo:
         return {"prepared": False, "track": "repo", "reason": "no repo url"}
-    env_ok = _ensure_memory_env()
+    env_image = os.environ.get("GT_REPO_DOCKER_IMAGE", "gt-memory-env:latest")
+    env_context = Path(
+        os.environ.get("GT_REPO_DOCKER_CONTEXT", "")
+        or Path(__file__).resolve().parents[2] / "docker" / "gt-memory-env"
+    ).resolve()
+    env_ok = _ensure_memory_env(env_image, env_context)
     src = d / "_work" / "src"
     shutil.rmtree(src, ignore_errors=True)
     if _sh(["git", "clone", str(repo), str(src)], timeout=1800).returncode != 0:
@@ -278,20 +430,97 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
             (d / "patch.diff").write_text(diff.stdout)
     if not (d / "patch.diff").exists():
         _stage_patch(sample, d, sid)
-    # poc from dataset/pocs/<sample_id>/
-    pocdir = Path(f"dataset/pocs/{sid}")
-    if pocdir.is_dir():
-        files = [f for f in pocdir.iterdir() if f.is_file() and f.name != "patch.diff"]
-        if files:
-            shutil.copy(str(max(files, key=lambda f: f.stat().st_size)), d / "poc")
+    staged_poc = _stage_repo_poc(sample, d, sid)
     (d / "build.sh").write_text(
-        f"# secbench/repo sample {sid}: gt_generator builds this in gt-memory-env\n"
-        f"# repo={repo} vulnerable_commit={vcommit}\n")
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n\n"
+        'ASSET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+        f"IMAGE={shlex.quote(env_image)}\n"
+        'if [[ $# -eq 0 ]]; then\n'
+        '  echo "usage: $0 <build-or-reproduction command>" >&2\n'
+        '  exit 2\n'
+        'fi\n'
+        'exec docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp '
+        '-v "${ASSET_DIR}:/gt" -w /gt/_work/src "${IMAGE}" '
+        'bash -lc "$*"\n'
+    )
+    (d / "build.sh").chmod(0o755)
     _init_state(sid, d)
-    return {"track": "repo/secbench", "sample_id": sid, "env": "gt-memory-env", "env_ok": env_ok,
+    return {"track": "repo/secbench", "sample_id": sid, "env": env_image,
+            "env_context": str(env_context), "env_ok": env_ok,
             "repo": repo, "vulnerable_commit": vcommit, "source": src.exists(),
-            "poc": (d / "poc").exists(), "patch": (d / "patch.diff").exists(),
+            "poc": (d / "poc").exists(), "poc_source": staged_poc,
+            "patch": (d / "patch.diff").exists(),
             "prepared": bool(src.exists())}
+
+
+def _stage_repo_poc(sample: dict[str, Any], d: Path, sid: str) -> str:
+    """Stage the actual runnable testcase as /gt/poc for repo-based samples.
+
+    Older SEC-bench imports stored the public issue/report text at
+    dataset/pocs/<sid>/poc. If prepare blindly picks the largest file in that
+    directory, a report or downloaded archive can be staged instead of the
+    testcase. Prefer explicit sample metadata and the testcase/ subdirectory;
+    only then fall back to legacy flat files while filtering obvious metadata.
+    """
+    destination = d / "poc"
+    destination.unlink(missing_ok=True)
+    repo_root = Path(__file__).resolve().parents[2]
+    raw_candidates = (
+        sample.get("poc_artifact_path"),
+        sample.get("poc_path"),
+    )
+    for raw in raw_candidates:
+        for candidate in _resolve_asset_candidates(raw, repo_root):
+            if candidate.is_file() and candidate.stat().st_size:
+                shutil.copy(candidate, destination)
+                return str(candidate)
+
+    pocdir = repo_root / "dataset" / "pocs" / sid
+    testcase_dir = pocdir / "testcase"
+    if testcase_dir.is_dir():
+        files = sorted((path for path in testcase_dir.rglob("*") if path.is_file()))
+        if files:
+            chosen = max(files, key=lambda path: path.stat().st_size)
+            shutil.copy(chosen, destination)
+            return str(chosen)
+
+    if pocdir.is_dir():
+        ignored_names = {
+            "patch.diff",
+            "bug_report.md",
+            "public_report.md",
+            "README",
+            "README.md",
+            "sample_info.json",
+            "default_crash_trace.txt",
+        }
+        ignored_suffixes = {".zip", ".tar", ".gz", ".tgz", ".xz", ".bz2", ".html", ".md", ".txt"}
+        files = [
+            path for path in pocdir.iterdir()
+            if (
+                path.is_file()
+                and path.name not in ignored_names
+                and path.suffix.lower() not in ignored_suffixes
+            )
+        ]
+        if files:
+            chosen = max(files, key=lambda path: path.stat().st_size)
+            shutil.copy(chosen, destination)
+            return str(chosen)
+    return ""
+
+
+def _resolve_asset_candidates(raw: Any, repo_root: Path) -> list[Path]:
+    if not raw:
+        return []
+    candidate = Path(str(raw)).expanduser()
+    if candidate.is_absolute():
+        return [candidate]
+    return [
+        repo_root / candidate,
+        repo_root / "dataset" / candidate,
+    ]
 
 
 def _stage_patch(sample: dict[str, Any], d: Path, sid: str) -> None:

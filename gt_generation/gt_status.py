@@ -53,23 +53,27 @@ def classify(sample_id: str) -> tuple[str, str]:
     if missing:
         return "incomplete", f"missing {', '.join(missing)}"
 
-    # Deterministic gates -- the same criteria that define a usable GT.
+    timing_path = d / "generation_timing.json"
+    if not timing_path.is_file():
+        return "incomplete", "missing generation_timing.json"
     try:
-        from gt_toolkit.assertions import validate_invariant_bindings, validate_binding_coverage
-        va = json.loads((d / "verified_assertions.json").read_text())
-        vi = json.loads((d / "verified_invariants.json").read_text())
-        fb = json.loads((d / "field_bindings.json").read_text()).get("bindings", {})
-        el = json.loads((d / "event_locations.json").read_text()).get("locations", {})
-        spec = {"schema_version": va.get("schema_version", "assertion-spec-v2"),
-                "assertions": va.get("assertions", [])}
-        binding = validate_invariant_bindings(vi, spec)
-        crit_errs = [e for e in binding.get("errors", []) if "root_cause_criterion" in e]
-        if crit_errs:
-            return "incomplete", f"criterion gate: {crit_errs[0][:70]}"
-        cov = validate_binding_coverage(spec, fb, el)
-        if not cov.get("valid"):
-            errs = cov.get("errors") or ["coverage gate failed"]
-            return "incomplete", f"coverage gate: {errs[0][:70]}"
+        timing = json.loads(timing_path.read_text())
+        if timing.get("status") != "completed":
+            failed_stages = [
+                str(stage.get("name"))
+                for stage in timing.get("stages", [])
+                if stage.get("ok") is not True
+            ]
+            detail = failed_stages[-1] if failed_stages else str(timing.get("status") or "unknown")
+            return "incomplete", f"generation failed at {detail}"
+
+        # Run the same final package audit as Stage 05. Checking only bindings
+        # and coverage can incorrectly accept failed Stage 04/05 leftovers.
+        from gt_toolkit.package_audit import audit_package
+        audit = audit_package(d)
+        if not audit.get("ok"):
+            errors = audit.get("errors") or ["package audit failed"]
+            return "incomplete", f"package audit: {str(errors[0])[:120]}"
     except Exception as exc:
         return "incomplete", f"gate error: {type(exc).__name__}: {exc}"
     return "complete", "ok"

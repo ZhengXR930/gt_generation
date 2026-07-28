@@ -77,6 +77,21 @@ def test_claude_adapter_uses_one_model_no_stage_escalation():
     assert 'GT_CLAUDE_COMPLEX_MODEL' not in adapter
 
 
+def test_codex_adapter_uses_model_reasoning_and_strict_config():
+    adapter = (
+        Path(__file__).parents[1]
+        / "gt_generation"
+        / "adapters"
+        / "codex"
+        / "gt_agent_codex.sh"
+    ).read_text()
+
+    assert 'GT_AGENT_MODEL' in adapter
+    assert 'GT_AGENT_REASONING_EFFORT' in adapter
+    assert 'model_reasoning_effort=' in adapter
+    assert '--strict-config' in adapter
+
+
 def test_failed_review_reopens_fresh_producer_and_reviewer_sessions(tmp_path, monkeypatch):
     producer = {"name": "02_fine_trace", "role": "roles/02_fine_trace.md"}
     review = {
