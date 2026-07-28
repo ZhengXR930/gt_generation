@@ -1,0 +1,258 @@
+{
+  "sample_id": "arvo_42530090",
+  "vuln_id": "OSS-Fuzz issue 42530090 / ARVO arvo:42530090",
+  "project": {
+    "id": "PcapPlusPlus",
+    "name": "PcapPlusPlus",
+    "repo": "https://github.com/seladb/PcapPlusPlus",
+    "vulnerable_commit": "98143666674d8d50ffed878d8d91c48c9567706c",
+    "fixed_commit": "a0ecc6dad71f445c95936697c7ee15997d5761b2",
+    "staged_checkout_commit": "0c95dfb3557644acc6a10060e48cfae1a61fc2f0",
+    "commit_note": "The exact staged vulnerable source under `_work/src/PcapPlusPlus` is commit `0c95dfb3557644acc6a10060e48cfae1a61fc2f0`, not the metadata `vulnerable_commit`. The line anchors below were resolved against that staged tree, which matches the saved AddressSanitizer stack and the packaged `patch.diff` that adds `GREv0Layer::isDataValid()` / `GREv1Layer::isDataValid()` checks before IPv4 and IPv6 GRE-layer construction.",
+    "fuzz_target": "FuzzTarget"
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-787",
+    "access": "WRITE",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42530090 (PcapPlusPlus): Heap-buffer-overflow WRITE 2 found by fuzz target FuzzTarget [asan]. https://issues.oss-fuzz.com/issues/42530090",
+    "original_source": "sample_info.json issue_description / patch.diff / sanitizer_trace.txt / reproduction_report.json / staged vulnerable source / static parse of the staged poc",
+    "normalized": "Stage 01 reproduced an AddressSanitizer heap-buffer-overflow WRITE of size 2 in `pcpp::GREv1Layer::computeCalculateFields()` at `Packet++/src/GreLayer.cpp:542`. A static parse of the staged `poc` shows a raw-IP pcap whose first packet has `incl_len == 25` and packet bytes `45 11 70 ff 64 77 80 00 6e 2f 91 16 df fd 93 62 e9 00 f6 00 00 21 65 80 00`. The IPv4 header consumes 20 bytes and its protocol byte is `0x2f` (GRE), so `IPv4Layer::parseNextLayer()` materializes the final five bytes `00 21 65 80 00` as the GRE payload. `GreLayer::getGREVersion()` only requires `sizeof(gre_basic_header)` (4 bytes), so it classifies that 5-byte slice as GREv1 from the low version bits of `0x21`. The vulnerable IPv4 GRE branch then constructs `GREv1Layer` with those five bytes and no `payloadLen >= sizeof(gre1_header)` check. On the witness all GRE optional-bit flags are clear, so GRE header-length calculation leaves only one payload byte beyond the 4-byte basic GRE header; the mandatory `gre1_header::payloadLength` and `callID` fields do not actually fit. When the harness later calls `parsedPacket.computeCalculateFields()`, `GREv1Layer::computeCalculateFields()` still writes the 2-byte `payloadLength` field at offset 4, beginning on the last byte of the 25-byte raw packet allocation and overrunning one byte past it. The staged fix adds `GREv0Layer::isDataValid()` / `GREv1Layer::isDataValid()` and requires those checks before constructing GRE layers from IPv4 or IPv6 payloads, so short GRE inputs fall back to `PayloadLayer` instead of being reserialized as GREv1."
+  },
+  "source": {
+    "file": "Packet++/src/IPv4Layer.cpp",
+    "function": "pcpp::IPv4Layer::parseNextLayer",
+    "line": 242,
+    "var": "hdrLen, payload, payloadLen",
+    "code": "size_t hdrLen = getHeaderLen();\nif (m_DataLen <= hdrLen || hdrLen == 0)\n    return;\n\niphdr* ipHdr = getIPv4Header();\n\nProtocolType greVer = UnknownProtocol;\nProtocolType igmpVer = UnknownProtocol;\nbool igmpQuery = false;\n\nuint8_t ipVersion = 0;\n\nuint8_t* payload = m_Data + hdrLen;\nsize_t payloadLen = m_DataLen - hdrLen;",
+    "description": "First project statement on the vulnerable path that materializes the attacker-controlled GRE byte slice and its length from the raw IPv4 packet tail.",
+    "value_from": "A static parse of `gt_results/arvo_42530090/poc` shows first-packet `incl_len == 25` and raw packet bytes `45 11 70 ff 64 77 80 00 6e 2f 91 16 df fd 93 62 e9 00 f6 00 00 21 65 80 00`. The IPv4 IHL nibble `5` makes `hdrLen == 20`, and the protocol byte `0x2f` routes into GRE parsing, so the final five bytes `00 21 65 80 00` become the `payload` / `payloadLen == 5` pair created here.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "Packet++/src/GreLayer.cpp",
+    "function": "pcpp::GREv1Layer::computeCalculateFields",
+    "line": 542,
+    "var": "getGreHeader()->payloadLength",
+    "code": "getGreHeader()->payloadLength = htobe16(m_DataLen - getHeaderLen());",
+    "description": "ASan crash site. `GREv1Layer::computeCalculateFields()` writes the 2-byte `payloadLength` field through `getGreHeader()` even though the layer only aliases a 5-byte GRE slice.",
+    "note": "The saved sanitizer trace reports `heap-buffer-overflow WRITE of size 2` at this exact line and says the target address is 0 bytes to the right of the 25-byte heap region allocated in `pcpp::PcapFileReaderDevice::getNextPacket()`.",
+    "trace_step": 5
+  },
+  "root_cause": {
+    "file": "Packet++/src/IPv4Layer.cpp",
+    "function": "pcpp::IPv4Layer::parseNextLayer",
+    "line": 294,
+    "var": "greVer, payload, payloadLen, m_NextLayer",
+    "code": "else if (greVer == GREv1)\n    m_NextLayer = new GREv1Layer(payload, payloadLen, this, m_Packet);",
+    "description": "Root cause. Once GRE version probing says `GREv1`, IPv4 parsing constructs a `GREv1Layer` from the same 5-byte slice without validating that the buffer is large enough for `sizeof(gre1_header)`.",
+    "note": "The staged patch changes this branch to `else if (greVer == GREv1 && GREv1Layer::isDataValid(payload, payloadLen))`, and `GREv1Layer::isDataValid()` requires at least `sizeof(gre1_header)` (8) bytes. The witness satisfies the old 4-byte version probe but not the fixed 8-byte constructor precondition.",
+    "trace_step": 3
+  },
+  "tainted_value_origin": {
+    "file": "Packet++/src/IPv4Layer.cpp",
+    "function": "pcpp::IPv4Layer::parseNextLayer",
+    "line": 242,
+    "var": "hdrLen, payload, payloadLen",
+    "code": "size_t hdrLen = getHeaderLen();\nif (m_DataLen <= hdrLen || hdrLen == 0)\n    return;\n\niphdr* ipHdr = getIPv4Header();\n\nProtocolType greVer = UnknownProtocol;\nProtocolType igmpVer = UnknownProtocol;\nbool igmpQuery = false;\n\nuint8_t ipVersion = 0;\n\nuint8_t* payload = m_Data + hdrLen;\nsize_t payloadLen = m_DataLen - hdrLen;",
+    "description": "The vulnerability-relevant attacker-controlled state is the GRE payload pointer and its 5-byte extent. These lines derive that exact slice from the raw IPv4 packet.",
+    "value_from": "On the staged witness the last five raw packet bytes are `00 21 65 80 00`, so this code materializes `payload` over those bytes and `payloadLen == 5`."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "Packet++/src/IPv4Layer.cpp",
+      "function": "pcpp::IPv4Layer::parseNextLayer",
+      "line": 291,
+      "code": "greVer = GreLayer::getGREVersion(payload, payloadLen);",
+      "description": "After the pcap packet has already been admitted as IPv4, the IPv4 protocol field `47` sends execution into the GRE branch and begins GRE-specific parsing on the final five packet bytes. The saved stdout confirms this path with `IPv4 Layer, Src: 223.253.147.98, Dst: 233.0.246.0` followed by `GRE Layer, version 1`."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "Packet++/src/IPv4Layer.cpp / Packet++/src/GreLayer.cpp",
+      "function": "pcpp::IPv4Layer::parseNextLayer / pcpp::GreLayer::getGREVersion",
+      "summary": "IPv4 parsing slices the final five packet bytes as GRE and version probing accepts them as GREv1 using only the 4-byte basic GRE header."
+    },
+    {
+      "step": 2,
+      "file": "Packet++/src/IPv4Layer.cpp",
+      "function": "pcpp::IPv4Layer::parseNextLayer",
+      "summary": "The GRE branch constructs a `GREv1Layer` over those five bytes with no `sizeof(gre1_header)` validation; the staged patch adds this exact missing check."
+    },
+    {
+      "step": 3,
+      "file": "Packet++/src/GreLayer.cpp",
+      "function": "pcpp::GreLayer::parseNextLayer",
+      "summary": "GRE header-length calculation leaves only one payload byte beyond the 4-byte basic GRE header, proving the mandatory GREv1 `payloadLength` and `callID` fields do not fit in the backing bytes."
+    },
+    {
+      "step": 4,
+      "file": "Packet++/src/GreLayer.cpp / Packet++/src/Packet.cpp",
+      "function": "pcpp::GREv1Layer::computeCalculateFields / pcpp::Packet::computeCalculateFields",
+      "summary": "Packet recalculation later writes the GREv1 `payloadLength` field through that truncated layer and overruns the 25-byte raw packet allocation with the saved 2-byte heap write."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "Packet++/src/IPv4Layer.cpp",
+      "function": "pcpp::IPv4Layer::parseNextLayer",
+      "line": 242,
+      "line_end": 255,
+      "var": "hdrLen, payload, payloadLen",
+      "code": "size_t hdrLen = getHeaderLen();\nif (m_DataLen <= hdrLen || hdrLen == 0)\n    return;\n\niphdr* ipHdr = getIPv4Header();\n\nProtocolType greVer = UnknownProtocol;\nProtocolType igmpVer = UnknownProtocol;\nbool igmpQuery = false;\n\nuint8_t ipVersion = 0;\n\nuint8_t* payload = m_Data + hdrLen;\nsize_t payloadLen = m_DataLen - hdrLen;",
+      "note": "Source. For the 25-byte raw-IP witness, `getHeaderLen()` returns 20 from the IPv4 IHL nibble `0x5`, so these lines materialize the final five packet bytes `00 21 65 80 00` as `payload` and set `payloadLen = 5`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "Packet++/src/GreLayer.cpp",
+      "function": "pcpp::GreLayer::getGREVersion",
+      "line": 25,
+      "line_end": 33,
+      "var": "greDataLen, version",
+      "code": "if (greDataLen < sizeof(gre_basic_header))\n    return UnknownProtocol;\n\nuint8_t version = *(greData+1);\nversion &= 0x07;\nif (version == 0)\n    return GREv0;\nelse if (version == 1)\n    return GREv1;",
+      "note": "This version probe is the only present admission check before GREv1 construction. Because step 1 produced `payloadLen = 5`, the `greDataLen < sizeof(gre_basic_header)` guard passes, and the low three bits of `payload[1]` (`0x21`) decode as version `1`, so the short buffer is classified as GREv1 using only the 4-byte basic header.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "payload, payloadLen"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "Packet++/src/IPv4Layer.cpp",
+      "function": "pcpp::IPv4Layer::parseNextLayer",
+      "line": 294,
+      "line_end": 295,
+      "var": "greVer, payload, payloadLen, m_NextLayer",
+      "code": "else if (greVer == GREv1)\n    m_NextLayer = new GREv1Layer(payload, payloadLen, this, m_Packet);",
+      "note": "Root cause. Once step 2 returns `GREv1`, IPv4 parsing constructs a `GREv1Layer` over the same five bytes without checking that `payloadLen` is large enough for `sizeof(gre1_header)` (8). The fixed code adds `GREv1Layer::isDataValid(payload, payloadLen)` here, which would reject this witness and fall back to `PayloadLayer`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "payload, payloadLen"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "greVer == GREv1"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "Packet++/src/GreLayer.cpp",
+      "function": "pcpp::GreLayer::parseNextLayer",
+      "line": 196,
+      "line_end": 202,
+      "var": "headerLen, payloadLen",
+      "code": "size_t headerLen = getHeaderLen();\nif (m_DataLen <= headerLen)\n    return;\n\ngre_basic_header* header = (gre_basic_header*)m_Data;\nuint8_t* payload = m_Data + headerLen;\nsize_t payloadLen = m_DataLen - headerLen;",
+      "note": "On the 5-byte GREv1 object from step 3, `getHeaderLen()` resolves to 4 because the first GRE bytes leave checksum, routing, key, sequence, and ack bits clear. That leaves only `payloadLen = 1`, matching the saved stdout line `Payload Layer, Data length: 1 [Bytes]`; the mandatory `gre1_header::payloadLength` and `callID` fields therefore do not fit in the layer backing bytes.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "m_Data, m_DataLen"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "Packet++/src/GreLayer.cpp",
+      "function": "pcpp::GREv1Layer::computeCalculateFields",
+      "line": 542,
+      "var": "getGreHeader()->payloadLength",
+      "code": "getGreHeader()->payloadLength = htobe16(m_DataLen - getHeaderLen());",
+      "note": "Sink. After the harness calls `parsedPacket.computeCalculateFields()`, `Packet::computeCalculateFields()` revisits the malformed GREv1 layer from step 3 and this store writes the 2-byte `payloadLength` field at offset 4 of `gre1_header`. With `m_DataLen = 5` and step 4 showing only one byte exists beyond the 4-byte basic GRE header, the store begins on the last byte of the 25-byte raw packet allocation and overruns one byte past it, matching ASan's `heap-buffer-overflow WRITE of size 2` at this exact line.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "m_DataLen"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "headerLen == 4"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "WRITE",
+    "access_size": 2,
+    "crash_location": {
+      "file": "Packet++/src/GreLayer.cpp",
+      "function": "pcpp::GREv1Layer::computeCalculateFields()",
+      "line": 542
+    },
+    "allocation_context": {
+      "file": "Pcap++/src/PcapFileDevice.cpp",
+      "function": "pcpp::PcapFileReaderDevice::getNextPacket(pcpp::RawPacket&)",
+      "line": 307,
+      "note": "ASan says the crashing 25-byte heap region was created by `new uint8_t[pkthdr.caplen]` at this line."
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "pcpp::GREv1Layer::computeCalculateFields()",
+        "file": "Packet++/src/GreLayer.cpp",
+        "line": 542
+      },
+      {
+        "frame": 1,
+        "function": "pcpp::Packet::computeCalculateFields()",
+        "file": "Packet++/src/Packet.cpp",
+        "line": 661
+      },
+      {
+        "frame": 2,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "Tests/Fuzzers/FuzzTarget.cpp",
+        "line": 70
+      },
+      {
+        "frame": 3,
+        "function": "fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)",
+        "file": "llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp",
+        "line": 611
+      },
+      {
+        "frame": 4,
+        "function": "fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long)",
+        "file": "llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp",
+        "line": 324
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01 reproduced the crash by running `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_42530090 run --version vulnerable --expect crash`, which produced `AddressSanitizer: heap-buffer-overflow WRITE of size 2` in `pcpp::GREv1Layer::computeCalculateFields()`.",
+    "format": {
+      "name": "raw-IP pcap with truncated GREv1 payload",
+      "contract": "A raw-IP pcap whose first packet is 25 bytes long: a 20-byte IPv4 header with protocol `47` (GRE) followed by exactly the five GRE bytes `00 21 65 80 00`. Those bytes satisfy `GreLayer::getGREVersion()` as GREv1 but do not satisfy the fixed `GREv1Layer::isDataValid(payload, payloadLen)` requirement of at least `sizeof(gre1_header)` bytes, so `GREv1Layer::computeCalculateFields()` later overwrites the missing 2-byte `payloadLength` field. The staged artifacts only prove this exact 5-byte short-GRE witness and do not justify a broader trigger contract."
+    }
+  }
+}

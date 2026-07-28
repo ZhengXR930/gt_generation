@@ -1,0 +1,458 @@
+{
+  "sample_id": "arvo_55365",
+  "vuln_id": "OSS-Fuzz issue 55365 / ARVO arvo:55365",
+  "project": {
+    "id": "libzip",
+    "name": "libzip",
+    "repo": "https://github.com/nih-at/libzip.git",
+    "vulnerable_commit": "5eeb3fdf58caef856c6050431187869f15006912",
+    "fixed_commit": "e907b0bda2f04c16eb7f10d5b2f41a3416a3e2b8",
+    "fuzz_target": "zip_read_fuzzer"
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416",
+    "detector": "AddressSanitizer",
+    "access": "read"
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=4820171095408640 Project: libzip Fuzz Target: zip_read_fuzzer Crash Type: Heap-use-after-free READ 1 Crash State: zip_source_open -> zip_source_open -> _zip_open Sanitizer: address (ASAN).",
+    "original_source": "sample_info.json issue_description / sanitizer_trace.txt / patch.diff / reproduction_report.json / staged vulnerable checkout `_work/src/libzip`",
+    "normalized": "The exact staged 44-byte witness is an EOCD-only ZIP record whose central-directory `size` and `offset` fields are both zero and whose EOCD `comment_len` field is `0x0016`, followed by the 22-byte comment `TORRENTZIPPED-       4`. `_zip_read_eocd()` and `_zip_read_cdir()` materialize those attacker-controlled fields, so `zip_check_torrentzip()` accepts the comment as a torrentzip marker, parses `crc_should == 4`, and creates `src_window = _zip_source_window_new(za->src, 0, 0, ...)`. `zip_source_crc_create(src_window, 1, NULL)` then stores that `src_window` pointer as the lower layer of `src_crc`, but the vulnerable code immediately calls `zip_source_free(src_window)`. Because the CRC wrapper did not retain an extra reference to its lower layer, `src_crc->src` becomes a dangling pointer. `zip_source_open(src_crc)` recurses into `zip_source_open(src->src)`, and the second frame reads `src->source_closed` from the freed `src_window`, which is the saved AddressSanitizer heap-use-after-free. The fix removes the extra `zip_source_free(src_window)` after successful CRC-wrapper creation."
+  },
+  "source": {
+    "file": "lib/zip_open.c",
+    "function": "_zip_read_eocd",
+    "line": 709,
+    "var": "size, offset",
+    "code": "size = _zip_buffer_get_32(buffer);\noffset = _zip_buffer_get_32(buffer);",
+    "description": "First project statement on the witnessed vulnerable path that consumes attacker-controlled bytes and materializes the central-directory bounds later reused by `zip_check_torrentzip()` when it builds `src_window`.",
+    "value_from": "The exact staged `poc` is a 44-byte EOCD-only ZIP record. Bytes 12-19 are all zero, so `_zip_read_eocd()` consumes them here as `size == 0` and `offset == 0`, the values later passed into `_zip_source_window_new()`.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "lib/zip_source_open.c",
+    "function": "zip_source_open",
+    "line": 39,
+    "var": "src->source_closed",
+    "code": "if (src->source_closed) {",
+    "description": "AddressSanitizer crash site. The recursive `zip_source_open(src->src)` on the CRC wrapper passes the freed `src_window` into a second `zip_source_open()` frame, and this read touches the freed heap object.",
+    "note": "The saved ASan report is `heap-use-after-free READ 1` at `zip_source_open.c:39:14` with stack `zip_source_open -> zip_source_open -> zip_check_torrentzip -> _zip_open`.",
+    "trace_step": 10
+  },
+  "root_cause": {
+    "file": "lib/zip_open.c",
+    "function": "zip_check_torrentzip",
+    "line": 931,
+    "var": "src_window",
+    "code": "zip_source_free(src_window);",
+    "description": "Root cause. After `zip_source_crc_create()` has already stored `src_window` as the lower layer of `src_crc`, this extra free drops `src_window`'s refcount to zero and destroys the object while `src_crc->src` still points to it. The fixing commit deletes this line.",
+    "note": "The vulnerability came from an outdated ownership assumption after the layered-source API change: the CRC wrapper keeps the pointer, but it does not take a new reference to `src_window`.",
+    "trace_step": 8
+  },
+  "tainted_value_origin": {
+    "file": "lib/zip_source_layered.c",
+    "function": "zip_source_layered_create",
+    "line": 66,
+    "var": "zs->src",
+    "code": "zs->src = src;",
+    "description": "When `zip_source_crc_create(src_window, 1, NULL)` builds the CRC wrapper, it stores the `src_window` pointer here as the wrapper's lower layer. That field is the dangling pointer later followed by `zip_source_open(src_crc)` after `zip_check_torrentzip()` frees `src_window`."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "lib/zip_open.c",
+      "function": "zip_check_torrentzip",
+      "line": 903,
+      "code": "if (_zip_string_length(cdir->comment) != TORRENTZIP_SIGNATURE_LENGTH + TORRENTZIP_CRC_LENGTH\n    || strncmp((const char *)cdir->comment->raw, TORRENTZIP_SIGNATURE, TORRENTZIP_SIGNATURE_LENGTH) != 0)\n    return;",
+      "description": "The staged witness reaches the vulnerable block because its EOCD comment is exactly 22 bytes, begins with `TORRENTZIPPED-`, and the trailing eight bytes `       4` pass the subsequent `strtoul(..., 16)` check, so `zip_check_torrentzip()` does not return before creating and opening `src_crc`.",
+      "condition": "_zip_string_length(cdir->comment) == TORRENTZIP_SIGNATURE_LENGTH + TORRENTZIP_CRC_LENGTH && strncmp((const char *)cdir->comment->raw, TORRENTZIP_SIGNATURE, TORRENTZIP_SIGNATURE_LENGTH) == 0"
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "regress/zip_read_fuzzer.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness wraps the exact 44-byte witness as a buffer-backed `zip_source_t` and calls `zip_open_from_source()`; the crash happens during archive open before the entry-reading loop."
+    },
+    {
+      "step": 2,
+      "file": "lib/zip_open.c",
+      "function": "_zip_read_eocd / _zip_read_cdir",
+      "summary": "libzip parses the EOCD record, materializing `size = 0`, `offset = 0`, `comment_len = 0x0016`, and the archive comment `TORRENTZIPPED-       4` from the witness."
+    },
+    {
+      "step": 3,
+      "file": "lib/zip_open.c / lib/zip_source_layered.c",
+      "function": "zip_check_torrentzip / zip_source_crc_create / zip_source_layered_create",
+      "summary": "The torrentzip checker accepts the comment, allocates `src_window`, wraps it in `src_crc`, and then erroneously frees `src_window` even though the CRC wrapper still stores it as `src_crc->src`."
+    },
+    {
+      "step": 4,
+      "file": "lib/zip_source_open.c",
+      "function": "zip_source_open",
+      "summary": "Opening the layered CRC source recursively follows the dangling lower-layer pointer and reads from the freed `src_window`, producing the saved AddressSanitizer heap-use-after-free."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "lib/zip_open.c",
+      "function": "_zip_read_eocd",
+      "line": 709,
+      "line_end": 710,
+      "var": "size, offset",
+      "code": "size = _zip_buffer_get_32(buffer);\noffset = _zip_buffer_get_32(buffer);",
+      "note": "Source. The EOCD parser reads the attacker-controlled central-directory bounds from the witness. For this exact input both values are zero, and `_zip_read_eocd()` later returns a `zip_cdir_t` carrying those same `size` and `offset` fields into `_zip_open()`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "lib/zip_open.c",
+      "function": "_zip_read_cdir",
+      "line": 283,
+      "line_end": 283,
+      "var": "comment_len",
+      "code": "comment_len = _zip_buffer_get_16(buffer);",
+      "note": "After `_zip_read_eocd()` succeeds, `_zip_read_cdir()` reads the attacker-controlled EOCD comment-length field. In the exact witness, bytes 20-21 are `16 00`, so `comment_len == 0x0016`; because the file is exactly 44 bytes long, the later `tail_len < comment_len` check also sees 22 remaining bytes and allows the comment copy to run.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "control",
+          "via": "cd != NULL"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "lib/zip_open.c",
+      "function": "_zip_read_cdir",
+      "line": 305,
+      "line_end": 305,
+      "var": "cd->comment",
+      "code": "if ((cd->comment = _zip_string_new(_zip_buffer_get(buffer, comment_len), comment_len, ZIP_FL_ENC_GUESS, error)) == NULL) {",
+      "note": "Using the length from step 2, `_zip_buffer_get(buffer, comment_len)` copies the full EOCD tail into a heap-backed `zip_string_t`. For the staged witness, `cd->comment->raw` becomes the exact 22-byte string `TORRENTZIPPED-       4`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "cd"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "comment_len"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "lib/zip_open.c",
+      "function": "zip_check_torrentzip",
+      "line": 903,
+      "line_end": 905,
+      "var": "cdir->comment",
+      "code": "if (_zip_string_length(cdir->comment) != TORRENTZIP_SIGNATURE_LENGTH + TORRENTZIP_CRC_LENGTH\n    || strncmp((const char *)cdir->comment->raw, TORRENTZIP_SIGNATURE, TORRENTZIP_SIGNATURE_LENGTH) != 0)\n    return;",
+      "note": "The comment from step 3 satisfies both guards, so `zip_check_torrentzip()` does not return and continues down the torrentzip-validation path.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "cdir->comment"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "lib/zip_open.c",
+      "function": "zip_check_torrentzip",
+      "line": 907,
+      "line_end": 911,
+      "var": "buf, crc_should",
+      "code": "memcpy(buf, cdir->comment->raw + TORRENTZIP_SIGNATURE_LENGTH, TORRENTZIP_CRC_LENGTH);\nbuf[TORRENTZIP_CRC_LENGTH] = '\\0';\nerrno = 0;\ncrc_should = strtoul(buf, &end, 16);\nif ((crc_should == UINT_MAX && errno != 0) || (end && *end)) {\n    return;\n}",
+      "note": "The trailing eight comment bytes `\"       4\"` are copied into `buf` and parsed as hexadecimal. `strtoul()` skips the leading spaces, yields `crc_should == 4`, and leaves `end` at the terminator, so the numeric-validity check does not return.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "cdir->comment->raw"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "_zip_string_length(cdir->comment) == TORRENTZIP_SIGNATURE_LENGTH + TORRENTZIP_CRC_LENGTH && strncmp((const char *)cdir->comment->raw, TORRENTZIP_SIGNATURE, TORRENTZIP_SIGNATURE_LENGTH) == 0"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "lib/zip_open.c",
+      "function": "zip_check_torrentzip",
+      "line": 920,
+      "line_end": 924,
+      "var": "st, src_window",
+      "code": "zip_stat_init(&st);\nst.valid |= ZIP_STAT_SIZE | ZIP_STAT_CRC;\nst.size = cdir->size;\nst.crc = crc_should;\nif ((src_window = _zip_source_window_new(za->src, cdir->offset, cdir->size, &st, NULL, NULL, 0, NULL))  == NULL) {",
+      "note": "With `cdir->offset == 0`, `cdir->size == 0`, and `crc_should == 4`, the checker requests a window source over `za->src`. The saved ASan allocation stack shows this call allocating the 88-byte `src_window` object that later becomes the use-after-free target.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "cdir->offset, cdir->size"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "crc_should"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "!((crc_should == UINT_MAX && errno != 0) || (end && *end))"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "lib/zip_source_layered.c",
+      "function": "zip_source_layered_create",
+      "line": 66,
+      "line_end": 69,
+      "var": "zs->src",
+      "code": "zs->src = src;\nzs->cb.l = cb;\nzs->ud = ud;\nzs->supports = supports;",
+      "note": "`zip_source_crc_create(src_window, 1, NULL)` reaches this assignment and stores the `src_window` pointer as the lower layer of the CRC wrapper `src_crc`. Unlike `_zip_source_window_new()`, this helper does not call `zip_source_keep(src)`, so the wrapper depends on the caller keeping `src_window` alive.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "src_window"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "lib/zip_open.c",
+      "function": "zip_check_torrentzip",
+      "line": 931,
+      "line_end": 931,
+      "var": "src_window",
+      "code": "zip_source_free(src_window);",
+      "note": "Root cause. `src_window` still has refcount 1 here, so `zip_source_free()` decrements it to zero and frees the object. The CRC wrapper from step 7 still holds the same pointer in `src_crc->src`, turning that field into a dangling lower-layer reference.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "src_window"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "src_crc->src == src_window"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "lib/zip_source_open.c",
+      "function": "zip_source_open",
+      "line": 54,
+      "line_end": 57,
+      "var": "src->src",
+      "code": "if (ZIP_SOURCE_IS_LAYERED(src)) {\n    if (zip_source_open(src->src) < 0) {\n        zip_error_set_from_source(&src->error, src->src);\n        return -1;\n    }\n}",
+      "note": "When `zip_check_torrentzip()` calls `zip_source_open(src_crc)`, the CRC wrapper is a layered source, so `zip_source_open()` recursively opens the lower-layer pointer saved in step 7. Because step 8 already freed that object, this call passes a dangling `src_window` pointer into the second `zip_source_open()` frame.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "src_crc->src"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "ZIP_SOURCE_IS_LAYERED(src)"
+        },
+        {
+          "on": 8,
+          "type": "order",
+          "via": "free_before_use"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "lib/zip_source_open.c",
+      "function": "zip_source_open",
+      "line": 39,
+      "line_end": 40,
+      "var": "src->source_closed",
+      "code": "if (src->source_closed) {\n    return -1;\n}",
+      "note": "Sink. The recursive open from step 9 receives the freed `src_window` as `src` and immediately reads its `source_closed` byte. ASan records this as the 1-byte heap-use-after-free at `zip_source_open.c:39:14`, 56 bytes inside the freed 88-byte `src_window` region.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "src->src"
+        },
+        {
+          "on": 8,
+          "type": "order",
+          "via": "free_before_use"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "AddressSanitizer",
+    "trace_format": "AddressSanitizer",
+    "sanitizer": "address",
+    "crash_type": "heap-use-after-free",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "lib/zip_source_open.c",
+      "function": "zip_source_open",
+      "line": 39
+    },
+    "allocation_context": {
+      "file": "lib/zip_source_window.c",
+      "function": "_zip_source_window_new",
+      "line": 117,
+      "description": "Saved ASan allocation stack: `_zip_source_window_new()` calls `zip_source_layered_create()` for the `src_window` object, which in turn allocates the 88-byte `zip_source_t` via `_zip_source_new()`."
+    },
+    "free_context": {
+      "file": "lib/zip_open.c",
+      "function": "zip_check_torrentzip",
+      "line": 931
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "zip_source_open",
+        "file": "lib/zip_source_open.c",
+        "line": 39
+      },
+      {
+        "frame": 1,
+        "function": "zip_source_open",
+        "file": "lib/zip_source_open.c",
+        "line": 55
+      },
+      {
+        "frame": 2,
+        "function": "zip_check_torrentzip",
+        "file": "lib/zip_open.c",
+        "line": 932
+      },
+      {
+        "frame": 3,
+        "function": "_zip_open",
+        "file": "lib/zip_open.c",
+        "line": 187
+      },
+      {
+        "frame": 4,
+        "function": "zip_open_from_source",
+        "file": "lib/zip_open.c",
+        "line": 134
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "regress/zip_read_fuzzer.cc",
+        "line": 22
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "asan_malloc_linux.cpp",
+        "line": 69
+      },
+      {
+        "frame": 1,
+        "function": "_zip_source_new",
+        "file": "lib/zip_source_function.c",
+        "line": 80
+      },
+      {
+        "frame": 2,
+        "function": "zip_source_layered_create",
+        "file": "lib/zip_source_layered.c",
+        "line": 62
+      },
+      {
+        "frame": 3,
+        "function": "_zip_source_window_new",
+        "file": "lib/zip_source_window.c",
+        "line": 117
+      },
+      {
+        "frame": 4,
+        "function": "zip_check_torrentzip",
+        "file": "lib/zip_open.c",
+        "line": 924
+      },
+      {
+        "frame": 5,
+        "function": "_zip_open",
+        "file": "lib/zip_open.c",
+        "line": 187
+      },
+      {
+        "frame": 6,
+        "function": "zip_open_from_source",
+        "file": "lib/zip_open.c",
+        "line": 134
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "free",
+        "file": "asan_malloc_linux.cpp",
+        "line": 52
+      },
+      {
+        "frame": 1,
+        "function": "zip_source_free",
+        "file": "lib/zip_source_free.c",
+        "line": 70
+      },
+      {
+        "frame": 2,
+        "function": "zip_check_torrentzip",
+        "file": "lib/zip_open.c",
+        "line": 931
+      },
+      {
+        "frame": 3,
+        "function": "_zip_open",
+        "file": "lib/zip_open.c",
+        "line": 187
+      },
+      {
+        "frame": 4,
+        "function": "zip_open_from_source",
+        "file": "lib/zip_open.c",
+        "line": 134
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "zip_read_fuzzer <poc_file>",
+    "format": {
+      "name": "EOCD-only ZIP",
+      "contract": "An exact 44-byte binary ZIP end-of-central-directory record: bytes `50 4b 05 06`, then sixteen zero bytes for the disk, entry-count, central-directory-size, and central-directory-offset fields, then comment length `16 00`, then the exact 22-byte ASCII comment `TORRENTZIPPED-       4`. This exact witness makes `zip_check_torrentzip()` accept the archive comment and parse `crc_should == 4`."
+    }
+  }
+}

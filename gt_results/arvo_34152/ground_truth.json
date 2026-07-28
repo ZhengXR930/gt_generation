@@ -1,0 +1,485 @@
+{
+  "sample_id": "arvo_34152",
+  "vuln_id": "OSS-Fuzz issue 34152 / ARVO arvo:34152",
+  "project": {
+    "id": "dovecot",
+    "name": "Dovecot",
+    "repo": "https://github.com/dovecot/core",
+    "vulnerable_commit": "829b04676ce43c1a79d4887be7173c30470c5350",
+    "reported_vulnerable_commit": "da1d2332bd704a24a98f59d1df5a464428298cc6",
+    "fixed_commit": "9f5e723974420af0014a397bb390b57f3b9a9431",
+    "commit_note": "The exact staged vulnerable source reviewed here is the prepared Dovecot checkout at `829b04676ce43c1a79d4887be7173c30470c5350`, whose `src/lib-smtp/smtp-server-cmd-data.c`, `src/lib-smtp/fuzz-smtp-server.c`, and `src/lib/istream.c` line map matches the saved ASan stack. Sample metadata separately reports `da1d2332bd704a24a98f59d1df5a464428298cc6` as vulnerable_commit, but the checked-out tree that reproduced the crash is the earlier April 15, 2021 regression-window snapshot. The staged `patch.diff` artifact is unrelated commit `97367ef61784a364ccf615cb816be6492329050d` in `src/indexer/indexer-client.c`; local Dovecot history in the staged checkout contains commit `9f5e723974420af0014a397bb390b57f3b9a9431` (`lib-smtp: smtp-server-cmd-data - Fix global state cleanup upon DATA command destroy.`), whose diff exactly guards the reviewed cleanup site with per-command `main_input` ownership tracking.",
+    "fuzz_target": "fuzz-smtp-server (afl_asan_dovecot, AddressSanitizer)"
+  },
+  "classification": {
+    "class": "heap-use-after-free read via ownerless DATA-command cleanup",
+    "cwe": "CWE-416",
+    "access": "read",
+    "detector": "AddressSanitizer",
+    "classification_note": "A later `DATA` command is rejected while an earlier `BDAT` sequence still owns the shared message-input stream, but the vulnerable destroy hook still frees global `conn->state.data_input`. The fuzz callback keeps a raw alias in `state.data_input` and later passes it into `i_stream_read()`."
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=5801549780615168 Project: dovecot Fuzz Target: fuzz-smtp-server Crash Type: Heap-use-after-free READ 8 Crash State: i_stream_read / server_cmd_data_continue / cmd_data_do_handle_input Sanitizer: address (ASAN).",
+    "original_source": "sample_info.json issue description, staged vulnerable checkout, saved sanitizer_trace.txt, reproduction_report.json, and local Dovecot git history",
+    "normalized": "The staged 1011-byte witness is an SMTP session transcript. In its printable prefix, lines 03-05 are `BDAT 0`, `BDAT 0`, and `BDAT 1`, which start SMTP chunking state and allocate a shared chain-backed `istream` in `conn->state.data_input`; the first-chunk callback `server_cmd_data_begin()` then stores the same pointer again in file-static fuzz-target state as `state.data_input`. Later line 20 is bare `DATA` on the same connection. `cmd_data_start()` correctly rejects that command with `503 Bad sequence of commands` because `conn->state.data_chunks > 0`, but the vulnerable `cmd_data_destroy()` still destroys global `conn->state.data_input` for this failed DATA command even though that command never acquired an input stream of its own. The stale fuzz-target alias survives, and when the earlier BDAT path re-enters `server_cmd_data_continue()`, it passes the dangling pointer into `i_stream_read()`, producing the recorded ASan heap-use-after-free read at `src/lib/istream.c:250`. The staged `patch.diff` is unrelated; the matching local fix is Dovecot commit `9f5e723974420af0014a397bb390b57f3b9a9431`, which records each command's `main_input` and only cleans up when the command being destroyed still owns the current global DATA input."
+  },
+  "source": {
+    "file": "src/lib-smtp/smtp-server-cmd-data.c",
+    "function": "smtp_server_connection_data_chunk_init",
+    "line": 541,
+    "var": "data_cmd->chunk_first, conn->state.data_chunks",
+    "code": "data_cmd->chunk_first = (conn->state.data_chunks++ == 0);",
+    "description": "First project-side state derived from the witness SMTP command stream: the first `BDAT` command marks chunking as active on the connection and tags this command as the first chunk, which later enables both the shared DATA-input alias and the `DATA`-after-`BDAT` bad-sequence path.",
+    "value_from": "The staged `poc` is a 1011-byte SMTP session transcript. Its earliest vulnerability-relevant lines are `BDAT 0`, `BDAT 0`, `BDAT 1`, followed later by bare `DATA`; on the first `BDAT 0` (line 03 in the decoded witness), this assignment flips `conn->state.data_chunks` from 0 to 1 and sets `chunk_first = TRUE`.",
+    "trace_step": 1
+  },
+  "tainted_value_origin": {
+    "file": "src/lib-smtp/smtp-server-cmd-data.c",
+    "function": "smtp_server_connection_data_chunk_init",
+    "line": 554,
+    "var": "conn->state.data_chain_input",
+    "code": "conn->state.data_chain_input =\n\t\t\ti_stream_create_chain(&conn->state.data_chain);",
+    "description": "ASan's allocation stack points here. On the first BDAT chunk, the server allocates the chain-backed `istream` object that later becomes both `conn->state.data_input` and the stale fuzz-callback alias."
+  },
+  "sink": {
+    "file": "src/lib/istream.c",
+    "function": "i_stream_read",
+    "line": 250,
+    "var": "stream->real_stream",
+    "code": "struct istream_private *_stream = stream->real_stream;",
+    "description": "Crash site. `server_cmd_data_continue()` re-enters `i_stream_read()` with a freed `struct istream *`, and `i_stream_read()` immediately dereferences `stream->real_stream`.",
+    "note": "The saved ASan trace reports `AddressSanitizer: heap-use-after-free READ of size 8` at `src/lib/istream.c:250:44` in `i_stream_read`.",
+    "trace_step": 10
+  },
+  "root_cause": {
+    "file": "src/lib-smtp/smtp-server-cmd-data.c",
+    "function": "cmd_data_destroy",
+    "line": 138,
+    "var": "data_cmd->chunk_last, conn->state.data_input",
+    "code": "if (data_cmd->chunk_last ||\n\t\t!smtp_server_command_replied_success(command)) {\n\t\t/* clean up */\n\t\ti_stream_destroy(&conn->state.data_input);",
+    "description": "Root cause. `cmd_data_destroy()` cleans global DATA-stream state based only on reply success / `chunk_last`; it never checks that the command being destroyed actually owns the current `conn->state.data_input`, so a later failed DATA command can free an earlier BDAT command's shared input stream.",
+    "note": "Local fix commit `9f5e723974420af0014a397bb390b57f3b9a9431` adds `data_cmd->main_input` in `cmd_data_start_input()` and guards this cleanup with `data_cmd->main_input == conn->state.data_input`, which is exactly the missing ownership check here. The staged `patch.diff` artifact is unrelated.",
+    "trace_step": 8
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "smtp_server_cmd_bdat",
+      "line": 621,
+      "code": "smtp_server_connection_data_chunk_init(cmd);",
+      "condition": "The decoded witness line 03 is `BDAT 0`, so the parsed SMTP command stream enters the BDAT handler and starts chunking state on the connection."
+    },
+    "bad_sequence_trigger": {
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "cmd_data_start",
+      "line": 480,
+      "code": "if (conn->state.data_chunks > 0) {",
+      "condition": "Later witness line 20 is bare `DATA` on the same connection after the earlier BDAT lines have already incremented `conn->state.data_chunks`, so control takes the 503 `Bad sequence of commands` path instead of assigning a DATA-specific input stream."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "smtp_server_connection_data_chunk_init / cmd_data_start_input",
+      "summary": "The witness's first `BDAT` command turns on chunking state, allocates a chain-backed `istream`, and installs it as global server DATA input."
+    },
+    {
+      "step": 2,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c / src/lib-smtp/fuzz-smtp-server.c",
+      "function": "cmd_data_next / server_cmd_data_begin",
+      "summary": "The first-chunk callback path exports the shared DATA-input stream into fuzz-target file-static state as a raw alias in `state.data_input`."
+    },
+    {
+      "step": 3,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "smtp_server_cmd_data / cmd_data_start",
+      "summary": "A later bare `DATA` command is initialized as a one-shot data command but then rejected with `503 Bad sequence of commands` because the earlier BDAT sequence is still active."
+    },
+    {
+      "step": 4,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "cmd_data_destroy",
+      "summary": "The failed DATA command's destroy hook frees global `conn->state.data_input` even though that command never owned the shared BDAT stream."
+    },
+    {
+      "step": 5,
+      "file": "src/lib-smtp/fuzz-smtp-server.c / src/lib/istream.c",
+      "function": "server_cmd_data_continue / i_stream_read",
+      "summary": "The earlier BDAT callback reloads the stale `state.data_input` alias and `i_stream_read()` dereferences the freed stream object, matching the ASan crash."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "smtp_server_connection_data_chunk_init",
+      "line": 541,
+      "var": "data_cmd->chunk_first, conn->state.data_chunks",
+      "code": "data_cmd->chunk_first = (conn->state.data_chunks++ == 0);",
+      "note": "Source. The first witnessed `BDAT 0` increments `conn->state.data_chunks` from 0 to 1 and marks this command as `chunk_first`. That chunking state is later reused in two ways: it causes the first BDAT path to publish a shared DATA-input stream, and it makes a later bare `DATA` command hit the `Bad sequence of commands` path.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "smtp_server_connection_data_chunk_init",
+      "line": 554,
+      "line_end": 555,
+      "var": "conn->state.data_chain_input",
+      "code": "conn->state.data_chain_input =\n\t\t\ti_stream_create_chain(&conn->state.data_chain);",
+      "note": "Because this is the first BDAT chunk and no chain exists yet, the server allocates a chain-backed `istream` object. ASan's allocation stack identifies this `i_stream_create_chain()` call as the origin of the later freed heap object.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "control",
+          "via": "data_cmd->chunk_first"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "cmd_data_start_input",
+      "line": 429,
+      "line_end": 431,
+      "var": "conn->state.data_input, input",
+      "code": "if (input != NULL) {\n\t\tconn->state.data_input = input;\n\t\ti_stream_ref(input);\n\t}",
+      "note": "The first BDAT command installs the chain stream from step 2 as global server DATA input and takes an owning reference. The call site at line 599 then unrefs `conn->state.data_chain_input`, leaving `conn->state.data_input` as the remaining live server-owned handle to this object.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "conn->state.data_chain_input"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "cmd_data_next",
+      "line": 392,
+      "line_end": 396,
+      "var": "conn->state.data_input",
+      "code": "smtp_server_command_ref(cmd_temp);\n\t\ti_assert(callbacks != NULL &&\n\t\t\t callbacks->conn_cmd_data_begin != NULL);\n\t\tif (callbacks->conn_cmd_data_begin(conn->context,\n\t\t\tcmd, conn->state.trans, conn->state.data_input) < 0) {",
+      "note": "Because this command is the first BDAT chunk, `cmd_data_next()` passes the shared chain stream in `conn->state.data_input` into the data-begin callback before continuing DATA processing.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "control",
+          "via": "data_cmd->chunk_first"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "conn->state.data_input"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/lib-smtp/fuzz-smtp-server.c",
+      "function": "server_cmd_data_begin",
+      "line": 57,
+      "var": "state.data_input, data_input",
+      "code": "state.data_input = data_input;",
+      "note": "The fuzz target stores the same stream pointer in file-static `state.data_input` without taking its own reference or clearing it when the server later destroys the connection's DATA input. This creates a raw second alias outside `conn->state.*`.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "data_input"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "smtp_server_cmd_data",
+      "line": 513,
+      "line_end": 526,
+      "var": "data_cmd->chunk_last, command->data",
+      "code": "data_cmd = p_new(cmd->pool, struct cmd_data_context, 1);\n\tdata_cmd->chunk_first = TRUE;\n\tdata_cmd->chunk_last = TRUE;\n\tdata_cmd->client_input = TRUE;\n\tcommand->data = data_cmd;\n\n\tsmtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_NEXT,\n\t\t\t\t     cmd_data_start, data_cmd);\n\tsmtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_REPLIED_ONE,\n\t\t\t\t     cmd_data_replied_one, data_cmd);\n\tsmtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_REPLIED,\n\t\t\t\t     cmd_data_replied, data_cmd);\n\tsmtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_DESTROY,\n\t\t\t\t     cmd_data_destroy, data_cmd);",
+      "note": "Later in the same witness, line 20 is bare `DATA`. `smtp_server_cmd_data()` allocates a new `data_cmd`, marks it as a one-shot `chunk_last` DATA command, and arms `cmd_data_destroy` before any input stream has been assigned to this new command.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "conn->state.data_chunks"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "cmd_data_start",
+      "line": 480,
+      "line_end": 482,
+      "var": "conn->state.data_chunks",
+      "code": "if (conn->state.data_chunks > 0) {\n\t\tsmtp_server_command_fail(cmd->cmd,\n\t\t\t503, \"5.5.0\", \"Bad sequence of commands\");",
+      "note": "When that later DATA command reaches its NEXT hook, the earlier BDAT sequence has left `conn->state.data_chunks > 0`, so the DATA command is rejected with `503 Bad sequence of commands` before `cmd_data_start_input()` can assign any main input of its own.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "control",
+          "via": "conn->state.data_chunks > 0"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "data_cmd"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "cmd_data_destroy",
+      "line": 138,
+      "line_end": 143,
+      "var": "data_cmd->chunk_last, conn->state.data_input",
+      "code": "if (data_cmd->chunk_last ||\n\t\t!smtp_server_command_replied_success(command)) {\n\t\t/* clean up */\n\t\ti_stream_destroy(&conn->state.data_input);\n\t\ti_stream_destroy(&conn->state.data_chain_input);\n\t\tconn->state.data_chain = NULL;\n\t}",
+      "note": "After the failed DATA command from step 7 finishes, its destroy hook takes this cleanup branch because `data_cmd->chunk_last` is true and the command did not reply successfully. In the vulnerable code the branch unconditionally destroys global `conn->state.data_input` / `data_chain_input`, even though this DATA command never acquired an input stream; the object freed is the earlier BDAT chain stream from steps 2-3. Commit `9f5e723974420af0014a397bb390b57f3b9a9431` fixes this by recording `data_cmd->main_input` and requiring `data_cmd->main_input == conn->state.data_input` before cleanup.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "conn->state.data_input"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "data_cmd->chunk_last"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "!smtp_server_command_replied_success(command)"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/lib-smtp/fuzz-smtp-server.c",
+      "function": "server_cmd_data_continue",
+      "line": 28,
+      "var": "data_input, state.data_input",
+      "code": "struct istream *data_input = state.data_input;",
+      "note": "The fuzz callback's file-static alias was never cleared by step 8. When the earlier BDAT command is serviced again, `server_cmd_data_continue()` reloads `state.data_input` into local `data_input`, so the callback now holds a dangling pointer to the freed chain stream.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "state.data_input"
+        },
+        {
+          "on": 8,
+          "type": "order",
+          "via": "free_before_use"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/lib/istream.c",
+      "function": "i_stream_read",
+      "line": 250,
+      "var": "stream->real_stream",
+      "code": "struct istream_private *_stream = stream->real_stream;",
+      "note": "Sink. `server_cmd_data_continue()` immediately calls `i_stream_read(data_input)` on the dangling pointer from step 9, and `i_stream_read()` dereferences `stream->real_stream`. ASan records this exact line as the heap-use-after-free READ of size 8.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "data_input"
+        },
+        {
+          "on": 8,
+          "type": "order",
+          "via": "free_before_use"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-use-after-free",
+    "access_type": "READ",
+    "access_size": 8,
+    "crash_location": {
+      "file": "src/lib/istream.c",
+      "function": "i_stream_read",
+      "line": 250
+    },
+    "allocation_context": {
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "smtp_server_connection_data_chunk_init",
+      "line": 555,
+      "note": "The saved ASan allocation stack reaches `i_stream_create_chain` from `smtp_server_connection_data_chunk_init` at `smtp-server-cmd-data.c:555`."
+    },
+    "free_context": {
+      "file": "src/lib-smtp/smtp-server-cmd-data.c",
+      "function": "cmd_data_destroy",
+      "line": 141,
+      "note": "The saved ASan free stack reports `i_stream_destroy(&conn->state.data_input);` in `cmd_data_destroy` as the final project-side invalidation before the later read."
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "i_stream_read",
+        "file": "src/lib/istream.c",
+        "line": 250
+      },
+      {
+        "frame": 1,
+        "function": "server_cmd_data_continue",
+        "file": "src/lib-smtp/fuzz-smtp-server.c",
+        "line": 33
+      },
+      {
+        "frame": 2,
+        "function": "cmd_data_do_handle_input",
+        "file": "src/lib-smtp/smtp-server-cmd-data.c",
+        "line": 276
+      },
+      {
+        "frame": 3,
+        "function": "cmd_data_handle_input",
+        "file": "src/lib-smtp/smtp-server-cmd-data.c",
+        "line": 324
+      },
+      {
+        "frame": 4,
+        "function": "cmd_data_next",
+        "file": "src/lib-smtp/smtp-server-cmd-data.c",
+        "line": 416
+      },
+      {
+        "frame": 5,
+        "function": "smtp_server_command_call_hooks",
+        "file": "src/lib-smtp/smtp-server-command.c",
+        "line": 414
+      },
+      {
+        "frame": 6,
+        "function": "smtp_server_command_next_to_reply",
+        "file": "src/lib-smtp/smtp-server-command.c",
+        "line": 468
+      },
+      {
+        "frame": 7,
+        "function": "smtp_server_connection_next_reply",
+        "file": "src/lib-smtp/smtp-server-connection.c",
+        "line": 630
+      },
+      {
+        "frame": 8,
+        "function": "smtp_server_connection_send_replies",
+        "file": "src/lib-smtp/smtp-server-connection.c",
+        "line": 688
+      },
+      {
+        "frame": 9,
+        "function": "smtp_server_connection_output",
+        "file": "src/lib-smtp/smtp-server-connection.c",
+        "line": 720
+      },
+      {
+        "frame": 10,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "src/lib-smtp/fuzz-smtp-server.c",
+        "line": 97
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "i_stream_create_chain",
+        "file": "src/lib/istream-chain.c",
+        "line": 307
+      },
+      {
+        "frame": 1,
+        "function": "smtp_server_connection_data_chunk_init",
+        "file": "src/lib-smtp/smtp-server-cmd-data.c",
+        "line": 555
+      },
+      {
+        "frame": 2,
+        "function": "smtp_server_cmd_bdat",
+        "file": "src/lib-smtp/smtp-server-cmd-data.c",
+        "line": 621
+      },
+      {
+        "frame": 3,
+        "function": "smtp_server_command_execute",
+        "file": "src/lib-smtp/smtp-server-command.c",
+        "line": 256
+      },
+      {
+        "frame": 4,
+        "function": "smtp_server_connection_handle_command",
+        "file": "src/lib-smtp/smtp-server-connection.c",
+        "line": 322
+      },
+      {
+        "frame": 5,
+        "function": "smtp_server_connection_handle_input",
+        "file": "src/lib-smtp/smtp-server-connection.c",
+        "line": 455
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "cmd_data_destroy",
+        "file": "src/lib-smtp/smtp-server-cmd-data.c",
+        "line": 141
+      },
+      {
+        "frame": 1,
+        "function": "smtp_server_command_call_hooks",
+        "file": "src/lib-smtp/smtp-server-command.c",
+        "line": 414
+      },
+      {
+        "frame": 2,
+        "function": "smtp_server_command_unref",
+        "file": "src/lib-smtp/smtp-server-command.c",
+        "line": 304
+      },
+      {
+        "frame": 3,
+        "function": "smtp_server_command_finished",
+        "file": "src/lib-smtp/smtp-server-command.c",
+        "line": 720
+      },
+      {
+        "frame": 4,
+        "function": "smtp_server_connection_next_reply",
+        "file": "src/lib-smtp/smtp-server-connection.c",
+        "line": 660
+      }
+    ],
+    "patch_resolves": true,
+    "patch_resolves_note": "The staged `patch.diff` is unrelated to this SMTP path, but the metadata fix commit and local Dovecot history provide direct source evidence. Commit `9f5e723974420af0014a397bb390b57f3b9a9431` adds `data_cmd->main_input` in `cmd_data_start_input()` and changes `cmd_data_destroy()` to clean up only when `data_cmd->main_input == conn->state.data_input`, which prevents the exact ownerless free in fine-trace step 8.",
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run executed `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_34152 run --version vulnerable --expect crash`, feeding `poc` to `/out/fuzz-smtp-server` and reproducing `AddressSanitizer: heap-use-after-free READ of size 8` with stack `i_stream_read -> server_cmd_data_continue -> cmd_data_do_handle_input`.",
+    "format": {
+      "name": "SMTP command transcript consumed by `fuzz-smtp-server`",
+      "contract": "The verified trigger semantics are limited to the exact staged 1011-byte SMTP session transcript `poc` (sha256 `a9731cd84c4c7a1922a109834f4d920f3f5adae1029a0a0095afec9d807b986c`). In its printable prefix, lines 03-05 are `BDAT 0`, `BDAT 0`, and `BDAT 1`, and line 20 is bare `DATA`; those exact command-order properties start a BDAT chunking sequence and then send `DATA` on the same connection before the prior chunking state is reset. The saved artifacts do not isolate which later malformed RCPT/BDAT/DATA fragments are strictly minimal, so this contract does not generalize beyond witnesses that reproduce the same DATA-after-BDAT ownership mix-up and stale `state.data_input` reuse path."
+    }
+  }
+}

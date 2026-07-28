@@ -1,0 +1,636 @@
+{
+  "sample_id": "arvo_42500437",
+  "vuln_id": "OSS-Fuzz issue 42500437 / ARVO arvo:42500437",
+  "project": {
+    "id": "espeak-ng",
+    "name": "espeak-ng",
+    "repo": "https://github.com/espeak-ng/espeak-ng",
+    "vulnerable_commit": "1f76c4b8bd320714aa61ad8abb527c5d92cc5164",
+    "fixed_commit": "1da9ad10e80f2e2365c4c00b532fe908b4b8fe19",
+    "fuzz_target": "ssml-fuzzer"
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416",
+    "access": "READ",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42500437 (espeak-ng): Heap-use-after-free READ 1 found by fuzz target ssml-fuzzer [asan]. https://issues.oss-fuzz.com/issues/42500437",
+    "original_source": "sample_info.json / reproduction_report.json / sanitizer_trace.txt / patch.diff / staged vulnerable source under `_work/src/espeak-ng` / staged `poc` bytes",
+    "normalized": "The exact staged 10-byte witness `e2 80 af 24 e0 a5 a5 2b 9c 72` is passed to `ssml-fuzzer`, which copies it into a NUL-terminated string and feeds it to `espeak_Synth()` as UTF-8/SSML text. In vulnerable `Synthesize()`, `text_decoder_decode_string_multibyte(p_decoder, text, translator->encoding, flags)` materializes that attacker-controlled text into shared decoder state; `ReadClause()` then pulls it back out through `GetC()` to build `TranslateClause()`'s clause buffer and tokenized `sbuf`/`words[]` state. Because non-alpha punctuation is split unless it is in `punct_within_word` (default only `'`), the attacker-controlled word that reaches `TranslateWord2()` is a token selected from that tokenized buffer rather than simply the raw byte suffix after the leading separator. The initial translation of that selected word emits `phonSWITCH`, so `TranslateWord2()` calls `SetTranslator2(new_language)` and re-translates the same word through global `translator2`; AddressSanitizer's allocation stack shows the later-stale translator object was allocated through this call path. During that nested translation, `TranslateRules()` hits a later non-alphabetic character with no rule match and calls `LookupLetter(tr, wc, -1, ...)` while `tr` still aliases the live `translator2`. Vulnerable `LookupLetter()` probes English by calling `SetTranslator2(\"en\")`, reusing the same global translator slot. The saved ASan free stack shows this nested call taking `SetTranslator2()`'s language-change branch and deleting the active `translator2` object. Control then returns to the outer `TranslateRules()` loop, which immediately dereferences the freed translator at `dictionary.c:2237` and crashes with the saved heap-use-after-free READ 1. The staged patch resolves this exact lifetime bug by moving nested fallback users in `numbers.c` onto separate `translator3` storage."
+  },
+  "source": {
+    "file": "src/libespeak-ng/speech.c",
+    "function": "Synthesize",
+    "line": 449,
+    "code": "status = text_decoder_decode_string_multibyte(p_decoder, text, translator->encoding, flags);",
+    "var": "p_decoder, text, flags",
+    "description": "First project statement that consumes the attacker-controlled text and materializes it into decoder state later consumed by `GetC()` and `ReadClause()`.",
+    "value_from": "The staged `poc` is exactly 10 bytes: `e2 80 af 24 e0 a5 a5 2b 9c 72`. `ssml-fuzzer` copies those bytes into a heap string, appends `str[size] = 0`, and calls `espeak_Synth()` with `espeakCHARS_UTF8 | espeakPHONEMES | espeakSSML`; this decode call is where project code first turns that witness into vulnerability-relevant project state.",
+    "note": "Source step. `Synthesize()` decodes the fuzzer-provided UTF-8/SSML buffer into shared `p_decoder` state. `SpeakNextClause()` later drives `TranslateClause()` by pulling characters back out of this decoder, so this is the earliest project-side materialization on the crashing path.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "src/libespeak-ng/translate.c",
+    "function": "SetTranslator2",
+    "line": 1281,
+    "code": "if ((translator2 != NULL) && (strcmp(new_language, translator2_language) != 0)) {\n    DeleteTranslator(translator2);\n    translator2 = NULL;\n}",
+    "var": "translator2, translator2_language, new_language",
+    "description": "Nested `SetTranslator2(\"en\")` reuses the same global `translator2` slot as the outer alternate-language translation. When the requested language differs, this branch frees the still-active translator object and clears the global, leaving the caller's live `tr` alias dangling.",
+    "note": "The staged patch fixes the bug by moving these nested fallback call sites onto independent `translator3` storage so this delete branch no longer tears down the outer translator.",
+    "trace_step": 12
+  },
+  "sink": {
+    "file": "src/libespeak-ng/dictionary.c",
+    "function": "TranslateRules",
+    "line": 2237,
+    "code": "n = tr->groups2_count[c];",
+    "var": "tr, c",
+    "description": "AddressSanitizer crash site. After the nested English fallback frees the active alternate translator, the outer `TranslateRules()` loop continues and dereferences freed translator memory through `tr->groups2_count[c]`.",
+    "note": "Stage 01's saved ASan trace reports a heap-use-after-free READ of size 1 at this exact line with stack `TranslateRules -> TranslateWord3 -> TranslateWord -> TranslateWord2`.",
+    "trace_step": 13
+  },
+  "tainted_value_origin": {
+    "file": "src/libespeak-ng/translate.c",
+    "function": "TranslateWord2",
+    "line": 1484,
+    "line_end": 1493,
+    "code": "if (p[0] == phonSWITCH) {\n    new_language = (char *)(&p[1]);\n    if (new_language[0] == 0)\n        new_language = \"en\";\n}",
+    "var": "p[0], new_language",
+    "description": "The first translation of the attacker-derived word emits `phonSWITCH` plus an alternate-language string, turning the word into a nested-translator case.",
+    "value_from": "This state comes from the attacker-controlled word selected only after `Synthesize()` populates `p_decoder`, `ReadClause()` copies decoded characters into `source`/`charix`, and `TranslateClause()` tokenizes the clause into `sbuf`/`words[]`. Because `translate.c:2240-2246` splits unsupported punctuation and `2474-2504` finalizes each word span, the trace does not assume the whole byte suffix after the leading separator remained one word. The later ASan free stack proves the emitted outer `new_language` was not already `\"en\"`, because nested `SetTranslator2(\"en\")` took the language-change delete branch.",
+    "note": "For this sample the first vulnerability-relevant derived state is not a size or index but the language-switch directive stored in `word_phonemes`: once `p[0] == phonSWITCH`, `TranslateWord2()` routes the same word through global `translator2` and sets up the stale-pointer lifetime hazard."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/libespeak-ng/translate.c",
+      "function": "TranslateClause",
+      "line": 2663,
+      "code": "dict_flags = TranslateWord2(tr, word, &words[ix], words[ix].pre_pause);",
+      "description": "After `Synthesize()` populates `p_decoder`, `ReadClause()` assembles the clause, and `TranslateClause()` tokenizes it, the selected word reaches `TranslateWord2()`, which is the entry point to the crashing translation logic.",
+      "note": "For the staged witness this call happens only after decoded characters have been copied out of `p_decoder` and tokenized into `sbuf`/`words[]`; unsupported punctuation is split at word boundaries, so the `word` argument here is an attacker-controlled token selected from `words[ix]`, not simply all bytes after the leading separator. That selected word is the one whose first translation emits `phonSWITCH` and whose retranslation later reaches `LookupLetter()`."
+    }
+  },
+  "evidence_limitations": [
+    "run_flags.json sets `runtime_disambiguation` to false, so Stage 02 did not instrument the workspace; the chain is closed from staged source, patch, saved ASan traces, reproduction_report.json, and direct inspection of the staged poc bytes alone.",
+    "The saved artifacts prove that the outer alternate translator differed from `\"en\"` because nested `SetTranslator2(\"en\")` executed the `strcmp(new_language, translator2_language) != 0` delete branch, but they do not name that exact alternate language string; the causal chain does not require it."
+  ],
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/libespeak-ng/speech.c / src/libespeak-ng/readclause.c / src/libespeak-ng/translate.c",
+      "function": "Synthesize / ReadClause / TranslateClause",
+      "summary": "`Synthesize()` decodes the witness into `p_decoder`; `ReadClause()` pulls those characters through `GetC()` into the clause buffer; `TranslateClause()` tokenizes the clause into `sbuf`/`words[]` and selects the attacker-controlled word."
+    },
+    {
+      "step": 2,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "TranslateWord2",
+      "summary": "The first translation of that selected word emits `phonSWITCH`, so `TranslateWord2()` allocates or selects global `translator2` for a different language."
+    },
+    {
+      "step": 3,
+      "file": "src/libespeak-ng/translate.c / src/libespeak-ng/dictionary.c / src/libespeak-ng/numbers.c",
+      "function": "TranslateWord / TranslateRules / LookupLetter",
+      "summary": "The same word is retranslated under `tr == translator2`; a later non-alphabetic character in that word has no rule match and falls into `LookupLetter()`'s normal-text fallback path."
+    },
+    {
+      "step": 4,
+      "file": "src/libespeak-ng/numbers.c / src/libespeak-ng/translate.c",
+      "function": "LookupLetter / SetTranslator2",
+      "summary": "The nested English fallback reuses global `translator2` by calling `SetTranslator2(\"en\")` while the outer translation still holds that same translator."
+    },
+    {
+      "step": 5,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "SetTranslator2",
+      "summary": "Because the requested language differs from the outer alternate translator, `SetTranslator2()` deletes the live `translator2` object and clears the global."
+    },
+    {
+      "step": 6,
+      "file": "src/libespeak-ng/dictionary.c",
+      "function": "TranslateRules",
+      "summary": "Control returns to the outer `TranslateRules()` loop, which keeps using stale `tr` and crashes on `tr->groups2_count[c]` with the saved ASan heap-use-after-free READ."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/libespeak-ng/speech.c",
+      "function": "Synthesize",
+      "line": 449,
+      "var": "p_decoder, text, flags",
+      "code": "status = text_decoder_decode_string_multibyte(p_decoder, text, translator->encoding, flags);",
+      "note": "Source step. `Synthesize()` consumes the fuzzer-provided UTF-8/SSML buffer and materializes it into shared decoder state `p_decoder`. `SpeakNextClause()` later drives clause translation by pulling characters back out of this decoder.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/libespeak-ng/readclause.c",
+      "function": "ReadClause",
+      "line": 516,
+      "var": "c2, p_decoder",
+      "code": "c2 = GetC();",
+      "note": "`ReadClause()` seeds its clause-reading loop by fetching the next decoded codepoint from `p_decoder` through `GetC()`. `GetC()` itself returns `text_decoder_getc(p_decoder)` at line 174, so this is the decoder-to-clause handoff.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "p_decoder"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/libespeak-ng/readclause.c",
+      "function": "ReadClause",
+      "line": 940,
+      "line_end": 946,
+      "var": "c1, buf, charix",
+      "code": "ix += utf8_out(c1, &buf[ix]);\nif (!iswspace(c1) && !IsBracket(c1)) {\n    charix[ix] = count_characters - clause_start_char;\n    while (j < ix)\n        charix[j++] = -1;\n}",
+      "note": "As the loop advances, `ReadClause()` writes each fetched character into `buf` and records its source position in `charix`, materializing the attacker-controlled clause text that `TranslateClause()` will later scan and tokenize.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "c2"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "TranslateClause",
+      "line": 2240,
+      "line_end": 2246,
+      "var": "c, tr->punct_within_word, space_inserted",
+      "code": "if (!IsAlpha(c) && !IsSpace(c) && (wcschr(tr->punct_within_word, c) == 0)) {\n    if (IsAlpha(prev_out)) {\n        c = ' ';\n        space_inserted = true;\n    }\n}",
+      "note": "While scanning `source` into `sbuf`, `TranslateClause()` turns unsupported non-alpha punctuation into spaces unless the character is in `tr->punct_within_word`. The default translator initializes `punct_within_word` to only apostrophe (`tr_languages.c:214,274`), so punctuation in the witness can split word boundaries before translation.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "source"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "TranslateClause",
+      "line": 2474,
+      "line_end": 2504,
+      "var": "sbuf, words[word_count], charix",
+      "code": "sbuf[ix++] = ' ';\n...\nwords[word_count].sourceix = charix[j];\n...\nwords[word_count].length = k;",
+      "note": "When a separator is reached, `TranslateClause()` finalizes the current token by appending a space in `sbuf` and recording that word's source offset and length in `words[]`. This preserves which attacker-controlled span from the clause buffer will later be treated as a word.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "space_inserted"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "charix"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "TranslateClause",
+      "line": 2580,
+      "var": "word, sbuf, words[ix].start",
+      "code": "word = pw = &sbuf[words[ix].start];",
+      "note": "For the current clause iteration, `TranslateClause()` selects one tokenized attacker-controlled span as `word`. This pointer, not the raw original byte suffix, is what the downstream translation logic processes.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "words[ix].start"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "TranslateWord2",
+      "line": 1484,
+      "line_end": 1493,
+      "var": "p[0], new_language",
+      "code": "if (p[0] == phonSWITCH) {\n    new_language = (char *)(&p[1]);\n    if (new_language[0] == 0)\n        new_language = \"en\";\n}",
+      "note": "The first translation of the selected `word` produces a `phonSWITCH` directive instead of finishing in the base translator, and `TranslateWord2()` materializes the alternate-language string in `new_language`. This is the first attacker-derived state that makes the later translator lifetime bug possible.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "word"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "TranslateWord2",
+      "line": 1495,
+      "var": "translator2, new_language",
+      "code": "switch_phonemes = SetTranslator2(new_language);",
+      "note": "`TranslateWord2()` selects or allocates global `translator2` for that alternate language. The ASan allocation stack ties the later-stale translator object back to this call path through `SetTranslator2 -> SelectTranslator -> NewTranslator`.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "new_language"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "p[0] == phonSWITCH"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "TranslateWord2",
+      "line": 1505,
+      "var": "translator2, word",
+      "code": "flags = TranslateWord(translator2, word, wtab, &word_replaced[2]);",
+      "note": "The same attacker-controlled word is retransmitted through `TranslateWord()` with `tr == translator2`. The outer translation now holds a live alias to the heap translator object selected in the previous step.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "word"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "translator2"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/libespeak-ng/dictionary.c",
+      "function": "TranslateRules",
+      "line": 2370,
+      "var": "tr, wc",
+      "code": "LookupLetter(tr, wc, -1, ph_buf, 0);",
+      "note": "During this outer `TranslateRules(tr == translator2, ...)` call, a later non-alphabetic character in the same word has no matching pronunciation rule, so the normal-text fallback sends that character and the live `tr` alias into `LookupLetter()`.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "translator2"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "word"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/libespeak-ng/numbers.c",
+      "function": "LookupLetter",
+      "line": 503,
+      "var": "new_language, translator2, tr",
+      "code": "SetTranslator2(\"en\");",
+      "note": "Nested fallback step. `LookupLetter()` probes English for that character by reusing the same global `translator2` slot, even though the outer translation is still holding `tr == translator2`. The staged patch changes this nested fallback to `SetTranslator3(\"en\")` instead.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "tr"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/libespeak-ng/translate.c",
+      "function": "SetTranslator2",
+      "line": 1281,
+      "line_end": 1284,
+      "var": "translator2, translator2_language, new_language",
+      "code": "if ((translator2 != NULL) && (strcmp(new_language, translator2_language) != 0)) {\n    DeleteTranslator(translator2);\n    translator2 = NULL;\n}",
+      "note": "Root-cause step. The nested English fallback enters `SetTranslator2()` while `translator2` still points at the outer alternate translator, and the different language request takes the delete branch. AddressSanitizer's free stack shows the free at line 1283; clearing `translator2` here invalidates the outer `tr` alias that `TranslateRules()` is still using.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "translator2"
+        },
+        {
+          "on": 11,
+          "type": "control",
+          "via": "strcmp(new_language, translator2_language) != 0"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "src/libespeak-ng/dictionary.c",
+      "function": "TranslateRules",
+      "line": 2237,
+      "var": "tr, c",
+      "code": "n = tr->groups2_count[c];",
+      "note": "After `LookupLetter()` returns, the outer `TranslateRules()` loop resumes on the same attacker-derived word and immediately reads through `tr`. Because the prior step already freed the translator object behind that alias, this dereference becomes the saved AddressSanitizer heap-use-after-free READ of size 1.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "tr"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "word"
+        },
+        {
+          "on": 12,
+          "type": "order",
+          "via": "free_before_use",
+          "obj": "tr"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "AddressSanitizer",
+    "trace_format": "libFuzzer+ASan",
+    "sanitizer": "address",
+    "crash_type": "heap-use-after-free",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "src/libespeak-ng/dictionary.c",
+      "function": "TranslateRules",
+      "line": 2237
+    },
+    "allocation_context": {
+      "file": "src/libespeak-ng/tr_languages.c",
+      "function": "NewTranslator",
+      "line": 241
+    },
+    "free_context": {
+      "file": "src/libespeak-ng/translate.c",
+      "function": "DeleteTranslator",
+      "line": 284
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "TranslateRules",
+        "file": "src/libespeak-ng/dictionary.c",
+        "line": 2237
+      },
+      {
+        "frame": 1,
+        "function": "TranslateWord3",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 800
+      },
+      {
+        "frame": 2,
+        "function": "TranslateWord",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 1167
+      },
+      {
+        "frame": 3,
+        "function": "TranslateWord2",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 1505
+      },
+      {
+        "frame": 4,
+        "function": "TranslateClause",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 2663
+      },
+      {
+        "frame": 5,
+        "function": "SpeakNextClause",
+        "file": "src/libespeak-ng/synthesize.c",
+        "line": 1566
+      },
+      {
+        "frame": 6,
+        "function": "Synthesize",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 453
+      },
+      {
+        "frame": 7,
+        "function": "sync_espeak_Synth",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 566
+      },
+      {
+        "frame": 8,
+        "function": "espeak_ng_Synthesize",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 674
+      },
+      {
+        "frame": 9,
+        "function": "espeak_Synth",
+        "file": "src/libespeak-ng/espeak_api.c",
+        "line": 90
+      },
+      {
+        "frame": 10,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/ssml-fuzzer.c",
+        "line": 64
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "asan_malloc_linux.cpp",
+        "line": 145
+      },
+      {
+        "frame": 1,
+        "function": "NewTranslator",
+        "file": "src/libespeak-ng/tr_languages.c",
+        "line": 241
+      },
+      {
+        "frame": 2,
+        "function": "SelectTranslator",
+        "file": "src/libespeak-ng/tr_languages.c",
+        "line": 472
+      },
+      {
+        "frame": 3,
+        "function": "SetTranslator2",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 1288
+      },
+      {
+        "frame": 4,
+        "function": "TranslateWord2",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 1495
+      },
+      {
+        "frame": 5,
+        "function": "TranslateClause",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 2663
+      },
+      {
+        "frame": 6,
+        "function": "SpeakNextClause",
+        "file": "src/libespeak-ng/synthesize.c",
+        "line": 1566
+      },
+      {
+        "frame": 7,
+        "function": "Synthesize",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 453
+      },
+      {
+        "frame": 8,
+        "function": "sync_espeak_Synth",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 566
+      },
+      {
+        "frame": 9,
+        "function": "espeak_ng_Synthesize",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 674
+      },
+      {
+        "frame": 10,
+        "function": "espeak_Synth",
+        "file": "src/libespeak-ng/espeak_api.c",
+        "line": 90
+      },
+      {
+        "frame": 11,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/ssml-fuzzer.c",
+        "line": 64
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "free",
+        "file": "asan_malloc_linux.cpp",
+        "line": 127
+      },
+      {
+        "frame": 1,
+        "function": "DeleteTranslator",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 284
+      },
+      {
+        "frame": 2,
+        "function": "SetTranslator2",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 1283
+      },
+      {
+        "frame": 3,
+        "function": "LookupLetter",
+        "file": "src/libespeak-ng/numbers.c",
+        "line": 503
+      },
+      {
+        "frame": 4,
+        "function": "TranslateRules",
+        "file": "src/libespeak-ng/dictionary.c",
+        "line": 2370
+      },
+      {
+        "frame": 5,
+        "function": "TranslateWord3",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 800
+      },
+      {
+        "frame": 6,
+        "function": "TranslateWord",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 1167
+      },
+      {
+        "frame": 7,
+        "function": "TranslateWord2",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 1505
+      },
+      {
+        "frame": 8,
+        "function": "TranslateClause",
+        "file": "src/libespeak-ng/translate.c",
+        "line": 2663
+      },
+      {
+        "frame": 9,
+        "function": "SpeakNextClause",
+        "file": "src/libespeak-ng/synthesize.c",
+        "line": 1566
+      },
+      {
+        "frame": 10,
+        "function": "Synthesize",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 453
+      },
+      {
+        "frame": 11,
+        "function": "sync_espeak_Synth",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 566
+      },
+      {
+        "frame": 12,
+        "function": "espeak_ng_Synthesize",
+        "file": "src/libespeak-ng/speech.c",
+        "line": 674
+      },
+      {
+        "frame": 13,
+        "function": "espeak_Synth",
+        "file": "src/libespeak-ng/espeak_api.c",
+        "line": 90
+      },
+      {
+        "frame": 14,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/ssml-fuzzer.c",
+        "line": 64
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_42500437 run --version vulnerable --expect crash",
+    "format": {
+      "name": "espeak-ng UTF-8/SSML text",
+      "contract": "The input must still be accepted as UTF-8 text under `espeakCHARS_UTF8 | espeakPHONEMES | espeakSSML` and, after `TranslateClause()` tokenization, present an attacker-controlled word that first makes `TranslateWord2()` produce `phonSWITCH` to a non-English alternate translator, then later in that same retranslation makes `LookupLetter()` call `SetTranslator2(\"en\")`; that nested reuse of `translator2` is the minimal witnessed trigger for the UAF."
+    }
+  }
+}

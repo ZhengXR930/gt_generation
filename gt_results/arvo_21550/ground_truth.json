@@ -1,0 +1,472 @@
+{
+  "sample_id": "arvo_21550",
+  "vuln_id": "OSS-Fuzz issue 21550 / ARVO arvo:21550",
+  "project": {
+    "id": "openssl",
+    "name": "OpenSSL",
+    "repo": "https://github.com/openssl/openssl",
+    "vulnerable_commit": "a4a93bbfb0e679eaa249f77c7c4e7e823ca870ef",
+    "fixed_commit": "fe56d5951f0b42fd3ff1cf42a96d07f06f9692bc",
+    "fuzz_target": "client (honggfuzz_asan_openssl, AddressSanitizer)"
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416",
+    "access": "write",
+    "detector": "AddressSanitizer",
+    "classification_note": "The lifetime bug is a double free caused by leaving a transferred `DH *` reachable through both `dh` and `peer_tmp`, but ASan crashes earlier as a heap-use-after-free WRITE in `CRYPTO_DOWN_REF` during the second `DH_free`."
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=6296602006519808 Project: openssl Fuzzing Engine: honggfuzz Fuzz Target: client Job Type: honggfuzz_asan_openssl Platform Id: linux Crash Type: Heap-use-after-free WRITE 4 Crash Address: 0x60f00019d8a0 Crash State: CRYPTO_DOWN_REF DH_free evp_pkey_free_legacy Sanitizer: address (ASAN) Recommended Security Severity: High Regressed: https://oss-fuzz.com/revisions?job=honggfuzz_asan_openssl&range=202002200411:202002210408 Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=6296602006519808 Issue filed automatically. See https://google.github.io/oss-fuzz/advanced-topics/reproducing for instructions to reproduce this bug locally. When you fix this bug, please * mention the fix revision(s). * state whether the bug was a short-lived regression or an old bug in any stable releases. * add any other useful information. This information can help downstream consumers. If you need to contact the OSS-Fuzz team with a question, concern, or any other feedback, please file an issue at https://github.com/google/oss-fuzz/issues. Comments on individual Monorail issues are not monitored. This bug is subject to a 90 day disclosure deadline. If 90 days elapse without an upstream patch, then the bug report will automatically become visible to the public.",
+    "original_source": "ARVO-Meta.report.comments[0].content / staged vulnerable source / patch.diff / sanitizer_trace.txt / reproduction_report.json / staged poc bytes",
+    "normalized": "Stage 01 reproduced `AddressSanitizer: heap-use-after-free WRITE of size 4` in `CRYPTO_DOWN_REF`. The staged 469-byte TLS transcript reaches `tls_process_key_exchange()`'s DHE branch and enters `tls_process_ske_dhe()`, which parses attacker-controlled `prime`, `generator`, and `pub_key` fields from the ServerKeyExchange body and turns them into a temporary `DH` object. `EVP_PKEY_assign_DH(peer_tmp, dh)` then stores that same raw `DH *` in `peer_tmp` without incrementing its reference count. The client fuzz target sets `SSL_set_cipher_list(..., \"ALL:eNULL:@SECLEVEL=0\")`, so the default security callback still rejects temporary DH keys when `EVP_PKEY_security_bits(peer_tmp) < 80`; the parsed DHE parameters pass `DH_check_params()` but fail that post-assignment security check, so `tls_process_ske_dhe()` raises `SSL_R_DH_KEY_TOO_SMALL` and jumps to `err:`. The shared cleanup first calls `DH_free(dh)` even though `peer_tmp` already owns the same object, then calls `EVP_PKEY_free(peer_tmp)`, whose DH-specific free hook invokes `DH_free` again on the same pointer. That second `DH_free` decrements the freed object's reference count in `CRYPTO_DOWN_REF`, matching the saved ASan heap-use-after-free write. The fix nulls `dh` immediately after `EVP_PKEY_assign_DH` and uses `EVP_PKEY_get0_DH(peer_tmp)` for the later security check so the error path no longer frees the transferred `DH` twice."
+  },
+  "source": {
+    "file": "ssl/statem/statem_clnt.c",
+    "function": "tls_process_ske_dhe",
+    "line": 2094,
+    "var": "prime, generator, pub_key",
+    "code": "if (!PACKET_get_length_prefixed_2(pkt, &prime)\n    || !PACKET_get_length_prefixed_2(pkt, &generator)\n    || !PACKET_get_length_prefixed_2(pkt, &pub_key)) {",
+    "description": "First project-side parse on the crashing path that materializes the attacker-controlled DHE ServerKeyExchange body as the three length-prefixed DH field slices later converted into a `DH` object.",
+    "value_from": "The staged `gt_results/arvo_21550/poc` file is a 469-byte TLS transcript beginning `16 03 03`. The saved crash stack shows this same input reached `tls_process_key_exchange()` -> `tls_process_ske_dhe()`, so this statement is the first project parser that splits its ServerKeyExchange body into `prime`, `generator`, and `pub_key`.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "include/internal/refcount.h",
+    "function": "CRYPTO_DOWN_REF",
+    "line": 51,
+    "var": "val, *ret",
+    "code": "*ret = atomic_fetch_sub_explicit(val, 1, memory_order_relaxed) - 1;",
+    "description": "ASan sink. During the second `DH_free`, `CRYPTO_DOWN_REF` writes to the freed `DH` object's reference counter.",
+    "note": "The saved AddressSanitizer report identifies `CRYPTO_DOWN_REF` at `include/internal/refcount.h:51:12` as a heap-use-after-free WRITE of size 4, reached from `DH_free` during `EVP_PKEY_free(peer_tmp)`.",
+    "trace_step": 12
+  },
+  "root_cause": {
+    "file": "ssl/statem/statem_clnt.c",
+    "function": "tls_process_ske_dhe",
+    "line": 2179,
+    "var": "dh, peer_tmp",
+    "code": "DH_free(dh);",
+    "description": "After `EVP_PKEY_assign_DH(peer_tmp, dh)` has already transferred the same `DH` object into `peer_tmp`, the shared error cleanup still frees the local `dh` alias. That leaves `peer_tmp` holding a dangling `DH *` that `EVP_PKEY_free(peer_tmp)` will free again.",
+    "note": "The fixing diff inserts `dh = NULL;` immediately after successful `EVP_PKEY_assign_DH(peer_tmp, dh)` and changes the later `ssl_security` call to `EVP_PKEY_get0_DH(peer_tmp)`, preventing this cleanup free from re-freeing a transferred object.",
+    "trace_step": 10
+  },
+  "tainted_value_origin": {
+    "file": "ssl/statem/statem_clnt.c",
+    "function": "tls_process_ske_dhe",
+    "line": 2112,
+    "var": "p, g, bnpub_key",
+    "code": "p = BN_bin2bn(PACKET_data(&prime), (int)PACKET_remaining(&prime), NULL);\ng = BN_bin2bn(PACKET_data(&generator), (int)PACKET_remaining(&generator),\n              NULL);\nbnpub_key = BN_bin2bn(PACKET_data(&pub_key),\n                      (int)PACKET_remaining(&pub_key), NULL);",
+    "description": "The parsed `prime`, `generator`, and `pub_key` spans are converted into attacker-controlled BIGNUMs here. These values later populate `dh`, determine the DH validity checks, and drive `EVP_PKEY_security_bits(peer_tmp)`."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_key_exchange",
+      "line": 2287,
+      "code": "} else if (alg_k & (SSL_kDHE | SSL_kDHEPSK)) {",
+      "description": "The reproduced handshake selected the DHE ServerKeyExchange parser and dispatched into `tls_process_ske_dhe()` before the lifetime bug executes."
+    }
+  },
+  "evidence_limitations": [
+    "The staged artifacts do not decode the exact DH modulus from the 469-byte transcript. Because the client fuzz target uses `SSL_set_cipher_list(..., \"ALL:eNULL:@SECLEVEL=0\")`, the failed `ssl_security(..., SSL_SECOP_TMP_DH, EVP_PKEY_security_bits(peer_tmp), ...)` call proves only the source-grounded threshold `EVP_PKEY_security_bits(peer_tmp) < 80`."
+  ],
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "summary": "The DHE ServerKeyExchange parser splits the attacker-controlled packet into `prime`, `generator`, and `pub_key`, allocates a `DH` object, and populates it with those values."
+    },
+    {
+      "step": 2,
+      "file": "crypto/evp/p_lib.c",
+      "function": "EVP_PKEY_assign",
+      "summary": "Via `EVP_PKEY_assign_DH(peer_tmp, dh)`, the same raw `DH *` is stored in `peer_tmp` without `DH_up_ref`, so `dh` and `peer_tmp->pkey.ptr` alias one ownership-sensitive object."
+    },
+    {
+      "step": 3,
+      "file": "ssl/ssl_cert.c",
+      "function": "ssl_security_default_callback",
+      "summary": "The post-assignment temporary-DH security check rejects the parsed key because its security bits are below the remaining level-0 floor, so `tls_process_ske_dhe()` enters its shared `err:` cleanup."
+    },
+    {
+      "step": 4,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "summary": "The `err:` path first calls `DH_free(dh)` and then frees `peer_tmp`, whose destructor dispatches to `DH_free` again on the same pointer."
+    },
+    {
+      "step": 5,
+      "file": "include/internal/refcount.h",
+      "function": "CRYPTO_DOWN_REF",
+      "summary": "The second `DH_free` decrements the freed `DH` object's refcount, producing the observed heap-use-after-free write."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "line": 2094,
+      "line_end": 2096,
+      "var": "prime, generator, pub_key",
+      "code": "if (!PACKET_get_length_prefixed_2(pkt, &prime)\n    || !PACKET_get_length_prefixed_2(pkt, &generator)\n    || !PACKET_get_length_prefixed_2(pkt, &pub_key)) {",
+      "note": "Source. On the crashing path, the attacker-controlled ServerKeyExchange body is parsed into three length-prefixed DH field slices: `prime`, `generator`, and `pub_key`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "line": 2102,
+      "line_end": 2103,
+      "var": "peer_tmp, dh",
+      "code": "peer_tmp = EVP_PKEY_new();\ndh = DH_new();",
+      "note": "After the parse succeeds, the function allocates the `EVP_PKEY` container and the `DH` object that ASan later reports as the allocation eventually freed twice.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "control",
+          "via": "!PACKET_get_length_prefixed_2(pkt, &prime) || !PACKET_get_length_prefixed_2(pkt, &generator) || !PACKET_get_length_prefixed_2(pkt, &pub_key)"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "line": 2112,
+      "line_end": 2116,
+      "var": "p, g, bnpub_key",
+      "code": "p = BN_bin2bn(PACKET_data(&prime), (int)PACKET_remaining(&prime), NULL);\ng = BN_bin2bn(PACKET_data(&generator), (int)PACKET_remaining(&generator),\n              NULL);\nbnpub_key = BN_bin2bn(PACKET_data(&pub_key),\n                      (int)PACKET_remaining(&pub_key), NULL);",
+      "note": "The three packet slices from step 1 are materialized as BIGNUMs `p`, `g`, and `bnpub_key`. These attacker-controlled values later populate `dh` and determine the security-bit check.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "prime, generator, pub_key"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "peer_tmp == NULL || dh == NULL"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "line": 2124,
+      "line_end": 2127,
+      "var": "bnpub_key",
+      "code": "if (BN_is_zero(bnpub_key)) {",
+      "note": "The parsed public key must be nonzero to stay on the DHE path. The crashing transcript passes this guard, so the packet is not rejected as `SSL_R_BAD_DH_VALUE` here.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "bnpub_key"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "line": 2130,
+      "line_end": 2135,
+      "var": "dh, p, g",
+      "code": "if (!DH_set0_pqg(dh, p, NULL, g)) {\n    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLS_PROCESS_SKE_DHE,\n             ERR_R_BN_LIB);\n    goto err;\n}\np = g = NULL;",
+      "note": "The attacker-controlled prime and generator are moved into `dh`, and the local `p`/`g` pointers are nulled. From this point, `dh` carries the parsed parameter pair checked in the next step.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "p, g"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "dh"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "line": 2137,
+      "line_end": 2140,
+      "var": "dh, check_bits",
+      "code": "if (DH_check_params(dh, &check_bits) == 0 || check_bits != 0) {",
+      "note": "OpenSSL validates the parsed prime/generator pair and the crashing input passes with `check_bits == 0`, so execution continues instead of rejecting the DHE parameters here.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "dh"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "line": 2143,
+      "line_end": 2148,
+      "var": "dh, bnpub_key",
+      "code": "if (!DH_set0_key(dh, bnpub_key, NULL)) {\n    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLS_PROCESS_SKE_DHE,\n             ERR_R_BN_LIB);\n    goto err;\n}\nbnpub_key = NULL;",
+      "note": "The attacker-controlled public key is moved into `dh`, completing the temporary DH object that the rest of the function treats as the peer's key.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "bnpub_key"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "DH_check_params(dh, &check_bits) == 0 || check_bits != 0"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "crypto/evp/p_lib.c",
+      "function": "EVP_PKEY_assign",
+      "line": 425,
+      "var": "pkey->pkey.ptr, key",
+      "code": "pkey->pkey.ptr = key;",
+      "note": "Via `EVP_PKEY_assign_DH(peer_tmp, dh)` in `tls_process_ske_dhe()`, this stores the same `DH *` in `peer_tmp` without `DH_up_ref`; `EVP_PKEY_set1_DH()` is the refcounting variant. After this assignment, the error path must not free the local `dh` alias separately.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "dh"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "peer_tmp"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "ssl/ssl_cert.c",
+      "function": "ssl_security_default_callback",
+      "line": 962,
+      "line_end": 963,
+      "var": "op, bits",
+      "code": "if (op == SSL_SECOP_TMP_DH && bits < 80)\n    return 0;",
+      "note": "The client fuzz target set `@SECLEVEL=0`, so this is the remaining temporary-DH floor. The parsed key from step 8 fails here, and `tls_process_ske_dhe()` turns that `0` return into `SSL_R_DH_KEY_TOO_SMALL` and `goto err;`.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "EVP_PKEY_security_bits(peer_tmp)"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "ssl/statem/statem_clnt.c",
+      "function": "tls_process_ske_dhe",
+      "line": 2179,
+      "var": "dh, peer_tmp",
+      "code": "DH_free(dh);",
+      "note": "Root cause. After step 9 sends execution to `err:`, cleanup frees the local `dh` pointer even though step 8 already transferred the same object into `peer_tmp`. The fix prevents this by setting `dh = NULL` immediately after the assignment.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "dh",
+          "obj": "peer_tmp->pkey.ptr"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "op == SSL_SECOP_TMP_DH && bits < 80"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "crypto/evp/p_lib.c",
+      "function": "evp_pkey_free_it",
+      "line": 878,
+      "var": "x->pkey.ptr",
+      "code": "x->ameth->pkey_free(x);",
+      "note": "The same `err:` block then frees `peer_tmp`. Its key-specific free hook dispatches to `DH_free` on `x->pkey.ptr`, which is still the freed `DH *` from step 10.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "peer_tmp->pkey.ptr"
+        },
+        {
+          "on": 10,
+          "type": "order",
+          "via": "double_free",
+          "obj": "DH *dh"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "include/internal/refcount.h",
+      "function": "CRYPTO_DOWN_REF",
+      "line": 51,
+      "var": "val, *ret",
+      "code": "*ret = atomic_fetch_sub_explicit(val, 1, memory_order_relaxed) - 1;",
+      "note": "Sink. The second `DH_free` decrements `r->references` inside the already-freed `DH` object, producing the recorded AddressSanitizer heap-use-after-free WRITE of size 4.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "&r->references"
+        },
+        {
+          "on": 10,
+          "type": "order",
+          "via": "double_free",
+          "obj": "DH *r"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "asan",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-use-after-free",
+    "access_type": "WRITE",
+    "access_size": 4,
+    "crash_location": {
+      "function": "CRYPTO_DOWN_REF",
+      "file": "include/internal/refcount.h",
+      "line": 51
+    },
+    "free_context": {
+      "function": "tls_process_ske_dhe",
+      "file": "ssl/statem/statem_clnt.c",
+      "line": 2179
+    },
+    "allocation_context": {
+      "function": "dh_new_intern",
+      "file": "crypto/dh/dh_lib.c",
+      "line": 66
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "CRYPTO_DOWN_REF",
+        "file": "include/internal/refcount.h",
+        "line": 51
+      },
+      {
+        "frame": 1,
+        "function": "DH_free",
+        "file": "crypto/dh/dh_lib.c",
+        "line": 128
+      },
+      {
+        "frame": 2,
+        "function": "evp_pkey_free_it",
+        "file": "crypto/evp/p_lib.c",
+        "line": 878
+      },
+      {
+        "frame": 3,
+        "function": "EVP_PKEY_free",
+        "file": "crypto/evp/p_lib.c",
+        "line": 901
+      },
+      {
+        "frame": 4,
+        "function": "tls_process_ske_dhe",
+        "file": "ssl/statem/statem_clnt.c",
+        "line": 2180
+      },
+      {
+        "frame": 5,
+        "function": "tls_process_key_exchange",
+        "file": "ssl/statem/statem_clnt.c",
+        "line": 2288
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "free",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 123
+      },
+      {
+        "frame": 1,
+        "function": "DH_free",
+        "file": "crypto/dh/dh_lib.c",
+        "line": 148
+      },
+      {
+        "frame": 2,
+        "function": "tls_process_ske_dhe",
+        "file": "ssl/statem/statem_clnt.c",
+        "line": 2179
+      },
+      {
+        "frame": 3,
+        "function": "tls_process_key_exchange",
+        "file": "ssl/statem/statem_clnt.c",
+        "line": 2288
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 145
+      },
+      {
+        "frame": 1,
+        "function": "CRYPTO_zalloc",
+        "file": "crypto/mem.c",
+        "line": 191
+      },
+      {
+        "frame": 2,
+        "function": "dh_new_intern",
+        "file": "crypto/dh/dh_lib.c",
+        "line": 66
+      },
+      {
+        "frame": 3,
+        "function": "tls_process_ske_dhe",
+        "file": "ssl/statem/statem_clnt.c",
+        "line": 2103
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "source": "parsed from staged sanitizer_trace.txt / default_crash_trace.txt / reproduction_report.json / vulnerable source / patch.diff",
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "The allocation context identifies the `DH` object created by `DH_new`; the root cause is the later error-path `DH_free(dh)` after `EVP_PKEY_assign_DH` has already transferred that same object to `peer_tmp`.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_21550 run --version vulnerable --expect crash",
+    "format": {
+      "name": "OpenSSL client-fuzzer TLS transcript",
+      "contract": "A TLS handshake transcript that takes `tls_process_key_exchange()` into the DHE branch and provides a ServerKeyExchange body whose three 2-byte-length-prefixed fields parse successfully, yield a nonzero `bnpub_key`, pass `DH_check_params()`, and still make `EVP_PKEY_security_bits(peer_tmp) < 80` after `EVP_PKEY_assign_DH(peer_tmp, dh)`, so the post-assignment `ssl_security(..., SSL_SECOP_TMP_DH, ...)` check fails and `err:` frees both `dh` and `peer_tmp`."
+    }
+  }
+}

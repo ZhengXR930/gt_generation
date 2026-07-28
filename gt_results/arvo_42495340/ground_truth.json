@@ -1,0 +1,417 @@
+{
+  "sample_id": "arvo_42495340",
+  "vuln_id": "OSS-Fuzz issue 42495340 / ARVO arvo:42495340",
+  "project": {
+    "id": "assimp",
+    "name": "assimp",
+    "repo": "https://github.com/assimp/assimp.git",
+    "vulnerable_commit": "1e89c06157e33459a478e9cbf56863936a004ef5",
+    "fixed_commit": "785cca1bb43f9e6047cb566a910fcd0e3d49951f",
+    "fuzz_target": "assimp_fuzzer"
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416",
+    "access": "READ",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42495340 (assimp): Heap-use-after-free READ 8 found by fuzz target assimp_fuzzer [asan]. https://issues.oss-fuzz.com/issues/42495340",
+    "original_source": "sample_info.json, reproduction_report.json, sanitizer_trace.txt, patch.diff, staged vulnerable source under `_work/src/assimp`, and staged `poc` bytes",
+    "normalized": "The exact staged witness is the 4-byte ASCII string `<amf`, which `assimp_fuzzer` passes to `Importer::ReadFileFromMemory()`. Vulnerable `ReadFileFromMemory()` immediately consumes that buffer by installing `new MemoryIOSystem((const uint8_t*)pBuffer,pLength,io)`, so later opens of the synthetic in-memory filename read directly from the same attacker-controlled bytes in memory. Assimp selects the AMF importer, `AMFImporter::ParseFile()` opens that memory-backed stream, allocates `mXmlParser`, and `TXmlParser::parse()` copies the four bytes into `mData`; `pugi::xml_document::load_string()` then rejects the truncated opening AMF tag. On this parse-failure path `AMFImporter::ParseFile()` executes `delete mXmlParser; throw DeadlyImportError(...)` without clearing the member. `BaseImporter::ReadFile()` catches the exception and returns `nullptr`, so the same `AMFImporter` instance survives until `Importer::~Importer()` later deletes registered importers. `AMFImporter::~AMFImporter()` then executes `delete mXmlParser` again on the dangling pointer, re-entering `TXmlParser::~TXmlParser()/clear()` on freed storage; `mData.resize(0)` reads the freed `std::vector<char>` state and AddressSanitizer reports the saved heap-use-after-free READ 8. The staged patch fixes this exact lifetime bug by setting `mXmlParser = nullptr` immediately after the first delete."
+  },
+  "source": {
+    "file": "code/Common/Importer.cpp",
+    "function": "Assimp::Importer::ReadFileFromMemory",
+    "line": 505,
+    "code": "SetIOHandler(new MemoryIOSystem((const uint8_t*)pBuffer,pLength,io));",
+    "var": "pBuffer, pLength",
+    "description": "Source. `ReadFileFromMemory()` consumes the fuzzer buffer by installing a `MemoryIOSystem` that aliases the attacker-controlled bytes and length as the active IO handler for this import.",
+    "value_from": "The staged `poc` is exactly the 4-byte ASCII file `3c 61 6d 66` (`<amf`) with SHA-256 `b091851ab4fd81d4672eb054e5f019860b05bb3070f0b3e8685fca7b685c4a84`. This statement passes that witness as `pBuffer` with `pLength == 4` into `MemoryIOSystem`, so later `Open()` and `Read()` calls pull these exact four bytes from memory-backed IO.",
+    "note": "This is the first project statement that reads the fuzz buffer into vulnerability-relevant project state; later steps open the resulting in-memory stream and copy the same bytes into `TXmlParser::mData`.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "code/AssetLib/AMF/AMFImporter.cpp",
+    "function": "Assimp::AMFImporter::ParseFile",
+    "line": 276,
+    "code": "delete mXmlParser;",
+    "var": "mXmlParser",
+    "description": "Root cause. On XML parse failure, `ParseFile()` frees the member-owned `XmlParser` object but leaves `AMFImporter::mXmlParser` non-null, so later cleanup reuses a dangling pointer.",
+    "note": "The staged patch adds `mXmlParser = nullptr;` immediately after this delete. Because `AMFImporter::~AMFImporter()` later does an unconditional `delete mXmlParser;`, leaving the member dangling turns the later importer teardown into a second delete/use-after-free path.",
+    "trace_step": 7
+  },
+  "sink": {
+    "file": "include/assimp/XmlParser.h",
+    "function": "Assimp::TXmlParser<pugi::xml_node>::clear",
+    "line": 91,
+    "code": "mData.resize(0);",
+    "var": "mData",
+    "description": "ASan crash site. The second `delete mXmlParser` re-enters `clear()` on freed `TXmlParser` storage, and `mData.resize(0)` reads the dead `std::vector<char>` state.",
+    "note": "AddressSanitizer reports the resulting heap-use-after-free during this call chain as `std::__1::vector<char>::size() -> resize() -> Assimp::TXmlParser<pugi::xml_node>::clear()`.",
+    "trace_step": 9
+  },
+  "tainted_value_origin": {
+    "file": "include/assimp/XmlParser.h",
+    "function": "Assimp::TXmlParser<pugi::xml_node>::parse",
+    "line": 130,
+    "line_end": 135,
+    "code": "pugi::xml_parse_result parse_result = mDoc->load_string(&mData[0], pugi::parse_full);\nif (parse_result.status == pugi::status_ok) {\n    return true;\n} else {\n    ASSIMP_LOG_DEBUG(\"Error while parse xml.\");\n    return false;\n}",
+    "var": "parse_result.status",
+    "description": "The malformed `<amf` buffer produces a non-OK XML parse status, and `parse()` returns `false` to select the later free-and-throw path in `AMFImporter::ParseFile()`.",
+    "value_from": "This statement parses the same 4-byte `mData` buffer copied from the `MemoryIOSystem`-backed stream created from the staged `poc`.",
+    "note": "For this sample the vulnerability-relevant attacker-derived state after ingress is the boolean parse-failure result, not a numeric length or offset: `false` is what sends `ParseFile()` down the stale-pointer cleanup path."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "code/AssetLib/AMF/AMFImporter.cpp",
+      "function": "Assimp::AMFImporter::ParseFile",
+      "line": 275,
+      "code": "if (!mXmlParser->parse(file.get())) {",
+      "description": "The staged witness is routed into the AMF importer and reaches the XML parse call. The crash occurs during cleanup of this failed parse attempt, before any AMF scene graph is built.",
+      "note": "The saved run logs `Found a matching importer for this file format: Additive manufacturing file format(AMF) Importer.` followed by `Failed to create XML reader for file...`, showing that the AMF importer and its parse-failure path were both reached."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "code/Common/Importer.cpp",
+      "function": "Assimp::Importer::ReadFileFromMemory",
+      "summary": "`ReadFileFromMemory()` wraps the 4-byte witness in `MemoryIOSystem`, making the import read attacker bytes from a synthetic in-memory file."
+    },
+    {
+      "step": 2,
+      "file": "code/AssetLib/AMF/AMFImporter.cpp / include/assimp/XmlParser.h",
+      "function": "Assimp::AMFImporter::ParseFile / Assimp::TXmlParser<pugi::xml_node>::parse",
+      "summary": "`ParseFile()` opens the memory-backed stream, allocates `mXmlParser`, and `parse()` copies the 4-byte `<amf` witness into `mData`."
+    },
+    {
+      "step": 3,
+      "file": "include/assimp/XmlParser.h",
+      "function": "Assimp::TXmlParser<pugi::xml_node>::parse",
+      "summary": "`load_string()` rejects the truncated opening tag, so `parse()` returns false to the AMF importer."
+    },
+    {
+      "step": 4,
+      "file": "code/AssetLib/AMF/AMFImporter.cpp",
+      "function": "Assimp::AMFImporter::ParseFile",
+      "summary": "The parse-failure branch deletes `mXmlParser` but leaves the member dangling before throwing `DeadlyImportError`."
+    },
+    {
+      "step": 5,
+      "file": "code/Common/BaseImporter.cpp",
+      "function": "Assimp::BaseImporter::ReadFile",
+      "summary": "`ReadFile()` catches the exception and returns `nullptr`, so the registered `AMFImporter` instance survives the failed parse."
+    },
+    {
+      "step": 6,
+      "file": "code/AssetLib/AMF/AMFImporter.cpp / include/assimp/XmlParser.h",
+      "function": "Assimp::AMFImporter::~AMFImporter / Assimp::TXmlParser<pugi::xml_node>::clear",
+      "summary": "Later importer teardown deletes the dangling `mXmlParser` again, and `clear()` reads freed `mData` vector state, producing the saved ASan heap-use-after-free."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "code/Common/Importer.cpp",
+      "function": "Assimp::Importer::ReadFileFromMemory",
+      "line": 505,
+      "var": "pBuffer, pLength",
+      "code": "SetIOHandler(new MemoryIOSystem((const uint8_t*)pBuffer,pLength,io));",
+      "note": "Source step. `ReadFileFromMemory()` consumes the exact 4-byte witness `<amf` by wrapping `pBuffer` and `pLength` in a `MemoryIOSystem`. The new IO handler keeps an alias to the attacker-controlled bytes and length 4, which later serves the AMF parser's synthetic in-memory filename.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "code/AssetLib/AMF/AMFImporter.cpp",
+      "function": "Assimp::AMFImporter::ParseFile",
+      "line": 267,
+      "var": "file",
+      "code": "std::unique_ptr<IOStream> file(pIOHandler->Open(pFile, \"rb\"));",
+      "note": "`ParseFile()` opens the synthetic in-memory filename through the active `pIOHandler`. Because step 1 installed a `MemoryIOSystem`, this `Open()` call materializes a `MemoryIOStream` whose `buffer` and `length` still alias the same 4-byte witness; `file.get()` is the stream later passed to `mXmlParser->parse(file.get())`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "pBuffer, pLength"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "code/AssetLib/AMF/AMFImporter.cpp",
+      "function": "Assimp::AMFImporter::ParseFile",
+      "line": 274,
+      "var": "mXmlParser",
+      "code": "mXmlParser = new XmlParser();",
+      "note": "Because step 2 returned a live stream and the `file.get() == nullptr` guard is false in the saved run, `ParseFile()` allocates a fresh heap `XmlParser` object and stores the owning pointer in member `mXmlParser`. This member alias is later freed on the error path and then reused during importer destruction.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "file.get() == nullptr"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "include/assimp/XmlParser.h",
+      "function": "Assimp::TXmlParser<pugi::xml_node>::parse",
+      "line": 124,
+      "var": "len",
+      "code": "const size_t len = stream->FileSize();",
+      "note": "Inside `mXmlParser->parse(file.get())`, `stream` is the same memory-backed stream from step 2. `FileSize()` recovers the exact byte count 4 from that stream, and this `len` value is used for the upcoming `mData` read.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "file.get()"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "include/assimp/XmlParser.h",
+      "function": "Assimp::TXmlParser<pugi::xml_node>::parse",
+      "line": 127,
+      "var": "mData",
+      "code": "stream->Read(&mData[0], 1, len);",
+      "note": "After resizing and zero-terminating `mData`, `parse()` copies `len == 4` bytes from the `MemoryIOStream` into parser-owned storage. This materializes the exact malformed XML buffer `<amf` inside the heap `XmlParser` object from step 3.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "stream"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "len"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "include/assimp/XmlParser.h",
+      "function": "Assimp::TXmlParser<pugi::xml_node>::parse",
+      "line": 130,
+      "line_end": 135,
+      "var": "parse_result.status",
+      "code": "pugi::xml_parse_result parse_result = mDoc->load_string(&mData[0], pugi::parse_full);\nif (parse_result.status == pugi::status_ok) {\n    return true;\n} else {\n    ASSIMP_LOG_DEBUG(\"Error while parse xml.\");\n    return false;\n}",
+      "note": "The copied string `<amf` is not a complete XML document, so `load_string()` yields a non-OK status and `parse()` returns false. That false return is the attacker-controlled control state that selects `ParseFile()`'s delete-and-throw branch.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "mData"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "code/AssetLib/AMF/AMFImporter.cpp",
+      "function": "Assimp::AMFImporter::ParseFile",
+      "line": 276,
+      "var": "mXmlParser",
+      "code": "delete mXmlParser;",
+      "note": "Root-cause step. Because step 6 made `!mXmlParser->parse(file.get())` true, `ParseFile()` deletes the heap `XmlParser` object stored in member `mXmlParser`. The member itself is not cleared, so `mXmlParser` now holds a dangling non-null pointer to freed storage.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "mXmlParser"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "!mXmlParser->parse(file.get())"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "code/AssetLib/AMF/AMFImporter.cpp",
+      "function": "Assimp::AMFImporter::~AMFImporter",
+      "line": 101,
+      "var": "mXmlParser",
+      "code": "delete mXmlParser;",
+      "note": "After step 7 throws, `BaseImporter::ReadFile()` catches the `DeadlyImportError` and returns `nullptr` without deleting the registered importer. When `Importer::~Importer()` later destroys importer instances, `AMFImporter::~AMFImporter()` reuses the same dangling member and issues a second `delete mXmlParser`, entering `TXmlParser` destruction on freed memory.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "mXmlParser"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "!mXmlParser->parse(file.get())"
+        },
+        {
+          "on": 7,
+          "type": "order",
+          "via": "free_before_use",
+          "obj": "mXmlParser"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "include/assimp/XmlParser.h",
+      "function": "Assimp::TXmlParser<pugi::xml_node>::clear",
+      "line": 91,
+      "var": "mData",
+      "code": "mData.resize(0);",
+      "note": "Sink. The second destructor invocation from step 8 executes `clear()` on the freed `TXmlParser` object, and `mData.resize(0)` immediately reads the dead `std::vector<char>` state. AddressSanitizer reports this as the project-level heap-use-after-free read, with top frames `vector<char>::size() -> resize() -> Assimp::TXmlParser<pugi::xml_node>::clear()`.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "this"
+        },
+        {
+          "on": 7,
+          "type": "order",
+          "via": "free_before_use",
+          "obj": "mXmlParser"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "asan",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-use-after-free",
+    "access_type": "READ",
+    "access_size": 8,
+    "crash_location": {
+      "file": "include/assimp/XmlParser.h",
+      "function": "Assimp::TXmlParser<pugi::xml_node>::clear",
+      "line": 91
+    },
+    "runtime_crash_location": {
+      "file": "include/assimp/XmlParser.h",
+      "function": "Assimp::TXmlParser<pugi::xml_node>::clear",
+      "line": 91
+    },
+    "allocation_context": {
+      "file": "code/AssetLib/AMF/AMFImporter.cpp",
+      "function": "Assimp::AMFImporter::ParseFile",
+      "line": 274
+    },
+    "free_context": {
+      "file": "code/AssetLib/AMF/AMFImporter.cpp",
+      "function": "Assimp::AMFImporter::ParseFile",
+      "line": 276
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "std::__1::vector<char, std::__1::allocator<char> >::size() const",
+        "file": "/usr/local/bin/../include/c++/v1/vector",
+        "line": 658
+      },
+      {
+        "frame": 1,
+        "function": "std::__1::vector<char, std::__1::allocator<char> >::resize(unsigned long)",
+        "file": "/usr/local/bin/../include/c++/v1/vector",
+        "line": 2022
+      },
+      {
+        "frame": 2,
+        "function": "Assimp::TXmlParser<pugi::xml_node>::clear",
+        "file": "include/assimp/XmlParser.h",
+        "line": 91
+      },
+      {
+        "frame": 3,
+        "function": "Assimp::TXmlParser<pugi::xml_node>::~TXmlParser",
+        "file": "include/assimp/XmlParser.h",
+        "line": 87
+      },
+      {
+        "frame": 4,
+        "function": "Assimp::AMFImporter::~AMFImporter",
+        "file": "code/AssetLib/AMF/AMFImporter.cpp",
+        "line": 101
+      },
+      {
+        "frame": 5,
+        "function": "Assimp::DeleteImporterInstanceList",
+        "file": "code/Common/ImporterRegistry.cpp",
+        "line": 370
+      },
+      {
+        "frame": 6,
+        "function": "Assimp::Importer::~Importer",
+        "file": "code/Common/Importer.cpp",
+        "line": 179
+      },
+      {
+        "frame": 7,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/assimp_fuzzer.cc",
+        "line": 59
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "operator new(unsigned long)",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp",
+        "line": 99
+      },
+      {
+        "frame": 1,
+        "function": "Assimp::AMFImporter::ParseFile",
+        "file": "code/AssetLib/AMF/AMFImporter.cpp",
+        "line": 274
+      },
+      {
+        "frame": 2,
+        "function": "Assimp::AMFImporter::InternReadFile",
+        "file": "code/AssetLib/AMF/AMFImporter.cpp",
+        "line": 536
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "operator delete(void*)",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp",
+        "line": 160
+      },
+      {
+        "frame": 1,
+        "function": "Assimp::AMFImporter::ParseFile",
+        "file": "code/AssetLib/AMF/AMFImporter.cpp",
+        "line": 276
+      },
+      {
+        "frame": 2,
+        "function": "Assimp::AMFImporter::InternReadFile",
+        "file": "code/AssetLib/AMF/AMFImporter.cpp",
+        "line": 536
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_free_context": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run executed `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_42495340 run --version vulnerable --expect crash`, which fed the staged `poc` file to `/out/assimp_fuzzer` and reproduced `AddressSanitizer: heap-use-after-free READ of size 8` with stack `vector<char>::size() -> resize() -> Assimp::TXmlParser<pugi::xml_node>::clear()`.",
+    "format": {
+      "name": "truncated AMF/XML document",
+      "contract": "Exactly the staged 4-byte ASCII file `3c 61 6d 66` (`<amf`) with SHA-256 `b091851ab4fd81d4672eb054e5f019860b05bb3070f0b3e8685fca7b685c4a84` and no trailing newline. In the saved run, `ReadFileFromMemory()` wraps these bytes in `MemoryIOSystem`, Assimp selects the AMF importer, and `TXmlParser::parse()` reads the same four bytes as XML; because the opening tag is incomplete, `load_string()` fails, `AMFImporter::ParseFile()` takes the `!mXmlParser->parse(file.get())` error path, deletes the parser without nulling `mXmlParser`, and later crashes during importer teardown when the dangling member is deleted again. Stage 01 proves only this exact witness and observed parse-failure cleanup path; this contract does not generalize to all malformed AMF files."
+    }
+  }
+}

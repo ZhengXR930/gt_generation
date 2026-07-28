@@ -1,0 +1,456 @@
+{
+  "sample_id": "arvo_42540566",
+  "vuln_id": "OSS-Fuzz issue 42540566 / ARVO arvo:42540566",
+  "project": {
+    "id": "freetype2",
+    "name": "FreeType 2",
+    "repo": "https://github.com/freetype/freetype2",
+    "vulnerable_commit": "8f403ab8a8bb211aff88897319a15a418f85c86e",
+    "fixed_commit": "1079063701986505980f5c5183b3a92700dc1cf5",
+    "staged_checkout_commit": "a44e20879cefea41663bb36ff4af908cc4146fb8",
+    "commit_note": "The staged ARVO workspace checkout at `_work/src/freetype2` is on commit `a44e20879cefea41663bb36ff4af908cc4146fb8`, not the metadata `vulnerable_commit`. The line anchors below were resolved against that staged vulnerable tree, which still contains the unfixed `ttcpal.c` code shown in `patch.diff`.",
+    "fuzz_target": "ftfuzzer"
+  },
+  "classification": {
+    "class": "out-of-bounds read",
+    "cwe": "CWE-125",
+    "access": "read",
+    "detector": "AddressSanitizer",
+    "classification_note": "AddressSanitizer reports `heap-buffer-overflow READ of size 1` and marks the computed address as a wild pointer. Source analysis shows the bug is an unchecked CPAL palette-span calculation on a 32-byte `CPAL` slice borrowed from the in-memory font buffer: a malformed palette start index and entry count move the read cursor beyond that table extent and past the backing allocation."
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42540566 (freetype2): Heap-buffer-overflow READ 1 found by fuzz target ftfuzzer [asan]. https://issues.oss-fuzz.com/issues/42540566",
+    "original_source": "sample_info.json issue_description / patch.diff / sanitizer_trace.txt / reproduction_report.json",
+    "normalized": "The exact 4319-byte `OTTO` witness contains a `CPAL` table directory entry at file offset 4260 with length 32. `FT_New_Memory_Face()` opens the witness as a memory-backed stream, so when `tt_face_load_cpal()` executes `FT_FRAME_EXTRACT( table_size, table )`, `table` becomes a borrowed pointer to that 32-byte slice inside the original font buffer. The loader then parses header fields `num_palette_entries = 0x2020`, `num_palettes = 0x2020`, `num_colors = 0`, and `colors_offset = 0`. Because the vulnerable loader validates only `colors_offset` and `num_colors`, it accepts the table, sets `cpal->colors` to the slice base, and immediately calls `tt_face_palette_set(face, 0)`. There, `FT_PEEK_USHORT(cpal->color_indices)` reads `0x2020` from the first palette-index slot, `p = cpal->colors + 4 * 0x2020` becomes `table + 32896`, and the first `FT_NEXT_BYTE(p)` at `src/sfnt/ttcpal.c:268` reads outside the 32-byte `CPAL` table extent and far beyond the 4319-byte backing font buffer. The fix stores the extracted table size and rejects any palette whose `record_offset + COLOR_SIZE * num_palette_entries` exceeds that extent."
+  },
+  "source": {
+    "file": "src/sfnt/ttcpal.c",
+    "function": "tt_face_load_cpal",
+    "line": 96,
+    "code": "if ( FT_FRAME_EXTRACT( table_size, table ) )",
+    "var": "table_size, table",
+    "description": "First project-side materialization of the attacker-controlled `CPAL` table as parser state: `table` becomes a borrowed pointer to the in-memory font's `CPAL` bytes and `table_size` records the 32-byte logical table extent later exceeded.",
+    "value_from": "The exact witness stored in `poc` (SHA-256 `9343b0526559d4db98fb4eeada80b480a5500efb39613d7d877efbeee414640e`) is an `OTTO` sfnt whose table directory advertises `CPAL` at offset 4260 with length 32. `FT_New_Memory_Face()` receives `files[0].data()` and `files[0].size()`, `FT_Stream_OpenMemory()` stores that buffer in `stream->base` with `stream->read = NULL`, and after `face->goto_table( face, TTAG_CPAL, stream, &table_size )` positions the stream at offset 4260, `FT_Stream_EnterFrame()` sets `stream->cursor = stream->base + stream->pos`. Through `FT_Stream_ExtractFrame()`, this `FT_FRAME_EXTRACT` therefore makes `table` alias the existing 32 `CPAL` bytes beginning `00 00 20 20 20 20 00 00 00 00 00 00 20 20 ...` inside the 4319-byte in-memory font buffer; it does not allocate a separate 32-byte copy.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "src/sfnt/ttcpal.c",
+    "function": "tt_face_palette_set",
+    "line": 261,
+    "code": "p      = cpal->colors + COLOR_SIZE * FT_PEEK_USHORT( offset );",
+    "var": "p, offset, face->palette_data.num_palette_entries, table_size",
+    "description": "Unchecked palette span. `tt_face_palette_set()` trusts the attacker-controlled first palette index, converts it into a byte offset from `cpal->colors`, and never verifies that the resulting palette range of `num_palette_entries` color records fits inside the 32-byte `CPAL` table extent referenced by `cpal->table`.",
+    "note": "The fix adds `table_size` to `Cpal`, computes `record_offset`, and rejects `record_offset + COLOR_SIZE * face->palette_data.num_palette_entries > cpal->table_size` before assigning `p`.",
+    "trace_step": 9
+  },
+  "sink": {
+    "file": "src/sfnt/ttcpal.c",
+    "function": "tt_face_palette_set",
+    "line": 268,
+    "code": "q->blue  = FT_NEXT_BYTE( p );",
+    "var": "p",
+    "description": "ASan sink. The first palette-byte load dereferences `table + 32896`, which is 32864 bytes past the end of the borrowed 32-byte `CPAL` slice and far beyond the 4319-byte backing font buffer.",
+    "note": "The saved AddressSanitizer stack is `tt_face_palette_set -> tt_face_load_cpal -> sfnt_load_face`, and line 268 is the first byte read in the palette-copy loop.",
+    "trace_step": 12
+  },
+  "tainted_value_origin": {
+    "file": "src/tools/ftfuzzer/ftfuzzer.cc",
+    "function": "LLVMFuzzerTestOneInput",
+    "line": 313,
+    "code": "if ( FT_New_Memory_Face( library,\n                         files[0].data(),\n                         (FT_Long)files[0].size(),\n                         face_index,\n                         &face ) )",
+    "var": "files[0].data(), files[0].size()",
+    "description": "The fuzz target passes the exact 4319-byte witness to FreeType as an in-memory font. All later `CPAL` bytes and sizes originate from this buffer."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/sfnt/sfobjs.c",
+      "function": "sfnt_load_face",
+      "line": 1347,
+      "code": "LOAD_( cpal );",
+      "description": "The witness is an `OTTO` OpenType/CFF face with a `CPAL` table directory entry, so optional color-table loading enters `tt_face_load_cpal()` during face initialization."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/tools/ftfuzzer/ftfuzzer.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness gives FreeType the exact 4319-byte witness as an in-memory font via `FT_New_Memory_Face()`."
+    },
+    {
+      "step": 2,
+      "file": "src/sfnt/sfobjs.c",
+      "function": "sfnt_load_face",
+      "summary": "Face loading recognizes the input as an OpenType/CFF font and invokes optional `CPAL` parsing through `tt_face_load_cpal()`."
+    },
+    {
+      "step": 3,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_load_cpal",
+      "summary": "The loader resolves a 32-byte `CPAL` slice inside the in-memory font, materializes header values `num_palette_entries = 8224`, `num_palettes = 8224`, `num_colors = 0`, and `colors_offset = 0`, passes the existing `num_colors/colors_offset` guard, and prepares palette pointers into that slice."
+    },
+    {
+      "step": 4,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_palette_set",
+      "summary": "Default palette loading uses palette 0's first color index `0x2020` as a byte offset from the `CPAL` slice base without checking that the full palette span fits inside the 32-byte table extent, and the first `FT_NEXT_BYTE(p)` read triggers the saved heap-buffer-overflow."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 0,
+      "file": "src/tools/ftfuzzer/ftfuzzer.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 313,
+      "line_end": 317,
+      "var": "files[0].data(), files[0].size()",
+      "code": "if ( FT_New_Memory_Face( library,\n                         files[0].data(),\n                         (FT_Long)files[0].size(),\n                         face_index,\n                         &face ) )",
+      "note": "The harness passes the exact 4319-byte witness into `FT_New_Memory_Face()` as an in-memory OpenType font."
+    },
+    {
+      "step": 1,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_load_cpal",
+      "line": 96,
+      "var": "table_size, table",
+      "code": "if ( FT_FRAME_EXTRACT( table_size, table ) )",
+      "note": "Source. `goto_table( TTAG_CPAL, ... )` has just resolved the witness's `CPAL` entry to 32 bytes. Because this face was opened from memory, `FT_FRAME_EXTRACT` returns a borrowed pointer to that existing `CPAL` slice inside the 4319-byte font buffer, and `table` becomes the later out-of-bounds base.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "data",
+          "via": "files[0].data(), files[0].size()"
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_load_cpal",
+      "line": 108,
+      "var": "face->palette_data.num_palette_entries",
+      "code": "face->palette_data.num_palette_entries = FT_NEXT_USHORT( p );",
+      "note": "Bytes 2-3 of the borrowed 32-byte `CPAL` slice are `0x20 0x20`, so the loader materializes `num_palette_entries = 8224`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "table"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_load_cpal",
+      "line": 109,
+      "var": "face->palette_data.num_palettes",
+      "code": "face->palette_data.num_palettes        = FT_NEXT_USHORT( p );",
+      "note": "Bytes 4-5 of the same slice are also `0x20 0x20`, so `num_palettes = 8224`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "table"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_load_cpal",
+      "line": 111,
+      "line_end": 112,
+      "var": "cpal->num_colors, colors_offset",
+      "code": "cpal->num_colors = FT_NEXT_USHORT( p );\ncolors_offset    = FT_NEXT_ULONG( p );",
+      "note": "Bytes 6-11 of the same slice are zero, so `num_colors = 0` and `colors_offset = 0`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "table"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_load_cpal",
+      "line": 114,
+      "line_end": 117,
+      "var": "colors_offset, cpal->num_colors, table_size",
+      "code": "if ( colors_offset >= table_size )\n  goto InvalidTable;\nif ( cpal->num_colors * COLOR_SIZE > table_size - colors_offset )\n  goto InvalidTable;",
+      "note": "The only CPAL extent check passes because `0 < 32` and `0 * 4 <= 32`. The loader still does not reject the later palette counts and indices that will drive the out-of-bounds read.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "table_size"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "colors_offset, cpal->num_colors"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_load_cpal",
+      "line": 119,
+      "line_end": 120,
+      "var": "cpal->color_indices, cpal->colors",
+      "code": "cpal->color_indices = p;\ncpal->colors        = (FT_Byte*)( table + colors_offset );",
+      "note": "After the 12-byte header, `p` now points at `table + 12`, so `cpal->color_indices` aliases the first palette-index slot. Because `colors_offset == 0`, `cpal->colors` aliases the start of the borrowed `CPAL` slice.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "table"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "colors_offset"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "cpal->num_colors * COLOR_SIZE > table_size - colors_offset"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_palette_set",
+      "line": 257,
+      "line_end": 258,
+      "var": "palette_index, face->palette_data.num_palettes",
+      "code": "if ( palette_index >= face->palette_data.num_palettes )\n  return FT_THROW( Invalid_Argument );",
+      "note": "The caller has just requested the default palette with `palette_index == 0`; this guard passes because `0 < num_palettes (8224)`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "face->palette_data.num_palettes"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_palette_set",
+      "line": 260,
+      "var": "offset",
+      "code": "offset = cpal->color_indices + 2 * palette_index;",
+      "note": "With palette 0 selected, `offset` points to the first palette-index field at `table + 12`.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "cpal->color_indices"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "palette_index >= face->palette_data.num_palettes"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_palette_set",
+      "line": 261,
+      "var": "p",
+      "code": "p      = cpal->colors + COLOR_SIZE * FT_PEEK_USHORT( offset );",
+      "note": "The two bytes at `offset` are `0x20 0x20`, so `FT_PEEK_USHORT( offset )` yields 8224 and `p` becomes `cpal->colors + 4 * 8224 = table + 32896`. No check ensures that this record offset plus the palette's `num_palette_entries` span fits inside the 32-byte `CPAL` table extent.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "table_size"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "face->palette_data.num_palette_entries"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "cpal->colors"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "offset"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_palette_set",
+      "line": 263,
+      "line_end": 264,
+      "var": "q, limit",
+      "code": "q     = face->palette;\nlimit = q + face->palette_data.num_palette_entries;",
+      "note": "The copy loop uses `num_palette_entries` as its bound, so `limit` is 8224 `FT_Color` slots ahead of `q` and the function intends to consume 32896 color bytes from `p`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "face->palette_data.num_palette_entries"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_palette_set",
+      "line": 266,
+      "var": "q, limit",
+      "code": "while ( q < limit )",
+      "note": "On the first iteration `q < limit` is true because the palette count is nonzero, so the loop proceeds to dereference `p`.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "q, limit"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_palette_set",
+      "line": 268,
+      "var": "p",
+      "code": "q->blue  = FT_NEXT_BYTE( p );",
+      "note": "Sink. The first `FT_NEXT_BYTE( p )` reads from `table + 32896`, which is 32864 bytes past the end of the borrowed 32-byte `CPAL` slice and therefore outside the 4319-byte backing font buffer, and AddressSanitizer reports the 1-byte heap-buffer-overflow at this line.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "p"
+        },
+        {
+          "on": 11,
+          "type": "control",
+          "via": "q < limit"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "src/sfnt/ttcpal.c",
+      "function": "tt_face_palette_set",
+      "line": 268
+    },
+    "allocation_context": null,
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "tt_face_palette_set",
+        "file": "src/sfnt/ttcpal.c",
+        "line": 268
+      },
+      {
+        "frame": 1,
+        "function": "tt_face_load_cpal",
+        "file": "src/sfnt/ttcpal.c",
+        "line": 209
+      },
+      {
+        "frame": 2,
+        "function": "sfnt_load_face",
+        "file": "src/sfnt/sfobjs.c",
+        "line": 1347
+      },
+      {
+        "frame": 3,
+        "function": "cff_face_init",
+        "file": "src/cff/cffobjs.c",
+        "line": 566
+      },
+      {
+        "frame": 4,
+        "function": "open_face",
+        "file": "src/base/ftobjs.c",
+        "line": 1382
+      },
+      {
+        "frame": 5,
+        "function": "ft_open_face_internal",
+        "file": "src/base/ftobjs.c",
+        "line": 2454
+      },
+      {
+        "frame": 6,
+        "function": "FT_New_Memory_Face",
+        "file": "src/base/ftobjs.c",
+        "line": 1472
+      },
+      {
+        "frame": 7,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "src/tools/ftfuzzer/ftfuzzer.cc",
+        "line": 313
+      },
+      {
+        "frame": 8,
+        "function": "fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)",
+        "file": "libfuzzer/FuzzerLoop.cpp",
+        "line": 526
+      },
+      {
+        "frame": 9,
+        "function": "fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long)",
+        "file": "libfuzzer/FuzzerDriver.cpp",
+        "line": 280
+      },
+      {
+        "frame": 10,
+        "function": "fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long))",
+        "file": "libfuzzer/FuzzerDriver.cpp",
+        "line": 707
+      },
+      {
+        "frame": 11,
+        "function": "main",
+        "file": "libfuzzer/FuzzerMain.cpp",
+        "line": 20
+      }
+    ],
+    "allocation_stack": [],
+    "free_stack": [],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "The saved Stage 01 command runs `ftfuzzer` on this exact file and reproduces `AddressSanitizer: heap-buffer-overflow READ of size 1` in `tt_face_palette_set()`.",
+    "format": {
+      "name": "OpenType/CFF font with malformed CPAL table",
+      "contract": "Exactly the 4319-byte binary witness stored in `poc` (SHA-256 `9343b0526559d4db98fb4eeada80b480a5500efb39613d7d877efbeee414640e`). It is an `OTTO` sfnt whose `CPAL` table directory entry is `offset = 4260`, `length = 32`; that table begins `00 00 20 20 20 20 00 00 00 00 00 00 20 20 ...`, so `version = 0`, `num_palette_entries = 0x2020`, `num_palettes = 0x2020`, `num_colors = 0`, `colors_offset = 0`, and the first palette index is `0x2020`. In vulnerable `tt_face_palette_set(face, 0)`, those exact fields make `p = table + 32896`, and the first `FT_NEXT_BYTE(p)` produces the saved 1-byte heap-buffer-overflow. This GT does not generalize beyond that exact witness."
+    }
+  }
+}

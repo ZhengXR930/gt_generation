@@ -1,0 +1,417 @@
+{
+  "sample_id": "arvo_36861",
+  "vuln_id": "ARVO arvo:36861",
+  "project": {
+    "id": "spice-usbredir",
+    "name": "spice-usbredir",
+    "repo": "https://gitlab.freedesktop.org/spice/usbredir.git",
+    "vulnerable_commit": "58f198e8d4ae36cc29b76c7a9f731021aa92f146",
+    "fixed_commit": "03c519ff5831ba75120e00ebebbf1d5a1f7220ab",
+    "fuzz_target": "usbredirparserfuzz (libFuzzer, ASan)"
+  },
+  "staged_source_snapshot": {
+    "path": "ARVO workspace container gt-arvo_36861-workspace:/src/spice-usbredir",
+    "commit": "58f198e8d4ae36cc29b76c7a9f731021aa92f146",
+    "description": "Stage 01 reproduced against this staged vulnerable snapshot. Its line map matches the saved ASan frames at `usbredirparser.c:1534`, `1590`, `1665`, `1712`, and `1720`, plus the crashing harness call site at `fuzzing/usbredirparserfuzz.cc:495`."
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416",
+    "access": "write",
+    "detector": "AddressSanitizer",
+    "classification_note": "The memory error is a stale interior-pointer write: `usbredirparser_serialize()` stores `write_buf_count_pos = pos`, later `serialize_data()` reallocates the serializer buffer, and the final count patch writes 4 bytes through that freed old pointer."
+  },
+  "bug_description": {
+    "original": "A use-after-free vulnerability exists in the serialization process when serializing parsers with large amounts of buffered write data, such as in cases of a slow or blocked write destination. The \"serialize_data\" function may reallocate the state buffer (default size 64kB, defined by USBREDIRPARSER_SERIALIZE_BUF_SIZE), causing the pointer to the write buffer count position to reference memory outside the buffer. This results in the number of write buffers being written as a 32-bit value to an invalid location. This issue is relevant during QEMU migrations, where the serializer is invoked under QEMU's I/O lock, and the value written depends on the number of outstanding buffers, which is influenced by timing and host system load.",
+    "original_source": "sample_info.json / patch.diff / sanitizer_trace.txt / exact staged vulnerable source / static decode of the saved `poc` under `FuzzedDataProvider` and the usbredir wire format",
+    "normalized": "The exact staged 71,298-byte witness drives `usbredirparserfuzz` with `init_flags = 0`, skips `try_unserialize()`, and later takes the post-`do_read()` serialize branch at `fuzzing/usbredirparserfuzz.cc:495`. Because `usbredirparser_fl_no_hello` is not set, `usbredirparser_init()` first queues its normal 80-byte hello write buffer. The valid front-of-buffer packet prefix then contains a hello packet at wire offset 44 whose capabilities word `0x49495d49` sets `usb_redir_cap_device_disconnect_ack`, followed by 4,089 valid `device_disconnect` packets before a malformed final hello header causes `usbredirparser_do_read()` to return `usbredirparser_read_parse_error`. Each disconnect auto-queues one 12-byte `device_disconnect_ack` buffer, so when line 495 calls `usbredirparser_serialize()` the parser still holds 4,090 pending write buffers total: the init hello plus 4,089 queued acks. The serializer allocates a 65,536-byte `state` buffer, stores `write_buf_count_pos = pos` as an interior pointer at byte offset 40, then serializes the pending buffers. Because `serialize_data()` adds a 4-byte length prefix to each queued buffer, the write-buffer section is `84 + 4089 * 16 = 65508` bytes, and with the 44-byte prelude the state grows to 65,552 bytes. A later `serialize_alloc()` therefore `realloc()`s the buffer and frees the original 65,536-byte region while `write_buf_count_pos` still points into it. After the loop recomputes `write_buf_count = 4090`, `memcpy(write_buf_count_pos, &write_buf_count, sizeof(int32_t))` performs the observed 4-byte heap-use-after-free write at `usbredirparser.c:1720`."
+  },
+  "source": {
+    "file": "usbredirparser/usbredirparser.c",
+    "function": "usbredirparser_handle_hello",
+    "line": 295,
+    "code": "parser->peer_caps[i] = peer_caps[i];",
+    "var": "parser->peer_caps[i]",
+    "description": "First project-code materialization of attacker-controlled state that governs the vulnerable buffering path. The incoming hello packet's capabilities word is copied into `parser->peer_caps[0]`; bit 3 enables automatic `device_disconnect_ack` queueing for later disconnect packets.",
+    "value_from": "In the exact staged 71,298-byte `poc`, the third valid packet starts at wire offset 44 and is a `hello` packet whose 4-byte capabilities payload at wire offset 120 is `49 5d 49 49` (`0x49495d49`). This loop copies that word into `parser->peer_caps[0]`.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "usbredirparser/usbredirparser.c",
+    "function": "usbredirparser_serialize",
+    "line": 1705,
+    "code": "write_buf_count_pos = pos;",
+    "var": "write_buf_count_pos, pos, state",
+    "description": "Root cause. `usbredirparser_serialize()` stores an absolute interior pointer into the current serialization buffer instead of a stable offset. If later `serialize_data()` grows the buffer with `realloc()`, this pointer is left dangling into the freed old allocation.",
+    "note": "The fixing commit changes `write_buf_count_pos` from `uint8_t *` to `ptrdiff_t`, stores `pos - state`, and patches the count back with `memcpy(state + write_buf_count_pos, ...)` so buffer relocation cannot stale the reference.",
+    "trace_step": 5
+  },
+  "sink": {
+    "file": "usbredirparser/usbredirparser.c",
+    "function": "usbredirparser_serialize",
+    "line": 1720,
+    "code": "memcpy(write_buf_count_pos, &write_buf_count, sizeof(int32_t));",
+    "var": "write_buf_count_pos, write_buf_count",
+    "description": "ASan crash site. After `serialize_alloc()` has reallocated `state`, this final 4-byte patch write still targets the old freed buffer through `write_buf_count_pos`.",
+    "note": "The saved ASan report records `WRITE of size 4` at `usbredirparser.c:1720` to an address 40 bytes inside the 65,536-byte region freed by `realloc` in `serialize_alloc`.",
+    "trace_step": 8
+  },
+  "tainted_value_origin": {
+    "file": "usbredirparser/usbredirparser.c",
+    "function": "usbredirparser_queue",
+    "line": 1179,
+    "line_end": 1180,
+    "code": "new_wbuf->buf = buf;\nnew_wbuf->len = header_len + type_header_len + data_len;",
+    "var": "new_wbuf->buf, new_wbuf->len",
+    "description": "Each attacker-induced `device_disconnect_ack` becomes a concrete queued write buffer here. On the witnessed path these calls create 4,089 12-byte ack buffers that later drive `usbredirparser_serialize()` past the initial 64 KiB slab."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_handle_hello",
+      "line": 295,
+      "code": "parser->peer_caps[i] = peer_caps[i];",
+      "description": "The witness's third valid packet is a `hello` packet, and its capabilities word is accepted into parser state. This is the point where the input has entered the usbredir protocol path far enough to enable later auto-generated disconnect acknowledgements."
+    },
+    "post_read_serialize": {
+      "file": "fuzzing/usbredirparserfuzz.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 495,
+      "code": "if (fdp->ConsumeBool() && try_serialize(parser.get()) != 0) {",
+      "description": "Static `FuzzedDataProvider` decoding of the exact witness shows the line-495 bool is true. Because this call runs before line 500's `usbredirparser_do_write()` drain loop, it serializes the still-queued init hello plus the 4,089 auto-generated disconnect-ack buffers."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_init",
+      "summary": "With `init_flags = 0`, parser initialization queues the normal outgoing hello buffer before any input is read."
+    },
+    {
+      "step": 2,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_handle_hello / usbredirparser_queue",
+      "summary": "The saved witness's incoming hello packet sets peer capability bit 3, and the valid packet prefix then contains 4,089 `device_disconnect` packets that each append one `device_disconnect_ack` buffer to `parser->write_buf`."
+    },
+    {
+      "step": 3,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_do_read / LLVMFuzzerTestOneInput",
+      "summary": "A malformed final header makes `usbredirparser_do_read()` return `usbredirparser_read_parse_error`, and the harness still takes the post-read `try_serialize()` branch before any queued output is drained."
+    },
+    {
+      "step": 4,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_serialize",
+      "summary": "Serialization allocates a 64 KiB state buffer, stores `write_buf_count_pos` as an interior pointer to the future count field, then serializes the pending hello and disconnect-ack buffers."
+    },
+    {
+      "step": 5,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "serialize_alloc / usbredirparser_serialize",
+      "summary": "The pending-output serialization exceeds 65,536 bytes, so `serialize_alloc()` reallocates the buffer and frees the old one; the final count patch then writes 4 bytes through the stale pointer and ASan reports a heap-use-after-free."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_handle_hello",
+      "line": 295,
+      "var": "parser->peer_caps[i]",
+      "code": "parser->peer_caps[i] = peer_caps[i];",
+      "note": "Source. The witness's third valid packet is a `hello` packet at wire offset 44. Its 4-byte capabilities payload `49 5d 49 49` is copied into `parser->peer_caps[0]`; bit 3 (`usb_redir_cap_device_disconnect_ack`) is set, enabling the later automatic ack-queue path for incoming `device_disconnect` packets.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_queue",
+      "line": 1179,
+      "line_end": 1206,
+      "var": "new_wbuf->buf, new_wbuf->len, parser->write_buf, parser->write_buf_count",
+      "code": "new_wbuf->buf = buf;\nnew_wbuf->len = header_len + type_header_len + data_len;\n...\nif (!parser->write_buf) {\n    parser->write_buf = new_wbuf;\n} else {\n    wbuf = parser->write_buf;\n    while (wbuf->next)\n        wbuf = wbuf->next;\n    wbuf->next = new_wbuf;\n}\nparser->write_buf_count++;",
+      "note": "When `usbredirparser_call_type_func()` sees each incoming `device_disconnect` and step 2's capability bit is set, it calls `usbredirparser_queue(..., usb_redir_device_disconnect_ack, ...)`. With 32-bit IDs and no payload, each such call creates a 12-byte ack buffer, links it onto `parser->write_buf`, and increments `parser->write_buf_count`. Static parsing of the valid packet prefix before the malformed final header finds 4,089 `device_disconnect` packets, so this step repeats 4,089 times.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "control",
+          "via": "usbredirparser_peer_has_cap(parser_pub, usb_redir_cap_device_disconnect_ack)"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "fuzzing/usbredirparserfuzz.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 486,
+      "line_end": 495,
+      "var": "ret",
+      "code": "switch (ret) {\ncase usbredirparser_read_parse_error:\n    // Keep reading\n    break;\ndefault:\n    log(\"usbredirparser_do_read failed: %d\\n\", ret);\n    goto out;\n}\n\nif (fdp->ConsumeBool() && try_serialize(parser.get()) != 0) {",
+      "note": "The valid packet prefix ends at wire offset 71176; the next 12-byte header claims `type = 0` and `length = 1229539657`, so `usbredirparser_do_read()` returns `usbredirparser_read_parse_error`. The harness explicitly keeps going on that return code, and static `FuzzedDataProvider` decoding of the exact witness shows the line-495 bool is true. Because `init_flags = 0`, `usbredirparser_init()` had already queued one 80-byte hello buffer at line 192, and line 500's `usbredirparser_do_write()` drain loop has not run yet. The subsequent `try_serialize()` therefore sees that pending hello plus step 2's 4,089 queued ack buffers.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "parser->write_buf_count"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_serialize",
+      "line": 1665,
+      "line_end": 1666,
+      "var": "state, pos, remain",
+      "code": "if (serialize_int(parser, &state, &pos, &remain,\n                               USBREDIRPARSER_SERIALIZE_MAGIC, \"magic\"))",
+      "note": "The first `serialize_int()` call invokes `serialize_alloc()` and allocates the 65,536-byte `state` buffer that ASan later reports as the original allocation site (`serialize_alloc:1534` via `serialize_int:1553`).",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "control",
+          "via": "fdp->ConsumeBool()"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_serialize",
+      "line": 1705,
+      "var": "write_buf_count_pos, pos, state",
+      "code": "write_buf_count_pos = pos;",
+      "note": "Root cause. After only the fixed prelude has been serialized, `pos - state == 40`, so this stores an absolute pointer to byte offset 40 of the current `state` buffer as the future `write_buf_count` slot. If `state` later moves, this interior pointer is not rebased.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "state and pos"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_serialize",
+      "line": 1712,
+      "line_end": 1714,
+      "var": "wbuf->buf, wbuf->len, state, pos, remain, write_buf_count_pos",
+      "code": "if (serialize_data(parser, &state, &pos, &remain,\n                   wbuf->buf + wbuf->pos, wbuf->len - wbuf->pos,\n                   \"write-buf\"))\n    return -1;",
+      "note": "Each pending write buffer is serialized as a 4-byte length plus its bytes. The pending init hello from line 192 contributes 84 serialized bytes, and step 2's 4,089 12-byte ack buffers contribute `4089 * 16 = 65424` bytes. With the 44-byte prelude already in place, the final serialized state reaches `44 + 84 + 65424 = 65552` bytes. A later `serialize_data()` call therefore enters `serialize_alloc()` again, `realloc()`s `state`, frees the original 65,536-byte region, and updates only `state` and `pos`, leaving `write_buf_count_pos` dangling into the freed old allocation.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "parser->write_buf_count"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "write_buf_count_pos"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "parser->write_buf"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_serialize",
+      "line": 1716,
+      "var": "write_buf_count",
+      "code": "write_buf_count++;",
+      "note": "The loop increments the local counter once for every serialized pending buffer. By loop exit the value is 4,090: the one init hello buffer from line 192 plus step 2's 4,089 queued disconnect acks. This is the 32-bit count later patched back into the serialization header.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "parser->write_buf_count"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "parser->write_buf"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_serialize",
+      "line": 1720,
+      "var": "write_buf_count_pos, write_buf_count",
+      "code": "memcpy(write_buf_count_pos, &write_buf_count, sizeof(int32_t));",
+      "note": "ASan sink. `write_buf_count_pos` still aliases byte offset 40 of the freed old `state` buffer from step 7, so patching the 32-bit count performs the observed 4-byte heap-use-after-free write.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "write_buf_count_pos"
+        },
+        {
+          "on": 6,
+          "type": "order",
+          "via": "free_before_use"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "write_buf_count"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "AddressSanitizer text report",
+    "sanitizer": "ASan",
+    "crash_type": "heap-use-after-free",
+    "access_type": "write",
+    "access_size": 4,
+    "crash_location": {
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_serialize",
+      "line": 1720
+    },
+    "runtime_crash_location": {
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "usbredirparser_serialize",
+      "line": 1720
+    },
+    "allocation_context": {
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "serialize_alloc",
+      "line": 1534
+    },
+    "free_context": {
+      "file": "usbredirparser/usbredirparser.c",
+      "function": "serialize_alloc",
+      "line": 1534
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "memcpy",
+        "file": "/usr/include/x86_64-linux-gnu/bits/string3.h",
+        "line": 53
+      },
+      {
+        "frame": 1,
+        "function": "usbredirparser_serialize",
+        "file": "usbredirparser/usbredirparser.c",
+        "line": 1720
+      },
+      {
+        "frame": 2,
+        "function": "try_serialize",
+        "file": "fuzzing/usbredirparserfuzz.cc",
+        "line": 400
+      },
+      {
+        "frame": 3,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzzing/usbredirparserfuzz.cc",
+        "line": 495
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "realloc",
+        "file": "/src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 164
+      },
+      {
+        "frame": 1,
+        "function": "serialize_alloc",
+        "file": "usbredirparser/usbredirparser.c",
+        "line": 1534
+      },
+      {
+        "frame": 2,
+        "function": "serialize_int",
+        "file": "usbredirparser/usbredirparser.c",
+        "line": 1553
+      },
+      {
+        "frame": 3,
+        "function": "usbredirparser_serialize",
+        "file": "usbredirparser/usbredirparser.c",
+        "line": 1665
+      },
+      {
+        "frame": 4,
+        "function": "try_serialize",
+        "file": "fuzzing/usbredirparserfuzz.cc",
+        "line": 400
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzzing/usbredirparserfuzz.cc",
+        "line": 495
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "realloc",
+        "file": "/src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 164
+      },
+      {
+        "frame": 1,
+        "function": "serialize_alloc",
+        "file": "usbredirparser/usbredirparser.c",
+        "line": 1534
+      },
+      {
+        "frame": 2,
+        "function": "serialize_data",
+        "file": "usbredirparser/usbredirparser.c",
+        "line": 1590
+      },
+      {
+        "frame": 3,
+        "function": "usbredirparser_serialize",
+        "file": "usbredirparser/usbredirparser.c",
+        "line": 1712
+      },
+      {
+        "frame": 4,
+        "function": "try_serialize",
+        "file": "fuzzing/usbredirparserfuzz.cc",
+        "line": 400
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzzing/usbredirparserfuzz.cc",
+        "line": 495
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "Step 6 aliases the same 65,536-byte `state` allocation created via `serialize_int -> serialize_alloc` at `1665 -> 1534` and invalidated by the `serialize_data -> serialize_alloc` reallocation at `1712 -> 1590 -> 1534`.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Feed the exact staged 71,298-byte `poc` file to `usbredirparserfuzz`. Static `FuzzedDataProvider` decoding of that witness yields `init_flags = 0`, `try_unserialize = false`, and the post-`do_read()` serialize branch at `fuzzing/usbredirparserfuzz.cc:495` as taken. The front-of-buffer packet prefix contains one `hello` packet with capability word `0x49495d49` followed by 4,089 valid `device_disconnect` packets before a malformed final header, so line 495 serializes the init hello plus 4,089 auto-generated `device_disconnect_ack` buffers and triggers the ASan heap-use-after-free write in `usbredirparser_serialize`.",
+    "format": {
+      "name": "raw libFuzzer byte stream for usbredirparserfuzz",
+      "contract": "Exactly the staged 71,298-byte `poc` file saved in `gt_results/arvo_36861/poc`. Under `usbredirparserfuzz`'s `FuzzedDataProvider` splitting, that witness specifically yields `init_flags = 0`, `try_unserialize = false`, the line-495 bool as true, a valid packet prefix containing a `hello` packet with peer capabilities `0x49495d49`, and 4,089 valid `device_disconnect` packets before a malformed final header. No broader input class is asserted."
+    }
+  }
+}

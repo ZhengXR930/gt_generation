@@ -1,0 +1,441 @@
+{
+  "sample_id": "arvo_42488098",
+  "vuln_id": "OSS-Fuzz issue 42488098 / ARVO arvo_42488098",
+  "project": {
+    "id": "fluent-bit",
+    "repo": "https://github.com/fluent/fluent-bit/",
+    "vulnerable_commit": "32588477159f5df8eda835c2d23edc4fce34f4b7",
+    "fixed_commit": "979a9bb728b490659e7e6076c17f3e4cb2c5bd59",
+    "metadata_vulnerable_commit": "e5289e606c4b55b0fac29046c8343958248189e7"
+  },
+  "staged_source_snapshot": {
+    "path": "gt_results/arvo_42488098/_work/src/fluent-bit",
+    "commit": "32588477159f5df8eda835c2d23edc4fce34f4b7",
+    "description": "Stage 01 reproduced the crash against this staged vulnerable checkout, and the line anchors below are grounded in this tree. The sample metadata names vulnerable commit `e5289e606c4b55b0fac29046c8343958248189e7`, but the prepared ARVO workspace is on the commit above; the staged `patch.diff` still edits the same vulnerable `flb_utils_write_str()` blocks present here."
+  },
+  "evidence_note": "Stage 02 used the staged `sample_info.json`, `patch.diff`, `sanitizer_trace.txt`, `default_crash_trace.txt`, `reproduction_report.json`, `trace_feedback.json`, the saved `poc`, and the staged vulnerable workspace under `_work/src`. A local static replay of the exact witness bytes identified the first parsed 15-entry MessagePack object and the exact crashing top-level key. `run_flags.json` keeps `runtime_disambiguation` false, so no instrumentation or reruns were performed.",
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-787"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42488098 (fluent-bit): Heap-buffer-overflow WRITE 1 found by fuzz target flb-it-fuzz-msgpack_parse_fuzzer_OSSFUZZ [asan]. https://issues.oss-fuzz.com/issues/42488098",
+    "original_source": "sample_info.json / patch.diff / sanitizer_trace.txt / default_crash_trace.txt / reproduction_report.json / trace_feedback.json / staged vulnerable source / staged poc bytes",
+    "normalized": "The staged 512-byte witness passes the harness `size == 512` gate, so `flb_msgpack_raw_to_json_sds()` computes `out_size = 768`, allocates one SDS with `alloc = 768`, and `msgpack_unpack_next()` parses the first 388 bytes as a 15-entry MessagePack map. When `flb_msgpack_to_json()` serializes that root object with logical payload limit `left = 767`, the crashing `MSGPACK_OBJECT_STR` at `msgpack2json:528` is the top-level map key at index 9 (the 10th pair) with raw bytes `e0e0e000012a0200a50200a5888888f288888800`. `msgpack2json()` has already emitted that key's opening quote at output offset 723, so `flb_utils_write_str()` enters the same call with `*off = 724` and `available = 43`. In that call, control-byte escapes for bytes 3/4/6/7/9/10 plus the literal `'*'` move the cursor to 761 and `written` to 37. On the staged x86_64 clang build there is no staged `-funsigned-char` override, so `uint32_t c = (uint32_t) str[i];` sign-extends byte 15 `0xf2` to `0xfffffff2` and the valid UTF-8 sequence `f2 88 88 88` enters the `c > 0xFFFF` branch. `flb_utf8_decode()` still produces `codepoint = 0x88208`, and the vulnerable line-710 `snprintf(..., \"\\\\u%04x\", codepoint)` checks only for 6 bytes beforehand but returns `len = 7` for `\\\\u88208`, so copying that escape moves `p` to 768 and makes `written = 44 > available = 43`. The later `available - written` guard is a `size_t` subtraction, so it wraps instead of rejecting the trailing byte 19 `0x00`; the control-byte branch at `flb_utils_write_str:650` then starts a 6-byte `\\\\u0000` copy at offset 768, and its second byte is the first write at offset 769 outside the 769-byte SDS user area inside ASan's 785-byte allocation. The fix adds `if ((available - written) < len) return FLB_FALSE;` after each escape `snprintf`, preventing the overlong `\\\\u88208` copy and the wrapped line-650 control escape that follows it."
+  },
+  "source": {
+    "file": "src/flb_pack.c",
+    "function": "flb_msgpack_raw_to_json_sds",
+    "line": 670,
+    "var": "in_size, out_size",
+    "code": "out_size = in_size * 1.5;",
+    "description": "First project statement on the vulnerable path that consumes attacker-controlled input and creates the initial JSON output budget from it.",
+    "value_from": "The staged witness has sha256 `d3e8f165bab403043f6787e79001a2ddebac6dfd5ef113ce4c7dd58d1c78bc23` and the harness only calls this path when `size == 512`. This statement therefore materializes `out_size = 768`, which becomes the vulnerable buffer extent later walked by the crashing serializer.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "src/flb_utils.c",
+    "function": "flb_utils_write_str",
+    "line": 710,
+    "var": "len, codepoint",
+    "code": "len = snprintf(tmp, sizeof(tmp) - 1, \"\\\\u%04x\", codepoint);",
+    "description": "Root cause. On the exact crashing key, byte 15 `0xf2` reaches `const char *str` without unsigned normalization, so `uint32_t c = (uint32_t) str[i];` sign-extends it to `0xfffffff2` and the call takes the `c > 0xFFFF` branch. `flb_utf8_decode()` still resolves bytes `f2 88 88 88` to `0x88208`, so this `snprintf` returns 7 for `\\\\u88208` after only a 6-byte availability check. The patch adds `if ((available - written) < len) return FLB_FALSE;` immediately after this line and duplicates the same obligation at the sibling `\\\\u%.4x` and `\\\\u%.4hhx` escape sites.",
+    "trace_step": 7
+  },
+  "sink": {
+    "file": "src/flb_utils.c",
+    "function": "flb_utils_write_str",
+    "line": 650,
+    "var": "p, tmp, len",
+    "code": "encoded_to_buf(p, tmp, len);",
+    "description": "Closest project sink to the ASan crash. The final control-byte escape copy executes after the remaining-space arithmetic has wrapped, so the `\\\\u0000` write starts at the last in-bounds byte and immediately continues past the end of the original SDS allocation.",
+    "note": "The saved sanitizer trace reports the top frame in `encoded_to_buf` at `src/flb_utils.c:577`, but the callsite that decides to perform the overflowing copy is this line in `flb_utils_write_str()`.",
+    "trace_step": 10
+  },
+  "tainted_value_origin": {
+    "file": "src/flb_pack.c",
+    "function": "flb_msgpack_raw_to_json_sds",
+    "line": 660,
+    "var": "in_buf, in_size",
+    "code": "flb_sds_t flb_msgpack_raw_to_json_sds(const void *in_buf, size_t in_size)",
+    "description": "The raw fuzzer buffer and its length enter project code here. `in_size` defines the initial SDS budget, and `in_buf` is later parsed into the MessagePack object tree whose exact top-level key bytes reach the crashing escape path."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_raw_to_json_sds",
+      "line": 684,
+      "code": "root = &result.data;",
+      "description": "At this point `msgpack_unpack_next()` has already accepted the witness's first MessagePack object and project code has entered the JSON-conversion path that later reaches `flb_utils_write_str()`."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_raw_to_json_sds",
+      "summary": "The raw 512-byte witness fixes the initial serializer budget (`out_size = 768`), allocates one SDS buffer, and `msgpack_unpack_next()` parses the first 388 bytes as a 15-entry root map."
+    },
+    {
+      "step": 2,
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_to_json / msgpack2json",
+      "summary": "JSON serialization starts with logical limit `left = 767`, and the root map walker reaches the top-level key at map index 9 (`e0e0e000012a0200a50200a5888888f288888800`), calling `flb_utils_write_str()` on it after writing the opening quote at offset 723."
+    },
+    {
+      "step": 3,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "summary": "Inside that same key call, invalid UTF-8 runs are skipped, while control bytes 3/4/6/7/9/10 and the literal `'*'` advance the cursor from 724 to 761 and leave only 6 logical bytes before the checked budget is exhausted."
+    },
+    {
+      "step": 4,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "summary": "The valid UTF-8 sequence `f2 88 88 88` reaches `c = (uint32_t) str[i]` as sign-extended `0xfffffff2`, so the `c > 0xFFFF` branch at line 710 decodes `0x88208` and emits `\\\\u88208` of length 7 after only a 6-byte precheck, pushing `written` past `available`."
+    },
+    {
+      "step": 5,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str / encoded_to_buf",
+      "summary": "The key's trailing byte `0x00` then re-enters the control-byte escape with wrapped `available - written`, and `encoded_to_buf()` starts `\\\\u0000` at offset 768 so the second byte lands just past the SDS allocation reported by ASan."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_raw_to_json_sds",
+      "line": 670,
+      "var": "in_size, out_size",
+      "code": "out_size = in_size * 1.5;",
+      "note": "Source. The harness admits only the exact 512-byte witness, so this first project-side use of attacker-controlled input materializes `out_size = 768` as the initial JSON buffer budget for the vulnerable conversion path."
+    },
+    {
+      "step": 2,
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_raw_to_json_sds",
+      "line": 671,
+      "var": "out_buf",
+      "code": "out_buf = flb_sds_create_size(out_size);",
+      "note": "The derived budget is allocated as one SDS string. `flb_sds_create_size(768)` yields `alloc = 768` plus one terminator byte; together with the SDS header this is the 785-byte heap region named by ASan, and all later serializer writes target this same `out_buf`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "out_size"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_raw_to_json_sds",
+      "line": 678,
+      "var": "result.data, off",
+      "code": "ret = msgpack_unpack_next(&result, in_buf, in_size, &off);",
+      "note": "The same raw buffer is parsed into the first MessagePack object that `msgpack2json()` will walk. A static replay of the saved bytes shows this call consumes the first 388 bytes as a 15-entry map, and that its top-level map key at index 9 has raw bytes `e0e0e000012a0200a50200a5888888f288888800`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "in_size"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_to_json",
+      "line": 655,
+      "var": "off, json_size - 1",
+      "code": "ret = msgpack2json(json_str, &off, json_size - 1, obj);",
+      "note": "The serializer enters `msgpack2json()` with logical payload limit `left = json_size - 1 = 767` on the SDS from step 2. The saved stack frame at `msgpack2json:616` shows the later crash occurs while this root map is being walked under that shared `off` and `left` budget.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "out_buf"
+        },
+        {
+          "on": 1,
+          "type": "data",
+          "via": "out_size"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "result.data"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/flb_pack.c",
+      "function": "msgpack2json",
+      "line": 528,
+      "var": "o->via.str.ptr, o->via.str.size, *off, left, available",
+      "code": "try_to_write_str(buf, off, left, o->via.str.ptr, o->via.str.size)",
+      "note": "At frame `msgpack2json:528`, the exact crashing `MSGPACK_OBJECT_STR` is the top-level root-map key at index 9 (10th pair) with bytes `e0e0e000012a0200a50200a5888888f288888800`. `msgpack2json()` has just emitted that key's opening quote at output offset 723, so `flb_utils_write_str()` receives this key with `*off = 724`, `size = left = 767`, and `available = 43`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "result.data"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "off"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "left"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 649,
+      "line_end": 651,
+      "var": "c, len, p, written",
+      "code": "len = snprintf(tmp, sizeof(tmp) - 1, \"\\\\u%.4hhx\", (unsigned char) c);\\nencoded_to_buf(p, tmp, len);\\np += len;",
+      "note": "In the same call, bytes 0-2 and 8/11-14 are skipped as invalid UTF-8 without advancing `p`; control bytes 3/4/6/7/9/10 take this branch and the intervening byte 5 `'*'` stays literal. Those transformations move the cursor from 724 to 761 and raise `written` from 0 to 37 before the later UTF-8 escape is attempted.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "o->via.str.ptr"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "c < 32 || c == 0x7f"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 710,
+      "var": "len, codepoint",
+      "code": "len = snprintf(tmp, sizeof(tmp) - 1, \"\\\\u%04x\", codepoint);",
+      "note": "Root cause. Still in the same key call, byte 15 `0xf2` reaches `uint32_t c = (uint32_t) str[i];` through plain `char`, so on the staged build it sign-extends to `0xfffffff2` and enters the `c > 0xFFFF` branch. `flb_utf8_len()` still reads bytes 15-18 `f2 88 88 88` as one 4-byte UTF-8 sequence and `flb_utf8_decode()` resolves `codepoint = 0x88208`. The guard immediately above only checked `(available - written) < 6`, which passes because step 6 left exactly 6 bytes, but this `snprintf` returns `len = 7` for `\\\\u88208`.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "o->via.str.ptr"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "available"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "written"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 711,
+      "line_end": 712,
+      "var": "p, len",
+      "code": "encoded_to_buf(p, tmp, len);\\np += len;",
+      "note": "The unchecked Unicode escape from step 7 copies 7 bytes at output offsets 761 through 767 and leaves `p = 768`, one byte farther than the six-byte check budget allowed.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "p"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "len"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 719,
+      "var": "available, written",
+      "code": "written = (p - (buf + *off));",
+      "note": "After step 8, `written` becomes 44 while the call's `available` from step 5 remained 43. The next guard reuses `available - written` as a `size_t`, so the subtraction wraps instead of going negative and no longer blocks later escapes in this same `flb_utils_write_str()` invocation.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "available"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "p"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 650,
+      "var": "p, tmp, len",
+      "code": "encoded_to_buf(p, tmp, len);",
+      "note": "Sink. The trailing key byte 19 `0x00` re-enters the control-byte branch at line 649 after step 9 wrapped the remaining-space arithmetic. `encoded_to_buf()` starts the 6-byte `\\\\u0000` copy at output offset 768; the first byte uses the last in-bounds terminator slot and the second byte lands at offset 769, matching ASan's first out-of-bounds write in `encoded_to_buf:577`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "out_buf"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "o->via.str.ptr"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "(available - written) < 6"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "AddressSanitizer",
+    "trace_format": "asan",
+    "sanitizer": "address",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "WRITE",
+    "access_size": 1,
+    "crash_location": {
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 650
+    },
+    "runtime_crash_location": {
+      "file": "src/flb_utils.c",
+      "function": "encoded_to_buf",
+      "line": 577
+    },
+    "allocation_context": {
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_raw_to_json_sds",
+      "line": 671
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "encoded_to_buf",
+        "file": "src/flb_utils.c",
+        "line": 577
+      },
+      {
+        "frame": 1,
+        "function": "flb_utils_write_str",
+        "file": "src/flb_utils.c",
+        "line": 650
+      },
+      {
+        "frame": 2,
+        "function": "msgpack2json",
+        "file": "src/flb_pack.c",
+        "line": 528
+      },
+      {
+        "frame": 3,
+        "function": "msgpack2json",
+        "file": "src/flb_pack.c",
+        "line": 616
+      },
+      {
+        "frame": 4,
+        "function": "flb_msgpack_to_json",
+        "file": "src/flb_pack.c",
+        "line": 655
+      },
+      {
+        "frame": 5,
+        "function": "flb_msgpack_raw_to_json_sds",
+        "file": "src/flb_pack.c",
+        "line": 686
+      },
+      {
+        "frame": 6,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/internal/fuzzers/msgpack_parse_fuzzer.c",
+        "line": 12
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 145
+      },
+      {
+        "frame": 1,
+        "function": "flb_malloc",
+        "file": "include/fluent-bit/flb_mem.h",
+        "line": 62
+      },
+      {
+        "frame": 2,
+        "function": "sds_alloc",
+        "file": "src/flb_sds.c",
+        "line": 40
+      },
+      {
+        "frame": 3,
+        "function": "flb_sds_create_size",
+        "file": "src/flb_sds.c",
+        "line": 92
+      },
+      {
+        "frame": 4,
+        "function": "flb_msgpack_raw_to_json_sds",
+        "file": "src/flb_pack.c",
+        "line": 671
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/internal/fuzzers/msgpack_parse_fuzzer.c",
+        "line": 12
+      }
+    ],
+    "free_stack": [],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "Yes at buffer level: the missing post-`snprintf` length check acts on the same `out_buf` and cursor budget whose original allocation appears at `flb_msgpack_raw_to_json_sds:671`.",
+      "trace_consistent_with_stack": "Yes. Static replay of the exact witness identifies frame `msgpack2json:528` as serialization of the top-level root-map key at index 9 (`e0e0e000012a0200a50200a5888888f288888800`), reached from the enclosing map walker at `msgpack2json:616`; within that same `flb_utils_write_str()` call, signed promotion of byte `0xf2` selects the line-710 `\\\\u%04x` branch, the overlong `\\\\u88208` copy advances the cursor to 768, and the trailing `0x00` then hits the saved sink `flb_utils_write_str:650 -> encoded_to_buf:577`.",
+      "tainted_value_reaches_sink": "Yes. The exact top-level key bytes `e0e0e000012a0200a50200a5888888f288888800` from the saved witness supply both the control bytes and the valid `f2 88 88 88` UTF-8 sequence whose leading byte is sign-extended into the `c > 0xFFFF` branch, driving the same `flb_utils_write_str()` call from `msgpack2json:528` through the overlong escape to the final line-650 overflow."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run executed `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_42488098 run --version vulnerable --expect crash`, fed the staged `poc` to `/out/flb-it-fuzz-msgpack_parse_fuzzer_OSSFUZZ`, and reproduced `AddressSanitizer: heap-buffer-overflow WRITE of size 1` in `encoded_to_buf -> flb_utils_write_str -> msgpack2json`.",
+    "format": {
+      "name": "512-byte raw input for `flb-it-fuzz-msgpack_parse_fuzzer_OSSFUZZ`",
+      "contract": "Exactly the staged 512-byte witness `poc` with sha256 `d3e8f165bab403043f6787e79001a2ddebac6dfd5ef113ce4c7dd58d1c78bc23`. The harness rejects all other sizes. Static replay of this exact witness parses a 15-entry root map whose top-level key at index 9 is `e0e0e000012a0200a50200a5888888f288888800`; when serialized, that same key reaches `flb_utils_write_str()` with `*off = 724`, expands control bytes to offset 761, enters the sign-extended line-710 `\\\\u%04x` branch for bytes `f2 88 88 88`, emits the overlong `\\\\u88208` escape, and then overflows on the key's trailing `0x00`. The staged evidence grounds this exact witness and this exact parsed-key layout only; it does not prove a broader class of MessagePack inputs."
+    }
+  }
+}

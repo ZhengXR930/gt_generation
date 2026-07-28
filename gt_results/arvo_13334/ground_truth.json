@@ -1,0 +1,529 @@
+{
+  "sample_id": "arvo_13334",
+  "vuln_id": "OSS-Fuzz issue 13334 / ARVO arvo:13334",
+  "project": {
+    "id": "openthread",
+    "name": "OpenThread",
+    "repo": "https://github.com/openthread/openthread",
+    "vulnerable_commit": "d912393c7f055333378ba80ba5ae3ddcf0e4be02",
+    "fixed_commit": "a3548df579617e737b075be4a88591e68195e115",
+    "fuzz_target": "radio-receive-done-fuzzer (libFuzzer_openthread_radio-receive-done-fuzzer, ASan)"
+  },
+  "classification": {
+    "class": "stack-buffer-overflow",
+    "cwe": "CWE-787",
+    "access": "write",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed report: https://oss-fuzz.com/testcase?key=5765994272784384 Project: openthread Fuzzer: libFuzzer_openthread_radio-receive-done-fuzzer Fuzz target binary: radio-receive-done-fuzzer Job Type: libfuzzer_asan_openthread Platform Id: linux Crash Type: Stack-buffer-overflow WRITE {*} Crash Address: 0x7f3967be0fc8 Crash State: ot::NetworkData::NetworkData::GetNextOnMeshPrefix ot::Dhcp6::Dhcp6Client::UpdateAddresses ot::Mle::Mle::HandleStateChanged Sanitizer: address (ASAN) Recommended Security Severity: High Regressed: https://oss-fuzz.com/revisions?job=libfuzzer_asan_openthread&range=201902220245:201902230250 Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=5765994272784384 Issue filed automatically. See https://github.com/google/oss-fuzz/blob/master/docs/reproducing.md for instructions to reproduce this bug locally. This bug is subject to a 90 day disclosure deadline. If 90 days elapse without an upstream patch, then the bug report will automatically become visible to the public. When you fix this bug, please * mention the fix revision(s). * state whether the bug was a short-lived regression or an old bug in any stable releases. * add any other useful information. This information can help downstream consumers. If you need to contact the OSS-Fuzz team with a question, concern, or any other feedback, please file an issue at https://github.com/google/oss-fuzz/issues.",
+    "original_source": "ARVO-Meta.report.comments[0].content",
+    "normalized": "The exact staged 68-byte radio witness drives OpenThread's leader-side Server Data registration path and supplies a Thread Network Data Prefix TLV whose encoded prefix length expands to 25 bytes under `BitVectorBytes(...)`. During `Leader::RegisterNetworkData` and later `AddPrefix`, OpenThread calls the vulnerable `PrefixTlv::IsValid()`, but that helper only checks TLV-internal length consistency and never enforces the patch's missing bound `BitVectorBytes(mPrefixLength) <= sizeof(Ip6::Address)`. On the fresh leader instance created by the harness, leader network data contains only commissioning data, so `AddBorderRouter` finds no matching stored Prefix TLV, allocates a new Prefix TLV and BorderRouter TLV in `mTlvs`, and copies the malformed prefix length and BorderRouter entry into that persisted state. The later `Mle::HandleStateChanged -> Dhcp6Client::UpdateAddresses` refresh iterates on-mesh prefixes, and `NetworkData::GetNextOnMeshPrefix` executes `memcpy(&config.mPrefix.mPrefix, prefix->GetPrefix(), BitVectorBytes(prefix->GetPrefixLength()))` on stack local `config`. For this witness the byte count is 25, so the copy overruns the 16-byte `config.mPrefix.mPrefix` field and writes 1 byte past the 24-byte stack `otBorderRouterConfig` object, matching the saved ASan stack-buffer-overflow WRITE of size 25 at `network_data.cpp:138`. The fixing commit tightens `PrefixTlv::IsValid()` with exactly that missing upper bound, so the malformed prefix would be rejected during registration before `AddBorderRouter` can persist the bad prefix state and before `OT_CHANGED_THREAD_NETDATA` reaches the crashing DHCP6 refresh."
+  },
+  "source": {
+    "file": "src/core/thread/network_data_leader_ftd.cpp",
+    "function": "Leader::RegisterNetworkData",
+    "line": 759,
+    "var": "aTlvs, aTlvsLength",
+    "code": "SuccessOrExit(error = RlocLookup(aRloc16, rlocIn, rlocStable, aTlvs, aTlvsLength, kMatchModeRloc16, /* aAllowOtherEntries */ false));",
+    "description": "First direct project-side consumption of the attacker-controlled Thread Network Data TLV payload on the vulnerability path. Leader registration starts parsing the raw network-data byte span that came from the received Server Data message.",
+    "value_from": "The exact staged 68-byte `poc` is injected as `frame.mPsdu` into `otPlatRadioReceiveDone`. After OpenThread's radio, IPv6, CoAP, and Thread TLV parsing, `Leader::HandleServerData` extracts a valid `ThreadNetworkDataTlv` from the message and forwards `networkData.GetTlvs()` / `networkData.GetLength()` as `aTlvs` / `aTlvsLength` into `RegisterNetworkData`.",
+    "note": "This source is the first bug-relevant project statement after the earlier packet/container parsing has admitted a Thread Network Data TLV.",
+    "trace_step": 1
+  },
+  "tainted_value_origin": {
+    "file": "src/core/thread/network_data_leader_ftd.cpp",
+    "function": "Leader::RlocLookup",
+    "line": 468,
+    "var": "prefix->mPrefixLength",
+    "code": "prefix = static_cast<PrefixTlv *>(cur);",
+    "description": "The current attacker-controlled Prefix TLV entry inside `aTlvs`; its stored `mPrefixLength` field is the tainted value later expanded by `BitVectorBytes(...)` into the 25-byte copy span."
+  },
+  "sink": {
+    "file": "src/core/thread/network_data.cpp",
+    "function": "NetworkData::GetNextOnMeshPrefix",
+    "line": 138,
+    "var": "aConfig->mPrefix.mPrefix, prefix->GetPrefixLength()",
+    "code": "memcpy(&aConfig->mPrefix.mPrefix, prefix->GetPrefix(), BitVectorBytes(prefix->GetPrefixLength()));",
+    "description": "ASan sink. `GetNextOnMeshPrefix` copies `BitVectorBytes(prefix->GetPrefixLength())` bytes from the stored malformed Prefix TLV into the stack-local `otBorderRouterConfig config`, but the destination field `mPrefix.mPrefix` is only a 16-byte IPv6 address.",
+    "note": "Stage 01 reproduces `WRITE of size 25` here. Because `config` is a 24-byte stack object and `mPrefix.mPrefix` starts at its beginning, the 25-byte memcpy overwrites 9 bytes beyond the 16-byte address field and 1 byte past the end of `config` itself.",
+    "trace_step": 16
+  },
+  "root_cause": {
+    "file": "src/core/thread/network_data_leader_ftd.cpp",
+    "function": "Leader::RlocLookup",
+    "line": 469,
+    "var": "prefix",
+    "code": "VerifyOrExit(prefix->IsValid(), error = OT_ERROR_PARSE);",
+    "description": "Executed admission check that lets the malformed Prefix TLV survive registration. In the vulnerable commit, `PrefixTlv::IsValid()` only checks TLV-internal length consistency and does not require `BitVectorBytes(mPrefixLength) <= sizeof(Ip6::Address)`, so an oversized prefix length still passes validation.",
+    "note": "The fixing diff adds `&& (BitVectorBytes(mPrefixLength) <= sizeof(Ip6::Address))` inside `PrefixTlv::IsValid()`. With that extra conjunct, this `VerifyOrExit` would reject the witness before `AddNetworkData` persists the prefix and before `OT_CHANGED_THREAD_NETDATA` triggers the later crash.",
+    "trace_step": 3
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::HandleServerData",
+      "line": 172,
+      "statement": "RegisterNetworkData(HostSwap16(aMessageInfo.mPeerAddr.mFields.m16[7]), networkData.GetTlvs(), networkData.GetLength());",
+      "code": "RegisterNetworkData(HostSwap16(aMessageInfo.mPeerAddr.mFields.m16[7]), networkData.GetTlvs(), networkData.GetLength());",
+      "description": "The received CoAP Server Data message has already passed Thread TLV lookup and `networkData.IsValid()`, so execution now enters leader-side network-data registration on the attacker-controlled Thread Network Data TLV payload."
+    },
+    "fresh_leader_state": {
+      "file": "src/core/thread/mle_router.cpp",
+      "function": "MleRouter::BecomeLeader",
+      "line": 194,
+      "statement": "netif.GetNetworkDataLeader().Reset();",
+      "code": "netif.GetNetworkDataLeader().Reset();",
+      "description": "The harness creates a fresh `otInstance` for each input and immediately calls `otThreadBecomeLeader()`. `BecomeLeader()` resets leader network data to `mLength = 0` and then `SetEmptyCommissionerData()` seeds only a Commissioning Data TLV, so no stored Prefix TLV exists before the attacker frame reaches Server Data registration."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "tests/fuzz/radio_receive_done.cpp",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness copies the exact staged 68-byte witness into `frame.mPsdu`, calls `otPlatRadioReceiveDone`, and then processes queued tasklets until the reproduced crash occurs."
+    },
+    {
+      "step": 2,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::HandleServerData",
+      "summary": "Leader-side Server Data handling extracts a Thread Network Data TLV from the received message and forwards its raw TLV payload into `RegisterNetworkData`."
+    },
+    {
+      "step": 3,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::RegisterNetworkData",
+      "summary": "On the fresh leader instance created by the harness, registration parses the incoming Prefix TLV, both weak `PrefixTlv::IsValid()` checks accept it, `FindPrefix` misses because leader netdata still contains only commissioning data, and `AddBorderRouter` allocates/stores a new malformed Prefix TLV plus copied BorderRouter entry in `mTlvs`."
+    },
+    {
+      "step": 4,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::RegisterNetworkData",
+      "summary": "After persisting the malformed prefix and BorderRouter sub-TLV state, leader registration signals `OT_CHANGED_THREAD_NETDATA`, making the bad stored network data visible to later consumers."
+    },
+    {
+      "step": 5,
+      "file": "src/core/net/dhcp6_client.cpp",
+      "function": "Dhcp6Client::UpdateAddresses",
+      "summary": "The netdata-change notifier drives `Mle::HandleStateChanged`, which invokes `UpdateAddresses`; that refresh iterates on-mesh prefixes into stack `otBorderRouterConfig config`."
+    },
+    {
+      "step": 6,
+      "file": "src/core/thread/network_data.cpp",
+      "function": "NetworkData::GetNextOnMeshPrefix",
+      "summary": "The no-filter iterator re-reads the stored malformed Prefix TLV and copied BorderRouter entry, zeros stack `config`, and then memcpy's 25 bytes into the 16-byte `config.mPrefix.mPrefix` field, producing the reproduced ASan stack-buffer-overflow write."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::RegisterNetworkData",
+      "line": 759,
+      "line_end": 760,
+      "var": "aTlvs, aTlvsLength",
+      "code": "SuccessOrExit(error = RlocLookup(aRloc16, rlocIn, rlocStable, aTlvs, aTlvsLength, kMatchModeRloc16,\n                                     /* aAllowOtherEntries */ false));",
+      "note": "Source. Leader registration begins validating the attacker-controlled Thread Network Data TLV byte span `aTlvs` / `aTlvsLength` that was extracted from the received Server Data message.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::RlocLookup",
+      "line": 468,
+      "var": "prefix",
+      "code": "prefix = static_cast<PrefixTlv *>(cur);",
+      "note": "The current network-data entry is reinterpreted as a `PrefixTlv`, exposing its attacker-controlled `mPrefixLength` and prefix bytes to the leader-side validator.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "aTlvs"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::RlocLookup",
+      "line": 469,
+      "var": "prefix",
+      "code": "VerifyOrExit(prefix->IsValid(), error = OT_ERROR_PARSE);",
+      "note": "Root cause. This executed admission gate accepts the malformed prefix because vulnerable `PrefixTlv::IsValid()` only requires the TLV length to cover `BitVectorBytes(mPrefixLength)` plus header bytes; it does not enforce the fixed bound `BitVectorBytes(mPrefixLength) <= sizeof(Ip6::Address)`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "prefix"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::AddPrefix",
+      "line": 852,
+      "var": "aPrefix",
+      "code": "VerifyOrExit(aPrefix.IsValid(), error = OT_ERROR_PARSE);",
+      "note": "The same weak `PrefixTlv::IsValid()` predicate is evaluated again on the storage path. Because it still lacks the `BitVectorBytes(mPrefixLength) <= sizeof(Ip6::Address)` bound, the malformed prefix is not rejected before `AddBorderRouter` runs.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "same Prefix TLV bytes"
+        },
+        {
+          "on": 3,
+          "type": "control",
+          "via": "previous prefix->IsValid() admission"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::AddBorderRouter",
+      "line": 1103,
+      "var": "dstPrefix, dstBorderRouter",
+      "code": "if ((dstPrefix = FindPrefix(aPrefix.GetPrefix(), aPrefix.GetPrefixLength())) != NULL)",
+      "note": "Fresh-state miss. The staged harness delivers the frame to a new `otInstance`; `BecomeLeader()` resets leader netdata to `mLength = 0`, then `SetEmptyCommissionerData()` seeds only a commissioning-data TLV. `FindPrefix` returns only `kTypePrefix` matches, so no stored prefix matches the attacker bytes here; `dstPrefix` stays `NULL`, and the guarded `FindBorderRouter(...)` assignment is skipped so `dstBorderRouter` remains `NULL`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "aPrefix.GetPrefix(), aPrefix.GetPrefixLength()"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "aPrefix.IsValid()"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::AddBorderRouter",
+      "line": 1111,
+      "var": "appendLength, aPrefix.GetPrefixLength()",
+      "code": "appendLength += sizeof(PrefixTlv) + BitVectorBytes(aPrefix.GetPrefixLength());",
+      "note": "Because `dstPrefix == NULL`, AddBorderRouter reserves a new Prefix TLV payload sized as `sizeof(PrefixTlv) + BitVectorBytes(aPrefix.GetPrefixLength())`. For this witness the derived prefix span is 25 bytes, the same tainted copy size later used at the crash.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "aPrefix.GetPrefixLength()"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "dstPrefix == NULL"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::AddBorderRouter",
+      "line": 1136,
+      "line_end": 1138,
+      "var": "dstPrefix, aPrefix.GetPrefixLength(), aPrefix.GetPrefix()",
+      "code": "dstPrefix = reinterpret_cast<PrefixTlv *>(mTlvs + mLength);\nInsert(reinterpret_cast<uint8_t *>(dstPrefix), sizeof(PrefixTlv) + BitVectorBytes(aPrefix.GetPrefixLength()));\ndstPrefix->Init(aPrefix.GetDomainId(), aPrefix.GetPrefixLength(), aPrefix.GetPrefix());",
+      "note": "A new leader-side Prefix TLV is inserted at the end of `mTlvs`. `Init` stores the oversized `mPrefixLength` and copies the corresponding 25 prefix bytes, materializing the malformed prefix state later re-read by DHCP6 iteration.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "aPrefix.GetPrefix(), aPrefix.GetPrefixLength()"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "dstPrefix == NULL"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "appendLength"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::AddBorderRouter",
+      "line": 1155,
+      "line_end": 1167,
+      "var": "dstBorderRouter, dstPrefix, aBorderRouter.GetEntry(0)",
+      "code": "if (dstBorderRouter == NULL)\n{\n    dstBorderRouter = static_cast<BorderRouterTlv *>(dstPrefix->GetNext());\n    Insert(reinterpret_cast<uint8_t *>(dstBorderRouter), sizeof(BorderRouterTlv));\n    dstPrefix->SetLength(dstPrefix->GetLength() + sizeof(BorderRouterTlv));\n    dstBorderRouter->Init();\n}\n\nInsert(reinterpret_cast<uint8_t *>(dstBorderRouter->GetNext()), sizeof(BorderRouterEntry));\ndstBorderRouter->SetLength(dstBorderRouter->GetLength() + sizeof(BorderRouterEntry));\ndstPrefix->SetLength(dstPrefix->GetLength() + sizeof(BorderRouterEntry));\nmemcpy(dstBorderRouter->GetEntry(dstBorderRouter->GetNumEntries() - 1), aBorderRouter.GetEntry(0),\n       sizeof(BorderRouterEntry));",
+      "note": "Because step 5 left `dstBorderRouter` at its initialized `NULL`, the function allocates a new BorderRouter TLV behind the stored prefix, grows the prefix/sub-TLV lengths, and copies the incoming `BorderRouterEntry` into leader `mTlvs`. That copied entry is what the later iterator matches before the sink copy.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "aTlvs (incoming BorderRouter sub-TLV)"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "dstBorderRouter == NULL"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "dstPrefix"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/core/thread/network_data_leader_ftd.cpp",
+      "function": "Leader::RegisterNetworkData",
+      "line": 797,
+      "var": "mTlvs, mLength",
+      "code": "GetNotifier().Signal(OT_CHANGED_THREAD_NETDATA);",
+      "note": "After storing the malformed prefix and copied BorderRouter entry in leader network data, registration signals `OT_CHANGED_THREAD_NETDATA`, exposing that persisted state to later consumers.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "mTlvs"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/core/thread/mle.cpp",
+      "function": "Mle::HandleStateChanged",
+      "line": 1518,
+      "var": "OT_CHANGED_THREAD_NETDATA",
+      "code": "GetNetif().GetDhcp6Client().UpdateAddresses();",
+      "note": "The network-data change notifier reaches MLE state handling and triggers DHCPv6 address refresh; the saved ASan stack directly witnesses this caller above the crash.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "control",
+          "via": "(aFlags & OT_CHANGED_THREAD_NETDATA) != 0"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/core/net/dhcp6_client.cpp",
+      "function": "Dhcp6Client::UpdateAddresses",
+      "line": 117,
+      "var": "iterator, config",
+      "code": "while (otNetDataGetNextOnMeshPrefix(&GetInstance(), &iterator, &config) == OT_ERROR_NONE)",
+      "note": "UpdateAddresses iterates on-mesh prefixes into local stack `otBorderRouterConfig config`. ASan identifies this stack object at line 78 occupying `[48,72)`, so `&config` is the exact destination later overrun.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "control",
+          "via": "(aFlags & OT_CHANGED_THREAD_NETDATA) != 0"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/core/thread/network_data.cpp",
+      "function": "NetworkData::GetNextOnMeshPrefix",
+      "line": 88,
+      "var": "aRloc16, aConfig",
+      "code": "return GetNextOnMeshPrefix(aIterator, Mac::kShortAddrBroadcast, aConfig);",
+      "note": "The overload used by `UpdateAddresses` forces `aRloc16` to `Mac::kShortAddrBroadcast`, so any BorderRouter entry stored under the malformed prefix is eligible for copying into `config`.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "aConfig"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "src/core/thread/network_data.cpp",
+      "function": "NetworkData::GetNextOnMeshPrefix",
+      "line": 113,
+      "line_end": 116,
+      "var": "prefix, subCur, subEnd",
+      "code": "prefix = static_cast<PrefixTlv *>(cur);\nsubCur = reinterpret_cast<NetworkDataTlv *>(reinterpret_cast<uint8_t *>(prefix->GetSubTlvs()) +\n                                            iterator.GetSubTlvOffset());\nsubEnd = cur->GetNext();",
+      "note": "The stored leader bytes are reinterpreted as a Prefix TLV again. `prefix->GetSubTlvs()` reuses the oversized `mPrefixLength` from step 7 to skip the stored 25-byte prefix span, and the length growth from step 8 makes `subEnd = cur->GetNext()` cover the persisted BorderRouter TLV and copied entry. There is still no `BitVectorBytes(prefix->GetPrefixLength()) <= sizeof(Ip6::Address)` check before the copy path.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "mPrefixLength"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "dstPrefix length / stored BorderRouterTlv layout"
+        },
+        {
+          "on": 11,
+          "type": "data",
+          "via": "iterator"
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "file": "src/core/thread/network_data.cpp",
+      "function": "NetworkData::GetNextOnMeshPrefix",
+      "line": 124,
+      "line_end": 135,
+      "var": "subCur, borderRouter, aRloc16",
+      "code": "if (subCur->GetType() != NetworkDataTlv::kTypeBorderRouter)\n{\n    continue;\n}\n\nborderRouter = static_cast<BorderRouterTlv *>(subCur);\n\nfor (uint8_t index = iterator.GetEntryIndex(); index < borderRouter->GetNumEntries(); index++)\n{\n    if (aRloc16 == Mac::kShortAddrBroadcast || borderRouter->GetEntry(index)->GetRloc() == aRloc16)\n    {",
+      "note": "The inner loop skips any non-BorderRouter sub-TLVs until it reaches the stored `BorderRouterTlv`, then reads the copied `BorderRouterEntry` from step 8. Because step 12 fixed `aRloc16` to broadcast, the first matching BorderRouter entry immediately makes the stack copy path reachable.",
+      "depends_on": [
+        {
+          "on": 13,
+          "type": "data",
+          "via": "subCur"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "stored BorderRouterTlv / BorderRouterEntry"
+        },
+        {
+          "on": 12,
+          "type": "control",
+          "via": "aRloc16 == Mac::kShortAddrBroadcast"
+        }
+      ]
+    },
+    {
+      "step": 15,
+      "file": "src/core/thread/network_data.cpp",
+      "function": "NetworkData::GetNextOnMeshPrefix",
+      "line": 137,
+      "var": "aConfig",
+      "code": "memset(aConfig, 0, sizeof(*aConfig));",
+      "note": "Destination extent. The callee clears the 24-byte stack `config` object; within it, `aConfig->mPrefix.mPrefix` is only a 16-byte `otIp6Address`, so the next memcpy targets a smaller field than the whole object.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "aConfig"
+        },
+        {
+          "on": 14,
+          "type": "control",
+          "via": "aRloc16 == Mac::kShortAddrBroadcast || borderRouter->GetEntry(index)->GetRloc() == aRloc16"
+        }
+      ]
+    },
+    {
+      "step": 16,
+      "file": "src/core/thread/network_data.cpp",
+      "function": "NetworkData::GetNextOnMeshPrefix",
+      "line": 138,
+      "var": "aConfig->mPrefix.mPrefix, prefix->GetPrefixLength()",
+      "code": "memcpy(&aConfig->mPrefix.mPrefix, prefix->GetPrefix(), BitVectorBytes(prefix->GetPrefixLength()));",
+      "note": "Sink. For this witness `BitVectorBytes(prefix->GetPrefixLength())` is 25, matching ASAN's `WRITE of size 25`. The copy starts at the 16-byte `mPrefix.mPrefix` field inside 24-byte stack `config`, so it overwrites 9 bytes past that field and 1 byte past the end of `config`, producing the reported stack-buffer-overflow write at `network_data.cpp:138`.",
+      "depends_on": [
+        {
+          "on": 13,
+          "type": "data",
+          "via": "prefix->GetPrefixLength()"
+        },
+        {
+          "on": 15,
+          "type": "data",
+          "via": "aConfig"
+        },
+        {
+          "on": 14,
+          "type": "control",
+          "via": "aRloc16 == Mac::kShortAddrBroadcast || borderRouter->GetEntry(index)->GetRloc() == aRloc16"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "stack-buffer-overflow",
+    "access_type": "WRITE",
+    "access_size": 25,
+    "crash_location": {
+      "file": "src/core/thread/network_data.cpp",
+      "function": "ot::NetworkData::NetworkData::GetNextOnMeshPrefix(unsigned int*, unsigned short, otBorderRouterConfig*)",
+      "line": 138
+    },
+    "allocation_context": {
+      "file": "src/core/net/dhcp6_client.cpp",
+      "function": "ot::Dhcp6::Dhcp6Client::UpdateAddresses()",
+      "line": 74,
+      "note": "ASan reports the overflowing destination as local stack object `config` at line 78, occupying `[48,72)` in this frame."
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "__asan_memcpy",
+        "file": "llvm/projects/compiler-rt/lib/asan/asan_interceptors_memintrinsics.cc",
+        "line": 22
+      },
+      {
+        "frame": 1,
+        "function": "ot::NetworkData::NetworkData::GetNextOnMeshPrefix(unsigned int*, unsigned short, otBorderRouterConfig*)",
+        "file": "src/core/thread/network_data.cpp",
+        "line": 138
+      },
+      {
+        "frame": 2,
+        "function": "ot::Dhcp6::Dhcp6Client::UpdateAddresses()",
+        "file": "src/core/net/dhcp6_client.cpp",
+        "line": 117
+      },
+      {
+        "frame": 3,
+        "function": "ot::Mle::Mle::HandleStateChanged(unsigned int)",
+        "file": "src/core/thread/mle.cpp",
+        "line": 1518
+      },
+      {
+        "frame": 4,
+        "function": "ot::Notifier::HandleStateChanged()",
+        "file": "src/core/common/notifier.cpp",
+        "line": 158
+      },
+      {
+        "frame": 5,
+        "function": "ot::TaskletScheduler::ProcessQueuedTasklets()",
+        "file": "src/core/common/tasklet.cpp",
+        "line": 112
+      },
+      {
+        "frame": 6,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/fuzz/radio_receive_done.cpp",
+        "line": 75
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "dedup_token": "__asan_memcpy--ot::NetworkData::NetworkData::GetNextOnMeshPrefix(unsigned int*, unsigned short, otBorderRouterConfig*)--ot::Dhcp6::Dhcp6Client::UpdateAddresses()",
+    "source": "parsed from gt_results/arvo_13334/sanitizer_trace.txt and reproduction_report.json",
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": "The saved ASan stack directly matches fine-trace steps 10-16 (`Mle::HandleStateChanged -> Dhcp6Client::UpdateAddresses -> NetworkData::GetNextOnMeshPrefix`). Earlier admission and persistence steps 1-9 are reconstructed from the staged vulnerable source and the fixing `PrefixTlv::IsValid()` patch: `Leader::HandleServerData` is the sole `RegisterNetworkData` call site, `RlocLookup()` and `AddPrefix()` are the two executed `PrefixTlv::IsValid()` gates on this path, and the fresh-instance harness plus `MleRouter::BecomeLeader()` reset explains why `FindPrefix` misses before `AddBorderRouter` allocates the stored malformed prefix and copied BorderRouter entry.",
+      "tainted_value_reaches_sink": true,
+      "patch_resolves_note": "The fixing commit adds `&& (BitVectorBytes(mPrefixLength) <= sizeof(Ip6::Address))` to `PrefixTlv::IsValid()`. Both executed admissions in this path (`RlocLookup()` and later `AddPrefix()`) would then reject the witness's oversized prefix before `AddBorderRouter` can allocate/store it and before line 797 signals `OT_CHANGED_THREAD_NETDATA`, preventing the later crashing DHCP6 refresh."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Running the exact staged 68-byte `poc` under the Stage 01 vulnerable ARVO workspace reproduces `AddressSanitizer: stack-buffer-overflow` with `WRITE of size 25` in `ot::NetworkData::NetworkData::GetNextOnMeshPrefix`, matching the saved issue stack through `ot::Dhcp6::Dhcp6Client::UpdateAddresses` and `ot::Mle::Mle::HandleStateChanged`.",
+    "format": {
+      "name": "OpenThread radio receive frame bytes",
+      "contract": "The trigger contract is the exact 68-byte witness staged at `gt_results/arvo_13334/poc`. Stage 01 verified that this byte sequence, when passed as `frame.mPsdu` to `otPlatRadioReceiveDone`, reaches leader-side Server Data registration, admits a Prefix TLV whose `BitVectorBytes(mPrefixLength)` evaluates to 25, and later makes `GetNextOnMeshPrefix` memcpy 25 bytes into stack `otBorderRouterConfig config`. No narrower packet-level predicate was recovered from the staged artifacts, so the contract is intentionally limited to this exact witness."
+    }
+  }
+}

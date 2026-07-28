@@ -1,0 +1,595 @@
+{
+  "sample_id": "arvo_6574",
+  "vuln_id": "OSS-Fuzz issue 6574 / ARVO arvo:6574",
+  "project": {
+    "id": "open62541",
+    "repo": "https://github.com/open62541/open62541.git",
+    "vulnerable_commit": "6eca77a2849a386ceb48f600ba6f17fedde4b90c",
+    "fixed_commit": "b52793f9b872c1dc8452d504910ca6759bbef5c6"
+  },
+  "classification": {
+    "class": "use-of-uninitialized-value",
+    "cwe": "CWE-457",
+    "access": "branch",
+    "detector": "MemorySanitizer",
+    "classification_note": "The saved MSAN trace reports a use-of-uninitialized-value at the second delete because the freed nodestore entry is poisoned after deallocation; the underlying source bug is stale-pointer reuse after `addParentAndTypeRef` deletes the inserted node."
+  },
+  "bug_description": {
+    "original": "Detailed report: OSS-Fuzz issue 6574 on open62541 (`libFuzzer_open62541_fuzz_binary_message`) reports `Use-of-uninitialized-value` with crash state `NodeId_deleteMembers -> UA_deleteMembers -> UA_Node_deleteMembers` under MemorySanitizer.",
+    "original_source": "ARVO-Meta sample_info.json issue description / staged sanitizer_trace.txt / reproduction_report.json",
+    "normalized": "The staged 670-byte OPC UA binary witness reaches `processMSG`, whose decoded service id selects `Service_AddNodes`. `UA_decodeBinary` materializes an `UA_AddNodesRequest`, and `Service_AddNodes` / `UA_Server_processServiceOperations` pass one decoded `UA_AddNodesItem` from its `nodesToAdd` array into `Operation_addNode_begin`; the saved artifacts do not establish which array index was selected when the crash occurred. `Operation_addNode_begin` allocates a new node, inserts it into the nodestore, and then calls `addParentAndTypeRef` with the raw inserted `UA_Node *`. On the witnessed path, `checkParentReference` rejects that item's decoded parent/reference combination, and `addParentAndTypeRef` takes its early failure branch at line 707 and deletes the just-inserted node via `UA_Server_deleteNode(server, node->nodeId, true)`. `deleteNodeOperation` removes the nodestore entry and releases the last nodestore reference, so the node storage is freed. Control then returns to `Operation_addNode_begin`, which still holds the stale `node` pointer and runs its own error cleanup `UA_Nodestore_delete(server, node)`. That second delete walks the freed node structure and MemorySanitizer reports `use-of-uninitialized-value` when `NodeId_deleteMembers` switches on the freed `nodeId.identifierType`. The fix changes `addParentAndTypeRef` to take a node id, reacquire a nodestore reference, and delete by node id instead of reusing the stale raw pointer."
+  },
+  "source": {
+    "file": "src/server/ua_server_binary.c",
+    "function": "processMSG",
+    "line": 392,
+    "var": "requestTypeId",
+    "code": "UA_StatusCode retval = UA_NodeId_decodeBinary(msg, &offset, &requestTypeId);",
+    "description": "First project-side materialization of vulnerability-relevant attacker state: `processMSG` decodes the service NodeId from the attacker-controlled OPC UA `MSG` body into `requestTypeId`, creating the dispatch key that drives the message into AddNodes handling.",
+    "value_from": "The staged witness is the saved 670-byte raw OPC UA conversation at `gt_results/arvo_6574/poc`, beginning with `HELF` and `OPNF` before the crashing `MSG`. The decoded `MSG` service id later hits `UA_NS0ID_ADDNODESREQUEST_ENCODING_DEFAULTBINARY` in `getServicePointers`, so this `UA_NodeId_decodeBinary` call is the first project statement that turns attacker bytes into the AddNodes dispatch key.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "src/server/ua_services_nodemanagement.c",
+    "function": "Operation_addNode_begin",
+    "line": 954,
+    "var": "node, parentNodeId, referenceTypeId, item->typeDefinition.nodeId",
+    "code": "retval = addParentAndTypeRef(server, session, node, parentNodeId, referenceTypeId, &item->typeDefinition.nodeId);",
+    "description": "Root cause. After `UA_Nodestore_insert` has transferred ownership of the new node into the nodestore, `Operation_addNode_begin` still passes the raw `UA_Node *node` and the callback-selected item's parent/reference/type data into `addParentAndTypeRef` without acquiring a nodestore reference. If that helper deletes the node on an error path, the caller's `node` alias becomes dangling but is still reused in the caller's own error cleanup.",
+    "note": "The fix commit changes this exact call to pass `&node->nodeId` and rewrites `addParentAndTypeRef` to reacquire the protected nodestore reference with `UA_Nodestore_get` before examining or deleting the node.",
+    "trace_step": 8
+  },
+  "sink": {
+    "file": "src/ua_types.c",
+    "function": "NodeId_deleteMembers",
+    "line": 238,
+    "var": "p->identifierType",
+    "code": "switch(p->identifierType) {",
+    "description": "MSAN crash site. During the second delete of the already freed nodestore entry, cleanup reaches `NodeId_deleteMembers` and branches on the freed `nodeId.identifierType` field.",
+    "note": "The crashing call chain in the saved trace is `UA_Nodestore_delete -> UA_NodeMap_deleteNode -> deleteEntry -> UA_Node_deleteMembers -> UA_deleteMembers -> deleteMembers_noInit -> NodeId_deleteMembers`.",
+    "trace_step": 12
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/server/ua_server_binary.c",
+      "function": "getServicePointers",
+      "line": 233,
+      "description": "The decoded service id is admitted as `UA_NS0ID_ADDNODESREQUEST_ENCODING_DEFAULTBINARY` and dispatched to `Service_AddNodes`."
+    }
+  },
+  "tainted_value_origin": {
+    "file": "src/server/ua_server_binary.c",
+    "function": "processMSG",
+    "line": 428,
+    "var": "request->nodesToAddSize, request->nodesToAdd[i].parentNodeId.nodeId, request->nodesToAdd[i].referenceTypeId, request->nodesToAdd[i].typeDefinition.nodeId, request->nodesToAdd[i].nodeClass",
+    "code": "retval = UA_decodeBinary(msg, &offset, request, requestType,\n                         server->config.customDataTypesSize,\n                         server->config.customDataTypes);",
+    "description": "The generic binary decoder zero-initializes the stack request object and materializes `nodesToAddSize` plus the decoded `nodesToAdd` array from attacker bytes. The later crashing callback consumes one `UA_AddNodesItem` from that array, but the saved artifacts do not establish a concrete index `i`.",
+    "note": "The saved free stack proves the decoded AddNodes request body reaches `UA_Server_processServiceOperations` and `Operation_addNode_begin`; the exact crashing array index and the exact failing `checkParentReference` sub-check are not recoverable from the staged artifacts."
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processMSG",
+      "summary": "Decode the attacker-controlled `MSG` into an AddNodes dispatch key and AddNodes request body."
+    },
+    {
+      "step": 2,
+      "file": "src/server/ua_server_utils.c",
+      "function": "UA_Server_processServiceOperations",
+      "summary": "Iterate the decoded `nodesToAdd` array and hand one `UA_AddNodesItem` to `Operation_addNode` / `Operation_addNode_begin`."
+    },
+    {
+      "step": 3,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "Operation_addNode_begin",
+      "summary": "Allocate a new node, insert it into the nodestore, and hand the raw inserted pointer plus decoded parent/reference/type fields to `addParentAndTypeRef`."
+    },
+    {
+      "step": 4,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "addParentAndTypeRef",
+      "summary": "Parent/reference validation fails and the helper deletes the just-inserted node by node id."
+    },
+    {
+      "step": 5,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "deleteNodeOperation",
+      "summary": "The nodestore entry is freed when the temporary delete-by-id reference is released, and the caller still aliases that freed node."
+    },
+    {
+      "step": 6,
+      "file": "src/ua_types.c",
+      "function": "NodeId_deleteMembers",
+      "summary": "The second delete branches on freed nodeId bytes and MSAN reports use-of-uninitialized-value."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processMSG",
+      "line": 392,
+      "var": "requestTypeId",
+      "code": "UA_StatusCode retval = UA_NodeId_decodeBinary(msg, &offset, &requestTypeId);",
+      "note": "Decodes the attacker-controlled service NodeId from the OPC UA `MSG` body. On the witnessed path this produces the numeric dispatch key later mapped to AddNodes handling."
+    },
+    {
+      "step": 2,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processMSG",
+      "line": 408,
+      "line_end": 409,
+      "var": "requestType, service",
+      "code": "getServicePointers(requestTypeId.identifier.numeric, &requestType,\n                       &responseType, &service, &sessionRequired, &serviceType);",
+      "note": "Uses the decoded numeric NodeId from step 1 to select `Service_AddNodes` and `UA_TYPES[UA_TYPES_ADDNODESREQUEST]` for this message, admitting the input into the AddNodes parser/service path.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "requestTypeId.identifier.numeric"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processMSG",
+      "line": 428,
+      "line_end": 430,
+      "var": "request->nodesToAddSize, request->nodesToAdd[i].parentNodeId.nodeId, request->nodesToAdd[i].referenceTypeId, request->nodesToAdd[i].typeDefinition.nodeId, request->nodesToAdd[i].nodeClass",
+      "code": "retval = UA_decodeBinary(msg, &offset, request, requestType,\n                         server->config.customDataTypesSize,\n                         server->config.customDataTypes);",
+      "note": "Zero-initializes and decodes the AddNodesRequest body selected in step 2, materializing `nodesToAddSize` and the `nodesToAdd` array. The later crashing callback consumes one decoded `UA_AddNodesItem` from this array, but the saved artifacts do not identify a concrete index.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "requestType"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/server/ua_server_utils.c",
+      "function": "UA_Server_processServiceOperations",
+      "line": 405,
+      "line_end": 410,
+      "var": "ops, reqOp",
+      "code": "uintptr_t reqOp = *(uintptr_t*)((uintptr_t)requestOperations + sizeof(size_t));\nfor(size_t i = 0; i < ops; i++) {\n    operationCallback(server, session, context, (void*)reqOp, (void*)respOp);\n    reqOp += requestOperationsType->memSize;\n    respOp += responseOperationsType->memSize;\n}",
+      "note": "Called from `Service_AddNodes` with `&request->nodesToAddSize`, this helper uses `ops = *requestOperations` from line 392 and reads the adjacent `request->nodesToAdd` pointer into `reqOp`, then invokes `Operation_addNode` on the current `UA_AddNodesItem` at `reqOp`. The staged trace proves one decoded array element reaches the callback, but not which loop iteration `i` crashes.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "request->nodesToAddSize, request->nodesToAdd"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "Operation_addNode",
+      "line": 1029,
+      "line_end": 1030,
+      "var": "item, &item->parentNodeId.nodeId, &item->referenceTypeId",
+      "code": "result->statusCode = Operation_addNode_begin(server, session, nodeContext,\n                                                 item, &item->parentNodeId.nodeId, &item->referenceTypeId, &result->addedNodeId);",
+      "note": "The callback-selected array element from step 4 becomes the typed `item` argument to `Operation_addNode_begin`; this call also aliases that same element's parent node id and reference type fields as separate arguments. `item` itself continues to carry the decoded `typeDefinition.nodeId` and `nodeClass` used later on the same path.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "reqOp"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "Operation_addNode_begin",
+      "line": 898,
+      "var": "node, item->nodeClass",
+      "code": "UA_Node *node = UA_Nodestore_new(server, item->nodeClass);",
+      "note": "For the callback-selected `UA_AddNodesItem`, allocates a new heap-backed nodestore node of the item's decoded `nodeClass`.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "item->nodeClass"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "Operation_addNode_begin",
+      "line": 945,
+      "var": "node, outNewNodeId",
+      "code": "retval = UA_Nodestore_insert(server, node, outNewNodeId);",
+      "note": "Inserts the new node into the nodestore and copies its node id to `outNewNodeId`. In the default nodestore, `UA_NodeMap_insertNode` stores the entry in the hash slot at lines 360-366 without incrementing `refCount`, so the caller still keeps only an unprotected raw alias `node`.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "node"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "Operation_addNode_begin",
+      "line": 954,
+      "var": "node, parentNodeId, referenceTypeId, item->typeDefinition.nodeId",
+      "code": "retval = addParentAndTypeRef(server, session, node, parentNodeId, referenceTypeId, &item->typeDefinition.nodeId);",
+      "note": "Root cause. After step 7 transfers ownership to the nodestore, `Operation_addNode_begin` still passes the raw `node` pointer plus the callback-selected item's decoded parent/reference/type fields into `addParentAndTypeRef`. Because no nodestore reference was acquired for that caller-held alias, any in-helper deletion turns `node` dangling.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "node"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "item->parentNodeId.nodeId, item->referenceTypeId, item->typeDefinition.nodeId"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "addParentAndTypeRef",
+      "line": 702,
+      "line_end": 708,
+      "var": "retval, node->nodeId, parentNodeId, referenceTypeId",
+      "code": "retval = checkParentReference(server, session, node->nodeClass,\n                                  parentNodeId, referenceTypeId);\nif(retval != UA_STATUSCODE_GOOD) {\n    UA_LOG_INFO_SESSION(server->config.logger, session,\n                        \"AddNodes: The parent reference is invalid\");\n    UA_Server_deleteNode(server, node->nodeId, true);\n    return retval;\n}",
+      "note": "The callback-selected AddNodes item fails `checkParentReference`, so `addParentAndTypeRef` takes this early error branch and deletes the just-inserted node by `node->nodeId` before returning. The saved free stack pins the invalidation to this exact line-707 branch, but it does not reveal which internal sub-check inside `checkParentReference` failed.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "parentNodeId, referenceTypeId, node->nodeId"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "deleteNodeOperation",
+      "line": 1265,
+      "line_end": 1267,
+      "var": "node, item->nodeId",
+      "code": "deconstructNode(server, session, node);\nremoveDeconstructedNode(server, session, node, item->deleteTargetReferences);\nUA_Nodestore_release(server, node);",
+      "note": "`UA_Server_deleteNode` first reacquires the nodestore entry by node id at line 1247, which increments its temporary refcount. `removeDeconstructedNode` marks the entry deleted, and `UA_Nodestore_release` at line 1267 decrements that temporary reference; `cleanupEntry` then frees the deleted entry when `refCount == 0`. MSAN's origin stack reports the poisoned bytes were created by this heap deallocation.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "node->nodeId"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "retval != UA_STATUSCODE_GOOD"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "Operation_addNode_begin",
+      "line": 955,
+      "line_end": 959,
+      "var": "retval, node",
+      "code": "if(retval != UA_STATUSCODE_GOOD) {\n    UA_LOG_INFO_SESSION(server->config.logger, session,\n                        \"AddNodes: Node could add parent references with error code %s\",\n                        UA_StatusCode_name(retval));\n    UA_Nodestore_delete(server, node);\n}",
+      "note": "Control returns to `Operation_addNode_begin` with the same raw pointer from step 8. Because `retval` is non-GOOD, the caller runs its own error cleanup and passes stale pointer `node` into `UA_Nodestore_delete` a second time.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "node"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "retval != UA_STATUSCODE_GOOD"
+        },
+        {
+          "on": 10,
+          "type": "order",
+          "via": "free_before_use",
+          "obj": "node"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/ua_types.c",
+      "function": "NodeId_deleteMembers",
+      "line": 238,
+      "var": "p->identifierType",
+      "code": "switch(p->identifierType) {",
+      "note": "Sink. The second delete in step 11 reaches `UA_NodeMap_deleteNode -> deleteEntry -> UA_Node_deleteMembers -> UA_deleteMembers -> deleteMembers_noInit -> NodeId_deleteMembers`, and this `switch` reads and branches on freed `nodeId.identifierType` bytes from the node released in step 10. MemorySanitizer reports the resulting use-of-uninitialized-value here.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "node"
+        },
+        {
+          "on": 10,
+          "type": "order",
+          "via": "free_before_use",
+          "obj": "node"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "MemorySanitizer",
+    "trace_format": "text",
+    "sanitizer": "memory",
+    "crash_type": "use-of-uninitialized-value",
+    "access_type": "branch",
+    "access_size": null,
+    "crash_location": {
+      "file": "src/ua_types.c",
+      "function": "NodeId_deleteMembers",
+      "line": 238
+    },
+    "allocation_context": null,
+    "free_context": {
+      "file": "src/server/ua_services_nodemanagement.c",
+      "function": "deleteNodeOperation",
+      "line": 1267,
+      "description": "MSAN's origin stack says the later poisoned value was created by a heap deallocation when `deleteNodeOperation` released the just-deleted nodestore node."
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "NodeId_deleteMembers",
+        "file": "src/ua_types.c",
+        "line": 238
+      },
+      {
+        "frame": 1,
+        "function": "deleteMembers_noInit",
+        "file": "src/ua_types.c",
+        "line": 1030
+      },
+      {
+        "frame": 2,
+        "function": "UA_deleteMembers",
+        "file": "src/ua_types.c",
+        "line": 1044
+      },
+      {
+        "frame": 3,
+        "function": "UA_NodeId_deleteMembers",
+        "file": "/work/open62541/src_generated/ua_types_generated_handling.h",
+        "line": 441
+      },
+      {
+        "frame": 4,
+        "function": "UA_Node_deleteMembers",
+        "file": "src/server/ua_nodes.c",
+        "line": 22
+      },
+      {
+        "frame": 5,
+        "function": "deleteEntry",
+        "file": "plugins/ua_nodestore_default.c",
+        "line": 180
+      },
+      {
+        "frame": 6,
+        "function": "UA_NodeMap_deleteNode",
+        "file": "plugins/ua_nodestore_default.c",
+        "line": 245
+      },
+      {
+        "frame": 7,
+        "function": "Operation_addNode_begin",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 959
+      },
+      {
+        "frame": 8,
+        "function": "Operation_addNode",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 1029
+      },
+      {
+        "frame": 9,
+        "function": "UA_Server_processServiceOperations",
+        "file": "src/server/ua_server_utils.c",
+        "line": 407
+      },
+      {
+        "frame": 10,
+        "function": "Service_AddNodes",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 1056
+      },
+      {
+        "frame": 11,
+        "function": "processMSG",
+        "file": "src/server/ua_server_binary.c",
+        "line": 569
+      },
+      {
+        "frame": 12,
+        "function": "processSecureChannelMessage",
+        "file": "src/server/ua_server_binary.c",
+        "line": 608
+      },
+      {
+        "frame": 13,
+        "function": "UA_SecureChannel_finalizeChunk",
+        "file": "src/ua_securechannel.c",
+        "line": 747
+      },
+      {
+        "frame": 14,
+        "function": "UA_SecureChannel_processChunk",
+        "file": "src/ua_securechannel.c",
+        "line": 1012
+      },
+      {
+        "frame": 15,
+        "function": "processCompleteChunk",
+        "file": "src/server/ua_server_binary.c",
+        "line": 729
+      },
+      {
+        "frame": 16,
+        "function": "processChunk",
+        "file": "src/ua_connection.c",
+        "line": 143
+      },
+      {
+        "frame": 17,
+        "function": "UA_Connection_processChunks",
+        "file": "src/ua_connection.c",
+        "line": 168
+      },
+      {
+        "frame": 18,
+        "function": "UA_Server_processBinaryMessage",
+        "file": "src/server/ua_server_binary.c",
+        "line": 763
+      },
+      {
+        "frame": 19,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/fuzz/fuzz_binary_message.cc",
+        "line": 33
+      }
+    ],
+    "allocation_stack": [],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "cfree",
+        "file": "llvm/projects/compiler-rt/lib/msan/msan_interceptors.cc",
+        "line": 224
+      },
+      {
+        "frame": 1,
+        "function": "deleteNodeOperation",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 1267
+      },
+      {
+        "frame": 2,
+        "function": "UA_Server_deleteNode",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 1295
+      },
+      {
+        "frame": 3,
+        "function": "addParentAndTypeRef",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 707
+      },
+      {
+        "frame": 4,
+        "function": "Operation_addNode_begin",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 954
+      },
+      {
+        "frame": 5,
+        "function": "Operation_addNode",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 1029
+      },
+      {
+        "frame": 6,
+        "function": "UA_Server_processServiceOperations",
+        "file": "src/server/ua_server_utils.c",
+        "line": 407
+      },
+      {
+        "frame": 7,
+        "function": "Service_AddNodes",
+        "file": "src/server/ua_services_nodemanagement.c",
+        "line": 1056
+      },
+      {
+        "frame": 8,
+        "function": "processMSG",
+        "file": "src/server/ua_server_binary.c",
+        "line": 569
+      },
+      {
+        "frame": 9,
+        "function": "processSecureChannelMessage",
+        "file": "src/server/ua_server_binary.c",
+        "line": 608
+      },
+      {
+        "frame": 10,
+        "function": "UA_SecureChannel_finalizeChunk",
+        "file": "src/ua_securechannel.c",
+        "line": 747
+      },
+      {
+        "frame": 11,
+        "function": "UA_SecureChannel_processChunk",
+        "file": "src/ua_securechannel.c",
+        "line": 1012
+      },
+      {
+        "frame": 12,
+        "function": "processCompleteChunk",
+        "file": "src/server/ua_server_binary.c",
+        "line": 729
+      },
+      {
+        "frame": 13,
+        "function": "processChunk",
+        "file": "src/ua_connection.c",
+        "line": 143
+      },
+      {
+        "frame": 14,
+        "function": "UA_Connection_processChunks",
+        "file": "src/ua_connection.c",
+        "line": 168
+      },
+      {
+        "frame": 15,
+        "function": "UA_Server_processBinaryMessage",
+        "file": "src/server/ua_server_binary.c",
+        "line": 763
+      },
+      {
+        "frame": 16,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/fuzz/fuzz_binary_message.cc",
+        "line": 33
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_free_context": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    },
+    "patch_resolves_note": "The staged patch `b52793f9b872c1dc8452d504910ca6759bbef5c6` changes `addParentAndTypeRef` to take a node id, reacquire the nodestore reference with `UA_Nodestore_get`, release that reference at cleanup, and delete by node id rather than reusing the stale raw pointer. It also applies the same protection to the related `copyChildNode` call site.",
+    "evidence_note": "The saved artifacts prove the invalidation happens on the early `checkParentReference` failure branch at `addParentAndTypeRef:707` and that the later poisoned read originates from the heap deallocation at `deleteNodeOperation:1267`. They do not reveal which `request->nodesToAdd[i]` element `UA_Server_processServiceOperations` passed to the crashing callback or which individual sub-check inside `checkParentReference` returned the error."
+  },
+  "poc": {
+    "path": "/mnt/datastore/gt_generation/gt_results/arvo_6574/poc",
+    "trigger": "Run `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_6574 run --version vulnerable --expect crash` with the staged `poc`; `reproduction_report.json` records `MemorySanitizer: use-of-uninitialized-value` in `NodeId_deleteMembers`.",
+    "format": {
+      "name": "raw OPC UA HEL/OPN/MSG binary conversation",
+      "contract": "The exact staged witness is the saved 670-byte raw binary conversation at `gt_results/arvo_6574/poc`, beginning with `HELF` and `OPNF` before the crashing `MSG`. On the observed path, the `MSG` body must decode to `requestTypeId = UA_NS0ID_ADDNODESREQUEST_ENCODING_DEFAULTBINARY` and then to a non-empty AddNodes request whose `nodesToAdd` array contains at least one `UA_AddNodesItem` that `UA_Server_processServiceOperations` passes to `Operation_addNode_begin`. For that callback-selected item, the decoded parent/reference/type data must make `checkParentReference` return an error inside `addParentAndTypeRef` after the new node has been inserted into the nodestore. That error path deletes the inserted node via `UA_Server_deleteNode(server, node->nodeId, true)`, after which `Operation_addNode_begin` still executes `UA_Nodestore_delete(server, node)` on the stale raw pointer. This contract is limited to the staged witness and the observed validation-failure branch; the saved artifacts do not establish which `nodesToAdd` index the crashing callback used or which internal `checkParentReference` sub-check failed."
+    }
+  }
+}

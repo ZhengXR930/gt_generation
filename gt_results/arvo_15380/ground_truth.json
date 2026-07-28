@@ -1,0 +1,327 @@
+{
+  "sample_id": "arvo_15380",
+  "vuln_id": "OSS-Fuzz issue 15380 / ARVO arvo:15380",
+  "project": {
+    "id": "openthread",
+    "name": "OpenThread",
+    "repo": "https://github.com/openthread/openthread",
+    "vulnerable_commit": "ea9a6d2b14f794c756575bbbea668ac029acb1bb",
+    "fixed_commit": "8224b3c49f8bd285ad5658c1b3cd9683d6627bdb",
+    "fuzz_target": "radio-receive-done-fuzzer (libFuzzer_openthread_radio-receive-done-fuzzer, AddressSanitizer)"
+  },
+  "classification": {
+    "class": "stack-buffer-overflow",
+    "cwe": "CWE-787",
+    "access": "read",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed report: https://oss-fuzz.com/testcase?key=5759171934289920 Project: openthread Fuzzer: libFuzzer_openthread_radio-receive-done-fuzzer Fuzz target binary: radio-receive-done-fuzzer Job Type: libfuzzer_asan_openthread Platform Id: linux Crash Type: Stack-buffer-overflow READ {*} Crash Address: 0x7f2af368686a Crash State: ot::Message::Write ot::Message::Append ot::Mle::Mle::AppendResponse Sanitizer: address (ASAN) Recommended Security Severity: Medium Regressed: https://oss-fuzz.com/revisions?job=libfuzzer_asan_openthread&range=201906180307:201906190240 Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=5759171934289920 Issue filed automatically. See https://github.com/google/oss-fuzz/blob/master/docs/reproducing.md for instructions to reproduce this bug locally. This bug is subject to a 90 day disclosure deadline. If 90 days elapse without an upstream patch, then the bug report will automatically become visible to the public.",
+    "original_source": "ARVO-Meta.report.comments[0].content / staged vulnerable source / saved sanitizer_trace.txt / local patch.diff",
+    "normalized": "Stage 01 reproduced an AddressSanitizer stack-buffer-overflow READ of size 88 in `ot::Message::Write`. The staged 41-byte `radio-receive-done-fuzzer` witness is copied unchanged into `otRadioFrame.mPsdu`, then the OpenThread receive path admits it as an MLE Parent Request and dispatches to `ot::Mle::MleRouter::HandleParentRequest`. There, `Tlv::GetTlv(aMessage, Tlv::kChallenge, sizeof(challenge), challenge)` copies only 10 bytes into stack local `ChallengeTlv challenge` (the 2-byte TLV header plus the fixed 8-byte challenge field) but preserves the advertised Challenge length 88 in the copied header. `challenge.IsValid()` still accepts that object because `ChallengeTlv::IsValid()` only requires a length of at least 4. `SendParentResponse` then calls `AppendResponse(*message, aChallenge.GetChallenge(), aChallenge.GetLength())`, so the response builder reuses the attacker-controlled TLV header length instead of the clamped 8-byte challenge length. `AppendResponse` forwards that pointer-size pair into `Message::Append`, and `Message::Write` finally executes `memcpy(..., aBuf, bytesToCopy)` with `bytesToCopy = 88` while `aBuf` still points at the 8-byte challenge array inside stack local `challenge`. ASan reports the resulting stack overread at `message.cpp:595` and identifies `challenge` in `HandleParentRequest` as the overrun stack object. The fixing commit replaces the vulnerable `aChallenge.GetLength()` call with `aChallenge.GetChallengeLength()`, which caps the copy size at `sizeof(mChallenge) == 8`."
+  },
+  "source": {
+    "file": "src/core/thread/mle_router.cpp",
+    "function": "ot::Mle::MleRouter::HandleParentRequest",
+    "line": 1624,
+    "var": "challenge",
+    "code": "Tlv::GetTlv(aMessage, Tlv::kChallenge, sizeof(challenge), challenge)",
+    "description": "First project-side parse on the crashing path that materializes the attacker-controlled Challenge TLV into the fixed stack object later overread during response construction.",
+    "value_from": "The staged 41-byte `poc` is passed unchanged to `otPlatRadioReceiveDone()`. On the reproduced path it is decoded as an MLE Parent Request whose Challenge TLV advertises length 88. This call copies that TLV into stack local `challenge` with `aMaxLength = sizeof(challenge) == 10`, preserving the header length 88 while only storing the first 8 challenge bytes.",
+    "trace_step": 1
+  },
+  "tainted_value_origin": {
+    "file": "src/core/thread/mle_router.cpp",
+    "function": "ot::Mle::MleRouter::HandleParentRequest",
+    "line": 1624,
+    "var": "challenge.GetLength(), challenge.GetChallenge()",
+    "code": "Tlv::GetTlv(aMessage, Tlv::kChallenge, sizeof(challenge), challenge)",
+    "description": "This parse preserves the attacker-controlled Challenge length inside `challenge` and stores the fixed-size challenge bytes later referenced by `aChallenge.GetChallenge()`.",
+    "note": "Because `sizeof(challenge) == 10`, the copied stack object contains only the 2-byte TLV header plus the 8-byte `mChallenge` array even though the saved ASan trace shows the stored header length later drives an 88-byte read."
+  },
+  "sink": {
+    "file": "src/core/common/message.cpp",
+    "function": "ot::Message::Write",
+    "line": 595,
+    "var": "curBuffer->GetData() + aOffset, aBuf, bytesToCopy",
+    "code": "memcpy(curBuffer->GetData() + aOffset, aBuf, bytesToCopy);",
+    "description": "ASan sink. `Message::Write` copies `bytesToCopy` bytes from the forwarded Challenge pointer without checking that the source still fits in the fixed 8-byte challenge field.",
+    "note": "On the crashing path `aBuf` still aliases the challenge bytes inside stack local `challenge` from `HandleParentRequest`, and `bytesToCopy` becomes 88. ASan reports `stack-buffer-overflow READ of size 88` here and identifies `challenge` at `mle_router.cpp:1563` as the overrun stack object.",
+    "trace_step": 5
+  },
+  "root_cause": {
+    "file": "src/core/thread/mle_router.cpp",
+    "function": "ot::Mle::MleRouter::SendParentResponse",
+    "line": 1901,
+    "var": "aChallenge.GetLength()",
+    "code": "AppendResponse(*message, aChallenge.GetChallenge(), aChallenge.GetLength())",
+    "description": "The response builder reuses the incoming TLV header length as the outbound copy size instead of the fixed/clamped Challenge field length.",
+    "note": "`ChallengeTlv::GetChallengeLength()` already clamps to `sizeof(mChallenge)`, and the fixing commit changes this call site to use that accessor. Reusing `aChallenge.GetLength()` here is the missing size obligation that makes the later `memcpy()` read past stack local `challenge`.",
+    "trace_step": 3
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/core/thread/mle.cpp",
+      "function": "ot::Mle::Mle::HandleUdpReceive",
+      "line": 2796,
+      "code": "case Header::kCommandParentRequest:\n    Get<MleRouter>().HandleParentRequest(aMessage, aMessageInfo);",
+      "description": "The MLE header has already been decoded and classified as a Parent Request, so the receive path dispatches into the router-side Parent Request parser instead of rejecting the packet."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "tests/fuzz/radio_receive_done.cpp",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness copies the exact 41-byte witness into `otRadioFrame.mPsdu`, sets `mLength` and channel 11, and calls `otPlatRadioReceiveDone`, entering OpenThread's radio receive path."
+    },
+    {
+      "step": 2,
+      "file": "src/core/thread/mle.cpp",
+      "function": "ot::Mle::Mle::HandleUdpReceive",
+      "summary": "After MAC, 6LoWPAN, and UDP processing, the inbound message is admitted as MLE command `ParentRequest` and dispatched to `MleRouter::HandleParentRequest`."
+    },
+    {
+      "step": 3,
+      "file": "src/core/thread/mle_router.cpp",
+      "function": "ot::Mle::MleRouter::HandleParentRequest",
+      "summary": "The Challenge TLV is copied into 10-byte stack local `challenge` with advertised length 88, `challenge.IsValid()` accepts the malformed length, and the same stack object is forwarded to `SendParentResponse`."
+    },
+    {
+      "step": 4,
+      "file": "src/core/thread/mle_router.cpp",
+      "function": "ot::Mle::MleRouter::SendParentResponse",
+      "summary": "The response builder calls `AppendResponse(..., aChallenge.GetChallenge(), aChallenge.GetLength())`, turning the preserved length 88 into the append size for bytes sourced from the fixed challenge field."
+    },
+    {
+      "step": 5,
+      "file": "src/core/common/message.cpp",
+      "function": "ot::Message::Write",
+      "summary": "`AppendResponse` forwards that pointer-size pair into `Message::Append`, and `Message::Write` performs the final 88-byte `memcpy()` from stack local `challenge`, producing the saved ASan stack-buffer-overflow read."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/core/thread/mle_router.cpp",
+      "function": "ot::Mle::MleRouter::HandleParentRequest",
+      "line": 1624,
+      "var": "challenge",
+      "code": "Tlv::GetTlv(aMessage, Tlv::kChallenge, sizeof(challenge), challenge)",
+      "note": "The MLE parser finds the request's Challenge TLV and copies it into stack local `challenge`. On the witnessed path `ot::Tlv::Get()` first reads a Challenge header whose length is 88, then re-reads only `sizeof(challenge) == 10` bytes total, so the copied object keeps header length 88 but contains only the 2-byte TLV header plus the fixed 8-byte `mChallenge` field.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/core/thread/mle_router.cpp",
+      "function": "ot::Mle::MleRouter::HandleParentRequest",
+      "line": 1625,
+      "var": "challenge.GetLength()",
+      "code": "challenge.IsValid()",
+      "note": "The validity gate accepts the oversized object because `ChallengeTlv::IsValid()` only requires `GetLength() >= kMinSize` (4) and does not enforce `<= kMaxSize` (8). With stored length 88, execution stays on the response path instead of rejecting the malformed TLV.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "challenge"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "Tlv::GetTlv(aMessage, Tlv::kChallenge, sizeof(challenge), challenge) == OT_ERROR_NONE"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/core/thread/mle_router.cpp",
+      "function": "ot::Mle::MleRouter::SendParentResponse",
+      "line": 1901,
+      "var": "aChallenge.GetChallenge(), aChallenge.GetLength()",
+      "code": "AppendResponse(*message, aChallenge.GetChallenge(), aChallenge.GetLength())",
+      "note": "Root cause. This call forwards the fixed Challenge field pointer together with the attacker-controlled TLV header length, so the outbound response size becomes 88 instead of the clamped Challenge length 8. The patch replaces `aChallenge.GetLength()` with `aChallenge.GetChallengeLength()`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "aChallenge.GetChallenge()"
+        },
+        {
+          "on": 1,
+          "type": "data",
+          "via": "aChallenge.GetLength()"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "challenge.IsValid()"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/core/thread/mle.cpp",
+      "function": "ot::Mle::Mle::AppendResponse",
+      "line": 1193,
+      "line_end": 1197,
+      "var": "tlv, aResponse, aResponseLength",
+      "code": "tlv.SetType(Tlv::kResponse);\ntlv.SetLength(aResponseLength);\nSuccessOrExit(error = aMessage.Append(&tlv, sizeof(tlv)));\nSuccessOrExit(error = aMessage.Append(aResponse, aResponseLength));",
+      "note": "The response builder records the same 88-byte length in the outgoing Response TLV header and asks `Message::Append` to copy 88 bytes from `aResponse`. `aResponse` still aliases the 8-byte challenge array stored in step 1's stack object.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "aResponse"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "aResponseLength"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/core/common/message.cpp",
+      "function": "ot::Message::Write",
+      "line": 595,
+      "var": "curBuffer->GetData() + aOffset, aBuf, bytesToCopy",
+      "code": "memcpy(curBuffer->GetData() + aOffset, aBuf, bytesToCopy);",
+      "note": "Sink. `Message::Append` forwards `aResponse` and `aResponseLength` into `Write`, and on the first copy iteration `bytesToCopy` becomes 88. `aBuf` still points at the 8-byte `mChallenge` field inside stack local `challenge`, so this `memcpy()` reads 88 bytes from a 10-byte stack object and overruns its end. The saved ASan trace reports `stack-buffer-overflow READ of size 88` here and names `challenge` at `mle_router.cpp:1563` as the overflowed object.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "aResponse"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "aResponseLength"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "challenge.IsValid()"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "stack-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 88,
+    "crash_location": {
+      "file": "/src/openthread/src/core/common/message.cpp",
+      "function": "ot::Message::Write(unsigned short, unsigned short, void const*)",
+      "line": 595
+    },
+    "runtime_crash_location": {
+      "file": "/src/llvm/projects/compiler-rt/lib/asan/asan_interceptors_memintrinsics.cc",
+      "function": "__asan_memcpy",
+      "line": 22
+    },
+    "allocation_context": null,
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "__asan_memcpy",
+        "file": "/src/llvm/projects/compiler-rt/lib/asan/asan_interceptors_memintrinsics.cc",
+        "line": 22
+      },
+      {
+        "frame": 1,
+        "function": "ot::Message::Write(unsigned short, unsigned short, void const*)",
+        "file": "/src/openthread/src/core/common/message.cpp",
+        "line": 595
+      },
+      {
+        "frame": 2,
+        "function": "ot::Message::Append(void const*, unsigned short)",
+        "file": "/src/openthread/src/core/common/message.cpp",
+        "line": 390
+      },
+      {
+        "frame": 3,
+        "function": "ot::Mle::Mle::AppendResponse(ot::Message&, unsigned char const*, unsigned char)",
+        "file": "/src/openthread/src/core/thread/mle.cpp",
+        "line": 1197
+      },
+      {
+        "frame": 4,
+        "function": "ot::Mle::MleRouter::SendParentResponse(ot::Child*, ot::Mle::ChallengeTlv const&, bool)",
+        "file": "/src/openthread/src/core/thread/mle_router.cpp",
+        "line": 1901
+      },
+      {
+        "frame": 5,
+        "function": "ot::Mle::MleRouter::HandleParentRequest(ot::Message const&, ot::Ip6::MessageInfo const&)",
+        "file": "/src/openthread/src/core/thread/mle_router.cpp",
+        "line": 1664
+      },
+      {
+        "frame": 6,
+        "function": "ot::Mle::Mle::HandleUdpReceive(ot::Message&, ot::Ip6::MessageInfo const&)",
+        "file": "/src/openthread/src/core/thread/mle.cpp",
+        "line": 2797
+      },
+      {
+        "frame": 7,
+        "function": "ot::Ip6::Udp::HandleMessage(ot::Message&, ot::Ip6::MessageInfo&)",
+        "file": "/src/openthread/src/core/net/udp6.cpp",
+        "line": 389
+      },
+      {
+        "frame": 8,
+        "function": "ot::Ip6::Ip6::HandleDatagram(ot::Message&, ot::Ip6::Netif*, signed char, void const*, bool)",
+        "file": "/src/openthread/src/core/net/ip6.cpp",
+        "line": 917
+      },
+      {
+        "frame": 9,
+        "function": "ot::MeshForwarder::HandleLowpanHC(unsigned char*, unsigned char, ot::Mac::Address const&, ot::Mac::Address const&, otThreadLinkInfo const&)",
+        "file": "/src/openthread/src/core/thread/mesh_forwarder.cpp",
+        "line": 1478
+      },
+      {
+        "frame": 10,
+        "function": "ot::MeshForwarder::HandleReceivedFrame(ot::Mac::Frame&)",
+        "file": "/src/openthread/src/core/thread/mesh_forwarder.cpp",
+        "line": 1193
+      },
+      {
+        "frame": 11,
+        "function": "ot::Mac::Mac::HandleReceivedFrame(ot::Mac::Frame*, otError)",
+        "file": "/src/openthread/src/core/mac/mac.cpp",
+        "line": 1738
+      },
+      {
+        "frame": 12,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "/src/openthread/tests/fuzz/radio_receive_done.cpp",
+        "line": 74
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01 reproduced the crash by running `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_15380 run --version vulnerable --expect crash`, which produced `AddressSanitizer: stack-buffer-overflow READ of size 88` in `ot::Message::Write` with crash state `ot::Message::Write -> ot::Message::Append -> ot::Mle::Mle::AppendResponse`.",
+    "format": {
+      "name": "OpenThread radio-receive-done raw radio frame",
+      "contract": "Exactly the staged 41-byte witness `41 20 20 7f 3b 02 f2 20 4d 4c 20 ff 00 15 20 20 20 20 20 20 ff 20 20 09 03 ff 00 00 12 02 20 20 0e 01 ff 20 20 20 20 20 20`. The harness copies these bytes unchanged into `otRadioFrame.mPsdu`, sets `frame.mLength = 41` and `frame.mChannel = 11`, and calls `otPlatRadioReceiveDone()`. On the witnessed path the frame reaches `HandleParentRequest()` with a parsed Challenge TLV whose stored header length is 88, so `SendParentResponse()` later copies 88 bytes from the fixed 8-byte challenge field. The staged artifacts do not justify a broader trigger class beyond this exact witness."
+    }
+  }
+}

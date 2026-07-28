@@ -1,0 +1,494 @@
+{
+  "sample_id": "arvo_42472316",
+  "vuln_id": "OSS-Fuzz issue 42472316 / ARVO arvo:42472316",
+  "project": {
+    "id": "h2o",
+    "name": "h2o",
+    "repo": "https://github.com/h2o/h2o",
+    "vulnerable_commit": "b33e9a9fbcad4c97348dff1874c71e41d7c1357a",
+    "fixed_commit": "55438dbf9c5be844d1c06e707ef26813bb9f7d92",
+    "fuzz_target": "h2o-fuzzer-http2"
+  },
+  "staged_source_snapshot": {
+    "path": "container:gt-arvo_42472316-workspace:/src/h2o",
+    "commit": "b33e9a9fbcad4c97348dff1874c71e41d7c1357a",
+    "description": "Stage 01 reproduced against the staged vulnerable H2O checkout inside the persistent ARVO workspace container."
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "READ",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42472316 (h2o): Heap-buffer-overflow READ 8 found by fuzz target h2o-fuzzer-http2 [asan].",
+    "original_source": "sample_info.json / reproduction_report.json",
+    "normalized": "Stage 01 reproduces `AddressSanitizer: heap-buffer-overflow READ of size 8` in `h2o_http2_stream_has_pending_data()` from the staged vulnerable checkout `b33e9a9fbcad4c97348dff1874c71e41d7c1357a`. The staged PoC is an HTTP/2 fuzz-driver transcript split on `\\n--MARK--\\n`; the first packet contains the connection preface, a SETTINGS frame, a complete HEADERS request on stream 13, an ignored unknown frame, and then `WINDOW_UPDATE(stream=13, increment=0)`. Request handling reaches the send path and activates stream 13 in the HTTP/2 scheduler. The zero-increment WINDOW_UPDATE is a stream-level protocol error, so H2O resets and closes stream 13. During close, `preserve_stream_scheduler()` allocates a shrunken \"recently closed stream\" object that only retains `stream_id` and `_scheduler`, then relocates the still-active scheduler into that truncated object without deactivating it. `h2o_http2_scheduler_run()` later treats that preserved openref as active, reconstructs a full `h2o_http2_stream_t *` from the truncated `_scheduler` member, and `h2o_http2_stream_has_pending_data()` reads `stream->_data.size` past the short allocation. The staged fix expresses the missing obligation by adding `h2o_http2_scheduler_deactivate(&(*dst)->_scheduler)` immediately after the relocate call."
+  },
+  "source": {
+    "file": "lib/http2/connection.c",
+    "function": "handle_headers_frame",
+    "line": 778,
+    "var": "stream, frame->stream_id, payload.priority",
+    "code": "stream = h2o_http2_stream_open(conn, frame->stream_id, NULL, &payload.priority);\nset_priority(conn, stream, &payload.priority, 0);",
+    "description": "First project statement on the witnessed path that materializes attacker-controlled HTTP/2 state used by the bug: the HEADERS frame creates stream 13 and opens its scheduler reference.",
+    "value_from": "Before the fuzz-driver marker `\\n--MARK--\\n`, the staged 136-byte PoC contains a HEADERS frame at offset 45 with `len=48`, `type=1`, `flags=0x25` (`END_STREAM|END_HEADERS|PRIORITY`), and `stream_id=13`.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "include/h2o/http2_internal.h",
+    "function": "h2o_http2_stream_has_pending_data",
+    "line": 381,
+    "var": "stream->_data.size",
+    "code": "return stream->_data.size != 0;",
+    "description": "AddressSanitizer sink. The callback treats the preserved closed-stream scheduler stub as a full `h2o_http2_stream_t` and reads `_data.size` even though the allocation stops at `_scheduler`.",
+    "note": "Stage 01's ASan report records `READ of size 8` at this line, reached from `emit_writereq_of_openref -> proceed -> h2o_http2_scheduler_run`.",
+    "trace_step": 14
+  },
+  "root_cause": {
+    "file": "lib/http2/connection.c",
+    "function": "preserve_stream_scheduler",
+    "line": 268,
+    "var": "(*dst)->_scheduler, src->_scheduler",
+    "code": "h2o_http2_scheduler_relocate(&(*dst)->_scheduler, &src->_scheduler);",
+    "description": "Root cause site. `preserve_stream_scheduler()` moves a live scheduler reference into a deliberately truncated closed-stream stub, but the vulnerable code does not deactivate that relocated reference before leaving it in the scheduler tree.",
+    "note": "The staged patch adds `h2o_http2_scheduler_deactivate(&(*dst)->_scheduler);` immediately after this call, preventing the preserved stub from remaining runnable.",
+    "trace_step": 10
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "lib/http2/connection.c",
+      "function": "handle_incoming_request",
+      "line": 487,
+      "code": "execute_or_enqueue_request(conn, stream);",
+      "description": "After the HEADERS block is accepted as a complete request, H2O enqueues stream 13 for request execution. This is the point where attacker input has passed HTTP/2 frame and header parsing and entered the request/response path."
+    }
+  },
+  "tainted_value_origin": {
+    "file": "lib/http2/frame.c",
+    "function": "h2o_http2_decode_window_update_payload",
+    "line": 292,
+    "var": "payload->window_size_increment",
+    "code": "payload->window_size_increment = h2o_http2_decode32u(frame->payload) & 0x7fffffff;",
+    "description": "This is where the trigger value that closes the active stream is materialized from attacker bytes: the WINDOW_UPDATE payload decodes to increment 0.",
+    "value_from": "In the same first packet, the PoC contains a WINDOW_UPDATE frame at offset 111 with `stream_id=13` and payload `00 00 00 00`, so this statement produces `window_size_increment == 0`."
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "lib/http2/connection.c",
+      "function": "handle_headers_frame / handle_incoming_request / finalostream_send / h2o_http2_conn_register_for_proceed_callback",
+      "summary": "The first packet's HEADERS frame opens stream 13, leaves `_req_body.body` unset because `END_STREAM` is already present, admits it into request handling, and reaches the send path that activates stream 13 in the connection scheduler."
+    },
+    {
+      "step": 2,
+      "file": "lib/http2/frame.c",
+      "function": "h2o_http2_decode_window_update_payload / handle_window_update_frame / h2o_http2_stream_reset",
+      "summary": "The same packet then supplies `WINDOW_UPDATE(stream=13, increment=0)`, which is decoded as a stream-level protocol error and immediately resets and closes the active stream."
+    },
+    {
+      "step": 3,
+      "file": "lib/http2/connection.c",
+      "function": "preserve_stream_scheduler / h2o_http2_scheduler_relocate",
+      "summary": "Closing stream 13 preserves only `stream_id + _scheduler` in the recently-closed ring buffer and relocates the still-active scheduler state into that truncated stub without deactivating it."
+    },
+    {
+      "step": 4,
+      "file": "lib/http2/scheduler.c",
+      "function": "proceed / emit_writereq_of_openref / h2o_http2_stream_has_pending_data",
+      "summary": "The scheduler later dispatches the preserved stub as an active openref, reconstructs a full stream pointer from `_scheduler`, and overreads `_data.size` beyond the truncated allocation."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "lib/http2/connection.c",
+      "function": "handle_headers_frame",
+      "line": 778,
+      "line_end": 779,
+      "var": "stream, frame->stream_id, payload.priority",
+      "code": "stream = h2o_http2_stream_open(conn, frame->stream_id, NULL, &payload.priority);\nset_priority(conn, stream, &payload.priority, 0);",
+      "note": "Source. The HEADERS frame in the first PoC packet creates stream 13 and opens its `_scheduler` reference in the connection dependency tree. This is the first project state that later survives into the preserved closed-stream stub."
+    },
+    {
+      "step": 2,
+      "file": "lib/http2/connection.c",
+      "function": "handle_headers_frame",
+      "line": 785,
+      "line_end": 787,
+      "var": "frame->flags, stream->_req_body.body",
+      "code": "if ((frame->flags & H2O_HTTP2_FRAME_FLAG_END_STREAM) == 0)\n    h2o_buffer_init(&stream->_req_body.body, &h2o_socket_buffer_prototype);",
+      "note": "The same HEADERS frame carries `END_STREAM`, so this condition is false and `h2o_buffer_init` is skipped. Because `h2o_http2_stream_open()` zeroed the newly allocated stream prefix before `req`, `_req_body.body` stays `NULL` on stream 13.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "stream"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "((frame->flags & H2O_HTTP2_FRAME_FLAG_END_STREAM) == 0)"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "lib/http2/connection.c",
+      "function": "handle_incoming_request",
+      "line": 486,
+      "line_end": 487,
+      "var": "stream->_req_body.body, stream",
+      "code": "if (stream->_req_body.body == NULL) {\n    execute_or_enqueue_request(conn, stream);\n}",
+      "note": "Because `_req_body.body` is still `NULL`, the complete HEADERS-only request is executed immediately instead of moving into `RECV_BODY`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "stream->_req_body.body,stream"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "stream->_req_body.body == NULL"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "lib/http2/stream.c",
+      "function": "finalostream_send",
+      "line": 371,
+      "line_end": 408,
+      "var": "stream->send_state, stream->state, stream->_data.size",
+      "code": "stream->send_state = state;\n...\nif (bufcnt != 0) {\n    h2o_vector_reserve(&req->pool, &stream->_data, bufcnt);\n    memcpy(stream->_data.entries, bufs, sizeof(h2o_iovec_t) * bufcnt);\n    stream->_data.size = bufcnt;\n}\n\nh2o_http2_conn_register_for_proceed_callback(conn, stream);",
+      "note": "Request handling reaches H2O's send path for stream 13. `finalostream_send()` moves the stream into its outbound state, stores any queued response iovecs in `_data`, and then requests write scheduling for that live stream.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "stream"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "lib/http2/connection.c",
+      "function": "h2o_http2_conn_register_for_proceed_callback",
+      "line": 1152,
+      "line_end": 1155,
+      "var": "stream->_link, stream->_scheduler",
+      "code": "if (h2o_http2_stream_has_pending_data(stream) || stream->state >= H2O_HTTP2_STREAM_STATE_SEND_BODY_IS_FINAL) {\n    if (h2o_http2_window_get_avail(&stream->output_window) > 0) {\n        assert(!h2o_linklist_is_linked(&stream->_link));\n        h2o_http2_scheduler_activate(&stream->_scheduler);\n    }\n}",
+      "note": "The live outbound stream is made active in the HTTP/2 scheduler only after `assert(!h2o_linklist_is_linked(&stream->_link))` proves `_link` is unlinked. `h2o_http2_scheduler_activate()` then sets `_self_is_active = 1` and increments the active counts that later get preserved incorrectly.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "stream->_data.size,stream->state"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "h2o_http2_window_get_avail(&stream->output_window) > 0"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "lib/http2/frame.c",
+      "function": "h2o_http2_decode_window_update_payload",
+      "line": 292,
+      "line_end": 296,
+      "var": "payload->window_size_increment, err_is_stream_level",
+      "code": "payload->window_size_increment = h2o_http2_decode32u(frame->payload) & 0x7fffffff;\nif (payload->window_size_increment == 0) {\n    *err_is_stream_level = frame->stream_id != 0;\n    *err_desc = \"invalid WINDOW_UPDATE frame\";\n    return H2O_HTTP2_ERROR_PROTOCOL;\n}",
+      "note": "Later in the same first packet, the WINDOW_UPDATE frame for stream 13 decodes to increment 0. The decoder marks that as a stream-level protocol error because `frame->stream_id != 0`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "stream->stream_id"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "lib/http2/connection.c",
+      "function": "handle_window_update_frame",
+      "line": 899,
+      "line_end": 905,
+      "var": "ret, err_is_stream_level, stream",
+      "code": "if ((ret = h2o_http2_decode_window_update_payload(&payload, frame, err_desc, &err_is_stream_level)) != 0) {\n    if (err_is_stream_level) {\n        h2o_http2_stream_t *stream = h2o_http2_conn_get_stream(conn, frame->stream_id);\n        if (stream != NULL)\n            h2o_http2_stream_reset(conn, stream);\n        stream_send_error(conn, frame->stream_id, ret);\n        return 0;\n    }\n}",
+      "note": "The invalid zero-increment WINDOW_UPDATE is handled as a stream-level error on the already active stream 13, so H2O immediately calls `h2o_http2_stream_reset(conn, stream)` on that live outbound stream.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "payload->window_size_increment"
+        },
+        {
+          "on": 1,
+          "type": "data",
+          "via": "stream->stream_id"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "lib/http2/stream.c",
+      "function": "h2o_http2_stream_reset",
+      "line": 90,
+      "line_end": 102,
+      "var": "stream->state, stream->_data.size, stream->_link",
+      "code": "case H2O_HTTP2_STREAM_STATE_SEND_HEADERS:\ncase H2O_HTTP2_STREAM_STATE_SEND_BODY:\ncase H2O_HTTP2_STREAM_STATE_SEND_BODY_IS_FINAL:\n    h2o_http2_stream_set_state(conn, stream, H2O_HTTP2_STREAM_STATE_END_STREAM);\n/* continues */\ncase H2O_HTTP2_STREAM_STATE_END_STREAM:\n    stream->_data.size = 0;\n    if (h2o_linklist_is_linked(&stream->_link)) {\n        /* will be closed in the callback */\n    } else {\n        h2o_http2_stream_close(conn, stream);\n    }\n    break;",
+      "note": "Because the stream was already in a sending state, reset first advances it to `END_STREAM`, clears queued body count, and then takes the immediate `h2o_http2_stream_close` branch because step 5 established that `_link` is unlinked.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "stream"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "stream->state"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "!h2o_linklist_is_linked(&stream->_link)"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "lib/http2/connection.c",
+      "function": "preserve_stream_scheduler",
+      "line": 264,
+      "line_end": 264,
+      "var": "*dst",
+      "code": "*dst = h2o_mem_alloc(offsetof(h2o_http2_stream_t, _scheduler) + sizeof((*dst)->_scheduler));",
+      "note": "Before unregistering the stream, H2O allocates a shortened ring-buffer entry for recently closed priorities. This object intentionally retains only `stream_id` and `_scheduler`; fields after `_scheduler`, including `_data`, do not exist in this allocation.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "stream"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "lib/http2/connection.c",
+      "function": "preserve_stream_scheduler",
+      "line": 267,
+      "line_end": 268,
+      "var": "(*dst)->stream_id, (*dst)->_scheduler, src->_scheduler",
+      "code": "(*dst)->stream_id = src->stream_id;\nh2o_http2_scheduler_relocate(&(*dst)->_scheduler, &src->_scheduler);",
+      "note": "Root cause site. The close path preserves the active scheduler inside the truncated closed-stream stub and then returns to finish closing the original stream. Vulnerable code leaves the relocated scheduler active here; the patch adds an immediate deactivation after this call.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "(*dst)->_scheduler"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "stream->_scheduler"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "lib/http2/scheduler.c",
+      "function": "h2o_http2_scheduler_relocate",
+      "line": 252,
+      "line_end": 280,
+      "var": "dst->_active_cnt, dst->_self_is_active, dst->_queue_node._link",
+      "code": "dst->_active_cnt = src->_active_cnt;\ndst->_self_is_active = src->_self_is_active;\n...\nif (h2o_linklist_is_linked(&src->_queue_node._link)) {\n    h2o_linklist_insert(&src->_queue_node._link, &dst->_queue_node._link);\n    h2o_linklist_unlink(&src->_queue_node._link);\n}",
+      "note": "The relocate helper copies the live scheduler state into the stub verbatim: the active count, the `_self_is_active` bit, and the queued WRR link all move to `dst`. The preserved closed-stream stub therefore stays runnable in the scheduler even though it is no longer a full `h2o_http2_stream_t`.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "stream->_scheduler"
+        },
+        {
+          "on": 10,
+          "type": "data",
+          "via": "(*dst)->_scheduler"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "lib/http2/scheduler.c",
+      "function": "proceed",
+      "line": 364,
+      "line_end": 373,
+      "var": "ref->_self_is_active, ref",
+      "code": "if (!ref->_self_is_active) {\n    queue_set(node->_queue, &ref->_queue_node, ref->weight);\n    node = &ref->node;\n    goto Redo;\n}\nassert(ref->_active_cnt != 0);\n\n/* call the callbacks */\nint still_is_active, bail_out = cb(ref, &still_is_active, cb_arg);",
+      "note": "When the connection later runs the scheduler, the preserved closed-stream entry is still marked active, so `proceed()` invokes the write callback on that stub instead of treating it as an inactive interior node.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "ref->_self_is_active,_active_cnt"
+        },
+        {
+          "on": 11,
+          "type": "control",
+          "via": "!ref->_self_is_active"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "lib/http2/connection.c",
+      "function": "emit_writereq_of_openref",
+      "line": 1231,
+      "line_end": 1231,
+      "var": "stream",
+      "code": "h2o_http2_stream_t *stream = H2O_STRUCT_FROM_MEMBER(h2o_http2_stream_t, _scheduler, ref);",
+      "note": "The callback blindly reconstructs a full `h2o_http2_stream_t *` from the active scheduler reference. After steps 9-11, `ref` actually points into the shortened recently-closed-stream allocation, not a complete live stream object.",
+      "depends_on": [
+        {
+          "on": 12,
+          "type": "data",
+          "via": "ref"
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "file": "include/h2o/http2_internal.h",
+      "function": "h2o_http2_stream_has_pending_data",
+      "line": 381,
+      "line_end": 381,
+      "var": "stream->_data.size",
+      "code": "return stream->_data.size != 0;",
+      "note": "Sink. `_data` lives after `_scheduler` in the real stream struct, but the preserved object from step 9 stops at `_scheduler`. Evaluating this expression therefore performs the saved 8-byte heap out-of-bounds read beyond the truncated closed-stream stub.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "(*dst)"
+        },
+        {
+          "on": 13,
+          "type": "data",
+          "via": "stream"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 8,
+    "crash_location": {
+      "file": "include/h2o/http2_internal.h",
+      "function": "h2o_http2_stream_has_pending_data",
+      "line": 381
+    },
+    "allocation_context": {
+      "file": "lib/http2/connection.c",
+      "function": "preserve_stream_scheduler",
+      "line": 264,
+      "note": "The overflowed object is the shortened recently-closed-stream stub allocated here."
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "h2o_http2_stream_has_pending_data",
+        "file": "include/h2o/http2_internal.h",
+        "line": 381
+      },
+      {
+        "frame": 1,
+        "function": "emit_writereq_of_openref",
+        "file": "lib/http2/connection.c",
+        "line": 1233
+      },
+      {
+        "frame": 2,
+        "function": "proceed",
+        "file": "lib/http2/scheduler.c",
+        "line": 373
+      },
+      {
+        "frame": 3,
+        "function": "h2o_http2_scheduler_run",
+        "file": "lib/http2/scheduler.c",
+        "line": 392
+      },
+      {
+        "frame": 4,
+        "function": "do_emit_writereq",
+        "file": "lib/http2/connection.c",
+        "line": 1268
+      },
+      {
+        "frame": 5,
+        "function": "on_read",
+        "file": "lib/http2/connection.c",
+        "line": 1108
+      },
+      {
+        "frame": 6,
+        "function": "read_on_ready",
+        "file": "lib/common/socket/evloop.c.h",
+        "line": 248
+      },
+      {
+        "frame": 7,
+        "function": "run_socket",
+        "file": "lib/common/socket/evloop.c.h",
+        "line": 517
+      },
+      {
+        "frame": 8,
+        "function": "run_pending",
+        "file": "lib/common/socket/evloop.c.h",
+        "line": 555
+      },
+      {
+        "frame": 9,
+        "function": "h2o_evloop_run",
+        "file": "lib/common/socket/evloop.c.h",
+        "line": 602
+      },
+      {
+        "frame": 10,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/driver.cc",
+        "line": 409
+      }
+    ],
+    "dedup_token": "h2o_http2_stream_has_pending_data--emit_writereq_of_openref--proceed",
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "source": "staged sanitizer_trace.txt, default_crash_trace.txt, reproduction_report.json, and vulnerable source in the ARVO workspace container",
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true,
+      "patch_resolves_note": "The staged fix adds `h2o_http2_scheduler_deactivate(&(*dst)->_scheduler)` immediately after the preserve-time relocate call, so the truncated closed-stream stub no longer remains active or reaches `emit_writereq_of_openref()`."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01 reproduces the bug by running the vulnerable `h2o-fuzzer-http2` harness on the staged `poc`; the harness writer thread treats `\\n--MARK--\\n` as a packet boundary and the first packet alone is enough to trigger the crash.",
+    "format": {
+      "name": "h2o fuzz-driver HTTP/2 transcript",
+      "contract": "The staged PoC is a 136-byte HTTP/2 client transcript for `fuzz/driver.cc`. Bytes before `\\n--MARK--\\n` are sent as packet 1 and contain: the HTTP/2 connection preface, one SETTINGS frame, one HEADERS frame on stream 13 with flags `0x25` (`END_STREAM|END_HEADERS|PRIORITY`), one ignored unknown frame of type 11, and then one WINDOW_UPDATE frame on stream 13 whose 4-byte payload is exactly `00 00 00 00`. That zero increment is the verified trigger condition: H2O decodes it as an invalid stream-level WINDOW_UPDATE, resets the already-active stream 13, preserves its scheduler into a truncated closed-stream stub, and later overreads `_data.size` when the scheduler dispatches that stub. The two trailing bytes after the marker are not needed for the reproduced crash."
+    }
+  }
+}

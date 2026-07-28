@@ -1,0 +1,577 @@
+{
+  "sample_id": "arvo_42496071",
+  "vuln_id": "OSS-Fuzz issue 42496071 / ARVO arvo:42496071",
+  "project": {
+    "id": "aom",
+    "name": "libaom",
+    "repo": "https://aomedia.googlesource.com/aom",
+    "vulnerable_commit": "5d8a6c3fd57f2bb0695b09557817255a9eb20846",
+    "fixed_commit": "80bd452152ec39b7d88bded3d9090fb20b1ba12f",
+    "fuzz_target": "av1_dec_fuzzer"
+  },
+  "staged_source_snapshot": {
+    "path": "ARVO workspace container gt-arvo_42496071-workspace:/src/aom",
+    "commit": "7158bdf818ed8d885eb9b8b43ccf02f85a2ed50c",
+    "description": "Stage 01 reproduced against this exact staged vulnerable snapshot. Metadata names commit 5d8a6c3fd57f2bb0695b09557817255a9eb20846, but the live workspace above is the line map that matches the saved ASan crash and the vulnerable hunk in patch.diff."
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "READ",
+    "detector": "AddressSanitizer",
+    "classification_note": "The saved crash is a heap-buffer-overflow READ of size 8 in av1_free_cdef_buffers() during decoder teardown. The underlying bug is a stale CDEF row-sync allocation whose length is not refreshed when only the frame-row count changes."
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42496071 (aom): Heap-buffer-overflow READ 8 found by fuzz target av1_dec_fuzzer [asan]. https://issues.oss-fuzz.com/issues/42496071",
+    "original_source": "sample_info.json / sanitizer_trace.txt / reproduction_report.json / patch.diff / staged vulnerable source snapshot",
+    "normalized": "The staged 181-byte witness is not a valid IVF file, but av1_dec_fuzzer still skips its first 32 bytes, uses byte 32 (`0x20`) to configure 33 decode threads, interprets the next 12 bytes as one fake IVF frame header, and passes the remaining 137 bytes as a single non-Annex-B AV1 packet into aom_codec_decode(). In decoder_decode(), that packet is not split into separate harness calls; the same AV1Decoder instance repeatedly calls decode_one() until the packet bytes are exhausted. An earlier frame decoded from that packet reaches av1_alloc_cdef_buffers(), stores the then-current mi-column count, and allocates cdef_sync->cdef_row_mt for the earlier num_mi_rows. A later frame in the same packet materializes new geometry with a different mi-row count but the same mi-column count. Vulnerable av1_alloc_cdef_buffers() derives a later num_mi_rows, but its free/reallocation guard only checks mi-column changes and several other flags; it never frees cdef_row_mt when only the row count changes. The function then overwrites cdef_info->allocated_mi_rows with the later num_mi_rows and skips reallocation because cdef_row_mt is already non-NULL. On aom_codec_destroy(), av1_free_cdef_buffers() reads that later allocated_mi_rows back as its loop bound and iterates past the earlier smaller cdef_row_mt allocation, producing the saved AddressSanitizer heap-buffer-overflow READ at alloccommon.c:92. The staged patch fixes this exact obligation by freeing and reallocating the CDEF row-sync array when allocated_mi_rows and num_mi_rows differ."
+  },
+  "source": {
+    "file": "av1/decoder/decoder.c",
+    "function": "dec_set_mb_mi",
+    "line": 58,
+    "code": "mi_params->mi_cols = aligned_width >> MI_SIZE_LOG2;\nmi_params->mi_rows = aligned_height >> MI_SIZE_LOG2;",
+    "var": "mi_params->mi_cols, mi_params->mi_rows",
+    "description": "On the later frame that triggers the stale-length mismatch, the resize path materializes the new frame geometry into decoder state. This is the source step that makes the later CDEF row-sync length differ while preserving the column count used by the old free/reallocation guard.",
+    "value_from": "Within the single 137-byte packet that decoder_decode() reuses across multiple frame decodes, later attacker-controlled frame-size state has already resolved width and height before this assignment runs. The saved ASan allocation/crash pair proves that this later geometry changes the derived CDEF row count after an earlier frame has already allocated cdef_row_mt.",
+    "trace_step": 8
+  },
+  "root_cause": {
+    "file": "av1/common/alloccommon.c",
+    "function": "av1_alloc_cdef_buffers",
+    "line": 154,
+    "code": "if (is_frame_scaled || is_sub_sampling_changed || is_cdef_flag_changed ||\n    is_large_scale_tile_changed || is_num_planes_changed ||\n    is_num_workers_changed)\n  av1_free_cdef_buffers(cm, cdef_worker, cdef_sync,\n                        cdef_info->allocated_num_workers);",
+    "var": "is_frame_scaled, num_mi_rows, cdef_sync->cdef_row_mt",
+    "description": "Root cause. The reuse guard frees CDEF state only for column-count changes and other configuration deltas. When a later frame changes only the derived row count, this guard does not clear cdef_row_mt before allocated_mi_rows is overwritten, leaving a smaller row-sync array paired with a larger loop bound.",
+    "note": "patch.diff inserts the missing row-count case immediately after this guard: when cdef_info->allocated_mi_rows != num_mi_rows, it frees the old row-sync array before the later allocation step.",
+    "trace_step": 11
+  },
+  "sink": {
+    "file": "av1/common/alloccommon.c",
+    "function": "av1_free_cdef_buffers",
+    "line": 92,
+    "code": "pthread_mutex_destroy((*cdef_row_mt)[row_idx].row_mutex_);",
+    "var": "(*cdef_row_mt)[row_idx].row_mutex_, row_idx, num_mi_rows",
+    "description": "AddressSanitizer sink. During decoder teardown, the destroy loop trusts the later allocated_mi_rows as its bound and dereferences a row index past the earlier smaller cdef_row_mt allocation.",
+    "note": "Stage 01's saved ASan trace reports a heap-buffer-overflow READ of size 8 at av1/common/alloccommon.c:92; the accessed address is immediately past a 47-byte region allocated earlier at av1/common/alloccommon.c:199.",
+    "trace_step": 15
+  },
+  "tainted_value_origin": {
+    "file": "av1/common/alloccommon.c",
+    "function": "av1_alloc_cdef_buffers",
+    "line": 142,
+    "var": "num_mi_rows",
+    "code": "const int num_mi_rows =\n    (cm->mi_params.mi_rows + MI_SIZE_64X64 - 1) / MI_SIZE_64X64;",
+    "description": "This is the exact derived row-sync length computed from the later frame's attacker-controlled geometry. The stale metadata and the destroy-time loop bound both come from this value."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "av1/decoder/obu.c",
+      "function": "aom_decode_frame_from_obus",
+      "line": 897,
+      "code": "aom_read_obu_header_and_size(data, bytes_available, pbi->is_annexb,\n                             &obu_header, &payload_size, &bytes_read);",
+      "description": "The 137-byte packet is admitted as AV1 OBU data. decoder_decode() can therefore keep advancing data_start and re-enter decode_one() on the same AV1Decoder until the packet bytes are exhausted."
+    }
+  },
+  "evidence_limitations": [
+    "The reproduced line map is the staged ARVO workspace snapshot `7158bdf818ed8d885eb9b8b43ccf02f85a2ed50c`, not the metadata vulnerable commit `5d8a6c3fd57f2bb0695b09557817255a9eb20846`; all anchors above follow the exact staged source that reproduced and whose `alloccommon.c` lines match the saved ASan crash and patch hunk.",
+    "`run_flags.json` sets `runtime_disambiguation` to false and there is no `trace_feedback.json`, so Stage 02 did not instrument the decoder to recover exact later frame-header bit offsets. The existence of an earlier allocating frame and a later row-changing frame inside the same packet is closed from the staged `decoder_decode()` loop, the unique `allocated_mi_rows` assignment site, and the saved ASan allocation/crash pair."
+  ],
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "examples/av1_dec_fuzzer.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness treats the witness as fake IVF, uses byte 32 to configure 33 threads, and passes one 137-byte packet to `aom_codec_decode()`."
+    },
+    {
+      "step": 2,
+      "file": "av1/av1_dx_iface.c",
+      "function": "decoder_decode",
+      "summary": "Because the packet is non-Annex-B, `decoder_decode()` keeps calling `decode_one()` while bytes remain, so multiple AV1 frames can be decoded on the same persistent `AV1Decoder` from a single harness call."
+    },
+    {
+      "step": 3,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "summary": "An earlier frame snapshots the then-current mi-column count and allocates `cdef_row_mt`; a later frame derives a new CDEF row count but, because only rows changed, the vulnerable guard skips freeing or reallocating that array and only overwrites `allocated_mi_rows`."
+    },
+    {
+      "step": 4,
+      "file": "av1/av1_dx_iface.c",
+      "function": "decoder_destroy",
+      "summary": "Codec teardown calls `av1_free_cdef_buffers()` with the same `pbi->cdef_sync` and worker count that survived the packet decode."
+    },
+    {
+      "step": 5,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_free_cdef_buffers",
+      "summary": "The destroy loop reuses the later `allocated_mi_rows` as its bound over the earlier smaller `cdef_row_mt` allocation and overreads the heap, matching the saved ASan crash."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "examples/av1_dec_fuzzer.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 40,
+      "line_end": 56,
+      "var": "threads, data, frame_size",
+      "code": "const unsigned int threads = (data[IVF_FILE_HDR_SZ] & 0x3f) + 1;\naom_codec_dec_cfg_t cfg = { threads, 0, 0, !FORCE_HIGHBITDEPTH_DECODING };\n...\nframe_size = std::min(size, frame_size);\nconst aom_codec_err_t err =\n    aom_codec_decode(&codec, data, frame_size, nullptr);",
+      "note": "The harness skips the first 32 witness bytes, uses byte 32 (`0x20`) to configure `threads = 33`, interprets bytes 32-43 as one fake IVF frame header, clamps its huge advertised size to the remaining 137 bytes, and makes exactly one `aom_codec_decode()` call with that 137-byte packet."
+    },
+    {
+      "step": 2,
+      "file": "av1/av1_dx_iface.c",
+      "function": "decoder_decode",
+      "line": 651,
+      "line_end": 667,
+      "var": "data_start, data_end, frame_size",
+      "code": "while (data_start < data_end) {\n  uint64_t frame_size;\n  ...\n  frame_size = (uint64_t)(data_end - data_start);\n  res = decode_one(ctx, &data_start, (size_t)frame_size, user_priv);\n}",
+      "note": "For non-Annex-B input, the decoder treats the whole 137-byte packet as one frame unit at a time, advances `data_start` after each `decode_one()`, and reuses the same `ctx->frame_worker->pbi` while bytes remain. That persistent state is what lets one packet create an earlier allocation and a later mismatched resize before destroy.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "data, frame_size"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "av1/decoder/decoder.c",
+      "function": "dec_set_mb_mi",
+      "line": 58,
+      "line_end": 59,
+      "var": "mi_params->mi_cols, mi_params->mi_rows",
+      "code": "mi_params->mi_cols = aligned_width >> MI_SIZE_LOG2;\nmi_params->mi_rows = aligned_height >> MI_SIZE_LOG2;",
+      "note": "During an earlier frame decode from the same packet, `dec_set_mb_mi()` materializes that frame's geometry into `cm->mi_params`. Those earlier column and row counts feed the first CDEF row-sync allocation.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "while (data_start < data_end)"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 161,
+      "var": "cdef_info->allocated_mi_cols",
+      "code": "cdef_info->allocated_mi_cols = cm->mi_params.mi_cols;",
+      "note": "The earlier `av1_alloc_cdef_buffers()` call snapshots the then-current column count. The vulnerable reuse test later compares only against this cached column value.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "cm->mi_params.mi_cols"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 142,
+      "line_end": 143,
+      "var": "num_mi_rows",
+      "code": "const int num_mi_rows =\n    (cm->mi_params.mi_rows + MI_SIZE_64X64 - 1) / MI_SIZE_64X64;",
+      "note": "The same earlier call derives the initial row-sync length from the earlier frame's `mi_rows`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "cm->mi_params.mi_rows"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 198,
+      "line_end": 200,
+      "var": "*cdef_row_mt",
+      "code": "if (*cdef_row_mt == NULL) {\n  CHECK_MEM_ERROR(cm, *cdef_row_mt,\n                  aom_malloc(sizeof(**cdef_row_mt) * num_mi_rows));",
+      "note": "Because the decoder is running with more than one worker on this witness, `av1_alloc_cdef_buffers()` reaches the row-sync path. `cdef_row_mt` starts NULL, so the earlier frame allocates the row-sync array here. ASan's allocation stack names this exact site and reports the resulting heap region as 47 bytes.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "threads"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "num_mi_rows"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "av1/av1_dx_iface.c",
+      "function": "decode_one",
+      "line": 531,
+      "var": "*data, frame_worker_data->data_end",
+      "code": "*data = frame_worker_data->data_end;",
+      "note": "After the earlier frame finishes, `decode_one()` advances the caller's packet pointer to the next unread byte. Because step 2 keeps looping while bytes remain, the same decoder object and its non-NULL `cdef_row_mt` survive into a later frame decode from the same 137-byte packet.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "while (data_start < data_end)"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "*cdef_row_mt"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "av1/decoder/decoder.c",
+      "function": "dec_set_mb_mi",
+      "line": 58,
+      "line_end": 59,
+      "var": "mi_params->mi_cols, mi_params->mi_rows",
+      "code": "mi_params->mi_cols = aligned_width >> MI_SIZE_LOG2;\nmi_params->mi_rows = aligned_height >> MI_SIZE_LOG2;",
+      "note": "Source. On a later frame decoded from the same packet, `dec_set_mb_mi()` materializes a new geometry pair. The witness must preserve the earlier column count while changing the row count, because otherwise the later stale-length mismatch could not exist.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "while (data_start < data_end)"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "*data"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 135,
+      "line_end": 136,
+      "var": "is_frame_scaled",
+      "code": "const int is_frame_scaled =\n    cdef_info->allocated_mi_cols != cm->mi_params.mi_cols;",
+      "note": "The later frame is not treated as a scale change, because the cached earlier column count from step 4 still matches the later `cm->mi_params.mi_cols` from step 8. The vulnerable code does not compare row counts here.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "cdef_info->allocated_mi_cols"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "cm->mi_params.mi_cols"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 142,
+      "line_end": 143,
+      "var": "num_mi_rows",
+      "code": "const int num_mi_rows =\n    (cm->mi_params.mi_rows + MI_SIZE_64X64 - 1) / MI_SIZE_64X64;",
+      "note": "The later frame's new `mi_rows` is converted into a later CDEF row-sync length. This later `num_mi_rows` differs from the earlier allocation length at step 5, which is the size mismatch that the fix addresses.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "cm->mi_params.mi_rows"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 154,
+      "line_end": 158,
+      "var": "is_frame_scaled, cdef_sync->cdef_row_mt",
+      "code": "if (is_frame_scaled || is_sub_sampling_changed || is_cdef_flag_changed ||\n    is_large_scale_tile_changed || is_num_planes_changed ||\n    is_num_workers_changed)\n  av1_free_cdef_buffers(cm, cdef_worker, cdef_sync,\n                        cdef_info->allocated_num_workers);",
+      "note": "Root cause step. Even though the later derived row count changed at step 10, this guard only frees CDEF state for column-count changes and other configuration deltas. The later frame therefore skips the free that would have cleared the earlier smaller `cdef_row_mt` allocation.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "is_frame_scaled"
+        },
+        {
+          "on": 10,
+          "type": "data",
+          "via": "num_mi_rows"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 162,
+      "var": "cdef_info->allocated_mi_rows",
+      "code": "cdef_info->allocated_mi_rows = num_mi_rows;",
+      "note": "After the step-11 guard fails to free the old row-sync array, the function overwrites the cached row count with the later `num_mi_rows`. From this point on, metadata says the array is as long as the later frame even though the actual allocation is still the earlier smaller one from step 6.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "num_mi_rows"
+        },
+        {
+          "on": 11,
+          "type": "control",
+          "via": "is_frame_scaled || is_sub_sampling_changed || is_cdef_flag_changed || is_large_scale_tile_changed || is_num_planes_changed || is_num_workers_changed"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 198,
+      "line_end": 200,
+      "var": "*cdef_row_mt",
+      "code": "if (*cdef_row_mt == NULL) {\n  CHECK_MEM_ERROR(cm, *cdef_row_mt,\n                  aom_malloc(sizeof(**cdef_row_mt) * num_mi_rows));",
+      "note": "The later call does not reallocate the row-sync array, because step 6 left `cdef_row_mt` non-NULL and step 11 never freed it. The earlier smaller allocation therefore survives alongside the later cached row count from step 12.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "*cdef_row_mt"
+        },
+        {
+          "on": 11,
+          "type": "control",
+          "via": "is_frame_scaled || is_sub_sampling_changed || is_cdef_flag_changed || is_large_scale_tile_changed || is_num_planes_changed || is_num_workers_changed"
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_free_cdef_buffers",
+      "line": 69,
+      "var": "num_mi_rows",
+      "code": "const int num_mi_rows = cdef_info->allocated_mi_rows;",
+      "note": "When `aom_codec_destroy()` reaches `decoder_destroy()` and then `av1_free_cdef_buffers()`, the free-side loop bound is reloaded from the later overwritten metadata at step 12, not from the real allocation length at step 6.",
+      "depends_on": [
+        {
+          "on": 12,
+          "type": "data",
+          "via": "cdef_info->allocated_mi_rows"
+        }
+      ]
+    },
+    {
+      "step": 15,
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_free_cdef_buffers",
+      "line": 91,
+      "line_end": 92,
+      "var": "row_idx, num_mi_rows, (*cdef_row_mt)[row_idx].row_mutex_",
+      "code": "for (int row_idx = 0; row_idx < num_mi_rows; row_idx++) {\n  pthread_mutex_destroy((*cdef_row_mt)[row_idx].row_mutex_);",
+      "note": "The destroy loop iterates with the later larger bound from step 14 over the earlier smaller array from step 13. When `row_idx` reaches the first index beyond the original allocation, the read of `(*cdef_row_mt)[row_idx].row_mutex_` overruns the heap. ASan reports this exact 8-byte read at line 92 and points back to step 6 as the allocation site.",
+      "depends_on": [
+        {
+          "on": 13,
+          "type": "data",
+          "via": "*cdef_row_mt"
+        },
+        {
+          "on": 14,
+          "type": "data",
+          "via": "num_mi_rows"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "AddressSanitizer",
+    "trace_format": "AddressSanitizer",
+    "sanitizer": "address",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 8,
+    "crash_location": {
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_free_cdef_buffers",
+      "line": 92
+    },
+    "runtime_crash_location": {
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_free_cdef_buffers",
+      "line": 92
+    },
+    "allocation_context": {
+      "file": "av1/common/alloccommon.c",
+      "function": "av1_alloc_cdef_buffers",
+      "line": 199
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "av1_free_cdef_buffers",
+        "file": "av1/common/alloccommon.c",
+        "line": 92
+      },
+      {
+        "frame": 1,
+        "function": "decoder_destroy",
+        "file": "av1/av1_dx_iface.c",
+        "line": 123
+      },
+      {
+        "frame": 2,
+        "function": "aom_codec_destroy",
+        "file": "aom/src/aom_codec.c",
+        "line": 75
+      },
+      {
+        "frame": 3,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "examples/av1_dec_fuzzer.cc",
+        "line": 65
+      },
+      {
+        "frame": 4,
+        "function": "fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)",
+        "file": "FuzzerLoop.cpp",
+        "line": 599
+      },
+      {
+        "frame": 5,
+        "function": "fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long)",
+        "file": "FuzzerDriver.cpp",
+        "line": 323
+      },
+      {
+        "frame": 6,
+        "function": "fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long))",
+        "file": "FuzzerDriver.cpp",
+        "line": 856
+      },
+      {
+        "frame": 7,
+        "function": "main",
+        "file": "FuzzerMain.cpp",
+        "line": 20
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "asan_malloc_linux.cpp",
+        "line": 145
+      },
+      {
+        "frame": 1,
+        "function": "aom_memalign",
+        "file": "aom_mem/aom_mem.c",
+        "line": 55
+      },
+      {
+        "frame": 2,
+        "function": "aom_malloc",
+        "file": "aom_mem/aom_mem.c",
+        "line": 63
+      },
+      {
+        "frame": 3,
+        "function": "av1_alloc_cdef_buffers",
+        "file": "av1/common/alloccommon.c",
+        "line": 199
+      },
+      {
+        "frame": 4,
+        "function": "av1_decode_tg_tiles_and_wrapup",
+        "file": "av1/decoder/decodeframe.c",
+        "line": 5284
+      },
+      {
+        "frame": 5,
+        "function": "read_one_tile_group_obu",
+        "file": "av1/decoder/obu.c",
+        "line": 361
+      },
+      {
+        "frame": 6,
+        "function": "aom_decode_frame_from_obus",
+        "file": "av1/decoder/obu.c",
+        "line": 1027
+      },
+      {
+        "frame": 7,
+        "function": "av1_receive_compressed_data",
+        "file": "av1/decoder/decoder.c",
+        "line": 476
+      },
+      {
+        "frame": 8,
+        "function": "frame_worker_hook",
+        "file": "av1/av1_dx_iface.c",
+        "line": 411
+      },
+      {
+        "frame": 9,
+        "function": "execute",
+        "file": "aom_util/aom_thread.c",
+        "line": 163
+      },
+      {
+        "frame": 10,
+        "function": "decode_one",
+        "file": "av1/av1_dx_iface.c",
+        "line": 528
+      },
+      {
+        "frame": 11,
+        "function": "decoder_decode",
+        "file": "av1/av1_dx_iface.c",
+        "line": 667
+      },
+      {
+        "frame": 12,
+        "function": "aom_codec_decode",
+        "file": "aom/src/aom_decoder.c",
+        "line": 103
+      },
+      {
+        "frame": 13,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "examples/av1_dec_fuzzer.cc",
+        "line": 56
+      }
+    ],
+    "free_stack": [],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "ASan's allocation stack points to the earlier `cdef_row_mt` allocation at `av1_alloc_cdef_buffers:199`. Steps 3-13 show how a later row-only geometry change overwrites `allocated_mi_rows` without reallocating that earlier buffer before the destroy-time read at step 15.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "The staged 181-byte witness drives av1_dec_fuzzer to configure 33 threads and decode one 137-byte packet on a single persistent AV1Decoder; an earlier frame in that packet allocates `cdef_row_mt`, a later frame changes only the derived CDEF row count, and `aom_codec_destroy()` overreads the stale smaller array in `av1_free_cdef_buffers()`.",
+    "format": {
+      "name": "av1_dec_fuzzer staged fake-IVF / non-Annex-B multi-frame packet",
+      "contract": "Exactly the witnessed trigger shape: the first 32 bytes are only a skipped prefix, byte 32 must keep `threads > 1` (the staged witness uses `0x20`, giving 33), and the next 12 bytes must make av1_dec_fuzzer clamp a single decode call to the remaining 137 bytes. Within that one packet, decoder_decode() must parse at least two AV1 frames on the same AV1Decoder. An earlier frame must allocate `cdef_sync->cdef_row_mt` and snapshot `allocated_mi_cols`; a later frame must change the derived CDEF `num_mi_rows` while leaving `cm->mi_params.mi_cols` equal to the cached `allocated_mi_cols` and leaving the other existing reuse checks unchanged, so av1_alloc_cdef_buffers() updates `allocated_mi_rows` without reallocating `cdef_row_mt`; teardown must then reach av1_free_cdef_buffers(). This is only the verified trigger semantics of the staged witness, not a claim about all AV1 packets with size changes."
+    }
+  }
+}

@@ -1,0 +1,374 @@
+{
+  "sample_id": "arvo_56037",
+  "vuln_id": "ARVO arvo:56037 / libgit2 smart transport set_data heap-buffer-overflow",
+  "project": {
+    "id": "libgit2",
+    "name": "libgit2",
+    "repo": "https://github.com/libgit2/libgit2",
+    "vulnerable_commit": "6e4bbf222d8c4babaff90aef40615546c8bc9cde",
+    "fixed_commit": "11c89c386c8862f834097cdc5d9ed79634cf00f3",
+    "fuzz_target": "download_refs_fuzzer"
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "read",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 56037 reports an AddressSanitizer heap-buffer-overflow READ in `set_data`, reachable via `ref_pkt` and `git_pkt_parse_line` while `download_refs_fuzzer` connects to a smart transport.",
+    "original_source": "sample_info.json issue_description",
+    "normalized": "The exact staged witness is a 65536-byte smart-protocol pkt-line stream, so libgit2's first smart-transport read fills the fixed 64 KiB `gitno_buffer` completely. The stream starts with `000d# comment`, so `git_pkt_parse_line` accepts a 13-byte comment packet and `gitno_consume` shifts the remaining 65523 bytes to the front. In the vulnerable buffer implementation, that consume path zeros from the old `buf->offset` before subtracting the 13 consumed bytes, so after a full-buffer consume the new logical end is not NUL-terminated. The shifted buffer now begins with a ref advertisement whose pkt-line header is `00f2` and whose payload is `40-hex-oid`, a space, `HEAD`, an embedded NUL, and the capability string `multi_ack thin-pack side-band side-band-64k ofs-delta shallo5 deepen-since deepen-not deepen-rflative no-erogress includeKtag multi_ack_detailed synref=HEAD:refs/heads/master agent=git/2.11.0\\n`; that capability list omits `object-format=` entirely. Because this is the first ref packet, `ref_pkt` calls `set_data`, which finds the embedded NUL after `HEAD` and then falls through to `strstr(caps, \" object-format=\")`. Since `caps` is only bounded by the 65523 unread bytes and no longer terminated at the new logical end, that C-string search scans past the remaining pkt-line data and overreads the heap-allocated `transport_smart` object. AddressSanitizer reports the resulting heap-buffer-overflow READ of size 65487 in `set_data` line 234, and the allocation stack points to `git_transport_smart` line 480. The fix replaces `gitno_buffer` consumption with `git_staticstr_consume()`, which restores a terminator at the new logical end so the same capability scan stays within bounds."
+  },
+  "source": {
+    "file": "src/libgit2/transports/smart.c",
+    "function": "git_smart__recv_cb",
+    "line": 26,
+    "var": "buf->data, buf->offset, bytes_read",
+    "code": "if ((error = t->current_stream->read(t->current_stream, buf->data + buf->offset, buf->len - buf->offset, &bytes_read)) < 0)\n\treturn error;\n\nbuf->offset += bytes_read;",
+    "description": "First project-code statement that materializes attacker-controlled pkt-line bytes into libgit2's smart-transport buffer and records the full-buffer state used on the crashing path.",
+    "value_from": "The staged `poc` is exactly 65536 bytes, and `fuzzer_stream_read()` returns `min(buf_size, avail)` with both equal to 65536 on the first callback. This read therefore copies the entire witness into `t->buffer.data` and leaves `buf->offset == buf->len == 65536`.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "src/libgit2/transports/smart_pkt.c",
+    "function": "set_data",
+    "line": 234,
+    "var": "caps, format_str",
+    "code": "else if ((format_str = strstr(caps, \" object-format=\")) != NULL)",
+    "description": "AddressSanitizer sink. `caps` points into the ref advertisement's capability bytes, but after the stale consume state it is no longer guaranteed to terminate at the buffer's logical end, so this C-string search can run off the heap-backed transport object.",
+    "note": "The saved vulnerable run reports `AddressSanitizer: heap-buffer-overflow READ of size 65487` at this exact line, with callers `ref_pkt` and `git_pkt_parse_line`, and says the faulting address is 0 bytes to the right of the 66080-byte region allocated in `git_transport_smart`.",
+    "trace_step": 7
+  },
+  "root_cause": {
+    "file": "src/libgit2/netops.c",
+    "function": "gitno_consume",
+    "line": 73,
+    "var": "buf->data, buf->offset, consumed",
+    "code": "memmove(buf->data, ptr, buf->offset - consumed);\nmemset(buf->data + buf->offset, 0x0, buf->len - buf->offset);\nbuf->offset -= consumed;",
+    "description": "When a packet is consumed from a full `gitno_buffer`, this sequence shifts the unread tail and shrinks `offset` but never writes a NUL terminator at the new logical end. Later code then treats the remaining pkt-line bytes as an unterminated C string.",
+    "note": "On this witness `buf->offset == buf->len == 65536` and the first parsed packet consumes 13 bytes. `memset` starts at the old end and clears zero bytes, then `buf->offset` becomes 65523, leaving the new logical end stale. The fixing commit removes this bug by using `git_staticstr_consume()`, which re-establishes `data[len] = '\\0'` after every consume.",
+    "trace_step": 4
+  },
+  "tainted_value_origin": {
+    "file": "src/libgit2/transports/smart_pkt.c",
+    "function": "parse_len",
+    "line": 473,
+    "var": "len",
+    "code": "*out = (size_t) len;",
+    "description": "The first four bytes of the staged stream are parsed as the first pkt-line length. For this witness ASCII `000d` materializes `len == 13`, which becomes the exact byte count removed from the full transport buffer before the stale-end state is created.",
+    "value_from": "The exact staged `poc` begins with bytes `30 30 30 64` (`\"000d\"`)."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/libgit2/transports/smart_protocol.c",
+      "function": "git_smart__store_refs",
+      "line": 49,
+      "code": "error = git_pkt_parse_line(&pkt, &line_end, buf->data, buf->offset, &pkt_parse_data);",
+      "description": "After `git_remote_connect()` selects the RPC upload-pack listing service and step 1 fills the buffer, `git_smart__store_refs` enters pkt-line parsing at this call site."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "fuzzers/download_refs_fuzzer.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness exposes the exact 65536-byte witness through a custom smart subtransport and calls `git_remote_connect` in fetch mode."
+    },
+    {
+      "step": 2,
+      "file": "src/libgit2/transports/smart.c",
+      "function": "git_smart__recv_cb",
+      "summary": "libgit2 reads the entire witness into its fixed 64 KiB smart-transport buffer in one callback, creating the full-buffer state that the later consume bug mishandles."
+    },
+    {
+      "step": 3,
+      "file": "src/libgit2/netops.c",
+      "function": "gitno_consume",
+      "summary": "The opening `000d# comment` pkt-line is consumed from that full buffer, but the unread tail is shifted left without restoring a NUL terminator at the new logical end."
+    },
+    {
+      "step": 4,
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "ref_pkt",
+      "summary": "The shifted buffer front is parsed as the first ref advertisement, so `ref_pkt` invokes `set_data` on its 238-byte `HEAD\\0capabilities` payload."
+    },
+    {
+      "step": 5,
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "set_data",
+      "summary": "Because the capability bytes omit `object-format=` and the consumed full buffer is no longer terminated at its logical end, `strstr` scans off the heap object and triggers the saved heap-buffer-overflow read."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/libgit2/transports/smart.c",
+      "function": "git_smart__recv_cb",
+      "line": 26,
+      "line_end": 29,
+      "var": "buf->data, buf->offset, bytes_read",
+      "code": "if ((error = t->current_stream->read(t->current_stream, buf->data + buf->offset, buf->len - buf->offset, &bytes_read)) < 0)\n\treturn error;\n\nbuf->offset += bytes_read;",
+      "note": "Source step. The exact staged witness is 65536 bytes, so this callback copies the entire stream into `t->buffer.data` in one read. The buffer now begins `000d# comment00f2...`, and `buf->offset == buf->len == 65536`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "parse_len",
+      "line": 473,
+      "var": "len",
+      "code": "*out = (size_t) len;",
+      "note": "The first four buffered bytes `000d` decode to `len == 13` for the opening pkt-line. That attacker-controlled scalar becomes the number of bytes later removed from the full buffer.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "buf->data"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "git_pkt_parse_line",
+      "line": 561,
+      "line_end": 562,
+      "var": "pkt->type, data->seen_capabilities",
+      "code": "else if (*line == '#')\n\terror = comment_pkt(pkt, line, len);",
+      "note": "After the 13-byte length from step 2 is accepted, the first pkt-line payload starts with `#`, so it is classified as a comment packet, not a ref advertisement. No capabilities are parsed here, leaving `data->seen_capabilities == 0` for the next packet.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "buf->data"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "len"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/libgit2/netops.c",
+      "function": "gitno_consume",
+      "line": 72,
+      "line_end": 74,
+      "var": "buf->data, buf->offset, consumed",
+      "code": "memmove(buf->data, ptr, buf->offset - consumed);\nmemset(buf->data + buf->offset, 0x0, buf->len - buf->offset);\nbuf->offset -= consumed;",
+      "note": "Root-cause step. With `buf->offset == buf->len == 65536` from step 1 and `consumed == 13` from step 2, `memmove` shifts 65523 unread bytes to the front, `memset` starts at the old end and clears zero bytes, and then `buf->offset` becomes 65523. The new logical end at `buf->data[65523]` is therefore left unterminated.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "buf->offset, buf->len"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "len"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "git_pkt_parse_line",
+      "line": 547,
+      "line_end": 570,
+      "var": "len",
+      "code": "len -= PKT_LEN_SIZE; /* the encoded length includes its own size */",
+      "note": "At the shifted buffer front, the next pkt-line header is `00f2`, so the parser reduces the total packet length 242 to a 238-byte payload. Because step 3 left `data->seen_capabilities == 0`, this packet is then routed to `ref_pkt`, which calls `set_data` on that first ref advertisement.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "buf->data"
+        },
+        {
+          "on": 3,
+          "type": "control",
+          "via": "!data->seen_capabilities"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "set_data",
+      "line": 229,
+      "line_end": 235,
+      "var": "caps",
+      "code": "if ((caps = memchr(line, '\\0', len)) != NULL) {",
+      "note": "Within the 238-byte ref payload from step 5, `memchr` finds the embedded NUL after `HEAD`, so `caps` is advanced to the capability bytes beginning `multi_ack thin-pack ... agent=git/2.11.0\\n`. Static inspection of the staged witness shows that substring does not contain `object-format=` anywhere.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "len"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "set_data",
+      "line": 234,
+      "var": "caps, format_str",
+      "code": "else if ((format_str = strstr(caps, \" object-format=\")) != NULL)",
+      "note": "Sink step. The capability bytes from step 6 do not match the leading `object-format=` check, so execution falls through to this unbounded `strstr`. Because step 4 left the full-buffer tail unterminated at its new logical end, the search runs past the 65523 unread bytes and crosses the 66080-byte `transport_smart` allocation. AddressSanitizer reports the resulting `heap-buffer-overflow READ of size 65487` at this line.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "buf->data, buf->offset"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "caps"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "strncmp(caps, \"object-format=\", CONST_STRLEN(\"object-format=\")) == 0"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "read",
+    "access_size": 65487,
+    "crash_location": {
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "set_data",
+      "line": 234
+    },
+    "runtime_crash_location": {
+      "file": "src/libgit2/transports/smart_pkt.c",
+      "function": "set_data",
+      "line": 234
+    },
+    "allocation_context": {
+      "file": "src/libgit2/transports/smart.c",
+      "function": "git_transport_smart",
+      "line": 480
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "set_data",
+        "file": "src/libgit2/transports/smart_pkt.c",
+        "line": 234
+      },
+      {
+        "frame": 1,
+        "function": "ref_pkt",
+        "file": "src/libgit2/transports/smart_pkt.c",
+        "line": 284
+      },
+      {
+        "frame": 2,
+        "function": "git_pkt_parse_line",
+        "file": "src/libgit2/transports/smart_pkt.c",
+        "line": 570
+      },
+      {
+        "frame": 3,
+        "function": "git_smart__store_refs",
+        "file": "src/libgit2/transports/smart_protocol.c",
+        "line": 49
+      },
+      {
+        "frame": 4,
+        "function": "git_smart__connect",
+        "file": "src/libgit2/transports/smart.c",
+        "line": 161
+      },
+      {
+        "frame": 5,
+        "function": "git_remote_connect_ext",
+        "file": "src/libgit2/remote.c",
+        "line": 961
+      },
+      {
+        "frame": 6,
+        "function": "git_remote_connect",
+        "file": "src/libgit2/remote.c",
+        "line": 1000
+      },
+      {
+        "frame": 7,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzzers/download_refs_fuzzer.c",
+        "line": 215
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "stdalloc__calloc",
+        "file": "src/util/allocators/stdalloc.c",
+        "line": 42
+      },
+      {
+        "frame": 1,
+        "function": "git_transport_smart",
+        "file": "src/libgit2/transports/smart.c",
+        "line": 480
+      },
+      {
+        "frame": 2,
+        "function": "fuzzer_transport_cb",
+        "file": "fuzzers/download_refs_fuzzer.c",
+        "line": 157
+      },
+      {
+        "frame": 3,
+        "function": "git_remote_connect_ext",
+        "file": "src/libgit2/remote.c",
+        "line": 953
+      },
+      {
+        "frame": 4,
+        "function": "git_remote_connect",
+        "file": "src/libgit2/remote.c",
+        "line": 1000
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzzers/download_refs_fuzzer.c",
+        "line": 215
+      }
+    ],
+    "free_stack": [],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "The ASan allocation stack points to the `transport_smart` object that contains `buffer_data`; the trace's root cause explains how stale consume state on that buffer lets `set_data` read past the same allocation.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "gt_results/arvo_56037/poc",
+    "size": 65536,
+    "sha256": "4e12df82a9b2544b0eb5e382a3dd9b14ccee4d1812c5cda4489d2965903cba2b",
+    "trigger": "Stage 01 saved `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_56037 run --version vulnerable --expect crash`, which reproduced `AddressSanitizer: heap-buffer-overflow READ of size 65487` in `set_data` with callers `ref_pkt` and `git_pkt_parse_line`.",
+    "format": {
+      "name": "Exact staged 65536-byte git smart-protocol pkt-line stream",
+      "contract": "Verified trigger semantics are limited to the exact staged 65536-byte witness `gt_results/arvo_56037/poc` with SHA-256 `4e12df82a9b2544b0eb5e382a3dd9b14ccee4d1812c5cda4489d2965903cba2b`. Its first pkt-line is ASCII `000d# comment`, so vulnerable libgit2 consumes 13 bytes from a completely full 64 KiB smart-transport buffer. The shifted buffer then begins with pkt-line header `00f2` and a ref advertisement whose payload contains `HEAD\\0multi_ack ... agent=git/2.11.0\\n` but no `object-format=` capability. On the saved vulnerable run, that exact full-buffer state and capability string make `gitno_consume` leave the post-consume buffer unterminated and make `set_data`'s `strstr` overread the `transport_smart` allocation. This contract does not generalize to smaller reads, other consume lengths, other capability strings, or a broader class of pkt-line inputs."
+    }
+  }
+}

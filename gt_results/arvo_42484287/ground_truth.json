@@ -1,0 +1,654 @@
+{
+  "sample_id": "arvo_42484287",
+  "vuln_id": "OSS-Fuzz issue 42484287 / ARVO arvo:42484287",
+  "project": {
+    "id": "curl",
+    "name": "curl",
+    "repo": "https://github.com/curl/curl.git",
+    "vulnerable_commit": "4bd09877e31845172b27d0d6af7d0adec009d41f",
+    "fixed_commit": "8346c90b789e249e42cd1e9f4542f5c55a1cc917",
+    "fuzz_target": "curl_fuzzer_imap (OSS-Fuzz libFuzzer target, AddressSanitizer)"
+  },
+  "classification": {
+    "class": "stack-buffer-overflow",
+    "cwe": "CWE-787",
+    "access": "WRITE",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42484287 (curl): Stack-buffer-overflow WRITE {*} found by fuzz target curl_fuzzer_imap [asan]. https://issues.oss-fuzz.com/issues/42484287",
+    "original_source": "sample_info.json issue description / staged sanitizer_trace.txt / staged patch.diff / staged curl source",
+    "normalized": "The staged `curl_fuzzer_imap` witness is a 2256-byte TLV corpus from which `curl_fuzzer_tlv.cc` parses five TLVs and then stops because only four trailing `0xCA` bytes remain, fewer than `sizeof(TLV_RAW) == 6`. Those TLVs set `CUSTOMREQUEST=\"LSUB\"`, `URL=\"imap://.1\"`, and socket-0 `RESPONSE0`/`RESPONSE1`/`RESPONSE2` lengths 29/11/2122; there are no `USERNAME` or `PASSWORD` TLVs. The multi handle is allocated with `calloc`, so the first cached connection gets `connection_id == 0`; connect-phase `CAPABILITY` therefore sets `imapc->resptag` to `A001` after resetting IMAP capability state. The fuzz harness exposes no SSL option TLV, and the saved connect-phase responses contain no `PREAUTH`, `STARTTLS`, or `AUTH=` capability token, so `imap_state_capability_resp()` reaches `imap_perform_authentication()`, `Curl_sasl_can_authenticate()` returns false, and authentication stops at `IMAP_STOP` without another tagged IMAP command. In the DO phase, the empty IMAP path leaves `imap->mailbox == NULL`, and the custom request `LSUB` routes `imap_perform()` into the custom LIST path; that command advances `imapc->resptag` to `A002`. During the live transfer, `Curl_pp_readresp()` accepts the tagged `A002 OK/@[*\\n` line inside `RESPONSE2`; the 1025 bytes after that newline are cached in `pp->cache` / `pp->cache_size`. The custom LIST/SEARCH path stops in `imap_state_listsearch_resp()` and `imap_done()` skips fetch/append cleanup because `imap->custom` is set, so that 1025-byte cache survives unchanged until `curl_multi_cleanup()` closes cached connections. `Curl_conncache_close_all_connections()` then installs a stack closure buffer of only `READBUFFER_MIN` bytes while still exposing `set.buffer_size = READBUFFER_MIN`. IMAP disconnect re-enters `Curl_pp_readresp()` with that smaller closure buffer and the preexisting `pp->cache_size == 1025`. The guard at `pingpong.c:306` still allows exactly `buffer_size + 1` bytes, so `memcpy(ptr, pp->cache, pp->cache_size)` copies 1025 bytes into the 1024-byte stack `buffer`, matching the saved AddressSanitizer stack-buffer-overflow WRITE. The fix commit `8346c90b789e249e42cd1e9f4542f5c55a1cc917` changes the closure buffer to `READBUFFER_MIN + 1`, matching curl's normal receive-buffer invariant."
+  },
+  "source": {
+    "file": "lib/imap.c",
+    "function": "imap_parse_url_path",
+    "line": 1965,
+    "code": "imap->mailbox = NULL;",
+    "var": "imap->mailbox",
+    "description": "First project-code statement in the scored chain that materializes attacker-controlled request state for the vulnerable path. The staged URL `imap://.1` has no IMAP mailbox path, so libcurl records `imap->mailbox == NULL`; together with the staged custom request `LSUB`, that steers the DO phase into the custom LIST path whose `A002` tagged reply is later accepted and cached.",
+    "value_from": "In the fuzz harness, `curl_fuzzer_tlv.cc:185-191` decodes singleton TLVs with `fuzz_tlv_to_string()` and sets `CURLOPT_URL` and `CURLOPT_CUSTOMREQUEST` on the easy handle. The staged `gt_results/arvo_42484287/poc` (sha256 `f3f17bcf450cc3f41dd43b8cec321813f4d289de1b26fde9c1f741b967153e04`) is 2256 bytes: `fuzz_get_first_tlv()` / `fuzz_get_next_tlv()` parse five TLVs whose first NUL-terminated strings are `LSUB` and `imap://.1`, followed by socket-0 `RESPONSE0` length 29, `RESPONSE1` length 11, and `RESPONSE2` length 2122. After byte 2252, the parser ignores the final four `0xCA` bytes because fewer than `sizeof(TLV_RAW)` bytes remain (`curl_fuzzer_tlv.cc:45-50`, `curl_fuzzer.h:106-114`).",
+    "trace_step": 7
+  },
+  "sink": {
+    "file": "lib/pingpong.c",
+    "function": "Curl_pp_readresp",
+    "line": 310,
+    "code": "memcpy(ptr, pp->cache, pp->cache_size);",
+    "var": "ptr, pp->cache, pp->cache_size",
+    "description": "AddressSanitizer crash site. Disconnect-time IMAP response handling copies the cached 1025-byte tail into the closure handle's 1024-byte stack buffer, producing the recorded stack-buffer-overflow WRITE.",
+    "note": "The staged ASan trace reports `stack-buffer-overflow WRITE of size 1025` at `lib/pingpong.c:310` in `Curl_pp_readresp`, and the frame report identifies the overwritten stack object as `buffer` at `lib/conncache.c:537` with extent `[32, 1056)`.",
+    "trace_step": 21
+  },
+  "root_cause": {
+    "file": "lib/conncache.c",
+    "function": "Curl_conncache_close_all_connections",
+    "line": 537,
+    "code": "char buffer[READBUFFER_MIN];",
+    "var": "buffer",
+    "description": "Root cause. Connection-cache cleanup allocates the closure handle's temporary download buffer at only `READBUFFER_MIN` bytes even though curl's pingpong receive path can legally replay `set.buffer_size + 1` bytes into `state.buffer`.",
+    "note": "The fix commit changes this declaration to `char buffer[READBUFFER_MIN + 1];`, and its message states that the download buffer needs `+1` for the trailing zero. Normal easy-handle download buffers follow that invariant in `lib/multi.c:1539` (`malloc(data->set.buffer_size + 1)`).",
+    "trace_step": 17
+  },
+  "tainted_value_origin": {
+    "file": "lib/pingpong.c",
+    "function": "Curl_pp_readresp",
+    "line": 409,
+    "code": "clipamount = gotbytes - i;",
+    "var": "clipamount",
+    "description": "This is where the vulnerability-relevant replay length is derived. After `Curl_pp_readresp()` recognizes the `A002` tagged IMAP completion line while attacker bytes still trail in the same response chunk, it computes the cached suffix length as `gotbytes - i`; in this witness that length is 1025 and later becomes the crashing `pp->cache_size`."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "lib/imap.c",
+      "function": "imap_perform",
+      "line": 1545,
+      "code": "else if(imap->custom && (selected || !imap->mailbox))\n  result = imap_perform_list(conn);",
+      "description": "The saved URL/custom-request pair is admitted as an IMAP custom LIST request: `imap_parse_url_path()` leaves `imap->mailbox == NULL`, `imap_parse_custom_request()` stores `LSUB`, and `imap_perform()` dispatches to `imap_perform_list()`."
+    },
+    "connect_phase_no_auth": {
+      "file": "lib/imap.c / lib/curl_sasl.c",
+      "function": "imap_state_capability_resp / Curl_sasl_can_authenticate / imap_perform_authentication",
+      "line": 920,
+      "code": "else if(imapcode == IMAP_RESP_OK)\n  result = imap_perform_authentication(conn);",
+      "description": "After `CAPABILITY` tag `A001` completes, this five-TLV witness cannot take STARTTLS or auth subpaths: the corpus carries no `USERNAME`/`PASSWORD` TLVs, the harness has no SSL-option TLV, the saved connect-phase responses contain no `PREAUTH` or `AUTH=` capability token, and `Curl_sasl_can_authenticate()` therefore fails. Connect-phase authentication ends at `IMAP_STOP` without sending another tagged IMAP command before the DO-phase `LSUB` request."
+    },
+    "custom_list_route": {
+      "file": "lib/imap.c",
+      "function": "imap_perform",
+      "line": 1545,
+      "code": "else if(imap->custom && (selected || !imap->mailbox))\n  result = imap_perform_list(conn);",
+      "description": "The parsed URL/custom-request pair takes the IMAP custom LIST path, not FETCH. That is why the saved response is later handled by `imap_state_listsearch_resp()` and not by the body-cache consumption logic in `imap_state_fetch_resp()`."
+    },
+    "cleanup_trigger": {
+      "file": "lib/multi.c",
+      "function": "curl_multi_cleanup",
+      "line": 2476,
+      "code": "Curl_conncache_close_all_connections(&multi->conn_cache);",
+      "description": "The overflow is reached during multi-handle teardown. After the transfer completes, `curl_multi_cleanup()` walks cached connections through the closure-handle cleanup path that installs the undersized stack buffer."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "lib/conncache.c / lib/imap.c / lib/curl_sasl.c",
+      "function": "Curl_conncache_add_conn / imap_perform_capability / imap_state_capability_resp / Curl_sasl_can_authenticate / imap_perform_authentication",
+      "summary": "The first cached IMAP connection gets `connection_id == 0`, so connect-phase `CAPABILITY` uses tag `A001`; because this five-TLV witness provides no credentials, no SSL option, no PREAUTH greeting, and no `AUTH=` capability token, authentication stops at `IMAP_STOP` without another tagged command."
+    },
+    {
+      "step": 2,
+      "file": "lib/imap.c",
+      "function": "imap_parse_url_path / imap_parse_custom_request / imap_perform",
+      "summary": "The staged URL `imap://.1` leaves `imap->mailbox == NULL`, the staged custom request decodes to `LSUB`, and `imap_perform()` therefore routes the DO phase into the custom LIST path."
+    },
+    {
+      "step": 3,
+      "file": "lib/imap.c / lib/pingpong.c",
+      "function": "imap_sendf / Curl_pp_readresp",
+      "summary": "The DO-phase `LSUB` command advances `imapc->resptag` to `A002`, and `Curl_pp_readresp()` later accepts the staged `A002 OK/@[*\\n` line inside `RESPONSE2`."
+    },
+    {
+      "step": 4,
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "summary": "Curl derives the 1025-byte attacker-controlled suffix after that tagged line and stores it in persistent pingpong cache state (`pp->cache` / `pp->cache_size`)."
+    },
+    {
+      "step": 5,
+      "file": "lib/imap.c",
+      "function": "imap_state_listsearch_resp / imap_done",
+      "summary": "Because this witness stays on the custom LIST path, the request stops in `imap_state_listsearch_resp()` and `imap_done()` skips fetch/append cleanup, so the cached 1025-byte suffix survives unchanged until teardown."
+    },
+    {
+      "step": 6,
+      "file": "lib/conncache.c / lib/url.c / lib/imap.c",
+      "function": "Curl_conncache_close_all_connections / Curl_disconnect / imap_disconnect",
+      "summary": "During `curl_multi_cleanup()`, cached-connection teardown rebinds the IMAP connection to a closure handle whose receive buffer is only a 1024-byte stack array, then re-enters the IMAP pingpong state on the same cached 1025-byte suffix."
+    },
+    {
+      "step": 7,
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "summary": "The cache replay guard still allows `buffer_size + 1` bytes, so `memcpy` writes the cached 1025 bytes into the 1024-byte stack buffer and ASan reports the stack-buffer-overflow."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "lib/conncache.c",
+      "function": "Curl_conncache_add_conn",
+      "line": 259,
+      "var": "conn->connection_id, connc->next_connection_id",
+      "code": "conn->connection_id = connc->next_connection_id++;",
+      "note": "The first live IMAP connection receives `connection_id == 0`. `curl_multi_init()` allocates `struct Curl_multi` with `calloc` (`lib/multi.c:349`), so `multi->conn_cache.next_connection_id` starts at 0; `allocate_conn()` also zeroes `struct connectdata` (`lib/url.c:1576`), leaving `imapc->cmdid == 0` and `imapc->preauth == FALSE` before the first IMAP command."
+    },
+    {
+      "step": 2,
+      "file": "lib/imap.c",
+      "function": "imap_sendf",
+      "line": 1736,
+      "line_end": 1740,
+      "var": "imapc->cmdid, imapc->resptag, imapc->sasl.authmechs, imapc->tls_supported",
+      "code": "imapc->cmdid = (imapc->cmdid + 1) % 1000;\nmsnprintf(imapc->resptag, sizeof(imapc->resptag), \"%c%03d\",\n          'A' + curlx_sltosi(conn->connection_id % 26), imapc->cmdid);",
+      "note": "Connect-phase `imap_perform_capability()` is the first tagged IMAP command after the server greeting. Starting from step 1's zeroed state, it clears `imapc->sasl.authmechs` and `imapc->tls_supported`, then `imap_sendf()` increments `imapc->cmdid` to 1 and formats `imapc->resptag` as `A001` because `connection_id % 26 == 0` selects the `'A'` prefix.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "conn->connection_id, imapc->cmdid"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "lib/imap.c",
+      "function": "imap_state_capability_resp",
+      "line": 891,
+      "line_end": 914,
+      "var": "imapc->tls_supported, imapc->sasl.authmechs",
+      "code": "if(wordlen == 8 && !memcmp(line, \"STARTTLS\", 8))\n  imapc->tls_supported = TRUE;\nelse if(wordlen == 13 && !memcmp(line, \"LOGINDISABLED\", 13))\n  imapc->login_disabled = TRUE;\nelse if(wordlen == 7 && !memcmp(line, \"SASL-IR\", 7))\n  imapc->ir_supported = TRUE;\nelse if(wordlen > 5 && !memcmp(line, \"AUTH=\", 5)) {\n  size_t llen;\n  unsigned int mechbit;\n\n  line += 5;\n  wordlen -= 5;\n\n  mechbit = Curl_sasl_decode_mech(line, wordlen, &llen);\n  if(mechbit && llen == wordlen)\n    imapc->sasl.authmechs |= mechbit;\n}",
+      "note": "While parsing CAPABILITY tokens, this witness never matches `STARTTLS` or `AUTH=` in the saved connect-phase responses. Step 2 therefore remains unchanged: `imapc->tls_supported == FALSE` and `imapc->sasl.authmechs == SASL_AUTH_NONE`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "imapc->tls_supported, imapc->sasl.authmechs"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "lib/imap.c",
+      "function": "imap_state_capability_resp",
+      "line": 920,
+      "line_end": 935,
+      "var": "data->set.use_ssl, imapc->tls_supported, result",
+      "code": "else if(imapcode == IMAP_RESP_OK) {\n  if(data->set.use_ssl && !conn->ssl[FIRSTSOCKET].use) {\n    if(imapc->tls_supported)\n      result = imap_perform_starttls(conn);\n    else if(data->set.use_ssl == CURLUSESSL_TRY)\n      result = imap_perform_authentication(conn);\n    else {\n      failf(data, \"STARTTLS not supported.\");\n      result = CURLE_USE_SSL_FAILED;\n    }\n  }\n  else\n    result = imap_perform_authentication(conn);\n}",
+      "note": "Once the tagged `A001` capability exchange completes, `imap_state_capability_resp()` hands control to `imap_perform_authentication(conn)`. This witness cannot take the STARTTLS subpath because the fuzz harness exposes no SSL option TLV and step 3 left `imapc->tls_supported == FALSE`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "imapc->tls_supported"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "lib/curl_sasl.c",
+      "function": "Curl_sasl_can_authenticate",
+      "line": 240,
+      "line_end": 248,
+      "var": "conn->bits.user_passwd, sasl->authmechs, sasl->prefmech",
+      "code": "if(conn->bits.user_passwd)\n  return TRUE;\nif(sasl->authmechs & sasl->prefmech & SASL_MECH_EXTERNAL)\n  return TRUE;\nreturn FALSE;",
+      "note": "The verified corpus parses exactly five TLVs: `CUSTOMREQUEST`, `URL`, `RESPONSE0`, `RESPONSE1`, and `RESPONSE2`; `curl_fuzzer_tlv.cc` never reaches the singleton `USERNAME` or `PASSWORD` cases, so no credentials are configured. With step 3 still leaving `sasl->authmechs == SASL_AUTH_NONE`, the EXTERNAL check also fails and `Curl_sasl_can_authenticate()` returns false.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "sasl->authmechs"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "lib/imap.c",
+      "function": "imap_perform_authentication",
+      "line": 573,
+      "line_end": 576,
+      "var": "imapc->preauth, imapc->state",
+      "code": "if(imapc->preauth ||\n   !Curl_sasl_can_authenticate(&imapc->sasl, conn)) {\n  state(conn, IMAP_STOP);\n  return result;\n}",
+      "note": "Because step 5 made `!Curl_sasl_can_authenticate(...)` true and step 1 left `imapc->preauth == FALSE`, `imap_perform_authentication()` executes `state(conn, IMAP_STOP)` and returns before `Curl_sasl_start()` or `imap_perform_login()`. No tagged `AUTHENTICATE` or `LOGIN` command is issued between connect-phase `A001` and the later DO-phase request.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "imapc->preauth"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "!Curl_sasl_can_authenticate(&imapc->sasl, conn)"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "lib/imap.c",
+      "function": "imap_parse_url_path",
+      "line": 1965,
+      "var": "imap->mailbox",
+      "code": "imap->mailbox = NULL;",
+      "note": "Source. The staged URL `imap://.1` has an empty IMAP path, so libcurl materializes the request state `imap->mailbox == NULL`.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "control",
+          "via": "state(conn, IMAP_STOP)"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "lib/imap.c",
+      "function": "imap_parse_custom_request",
+      "line": 2080,
+      "var": "imap->custom",
+      "code": "result = Curl_urldecode(data, custom, 0, &imap->custom, NULL, TRUE);",
+      "note": "The staged custom request is URL-decoded into `imap->custom == \"LSUB\"`; because the string has no space, `imap->custom_params` stays NULL.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "control",
+          "via": "imap_do() parses the URL path before the custom request"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "lib/imap.c",
+      "function": "imap_perform",
+      "line": 1545,
+      "line_end": 1547,
+      "var": "imap->custom, imap->mailbox",
+      "code": "else if(imap->custom && (selected || !imap->mailbox))\n  result = imap_perform_list(conn);",
+      "note": "The DO phase takes the custom LIST branch because step 8 set `imap->custom` and step 7 left `imap->mailbox` NULL. Curl therefore issues the staged `LSUB` request through `imap_perform_list()` instead of entering SELECT/FETCH handling.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "!imap->mailbox"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "imap->custom"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "lib/imap.c",
+      "function": "imap_sendf",
+      "line": 1736,
+      "line_end": 1740,
+      "var": "imapc->cmdid, imapc->resptag",
+      "code": "imapc->cmdid = (imapc->cmdid + 1) % 1000;\nmsnprintf(imapc->resptag, sizeof(imapc->resptag), \"%c%03d\",\n          'A' + curlx_sltosi(conn->connection_id % 26), imapc->cmdid);",
+      "note": "The DO-phase `LSUB` command is the next tagged IMAP command after step 6 stopped connect-phase authentication without sending another one. Starting from step 2's `cmdid == 1` / `resptag == \"A001\"`, `imap_sendf()` advances the tag to `A002` and stores that in `imapc->resptag`, which is the exact tag `imap_endofresp()` later requires.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "imapc->cmdid, conn->connection_id"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "state(conn, IMAP_STOP)"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "imap_perform_list(conn)"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "line": 323,
+      "line_end": 325,
+      "var": "gotbytes, ptr",
+      "code": "result = Curl_read(conn, sockfd, ptr,\n                   data->set.buffer_size - pp->nread_resp,\n                   &gotbytes);",
+      "note": "Later in the live transfer, `Curl_pp_readresp()` materializes attacker-controlled bytes from socket-0 `RESPONSE2` into curl's receive buffer. The staged `RESPONSE2` blob is 2122 bytes long and contains both the `A002` completion line and the trailing bytes that become the cached suffix.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "imapc->resptag"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "line": 385,
+      "var": "pp->linestart_resp, perline, code",
+      "code": "if(pp->endofresp(conn, pp->linestart_resp, perline, code)) {",
+      "note": "While scanning those bytes, IMAP end-of-response detection accepts the line only when it matches the current `imapc->resptag`. In the staged `RESPONSE2` payload, bytes 1085-1096 are `A002 OK/@[*\\n`, so step 10's `resptag == \"A002\"` makes this line the tagged completion even though attacker bytes still remain after the newline.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "imapc->resptag"
+        },
+        {
+          "on": 11,
+          "type": "data",
+          "via": "pp->linestart_resp, perline"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "line": 409,
+      "var": "clipamount",
+      "code": "clipamount = gotbytes - i;",
+      "note": "Because the tagged completion line ended before the received chunk did, curl derives the trailing suffix length that must be preserved. In this witness that suffix is 1025 bytes, which later reappears as the ASan `WRITE of size 1025`.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "gotbytes"
+        },
+        {
+          "on": 12,
+          "type": "control",
+          "via": "pp->endofresp(conn, pp->linestart_resp, perline, code)"
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "line": 441,
+      "line_end": 444,
+      "var": "pp->cache, pp->cache_size",
+      "code": "pp->cache_size = clipamount;\npp->cache = malloc(pp->cache_size);\nif(pp->cache)\n  memcpy(pp->cache, pp->linestart_resp, pp->cache_size);",
+      "note": "The 1025 attacker-controlled bytes after the `A002` line are copied into persistent pingpong cache state by setting `pp->cache_size = 1025`, allocating `pp->cache`, and memcpying the suffix there.",
+      "depends_on": [
+        {
+          "on": 13,
+          "type": "data",
+          "via": "clipamount"
+        },
+        {
+          "on": 11,
+          "type": "data",
+          "via": "pp->linestart_resp"
+        }
+      ]
+    },
+    {
+      "step": 15,
+      "file": "lib/imap.c",
+      "function": "imap_state_listsearch_resp",
+      "line": 1039,
+      "line_end": 1043,
+      "var": "imapcode, imapc->state",
+      "code": "else if(imapcode != IMAP_RESP_OK)\n  result = CURLE_QUOTE_ERROR;\nelse\n  state(conn, IMAP_STOP);",
+      "note": "The custom `LSUB` request remains on the LIST/SEARCH response path. When the tagged line from step 12 yields `imapcode == IMAP_RESP_OK`, this handler ends the DO phase with `state(conn, IMAP_STOP)` instead of entering `IMAP_FETCH`; the body-cache mutation code at `imap_state_fetch_resp()` lines 1134-1169 is therefore unreachable on this witness.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "control",
+          "via": "imap->custom && (selected || !imap->mailbox)"
+        },
+        {
+          "on": 12,
+          "type": "data",
+          "via": "imapcode == IMAP_RESP_OK"
+        }
+      ]
+    },
+    {
+      "step": 16,
+      "file": "lib/imap.c",
+      "function": "imap_done",
+      "line": 1471,
+      "line_end": 1473,
+      "var": "imap->custom",
+      "code": "else if(!data->set.connect_only && !imap->custom &&\n        (imap->uid || imap->mindex || data->set.upload ||\n        data->set.mimepost.kind != MIMEKIND_NONE)) {",
+      "note": "After the DO phase, `imap_done()` skips its post-transfer fetch/append cleanup block because `imap->custom` from step 8 is non-NULL. No `IMAP_FETCH_FINAL` or APPEND-final state machine runs before teardown, so the cached `pp->cache_size == 1025` from step 14 persists unchanged into connection cleanup.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "imap->custom"
+        },
+        {
+          "on": 15,
+          "type": "data",
+          "via": "imapc->state == IMAP_STOP"
+        }
+      ]
+    },
+    {
+      "step": 17,
+      "file": "lib/conncache.c",
+      "function": "Curl_conncache_close_all_connections",
+      "line": 537,
+      "line_end": 541,
+      "var": "buffer, connc->closure_handle->state.buffer, connc->closure_handle->set.buffer_size",
+      "code": "char buffer[READBUFFER_MIN];\nif(!connc->closure_handle)\n  return;\nconnc->closure_handle->state.buffer = buffer;\nconnc->closure_handle->set.buffer_size = READBUFFER_MIN;",
+      "note": "Root cause. Connection-cache cleanup replaces the normal heap download buffer with a stack buffer that is only 1024 bytes long, then exposes that buffer through `closure_handle->state.buffer` while keeping `set.buffer_size = 1024`. Pingpong code elsewhere assumes a receive buffer of `buffer_size + 1`, which this local array violates.",
+      "depends_on": [
+        {
+          "on": 16,
+          "type": "data",
+          "via": "pp->cache_size persists into teardown"
+        }
+      ]
+    },
+    {
+      "step": 18,
+      "file": "lib/url.c",
+      "function": "Curl_disconnect",
+      "line": 809,
+      "var": "conn->data",
+      "code": "conn->data = data;",
+      "note": "Cached-connection teardown calls `Curl_disconnect(connc->closure_handle, conn, FALSE)`. This assignment rebinds the IMAP connection to the closure handle from step 17, so subsequent protocol reads use the 1024-byte stack `buffer` as `data->state.buffer`.",
+      "depends_on": [
+        {
+          "on": 17,
+          "type": "data",
+          "via": "closure_handle->state.buffer, closure_handle->set.buffer_size"
+        }
+      ]
+    },
+    {
+      "step": 19,
+      "file": "lib/imap.c",
+      "function": "imap_disconnect",
+      "line": 1623,
+      "line_end": 1625,
+      "var": "imapc->pp, conn->data",
+      "code": "if(!dead_connection && imapc->pp.conn && imapc->pp.conn->bits.protoconnstart)\n  if(!imap_perform_logout(conn))\n    (void)imap_block_statemach(conn, TRUE);",
+      "note": "Because cleanup passed `dead_connection == FALSE`, `imapc->pp.conn` is still live, and protocol connect previously set `conn->bits.protoconnstart = TRUE` (`lib/multi.c:1525-1526`), IMAP disconnect sends `LOGOUT` and runs `imap_block_statemach(conn, TRUE)` on the same pingpong state instead of discarding it. The cached `pp->cache` / `pp->cache_size` from step 14 are still attached to that state.",
+      "depends_on": [
+        {
+          "on": 14,
+          "type": "data",
+          "via": "pp->cache, pp->cache_size"
+        },
+        {
+          "on": 18,
+          "type": "data",
+          "via": "conn->data == closure_handle"
+        }
+      ]
+    },
+    {
+      "step": 20,
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "line": 306,
+      "var": "ptr, pp->cache_size, buf, data->set.buffer_size",
+      "code": "if((ptr + pp->cache_size) > (buf + data->set.buffer_size + 1)) {",
+      "note": "Disconnect-time cache replay still checks against `buffer_size + 1`. With `pp->cache_size == 1025` from step 14 and step 18's `data->set.buffer_size == 1024`, the comparison treats a 1025-byte replay as acceptable even though the actual stack object from step 17 is only 1024 bytes long.",
+      "depends_on": [
+        {
+          "on": 14,
+          "type": "data",
+          "via": "pp->cache_size"
+        },
+        {
+          "on": 18,
+          "type": "data",
+          "via": "buf, data->set.buffer_size"
+        },
+        {
+          "on": 19,
+          "type": "control",
+          "via": "imap_block_statemach(conn, TRUE)"
+        }
+      ]
+    },
+    {
+      "step": 21,
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "line": 310,
+      "var": "ptr, pp->cache, pp->cache_size",
+      "code": "memcpy(ptr, pp->cache, pp->cache_size);",
+      "note": "Sink. Disconnect-time cache replay copies the 1025 cached attacker bytes into the 1024-byte stack `buffer`. This matches the saved ASan `WRITE of size 1025` in `Curl_pp_readresp` and the frame report that the destination object is `buffer` at `lib/conncache.c:537`.",
+      "depends_on": [
+        {
+          "on": 14,
+          "type": "data",
+          "via": "pp->cache, pp->cache_size"
+        },
+        {
+          "on": 18,
+          "type": "data",
+          "via": "ptr"
+        },
+        {
+          "on": 20,
+          "type": "control",
+          "via": "ptr + pp->cache_size <= buf + data->set.buffer_size + 1"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan_trace",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "stack-buffer-overflow",
+    "access_type": "WRITE",
+    "access_size": 1025,
+    "crash_location": {
+      "file": "lib/pingpong.c",
+      "function": "Curl_pp_readresp",
+      "line": 310
+    },
+    "allocation_context": {
+      "file": "lib/conncache.c",
+      "function": "Curl_conncache_close_all_connections",
+      "line": 537
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "__asan_memcpy",
+        "file": "compiler-rt/lib/asan/asan_interceptors_memintrinsics.cpp",
+        "line": 22
+      },
+      {
+        "frame": 1,
+        "function": "Curl_pp_readresp",
+        "file": "lib/pingpong.c",
+        "line": 310
+      },
+      {
+        "frame": 2,
+        "function": "imap_statemach_act",
+        "file": "lib/imap.c",
+        "line": 1275
+      },
+      {
+        "frame": 3,
+        "function": "Curl_pp_statemach",
+        "file": "lib/pingpong.c",
+        "line": 134
+      },
+      {
+        "frame": 4,
+        "function": "imap_block_statemach",
+        "file": "lib/imap.c",
+        "line": 1370
+      },
+      {
+        "frame": 5,
+        "function": "imap_disconnect",
+        "file": "lib/imap.c",
+        "line": 1625
+      },
+      {
+        "frame": 6,
+        "function": "Curl_disconnect",
+        "file": "lib/url.c",
+        "line": 817
+      },
+      {
+        "frame": 7,
+        "function": "Curl_conncache_close_all_connections",
+        "file": "lib/conncache.c",
+        "line": 552
+      },
+      {
+        "frame": 8,
+        "function": "curl_multi_cleanup",
+        "file": "lib/multi.c",
+        "line": 2476
+      },
+      {
+        "frame": 9,
+        "function": "fuzz_handle_transfer",
+        "file": "curl_fuzzer/curl_fuzzer.cc",
+        "line": 391
+      },
+      {
+        "frame": 10,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "curl_fuzzer/curl_fuzzer.cc",
+        "line": 93
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "gt_results/arvo_42484287/poc",
+    "trigger": "Run the staged 2256-byte TLV corpus through the prepared vulnerable `curl_fuzzer_imap`; the parser consumes exactly five TLVs (`CUSTOMREQUEST`, `URL`, `RESPONSE0`, `RESPONSE1`, `RESPONSE2`) and ignores the final four `0xCA` bytes. During `curl_multi_cleanup()`, IMAP disconnect replays a cached 1025-byte suffix from socket-0 `RESPONSE2` into the 1024-byte closure buffer and AddressSanitizer reports a stack-buffer-overflow WRITE in `Curl_pp_readresp`.",
+    "format": {
+      "name": "curl_fuzzer TLV corpus",
+      "contract": "The verified witness is a 2256-byte `curl_fuzzer` TLV input from which `fuzz_get_first_tlv()` / `fuzz_get_next_tlv()` parse exactly five TLVs: `CUSTOMREQUEST` whose first NUL-terminated string is `LSUB`, `URL` whose first NUL-terminated string is `imap://.1`, then socket-0 `RESPONSE0` length 29, `RESPONSE1` length 11, and `RESPONSE2` length 2122. The corpus contains no `USERNAME` or `PASSWORD` TLV. After the fifth TLV ends at byte 2252, the parser ignores the final four `0xCA` bytes because fewer than `sizeof(TLV_RAW)` bytes remain. In this saved witness, `RESPONSE2` contains the tagged line `A002 OK/@[*\\n` at payload bytes 1085-1096, so the suffix beginning at payload byte 1097 is exactly 1025 bytes and is the cached tail later copied during disconnect."
+    }
+  }
+}

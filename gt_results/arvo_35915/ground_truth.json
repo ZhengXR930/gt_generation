@@ -1,0 +1,448 @@
+{
+  "sample_id": "arvo_35915",
+  "vuln_id": "OSS-Fuzz issue 35915",
+  "project": {
+    "id": "sleuthkit",
+    "repo": "https://github.com/sleuthkit/sleuthkit",
+    "vulnerable_commit": "0f1ef9725aaa55cd2f7f31f45e52518c7d451176",
+    "fixed_commit": "f7341664b1f3cc6e14586d5396d04003e8ad646a"
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "read",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=5725002489004032 Project: sleuthkit Fuzzing Engine: afl Fuzz Target: sleuthkit_fls_hfs_fuzzer Job Type: afl_asan_sleuthkit Platform Id: linux Crash Type: Heap-buffer-overflow READ 1 Crash Address: 0x60d000000a8b Crash State: hfs_dir_open_meta_cb hfs_cat_traverse hfs_dir_open_meta Sanitizer: address (ASAN) Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=5725002489004032",
+    "original_source": "ARVO-Meta.report.comments[0].content",
+    "normalized": "The staged HFS image drives Sleuth Kit's catalog traversal over a catalog leaf node whose decoded `nodesize` is 137 and whose offset-table entry `rec_off` points to a key that still fits inside that node. `hfs_cat_traverse` passes `cur_key = &node[rec_off]` into `hfs_dir_open_meta_cb`; the caller's `keylen <= nodesize - rec_off` check proves only that the key bytes fit in the node. The callback then aliases `rec_buf = (uint8_t *)cur_key`, derives `rec_off2` from the same key length, and applies `if ((nodesize < 2) || (rec_off2 >= nodesize - 2))` to that rebased pointer without accounting for `rec_off`, so it does not establish that the payload or a full `hfs_folder` remains after the key. The saved crash at `tsk/fs/hfs_dent.c:274` shows the later `rec_type` read still succeeds on this witness and selects `HFS_FOLDER_RECORD`, after which the folder branch casts `&rec_buf[rec_off2]` to `hfs_folder *` with no `sizeof(hfs_folder)` extent check. Because `folder->std.cnid` starts 8 bytes into that structure, the later `tsk_getu32(folder->std.cnid)` read touches `node[rec_off + rec_off2 + 8 .. rec_off + rec_off2 + 11]`, which is not fully inside the 137-byte heap node buffer allocated in `hfs_cat_traverse`, and AddressSanitizer reports the resulting heap-buffer-overflow at `tsk/fs/hfs_dent.c:274`."
+  },
+  "source": {
+    "file": "tsk/fs/hfs.c",
+    "function": "hfs_cat_traverse",
+    "line": 757,
+    "var": "nodesize",
+    "code": "nodesize = tsk_getu16(fs->endian, hfs->catalog_header.nodesize);",
+    "description": "First project-side decode on the crashing path that materializes the attacker-controlled catalog B-tree node size used for the heap allocation and every later bounds comparison.",
+    "value_from": "The staged HFS image controls `hfs->catalog_header.nodesize`. In the saved ASan run, the immediately following allocation at line 758 creates a 137-byte region, so this decode yields `nodesize = 137` for the crashing node.",
+    "note": "This local `nodesize` is the vulnerability-relevant size state for the rest of the trace.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "tsk/fs/hfs_dent.c",
+    "function": "hfs_dir_open_meta_cb",
+    "line": 274,
+    "var": "folder->std.cnid",
+    "code": "info->fs_name->meta_addr =\n                tsk_getu32(hfs->fs_info.endian, folder->std.cnid);",
+    "description": "ASan crash site. The callback reads the 4-byte `cnid` field from a truncated folder record whose payload extends past the end of the 137-byte node buffer.",
+    "note": "Through the `folder` alias, this statement reads the four `std.cnid` bytes at node offsets `rec_off + rec_off2 + 8 .. +11`. AddressSanitizer reports that access here as `heap-buffer-overflow READ of size 1`, on an address 2 bytes to the right of the 137-byte region allocated in `hfs_cat_traverse`.",
+    "trace_step": 10
+  },
+  "root_cause": {
+    "file": "tsk/fs/hfs_dent.c",
+    "function": "hfs_dir_open_meta_cb",
+    "line": 271,
+    "var": "folder, rec_buf, rec_off2",
+    "code": "hfs_folder *folder = (hfs_folder *) & rec_buf[rec_off2];",
+    "description": "Root cause. `hfs_cat_traverse` proves only that the key bytes at `node[rec_off .. rec_off + rec_off2 - 1]` fit inside the node. After the callback rebases `rec_buf = node + rec_off`, the folder branch aliases `rec_buf + rec_off2` as a full `hfs_folder` without a `sizeof(hfs_folder)` check, while the preceding `rec_off2 >= nodesize - 2` test compares that rebased offset only against the full node size and therefore does not prove the remaining bytes after `rec_off` can hold the structure.",
+    "note": "The staged vulnerable source itself shows the missing obligation: the adjacent `HFS_FILE_RECORD` branch performs a `sizeof(hfs_file)` extent check before casting, but `HFS_FOLDER_RECORD` reaches this cast immediately.",
+    "trace_step": 9
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "line": 1024,
+      "code": "a_cb(hfs, HFS_BT_NODE_TYPE_LEAF, key, keylen, nodesize,\n                    cur_off + rec_off, ptr);",
+      "description": "Once the current catalog leaf record's offset-table entry and key length pass the caller's node-local checks, `hfs_cat_traverse` dispatches `key = &node[rec_off]` to `hfs_dir_open_meta_cb` as `cur_key`, together with the decoded `keylen` and `nodesize`."
+    }
+  },
+  "tainted_value_origin": {
+    "file": "tsk/fs/hfs.c",
+    "function": "hfs_cat_traverse",
+    "line": 801,
+    "var": "node, nodesize",
+    "code": "cnt = tsk_fs_attr_read(hfs->catalog_attr, cur_off,\n            node, nodesize, 0);",
+    "description": "This read materializes the attacker-controlled catalog node bytes into the exact `nodesize`-byte heap buffer later overread.",
+    "value_from": "On the crashing run, `nodesize` is 137, so `tsk_fs_attr_read` fills a 137-byte heap node buffer whose contents later supply `key->key_len`, `rec_type`, and the truncated folder payload."
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "summary": "Catalog traversal decodes attacker-controlled `nodesize = 137`, allocates a 137-byte heap buffer for the current catalog node, and reads that node's bytes from the HFS image."
+    },
+    {
+      "step": 2,
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "summary": "The leaf walker decodes the attack-controlled record offset `rec_off` from the node's offset table, validates only that the key at `node[rec_off]` fits inside the node, and dispatches that same pointer to `hfs_dir_open_meta_cb`."
+    },
+    {
+      "step": 3,
+      "file": "tsk/fs/hfs_dent.c",
+      "function": "hfs_dir_open_meta_cb",
+      "summary": "Inside the callback, `rec_buf = (uint8_t *)cur_key` preserves the `node + rec_off` base, `rec_off2` is recomputed from the key length, and the callback only compares that rebased offset against the full `nodesize`, so it does not prove that the payload after the key still fits inside the remaining bytes of the node."
+    },
+    {
+      "step": 4,
+      "file": "tsk/fs/hfs_dent.c",
+      "function": "hfs_dir_open_meta_cb",
+      "summary": "The saved crash at line 274 shows the later `rec_type` read reaches the `HFS_FOLDER_RECORD` arm; that branch aliases `&node[rec_off + rec_off2]` as `hfs_folder *` without a `sizeof(hfs_folder)` check, and the later `folder->std.cnid` read at offsets `rec_off + rec_off2 + 8 .. +11` crosses the 137-byte heap buffer."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "line": 757,
+      "var": "nodesize",
+      "code": "nodesize = tsk_getu16(fs->endian, hfs->catalog_header.nodesize);",
+      "note": "The HFS catalog header controls the local node size used on this traversal. The saved ASan allocation stack proves the witness makes this decode produce `nodesize = 137`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "line": 758,
+      "var": "node",
+      "code": "if ((node = (char *) tsk_malloc(nodesize)) == NULL)",
+      "note": "Allocates the heap buffer that will hold the current catalog node. ASan identifies this allocation as a 137-byte region, which is the destination extent later overread.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "nodesize"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "line": 801,
+      "line_end": 802,
+      "var": "node, cnt",
+      "code": "cnt = tsk_fs_attr_read(hfs->catalog_attr, cur_off,\n            node, nodesize, 0);",
+      "note": "Reads the attacker-controlled catalog node bytes into the 137-byte heap buffer. The later key length, record type, and truncated folder payload are all interpreted from this buffer.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "nodesize"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "node"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "line": 985,
+      "line_end": 987,
+      "var": "rec_off",
+      "code": "rec_off =\n                    tsk_getu16(fs->endian,\n                    &node[nodesize - (rec + 1) * 2]);",
+      "note": "The leaf-node offset table is attacker-controlled. For the crashing record it yields the node-relative start `rec_off`, and every later callback address is relative to `node + rec_off`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "nodesize"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "node"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "line": 1000,
+      "line_end": 1024,
+      "var": "key, keylen, cur_key",
+      "code": "key = (hfs_btree_key_cat *) & node[rec_off];\nkeylen = 2 + tsk_getu16(hfs->fs_info.endian, key->key_len);\n...\nretval =\n                    a_cb(hfs, HFS_BT_NODE_TYPE_LEAF, key, keylen, nodesize,\n                    cur_off + rec_off, ptr);",
+      "note": "The leaf walker treats `node + rec_off` as `key`, computes `keylen`, rejects only keys that exceed `nodesize - rec_off`, and then passes that same pointer to `hfs_dir_open_meta_cb` as `cur_key` with `cur_keylen = keylen`. That admission proves the key bytes fit in the node, not that the payload after the key does.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "nodesize"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "node"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "rec_off"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "tsk/fs/hfs_dent.c",
+      "function": "hfs_dir_open_meta_cb",
+      "line": 224,
+      "var": "rec_buf",
+      "code": "uint8_t *rec_buf = (uint8_t *) cur_key;",
+      "note": "Inside the callback, `rec_buf` aliases the same address as `cur_key`, so on this path `rec_buf == node + rec_off`. Subsequent `rec_off2` and `folder` calculations therefore become absolute node offsets when added to `rec_off`.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "cur_key"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "tsk/fs/hfs_dent.c",
+      "function": "hfs_dir_open_meta_cb",
+      "line": 242,
+      "line_end": 244,
+      "var": "rec_off2",
+      "code": "rec_off2 = 2 + tsk_getu16(hfs->fs_info.endian, cur_key->key_len);\n\nif ((nodesize < 2) || (rec_off2 >= nodesize - 2)) {",
+      "note": "The callback recomputes the payload offset relative to `rec_buf` and then checks that rebased offset only against the full `nodesize`. Because `rec_buf == node + rec_off`, this test does not establish that bytes remain after `rec_off`; the earlier caller check proved only that the key itself ends no later than `node[nodesize]`, not that the post-key payload or a full `hfs_folder` fits.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "nodesize"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "cur_key->key_len"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "rec_buf"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "tsk/fs/hfs_dent.c",
+      "function": "hfs_dir_open_meta_cb",
+      "line": 249,
+      "line_end": 270,
+      "var": "rec_type",
+      "code": "rec_type = tsk_getu16(hfs->fs_info.endian, &rec_buf[rec_off2]);\n...\nelse if (rec_type == HFS_FOLDER_RECORD) {",
+      "note": "The saved crash at line 274 inside the `HFS_FOLDER_RECORD` branch shows this read completes on the witness and that `rec_type` selects that arm. That control-flow fact comes from reaching the later sink, not from step 7's rebased `nodesize` check; the code still has not established that a full folder record fits after `rec_off`.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "rec_buf"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "rec_off2"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "!((nodesize < 2) || (rec_off2 >= nodesize - 2))"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "tsk/fs/hfs_dent.c",
+      "function": "hfs_dir_open_meta_cb",
+      "line": 271,
+      "var": "folder, rec_buf, rec_off2",
+      "code": "hfs_folder *folder = (hfs_folder *) & rec_buf[rec_off2];",
+      "note": "The folder branch now aliases `node[rec_off + rec_off2]` as a full `hfs_folder` even though the staged vulnerable source has no `sizeof(hfs_folder)` check here. In `tsk_hfs.h`, `folder->std.cnid` starts 8 bytes into `hfs_folder`, so this alias makes the later read target node offsets `rec_off + rec_off2 + 8 .. +11`, which are not fully inside the 137-byte allocation on the witness path.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "rec_buf"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "rec_off2"
+        },
+        {
+          "on": 8,
+          "type": "control",
+          "via": "rec_type == HFS_FOLDER_RECORD"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "tsk/fs/hfs_dent.c",
+      "function": "hfs_dir_open_meta_cb",
+      "line": 273,
+      "line_end": 274,
+      "var": "folder->std.cnid",
+      "code": "info->fs_name->meta_addr =\n                tsk_getu32(hfs->fs_info.endian, folder->std.cnid);",
+      "note": "The callback reads the four-byte `cnid` field through that truncated `folder` alias. On the saved run, ASan reports the resulting heap-buffer-overflow at this line against the 137-byte node allocation from `hfs_cat_traverse`.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "rec_buf base"
+        },
+        {
+          "on": 9,
+          "type": "data",
+          "via": "folder"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "tsk/fs/hfs_dent.c",
+      "function": "hfs_dir_open_meta_cb",
+      "line": 274
+    },
+    "allocation_context": {
+      "file": "tsk/fs/hfs.c",
+      "function": "hfs_cat_traverse",
+      "line": 758,
+      "note": "ASan's allocation stack identifies the `tsk_malloc(nodesize)` call that created the overread 137-byte node buffer."
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "hfs_dir_open_meta_cb",
+        "file": "tsk/fs/hfs_dent.c",
+        "line": 274
+      },
+      {
+        "frame": 1,
+        "function": "hfs_cat_traverse",
+        "file": "tsk/fs/hfs.c",
+        "line": 1024
+      },
+      {
+        "frame": 2,
+        "function": "hfs_dir_open_meta",
+        "file": "tsk/fs/hfs_dent.c",
+        "line": 516
+      },
+      {
+        "frame": 3,
+        "function": "tsk_fs_dir_open_meta",
+        "file": "tsk/fs/fs_dir.c",
+        "line": 289
+      },
+      {
+        "frame": 4,
+        "function": "tsk_fs_path2inum",
+        "file": "tsk/fs/ifind_lib.c",
+        "line": 237
+      },
+      {
+        "frame": 5,
+        "function": "hfs_open",
+        "file": "tsk/fs/hfs.c",
+        "line": 6759
+      },
+      {
+        "frame": 6,
+        "function": "tsk_fs_open_img_decrypt",
+        "file": "tsk/fs/fs_open.c",
+        "line": 252
+      },
+      {
+        "frame": 7,
+        "function": "tsk_fs_open_img",
+        "file": "tsk/fs/fs_open.c",
+        "line": 108
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 145
+      },
+      {
+        "frame": 1,
+        "function": "tsk_malloc",
+        "file": "tsk/base/mymalloc.c",
+        "line": 32
+      },
+      {
+        "frame": 2,
+        "function": "hfs_cat_traverse",
+        "file": "tsk/fs/hfs.c",
+        "line": 758
+      },
+      {
+        "frame": 3,
+        "function": "hfs_dir_open_meta",
+        "file": "tsk/fs/hfs_dent.c",
+        "line": 516
+      },
+      {
+        "frame": 4,
+        "function": "tsk_fs_dir_open_meta",
+        "file": "tsk/fs/fs_dir.c",
+        "line": 289
+      },
+      {
+        "frame": 5,
+        "function": "tsk_fs_path2inum",
+        "file": "tsk/fs/ifind_lib.c",
+        "line": 237
+      },
+      {
+        "frame": 6,
+        "function": "hfs_open",
+        "file": "tsk/fs/hfs.c",
+        "line": 6759
+      }
+    ],
+    "free_stack": [],
+    "patch_resolves": false,
+    "patch_resolves_note": "The staged `patch.diff` does not match the vulnerable source under `_work/src/sleuthkit`: it changes `rec_off2 >= nodesize - sizeof(hfs_folder)` to `rec_off2 > ...` in a folder-branch check that is absent from the staged vulnerable `tsk/fs/hfs_dent.c`. Stage 02 therefore does not use that patch metadata as proof that this traced path is fixed.",
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "source": "staged sanitizer_trace.txt, default_crash_trace.txt, reproduction_report.json, patch.diff, and the vulnerable Sleuth Kit checkout under `_work/src/sleuthkit`",
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "The allocation context fixes the destination extent at the 137-byte node buffer; the root cause is the later missing folder-record size check before reading from that allocation.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run on the exact staged `poc` reproduced `AddressSanitizer: heap-buffer-overflow READ of size 1` in `hfs_dir_open_meta_cb`, with stack `hfs_dir_open_meta_cb -> hfs_cat_traverse -> hfs_dir_open_meta`, while `sleuthkit_fls_hfs_fuzzer` processed the HFS image.",
+    "format": {
+      "name": "HFS+ filesystem image",
+      "contract": "The staged image must make `hfs_cat_traverse` read a 137-byte catalog leaf node whose offset-table entry `rec_off` points at a key that passes the caller's `keylen <= nodesize - rec_off` check, then make `hfs_dir_open_meta_cb` rebase `rec_buf = node + rec_off`, derive `rec_off2` from that key, survive the callback's full-node `rec_off2 >= nodesize - 2` guard, and reach the `HFS_FOLDER_RECORD` branch while the 4-byte `folder->std.cnid` field at `node[rec_off + rec_off2 + 8 .. rec_off + rec_off2 + 11]` is not fully inside `node[0..136]`."
+    }
+  }
+}

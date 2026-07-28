@@ -1,0 +1,479 @@
+{
+  "sample_id": "arvo_13837",
+  "vuln_id": "OSS-Fuzz issue 13837 / ARVO arvo:13837",
+  "project": {
+    "id": "picotls",
+    "name": "picotls",
+    "repo": "https://github.com/h2o/picotls",
+    "vulnerable_commit": "254a1801ede6ed8f4b0c86303c0a9cb8dab9b40f",
+    "reported_vulnerable_commit": "b1999d666e431cf2879b18076cc4218e5c3dcb74",
+    "fixed_commit": "b1999d666e431cf2879b18076cc4218e5c3dcb74",
+    "reported_fixed_commit": "75f9c33cef261046f75c6fe3a02f9912e55211ee",
+    "commit_note": "The exact staged vulnerable source inspected here is the ARVO workspace checkout at `254a1801ede6ed8f4b0c86303c0a9cb8dab9b40f`; its `lib/minicrypto-pem.c` line map matches the saved ASan trace and it lacks any `last_byte1 < byte_index` rejection before the parameters parse. ARVO metadata separately reports `b1999d666e431cf2879b18076cc4218e5c3dcb74` / `75f9c33cef261046f75c6fe3a02f9912e55211ee` as vulnerable/fixed commits, but local picotls history shows `b1999d6` already adds the missing `last_byte1 < byte_index` guard and is therefore the actual fix for this staged path. The staged `patch.diff` is the later follow-on `75f9c33` hardening change, whose diff context assumes that earlier guard is already present.",
+    "fuzz_target": "fuzz-asn1 (AFL driver, ASAN)"
+  },
+  "classification": {
+    "class": "out-of-bounds-read",
+    "cwe": "CWE-125",
+    "access": "read",
+    "detector": "AddressSanitizer",
+    "root_cause_cwe": "CWE-191"
+  },
+  "bug_description": {
+    "original": "Crash Type: Heap-buffer-overflow READ 1 Crash State: ptls_asn1_read_type ptls_asn1_validation_recursive ptls_asn1_validation_recursive Sanitizer: address (ASAN)",
+    "original_source": "ARVO-Meta.report.comments[0].content / staged vulnerable source snapshot / saved sanitizer_trace.txt / local picotls history",
+    "normalized": "The staged 259-byte `fuzz-asn1` witness makes the harness set `bytes_max = 0x0100` and copy the next 256 bytes into a temp file. The final byte is `0xff`, so the outer selector at `fuzz-asn1.c:64` becomes `3` and enters the `ret == 2 || ret == 3` file-loading branch, but the later `if (ret == 2)` at line 91 tests the shadowed inner `ret = write(fd, bytes, bytes_max)`, which evaluates to `256`, so control falls through to `ptls_minicrypto_load_private_key`. `ptls_get_pem_object` accepts the `-----BEGIN PRIVATE KEY-----` prefix line and, using the sparse base64 fragments on the following lines, decodes the logical DER object `30 10 02 01 00 30 00 06 7f 28 84 0a 28 32 8c 07 82 8a`. That object is stored as `pkey->vec` with `len == 18`, but because the PEM buffer starts at capacity 0 and grows through `ptls_buffer_reserve`, its backing heap allocation is 1024 bytes. In `ptls_minicrypto_asn1_decode_private_key`, the outer sequence and version are accepted, the embedded AlgorithmIdentifier sequence is declared as zero-length (`30 00`), and the OID parse still advances `byte_index` from 7 to 8 so `last_byte1 < byte_index`. The staged vulnerable source performs no `last_byte1 < byte_index` rejection before calling `ptls_asn1_validation_recursive(bytes + byte_index, last_byte1 - byte_index, ...)`, so the `size_t` span underflows from `7 - 8` to `SIZE_MAX`. Recursive ASN.1 validation then treats the remaining attacker bytes as a constructed object with forged length `0x0a28328c`, recurses again from original offset 15, and in that nested parse `ptls_asn1_read_length` consumes a second length byte from original offset 18, the first byte past the 18-byte logical DER extent. The saved ASan report later faults in `ptls_asn1_read_type` after the same recursive descent continues through the remaining backing allocation, but the staged static artifacts do not close that later pointer progression, so this GT anchors the source-grounded sink at the first proven logical-length overread."
+  },
+  "source": {
+    "file": "lib/pembase64.c",
+    "function": "ptls_get_pem_object",
+    "line": 292,
+    "var": "buf",
+    "code": "ret = ptls_base64_decode(line, &state, buf);",
+    "description": "First project-code statement on the vulnerability path that consumes attacker-controlled PEM body text and appends decoded DER bytes into the private-key buffer.",
+    "value_from": "In the staged 259-byte `poc`, bytes 0..1 are `01 00`, so the harness writes bytes 2..257 to a 256-byte temp file. Byte 258 is `0xff`; it only selects the outer `ret == 2 || ret == 3` file-loading branch, and the actual private-key call happens because the shadowed `ret = write(fd, bytes, bytes_max)` returns `256` and makes line 91 fall through to line 102. After the accepted `-----BEGIN PRIVATE KEY-----` line, the surviving base64 fragments on lines 3..9 (`M`, `B`, `AC`, `AQ`, `A`, `wA`, `AZ/KIQKKDKMB4KK`) decode to `30 10 02 01 00 30 00 06 7f 28 84 0a 28 32 8c 07 82 8a`.",
+    "trace_step": 5
+  },
+  "tainted_value_origin": {
+    "file": "lib/pembase64.c",
+    "function": "ptls_load_pem_objects",
+    "line": 328,
+    "var": "list[count].base, list[count].len",
+    "code": "list[count].base = buf.base;\nlist[count].len = buf.off;",
+    "description": "This is where the decoded object becomes `pkey->vec`: `len` records the logical DER extent `18`, while the backing heap allocation was already grown from capacity 0 to 1024 by the first `ptls_buffer__do_pushv`."
+  },
+  "sink": {
+    "file": "lib/asn1.c",
+    "function": "ptls_asn1_read_length",
+    "line": 154,
+    "var": "bytes[byte_index++]",
+    "code": "*length |= bytes[byte_index++];",
+    "description": "First source-grounded unsafe read. In the nested recursive parse, this second long-form length-byte load reads original DER offset 18, one byte past `pkey->vec.len == 18`. That access is still inside the 1024-byte backing allocation, so it anchors the proven logical-length overread rather than the later ASan heap-crossing read at line 86.",
+    "trace_step": 15
+  },
+  "root_cause": {
+    "file": "lib/minicrypto-pem.c",
+    "function": "ptls_minicrypto_asn1_decode_private_key",
+    "line": 109,
+    "var": "*decode_error, last_byte1, byte_index",
+    "code": "if (*decode_error == 0) {",
+    "description": "The staged vulnerable source gates the parameters parse only on `*decode_error == 0`. It does not reject the already true `last_byte1 < byte_index` condition after OID parsing, so the next step subtracts `last_byte1 - byte_index` as an unsigned span and underflows.",
+    "trace_step": 11
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "lib/pembase64.c",
+      "function": "ptls_get_pem_object",
+      "line": 276,
+      "code": "if (ptls_compare_separator_line(line, \"BEGIN\", label) == 0) {",
+      "description": "The staged temp file's second line begins with `-----BEGIN PRIVATE KEY-----`. `ptls_compare_separator_line` verifies only the prefix components and the trailing five dashes, and does not require end-of-line afterwards, so the appended `0xff` byte and trailing spaces do not prevent the BEGIN line from being accepted."
+    },
+    "private_key_loader_selected": {
+      "file": "fuzz/fuzz-asn1.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 91,
+      "code": "if (ret == 2) {",
+      "description": "The final witness byte `0xff` makes the outer selector at line 64 evaluate to `3`, so execution enters the `ret == 2 || ret == 3` file-loading branch. Inside that branch, `int fd, ret;` shadows the selector, `ret = write(fd, bytes, bytes_max)` stores `256`, and this `if (ret == 2)` predicate is therefore false, so control falls through to the private-key loader call at line 102."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "fuzz/fuzz-asn1.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness interprets the first two witness bytes as a 256-byte temp-file length, copies bytes 2..257 into that file, uses final byte `0xff` to enter the `ret == 2 || ret == 3` file-loading branch, then falls through to `ptls_minicrypto_load_private_key` because the shadowed inner `ret = write(...)` stores `256` and makes `if (ret == 2)` false."
+    },
+    {
+      "step": 2,
+      "file": "lib/pembase64.c",
+      "function": "ptls_get_pem_object",
+      "summary": "PEM parsing accepts the `BEGIN PRIVATE KEY` prefix line, base64-decodes sparse body fragments into an 18-byte DER object, and stores it as `pkey->vec` with a 1024-byte backing allocation."
+    },
+    {
+      "step": 3,
+      "file": "lib/minicrypto-pem.c",
+      "function": "ptls_minicrypto_asn1_decode_private_key",
+      "summary": "PKCS#8 parsing accepts the outer sequence and version, parses a zero-length inner AlgorithmIdentifier sequence, then lets OID parsing advance past `last_byte1` and enters the parameters parse without any `last_byte1 < byte_index` rejection."
+    },
+    {
+      "step": 4,
+      "file": "lib/asn1.c",
+      "function": "ptls_asn1_validation_recursive",
+      "summary": "The underflowed parameters span makes recursive ASN.1 validation treat the remaining bytes as a huge constructed object, recurse again from original offset 15, and read the first byte past the logical DER extent during nested long-form length parsing. The saved ASan heap-buffer-overflow occurs later in the same recursive descent."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "fuzz/fuzz-asn1.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 54,
+      "line_end": 61,
+      "var": "bytes_max, bytes",
+      "code": "bytes_max = (feeder_next_byte() << 8) + feeder_next_byte();\n...\nbytes = malloc(bytes_max);\nfor (i = 0; i < bytes_max; i++) {\n    bytes[i] = feeder_next_byte();\n}",
+      "note": "The witness starts with `01 00`, so the harness sets `bytes_max = 256`, allocates `bytes`, and copies witness bytes 2..257 into that buffer as the future temp-file contents. After this loop, the only unread witness byte is the final selector byte at offset 258."
+    },
+    {
+      "step": 2,
+      "file": "fuzz/fuzz-asn1.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 64,
+      "var": "ret",
+      "code": "ret = feeder_next_byte() % 4;",
+      "note": "The remaining witness byte is `0xff`, so the outer selector becomes `3` and execution enters the `ret == 2 || ret == 3` file-loading branch instead of the standalone ASN.1 helper branches.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "feeder.data, feeder.size"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "fuzz/fuzz-asn1.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 82,
+      "line_end": 84,
+      "var": "ret",
+      "code": "ret = write(fd, bytes, bytes_max);\nif (ret != bytes_max) {\n    goto out2;\n}",
+      "note": "Inside that branch, `int fd, ret;` shadows the outer selector. `write(fd, bytes, 256)` stores the temp file and returns `256`, so the short-write early exit is not taken.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "bytes, bytes_max"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "ret == 2 || ret == 3"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "fuzz/fuzz-asn1.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 91,
+      "line_end": 102,
+      "var": "ret",
+      "code": "if (ret == 2) {\n    ptls_load_certificates(&ctx, fname);\n} else {\n    ptls_minicrypto_load_private_key(&ctx, fname);\n}",
+      "note": "The later predicate uses the shadowed inner `ret`, not the selector byte. Because step 3 set `ret = 256`, `if (ret == 2)` is false and control falls through to `ptls_minicrypto_load_private_key`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "ret"
+        },
+        {
+          "on": 3,
+          "type": "control",
+          "via": "ret == bytes_max"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "lib/pembase64.c",
+      "function": "ptls_get_pem_object",
+      "line": 292,
+      "var": "buf",
+      "code": "ret = ptls_base64_decode(line, &state, buf);",
+      "note": "After the accepted `BEGIN PRIVATE KEY` prefix line, each `fgets` buffer is decoded as a C string, so embedded `\\0` bytes terminate the visible line prefix and only the surviving base64 fragments `M`, `B`, `AC`, `AQ`, `A`, `wA`, and `AZ/KIQKKDKMB4KK` contribute. Together they decode into the exact 18-byte DER sequence `30 10 02 01 00 30 00 06 7f 28 84 0a 28 32 8c 07 82 8a`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "temp-file contents"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "ptls_minicrypto_load_private_key"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "lib/pembase64.c",
+      "function": "ptls_load_pem_objects",
+      "line": 328,
+      "line_end": 329,
+      "var": "list[count].base, list[count].len",
+      "code": "list[count].base = buf.base;\nlist[count].len = buf.off;",
+      "note": "The decoded object is published as `pkey->vec` with logical length `18`. Because `ptls_buffer_init(&buf, \"\", 0)` started at capacity 0 and the first `ptls_buffer_reserve` rounds growth up to 1024, those 18 logical DER bytes reside in a 1024-byte heap allocation.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "buf.base, buf.off"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "lib/minicrypto-pem.c",
+      "function": "ptls_minicrypto_asn1_decode_private_key",
+      "line": 58,
+      "line_end": 59,
+      "var": "byte_index, last_byte0",
+      "code": "byte_index = ptls_asn1_get_expected_type_and_length(bytes, bytes_max, byte_index, 0x30, &seq0_length, NULL, &last_byte0,\n                                                        decode_error, log_ctx);",
+      "note": "The DER begins with `30 10`, so outer PKCS#8 sequence parsing sets `byte_index = 2` and `last_byte0 = 18`, matching the logical `pkey->vec.len` extent.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "pkey->vec.base, pkey->vec.len"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "lib/minicrypto-pem.c",
+      "function": "ptls_minicrypto_asn1_decode_private_key",
+      "line": 71,
+      "line_end": 75,
+      "var": "byte_index",
+      "code": "} else if (bytes[byte_index] != 0x02 || bytes[byte_index + 1] != 0x01 || bytes[byte_index + 2] != 0x00) {\n    *decode_error = PTLS_ERROR_INCORRECT_PEM_KEY_VERSION;\n    byte_index = ptls_asn1_error_message(\"Incorrect PEM Version\", bytes_max, byte_index, 0, log_ctx);\n} else {\n    byte_index += 3;",
+      "note": "The next three DER bytes are `02 01 00`, so the version INTEGER is accepted and the cursor advances from offset 2 to offset 5.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "byte_index"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "pkey->vec.base[2..4]"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "lib/minicrypto-pem.c",
+      "function": "ptls_minicrypto_asn1_decode_private_key",
+      "line": 84,
+      "line_end": 85,
+      "var": "byte_index, last_byte1",
+      "code": "byte_index = ptls_asn1_get_expected_type_and_length(bytes, bytes_max, byte_index, 0x30, &seq1_length, NULL, &last_byte1,\n                                                            decode_error, log_ctx);",
+      "note": "At offsets 5..6 the bytes are `30 00`, so the embedded AlgorithmIdentifier sequence is parsed as zero-length. The returned cursor is `byte_index = 7`, and the declared end of that inner sequence is also `last_byte1 = 7`.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "byte_index"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "pkey->vec.base[5..6]"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "lib/minicrypto-pem.c",
+      "function": "ptls_minicrypto_asn1_decode_private_key",
+      "line": 93,
+      "line_end": 105,
+      "var": "oid_length, byte_index",
+      "code": "byte_index = ptls_asn1_get_expected_type_and_length(bytes, last_byte1, byte_index, 0x06, &oid_length, NULL, &last_oid_byte,\n                                                            decode_error, log_ctx);\n...\nbyte_index += oid_length;",
+      "note": "Despite the zero-length inner sequence, this call still reads `bytes[7] == 0x06` as an OID tag. Because it was invoked with `bytes_max = last_byte1 = 7`, there is no room for a length byte, so `oid_length` stays `0` while `byte_index` advances to `8`, leaving `last_byte1 < byte_index`.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "last_byte1, byte_index"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "pkey->vec.base[7]"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "lib/minicrypto-pem.c",
+      "function": "ptls_minicrypto_asn1_decode_private_key",
+      "line": 109,
+      "var": "*decode_error, last_byte1, byte_index",
+      "code": "if (*decode_error == 0) {",
+      "note": "Control still enters the parameters block because the staged vulnerable source checks only `*decode_error == 0`. Unlike local commit `b1999d6`, there is no `if (last_byte1 < byte_index)` rejection here, even though step 10 already established that the cursor has passed the declared end of the inner sequence.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "last_byte1, byte_index, *decode_error"
+        },
+        {
+          "on": 10,
+          "type": "control",
+          "via": "*decode_error == 0"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "lib/minicrypto-pem.c",
+      "function": "ptls_minicrypto_asn1_decode_private_key",
+      "line": 118,
+      "var": "last_byte1 - byte_index",
+      "code": "(uint32_t)ptls_asn1_validation_recursive(bytes + byte_index, last_byte1 - byte_index, decode_error, 2, log_ctx);",
+      "note": "The parameters parse subtracts `last_byte1 - byte_index` as unsigned `size_t`: `7 - 8` wraps to `SIZE_MAX`. Recursive validation is therefore invoked at original DER offset 8 with an effectively unbounded length.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "last_byte1, byte_index"
+        },
+        {
+          "on": 11,
+          "type": "control",
+          "via": "*decode_error == 0"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "lib/asn1.c",
+      "function": "ptls_asn1_validation_recursive",
+      "line": 227,
+      "var": "length, last_byte",
+      "code": "byte_index =\n    ptls_asn1_read_length(bytes, bytes_max, byte_index, &length, &indefinite_length, &last_byte, decode_error, level, log_ctx);",
+      "note": "Starting at original DER offset 8, `ptls_asn1_read_type` first interprets `7f 28` as a constructed high-tag-number object, and this `ptls_asn1_read_length` then parses `84 0a 28 32 8c` as long-form length `0x0a28328c`. That sets `last_byte = 170406547` even though only 10 logical DER bytes remain from offset 8 onward.",
+      "depends_on": [
+        {
+          "on": 12,
+          "type": "data",
+          "via": "bytes + byte_index, bytes_max"
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "file": "lib/asn1.c",
+      "function": "ptls_asn1_validation_recursive",
+      "line": 254,
+      "line_end": 255,
+      "var": "bytes + byte_index, last_byte - byte_index",
+      "code": "byte_index += ptls_asn1_validation_recursive(bytes + byte_index, last_byte - byte_index, decode_error,\n                                                                 level + 1, log_ctx);",
+      "note": "Because the first parameters object is constructed and `byte_index < last_byte`, the validator recurses again from original DER offset 15 with `bytes_max = 170406540`, carrying the underflowed extent deeper into the parse.",
+      "depends_on": [
+        {
+          "on": 13,
+          "type": "data",
+          "via": "last_byte, byte_index"
+        },
+        {
+          "on": 13,
+          "type": "control",
+          "via": "byte_index < last_byte"
+        }
+      ]
+    },
+    {
+      "step": 15,
+      "file": "lib/asn1.c",
+      "function": "ptls_asn1_read_length",
+      "line": 154,
+      "var": "bytes[byte_index++]",
+      "code": "*length |= bytes[byte_index++];",
+      "note": "In that nested parse, tag `0x07` is treated as primitive and `0x82` at original DER offset 16 claims a two-byte long-form length. The first length byte comes from original offset 17 (`0x8a`); this second load reads original offset 18, which is the first byte past `pkey->vec.len == 18`. That is the first source-grounded out-of-bounds read relative to the logical DER extent. The saved ASan fault happens later, after the same recursive descent continues through the remaining 1024-byte backing allocation.",
+      "depends_on": [
+        {
+          "on": 14,
+          "type": "data",
+          "via": "bytes + byte_index, bytes_max"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "lib/asn1.c",
+      "function": "ptls_asn1_read_type",
+      "line": 86
+    },
+    "allocation_context": null,
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "ptls_asn1_read_type",
+        "file": "lib/asn1.c",
+        "line": 86
+      },
+      {
+        "frame": 1,
+        "function": "ptls_asn1_validation_recursive",
+        "file": "lib/asn1.c",
+        "line": 219
+      },
+      {
+        "frame": 2,
+        "function": "ptls_asn1_validation_recursive",
+        "file": "lib/asn1.c",
+        "line": 254
+      },
+      {
+        "frame": 3,
+        "function": "ptls_minicrypto_asn1_decode_private_key",
+        "file": "lib/minicrypto-pem.c",
+        "line": 118
+      },
+      {
+        "frame": 4,
+        "function": "ptls_pem_parse_private_key",
+        "file": "lib/minicrypto-pem.c",
+        "line": 182
+      },
+      {
+        "frame": 5,
+        "function": "ptls_minicrypto_load_private_key",
+        "file": "lib/minicrypto-pem.c",
+        "line": 322
+      },
+      {
+        "frame": 6,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/fuzz-asn1.c",
+        "line": 102
+      }
+    ],
+    "dedup_token": "ptls_asn1_read_type--ptls_asn1_validation_recursive--ptls_asn1_validation_recursive",
+    "patch_resolves": false,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "source": "staged sanitizer_trace.txt and reproduction_report.json",
+    "cross_validation": {
+      "sink_matches_crash": "No at exact sink-step level. The saved ASan crash is later at `ptls_asn1_read_type` line 86 after recursive parsing continues through the remaining 1024-byte backing allocation; this GT intentionally narrows the source-grounded sink to the first proven logical-length overread at `ptls_asn1_read_length` line 154.",
+      "trace_consistent_with_stack": "Yes through the reviewed project frames. The saved stack `ptls_asn1_read_type -> ptls_asn1_validation_recursive -> ptls_asn1_validation_recursive -> ptls_minicrypto_asn1_decode_private_key` is the same recursive descent established by fine-trace steps 12-14, and the harness frame at `LLVMFuzzerTestOneInput` line 102 matches step 4's fallthrough into `ptls_minicrypto_load_private_key`. The exact later pointer progression from step 15 to the ASan read is not closed by the staged static artifacts.",
+      "tainted_value_reaches_sink": true,
+      "patch_resolves_note": "The staged `patch.diff` is follow-on commit `75f9c33cef261046f75c6fe3a02f9912e55211ee`, which only changes an already-present `if (last_byte1 < byte_index)` check to `if (*decode_error == 0 && last_byte1 < byte_index)`. The exact staged vulnerable source at workspace HEAD `254a1801ede6ed8f4b0c86303c0a9cb8dab9b40f` lacks that guard entirely. Local history shows commit `b1999d666e431cf2879b18076cc4218e5c3dcb74` adds the missing `last_byte1 < byte_index` rejection and is the actual source-level fix for this path."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": {
+      "trigger_type": "arvo_docker",
+      "container_image": "n132/arvo:13837-vul",
+      "target_command": "/out/fuzz-asn1 /tmp/poc",
+      "expected_crash_evidence": "AddressSanitizer: heap-buffer-overflow",
+      "crash_state": "ptls_asn1_read_type ptls_asn1_validation_recursive ptls_asn1_validation_recursive"
+    },
+    "format": {
+      "name": "fuzz-asn1 feeder input",
+      "contract": "Exactly the staged 259-byte witness: bytes 0..1 are `01 00`, so the harness allocates and later writes a 256-byte temp file; bytes 2..257 are that temp file, whose second line begins `-----BEGIN PRIVATE KEY-----` and whose accepted base64 body decodes to `30 10 02 01 00 30 00 06 7f 28 84 0a 28 32 8c 07 82 8a`; byte 258 is `0xff`, so the outer selector at line 64 becomes `3` and enters the file-loading branch, and because the shadowed inner `ret = write(fd, bytes, bytes_max)` returns `256`, line 91's `if (ret == 2)` is false and line 102 calls `ptls_minicrypto_load_private_key`."
+    }
+  }
+}

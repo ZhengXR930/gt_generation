@@ -1,0 +1,418 @@
+{
+  "sample_id": "arvo_14960",
+  "vuln_id": "OSS-Fuzz issue 14960 / ARVO arvo:14960",
+  "project": {
+    "id": "karchive",
+    "name": "KArchive",
+    "repo": "https://github.com/KDE/karchive.git",
+    "vulnerable_commit": "d9878a684bad6bff4dc9b052663b7bc87a44d729",
+    "fixed_commit": "5dedab8cb9ec5acb94d6f9957f0f3494f59a3316",
+    "fuzz_target": "karchive_fuzzer (afl_asan_karchive)"
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-787",
+    "access": "write",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed report: https://oss-fuzz.com/testcase?key=5726433327972352\n\nProject: karchive\nFuzzer: afl_karchive_fuzzer\nFuzz target binary: karchive_fuzzer\nJob Type: afl_asan_karchive\nPlatform Id: linux\n\nCrash Type: Heap-buffer-overflow WRITE 1\nCrash Address: 0x62b000014219\nCrash State:\n  inflate_fast\n  inflate\n  KGzipFilter::uncompress\n  \nSanitizer: address (ASAN)\n\nRecommended Security Severity: High\n\nRegressed: https://oss-fuzz.com/revisions?job=afl_asan_karchive&range=201905250252:201905260250\n\nReproducer Testcase: https://oss-fuzz.com/download?testcase_id=5726433327972352",
+    "original_source": "ARVO-Meta.report.comments[0].content",
+    "normalized": "While KTar parses the staged gzip-backed archive through KCompressionDevice, repeated tar-header reads advance the logical QIODevice position farther than the compression device's underlying read position. On the crashing seek, KCompressionDevice::seek computes `bytesToRead = pos - d->deviceReadPos`, allocates a dummy heap buffer capped at `3 * BUFFER_SIZE` (24,576 bytes), but still calls `read(dummy.data(), bytesToRead)` with the larger outstanding distance. KCompressionDevice::readData forwards that oversized length as the gzip output window, and KGzipFilter::uncompress calls zlib `inflate`, which writes one byte past the dummy buffer and triggers the observed heap-buffer-overflow WRITE 1 in `inflate_fast`."
+  },
+  "source": {
+    "file": "src/ktar.cpp",
+    "function": "KTar::KTarPrivate::readRawHeader",
+    "line": 189,
+    "var": "buffer, n",
+    "code": "qint64 n = q->device()->read(buffer, 0x200);",
+    "description": "First project-code read on the vulnerable path: pulls 512 decompressed bytes from the attacker-controlled gzip/tar stream into `buffer` for tar-header parsing, and advances the logical archive position later reused by `seek`.",
+    "value_from": "The staged 782-byte witness at `gt_results/arvo_14960/poc` begins with gzip magic `1f 8b 08`. Stage 01's crash log prints many `kf5.karchive: directory ... has entry ... already` messages before ASan aborts, showing that this gzip stream is accepted and repeatedly fed into the tar-header reader on the crashing path.",
+    "trace_step": 1
+  },
+  "tainted_value_origin": {
+    "file": "src/kcompressiondevice.cpp",
+    "function": "KCompressionDevice::seek",
+    "line": 231,
+    "var": "bytesToRead",
+    "code": "bytesToRead = pos - d->deviceReadPos;",
+    "description": "This assignment materializes the exact length later used both as the requested read size and as zlib's output budget. On the witnessed call it exceeds `3 * BUFFER_SIZE`, which is why the next step allocates the capped 24,576-byte dummy buffer."
+  },
+  "sink": {
+    "file": "src/kgzipfilter.cpp",
+    "function": "KGzipFilter::uncompress",
+    "line": 311,
+    "var": "d->zStream",
+    "code": "int result = inflate(&d->zStream, Z_SYNC_FLUSH);",
+    "description": "Project call site that hands zlib the undersized dummy buffer together with the oversized output length derived from `bytesToRead`. The ASan crash occurs immediately below this call in `inflate_fast` when zlib writes one byte past the 24,576-byte allocation.",
+    "note": "The sanitizer trace reports `WRITE of size 1` in `inflate_fast` and the call stack shows `inflate` <- `KGzipFilter::uncompress` <- `KCompressionDevice::readData` <- `KCompressionDevice::seek`.",
+    "trace_step": 9
+  },
+  "root_cause": {
+    "file": "src/kcompressiondevice.cpp",
+    "function": "KCompressionDevice::seek",
+    "line": 250,
+    "var": "dummy, bytesToRead",
+    "code": "const bool result = (read(dummy.data(), bytesToRead) == bytesToRead);",
+    "description": "The vulnerable seek path caps the dummy buffer size at `3 * BUFFER_SIZE` but still requests `bytesToRead` bytes from `read()`. When `bytesToRead` is larger than the allocation, the downstream decompressor is told to fill more bytes than `dummy` can hold.",
+    "note": "The fix replaces this single oversized read with a loop that limits each iteration to `qMin(bytesToRead, qint64(dummy.size()))`. In the vulnerable version there is no guard or chunking step tying the requested output length to `dummy.size()`.",
+    "trace_step": 7
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/ktar.cpp",
+      "function": "KTar::KTarPrivate::readRawHeader",
+      "line": 192,
+      "description": "The witness yields a full 0x200-byte header block whose first byte or prefix is non-zero and whose tar magic/checksum is accepted by `readRawHeader`, so `KTar::openArchive` stays in its header-processing loop instead of returning 0 or -1."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "karchive_fuzzer.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness wraps the attacker buffer in `QBuffer`, constructs `KTar(gzipKD.get())`, and opens it in read-only mode so tar parsing runs on a gzip-backed `KCompressionDevice`."
+    },
+    {
+      "step": 2,
+      "file": "src/ktar.cpp",
+      "function": "KTar::openArchive",
+      "summary": "The tar parser repeatedly reads attacker-controlled headers from the decompressed stream and, for non-directory entries, calls `dev->seek(dev->pos() + skip)` to skip entry payloads while continuing archive traversal."
+    },
+    {
+      "step": 3,
+      "file": "src/kcompressiondevice.cpp",
+      "function": "KCompressionDevice::seek",
+      "summary": "The compression-device seek path converts the logical target position into `bytesToRead`, allocates a dummy buffer capped at 24,576 bytes, but still requests the larger `bytesToRead` amount through `read()`."
+    },
+    {
+      "step": 4,
+      "file": "src/kgzipfilter.cpp",
+      "function": "KGzipFilter::uncompress",
+      "summary": "`readData` forwards the undersized buffer and oversized length to zlib, and `inflate` writes past the dummy allocation, producing the reported heap-buffer-overflow in `inflate_fast`."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/ktar.cpp",
+      "function": "KTar::KTarPrivate::readRawHeader",
+      "line": 189,
+      "var": "buffer, n",
+      "code": "qint64 n = q->device()->read(buffer, 0x200);",
+      "note": "Consumes the attacker-controlled gzip stream as 512-byte tar-header blocks. Each successful read both materializes the current header in `buffer` and advances the logical archive position that `KTar::openArchive` later passes to `seek`."
+    },
+    {
+      "step": 2,
+      "file": "src/ktar.cpp",
+      "function": "KTar::openArchive",
+      "line": 484,
+      "var": "size",
+      "code": "qint64 size = sizeBuffer.trimmed().toLongLong(nullptr, 8 /*octal*/);",
+      "note": "Parses the current tar header's 12-byte size field into the per-entry payload length `size`, the value later rounded up to a tar-block skip.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "buffer"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "n == 0x200"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/ktar.cpp",
+      "function": "KTar::openArchive",
+      "line": 506,
+      "var": "skip",
+      "code": "qint64 skip = size + (rest ? 0x200 - rest : 0);",
+      "note": "Rounds the attacker-derived entry length up to the next 512-byte boundary. This aligned `skip` is the payload distance that will be added to the current logical tar position before calling `seek`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "size"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/ktar.cpp",
+      "function": "KTar::openArchive",
+      "line": 508,
+      "var": "dev->pos(), skip",
+      "code": "if (! dev->seek(dev->pos() + skip)) {",
+      "note": "Uses the current logical tar position plus the aligned entry skip as the next target position. On the witnessed path, many prior header reads have already advanced `dev->pos()` deep into the decompressed stream before this call is made.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "dev->pos()"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "skip"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "n == 0x200"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/kcompressiondevice.cpp",
+      "function": "KCompressionDevice::seek",
+      "line": 231,
+      "var": "bytesToRead",
+      "code": "bytesToRead = pos - d->deviceReadPos;",
+      "note": "Converts the logical seek target into the remaining number of decompressed bytes to consume from the underlying device. The nearby comment at lines 232-235 shows this path exists specifically because QIODevice buffering can leave `pos` ahead of `d->deviceReadPos`; on the witnessed call, that difference exceeds `3 * BUFFER_SIZE`, as confirmed by the capped allocation in the next step.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "pos"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "d->deviceReadPos < pos"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/kcompressiondevice.cpp",
+      "function": "KCompressionDevice::seek",
+      "line": 249,
+      "var": "dummy",
+      "code": "QByteArray dummy(qMin(bytesToRead, qint64(3 * BUFFER_SIZE)), 0);",
+      "note": "Allocates the destination buffer with a hard cap of `3 * BUFFER_SIZE` = 24,576 bytes. ASan's allocation stack points to this `QByteArray` construction immediately before the overflow.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "bytesToRead"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/kcompressiondevice.cpp",
+      "function": "KCompressionDevice::seek",
+      "line": 250,
+      "var": "dummy, bytesToRead",
+      "code": "const bool result = (read(dummy.data(), bytesToRead) == bytesToRead);",
+      "note": "Root cause: the code uses the larger `bytesToRead` as the requested read length even when `dummy.size()` was capped smaller in step 6. The missing obligation is to chunk or bound the read to the buffer's actual extent.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "bytesToRead"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "dummy"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/kcompressiondevice.cpp",
+      "function": "KCompressionDevice::readData",
+      "line": 280,
+      "var": "data, maxlen",
+      "code": "filter->setOutBuffer(data, maxlen);",
+      "note": "The oversized read request becomes `readData(char *data, qint64 maxlen)`, which forwards the same pointer `dummy.data()` and the same oversized length `bytesToRead` into the gzip filter as its output buffer and output budget.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "dummy.data()"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "bytesToRead"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/kgzipfilter.cpp",
+      "function": "KGzipFilter::uncompress",
+      "line": 311,
+      "var": "d->zStream",
+      "code": "int result = inflate(&d->zStream, Z_SYNC_FLUSH);",
+      "note": "Sink call. zlib now treats the output window as `maxlen = bytesToRead` bytes even though the heap buffer from step 6 is only 24,576 bytes long. The sanitizer reports the resulting one-byte write past that allocation in `inflate_fast`.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "maxlen"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "dummy"
+        },
+        {
+          "on": 8,
+          "type": "control",
+          "via": "d->zStream.avail_in > 0"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan_trace",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "WRITE",
+    "access_size": 1,
+    "crash_location": {
+      "file": "zlib/inffast.c",
+      "function": "inflate_fast",
+      "line": 254
+    },
+    "allocation_context": {
+      "file": "src/kcompressiondevice.cpp",
+      "function": "KCompressionDevice::seek",
+      "line": 249
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "inflate_fast",
+        "file": "zlib/inffast.c",
+        "line": 254
+      },
+      {
+        "frame": 1,
+        "function": "inflate",
+        "file": "zlib/inflate.c",
+        "line": 1047
+      },
+      {
+        "frame": 2,
+        "function": "KGzipFilter::uncompress()",
+        "file": "src/kgzipfilter.cpp",
+        "line": 311
+      },
+      {
+        "frame": 3,
+        "function": "KCompressionDevice::readData(char*, long long)",
+        "file": "src/kcompressiondevice.cpp",
+        "line": 303
+      },
+      {
+        "frame": 4,
+        "function": "QIODevicePrivate::read(char*, long long, bool)",
+        "file": "qtbase/src/corelib/io/qiodevice.cpp",
+        "line": 1108
+      },
+      {
+        "frame": 5,
+        "function": "KCompressionDevice::seek(long long)",
+        "file": "src/kcompressiondevice.cpp",
+        "line": 250
+      },
+      {
+        "frame": 6,
+        "function": "KTar::openArchive(QFlags<QIODevice::OpenModeFlag>)",
+        "file": "src/ktar.cpp",
+        "line": 508
+      },
+      {
+        "frame": 7,
+        "function": "KArchive::open(QFlags<QIODevice::OpenModeFlag>)",
+        "file": "src/karchive.cpp",
+        "line": 178
+      },
+      {
+        "frame": 8,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "karchive_fuzzer.cc",
+        "line": 61
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "asan_malloc_linux.cc",
+        "line": 145
+      },
+      {
+        "frame": 1,
+        "function": "QArrayData::allocate(unsigned long, unsigned long, unsigned long, QFlags<QArrayData::AllocationOption>)",
+        "file": "qtbase/src/corelib/tools/qarraydata.cpp",
+        "line": 118
+      },
+      {
+        "frame": 2,
+        "function": "allocate",
+        "file": "qtbase/src/corelib/../../include/QtCore/../../src/corelib/tools/qarraydata.h",
+        "line": 224
+      },
+      {
+        "frame": 3,
+        "function": "QByteArray::QByteArray(int, char)",
+        "file": "qtbase/src/corelib/tools/qbytearray.cpp",
+        "line": 1808
+      },
+      {
+        "frame": 4,
+        "function": "KCompressionDevice::seek(long long)",
+        "file": "src/kcompressiondevice.cpp",
+        "line": 249
+      },
+      {
+        "frame": 5,
+        "function": "KTar::openArchive(QFlags<QIODevice::OpenModeFlag>)",
+        "file": "src/ktar.cpp",
+        "line": 508
+      },
+      {
+        "frame": 6,
+        "function": "KArchive::open(QFlags<QIODevice::OpenModeFlag>)",
+        "file": "src/karchive.cpp",
+        "line": 178
+      },
+      {
+        "frame": 7,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "karchive_fuzzer.cc",
+        "line": 61
+      }
+    ],
+    "free_stack": [],
+    "patch_resolves": false,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": "The fine-trace sink is the project `inflate(&d->zStream, Z_SYNC_FLUSH)` call that immediately invokes the crashing library frame `inflate_fast` reported by ASan.",
+      "root_cause_matches_allocation_context": "ASan's allocation context points to the undersized dummy buffer at step 6 (line 249); the root cause is the immediately following step 7 that reuses that buffer with the larger `bytesToRead` length.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "gt_results/arvo_14960/poc",
+    "trigger": "Feed the staged 782-byte PoC to `karchive_fuzzer`; in the `KTar(gzipKD.get())` handler, `KTar::openArchive` reaches `KCompressionDevice::seek`, which overflows its dummy heap buffer while inflating the gzip stream.",
+    "format": {
+      "name": "GZip-compressed TAR stream",
+      "contract": "A gzip-compressed tar input that makes `KCompressionDevice::seek` compute `bytesToRead > 3 * BUFFER_SIZE` for a `dev->seek(dev->pos() + skip)` call during `KTar::openArchive`, while enough compressed data remains for zlib to emit at least 24,577 output bytes into that call's dummy buffer."
+    }
+  }
+}

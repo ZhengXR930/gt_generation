@@ -1,0 +1,558 @@
+{
+  "sample_id": "arvo_42521280",
+  "vuln_id": "OSS-Fuzz issue 42521280 / ARVO arvo:42521280",
+  "project": {
+    "id": "elfutils",
+    "name": "elfutils",
+    "repo": "git://sourceware.org/git/elfutils.git",
+    "vulnerable_commit": "1807e14802d00a9320cd7a079b6c70c9cb7afca7",
+    "fixed_commit": "924bee3c416b50bfdfdb53a3058eac1d7d859ef0",
+    "staged_checkout_commit": "77d237798c8f262d618bd3ed2db8864022bfcacb",
+    "commit_note": "The staged ARVO workspace checkout at `_work/src/elfutils` is on commit `77d237798c8f262d618bd3ed2db8864022bfcacb`, not the metadata `vulnerable_commit`. The line anchors below were resolved against that staged vulnerable tree, which still lacks the `goto done` plus trailing `memmove` added by `patch.diff` in `libelf/gnuhash_xlate.h`.",
+    "fuzz_target": "fuzz-libdwfl (libFuzzer, MemorySanitizer)"
+  },
+  "classification": {
+    "class": "use-of-uninitialized-value",
+    "cwe": "CWE-457",
+    "detector": "MemorySanitizer",
+    "access": "READ"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42521280 (elfutils): Use-of-uninitialized-value found by fuzz target fuzz-libdwfl [msan]. https://issues.oss-fuzz.com/issues/42521280",
+    "original_source": "sample_info.json issue_description / sanitizer_trace.txt / reproduction_report.json / patch.diff",
+    "normalized": "The exact staged witness is a 192-byte malformed ELF64 big-endian file. In the staged vulnerable tree, libelf determines section count from `e_shoff = 0` and `e_shnum = 3`, then loads three fixed 64-byte section headers from file offset 0. Under that interpretation, section 1 is the section-header string table (`SHT_STRTAB`, `sh_offset = 8`, `sh_size = 32`) and its first string is `.debug_line_str`; section 2 has `sh_name = 0`, `sh_type = 0x6ffffff6 (SHT_GNU_HASH)`, `sh_offset = 32`, and `sh_size = 158`. In `global_read()`'s type-discovery scan, `scn_dwarf_type()` resolves `elf_strptr (result->elf, 1, 0)` for section 2 to `.debug_line_str`. Because that name starts with `.debug_` and has no `.dwo` suffix, `scn_dwarf_type()` returns `TYPE_PLAIN`, so `global_read()` promotes `result->type` to `TYPE_PLAIN`. In the later `check_section()` scan of the same section, the identical name resolution again yields `.debug_line_str`, and the `result->type == TYPE_PLAIN` guard lets libdw classify this non-string `SHT_GNU_HASH` section as the DWARF string section `IDX_debug_line_str` and request its data with `elf_getdata()`.\n\nInside libelf, `__libelf_set_rawdata_wrlock()` copies the section-2 header tuple into locals, maps `SHT_GNU_HASH` to `ELF_T_GNUHASH`, and on ELFCLASS64 assigns `entsize = 1`, so the non-multiple-of-word size `sh_size = 158` is accepted instead of being rejected as malformed. `__libelf_set_data_list_rdlock()` then calls `convert_data()` with `data = ELFDATA2MSB`, `size = 158`, and `type = ELF_T_GNUHASH`; because the saved x86_64 build uses `MY_ELFDATA = ELFDATA2LSB`, the fast path is skipped and `convert_data()` allocates a fresh 158-byte heap buffer before dispatching `__elf_xfctstom[ELFCLASS64 - 1][ELF_T_GNUHASH] = elf_cvt_gnuhash`.\n\nFor this exact section body, `elf_cvt_gnuhash()` swaps the first four 32-bit control words, yielding `bitmask_words = 0`, so the 64-bit loop is skipped. The trailing loop converts 35 full 32-bit words and stops with `len = 2`. In the vulnerable revision the function then falls off the end with no copy of those last two bytes, leaving `dest[156]` and `dest[157]` uninitialized even though the source section still has concrete file bytes there. `convert_data()` publishes that partially initialized heap allocation as `data->d_buf`. Back in `check_section()`, `.debug_line_str` maps to a string-section index, so the trailing-NUL trim loop runs with `size = data->d_size = 158` and first evaluates `*((const char *) data->d_buf + 157) != '\\0'`. That read lands in the two-byte uninitialized tail and produces the saved MemorySanitizer report at `libdw/dwarf_begin_elf.c:265`. The fix changes the early exits in `elf_cvt_gnuhash()` to `goto done` and adds `if (len > 0) memmove (dest + size - len, src + size - len, len);`, which copies those final two bytes and removes the undefined read."
+  },
+  "source": {
+    "file": "libdw/dwarf_begin_elf.c",
+    "function": "scn_dwarf_type",
+    "line": 105,
+    "var": "scnname, shstrndx, shdr->sh_name",
+    "code": "const char *scnname = elf_strptr (result->elf, shstrndx, shdr->sh_name);",
+    "description": "Source. During `global_read()`'s type-discovery scan, `scn_dwarf_type()` resolves the attacker-controlled section-name offset through the attacker-controlled shstrtab and materializes section 2's misleading name as `.debug_line_str`, which is the earliest project-side state that puts this non-string `SHT_GNU_HASH` section on the vulnerable DWARF path.",
+    "value_from": "For the staged 192-byte witness, libelf accepts `shstrndx = 1`, section 1 is `SHT_STRTAB` at file offset 8 with first string `.debug_line_str`, and section 2's header carries `sh_name = 0`. This statement therefore returns the exact string `.debug_line_str` for section 2.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "libdw/dwarf_begin_elf.c",
+    "function": "check_section",
+    "line": 265,
+    "var": "size, data->d_buf",
+    "code": "while (size > 0 && *((const char *) data->d_buf + size - 1) != '\\0')",
+    "description": "MSAN sink. Because `.debug_line_str` is treated as a string section, this backward trim loop reads `data->d_buf[size - 1]`; on the saved witness the first iteration dereferences `data->d_buf[157]` from the two-byte tail that `elf_cvt_gnuhash()` never wrote.",
+    "note": "Both `sanitizer_trace.txt` and `reproduction_report.json` identify `check_section` at `libdw/dwarf_begin_elf.c:265:7` as the observed `MemorySanitizer: use-of-uninitialized-value` site.",
+    "trace_step": 16
+  },
+  "root_cause": {
+    "file": "libelf/gnuhash_xlate.h",
+    "function": "elf_cvt_gnuhash",
+    "line": 69,
+    "var": "len, dest32, src32",
+    "code": "while (len >= 4) { *dest32++ = bswap_32 (*src32++); len -= 4; }",
+    "description": "Root cause. The vulnerable GNU-hash converter only writes complete 4-byte units after the control-word phase and has no fallback copy for leftover bytes. For the exact 158-byte witness, the earlier control words set `bitmask_words = 0`, this loop consumes 35 full words, and the final two bytes of the destination buffer remain uninitialized.",
+    "note": "`patch.diff` records the missing obligation precisely: it replaces the earlier `return` sites with `goto done`, tracks the original buffer length in `size`, and adds `if (len > 0) memmove (dest + size - len, src + size - len, len);` to define any remaining tail bytes.",
+    "trace_step": 13
+  },
+  "tainted_value_origin": {
+    "file": "libelf/elf_getdata.c",
+    "function": "__libelf_set_rawdata_wrlock",
+    "line": 247,
+    "var": "offset, size, type, align, flags",
+    "code": "offset = shdr->sh_offset; size = shdr->sh_size; type = shdr->sh_type; align = shdr->sh_addralign; flags = shdr->sh_flags;",
+    "description": "The concrete witness-derived state that drives the conversion bug is section 2's header tuple: `sh_offset = 32`, `sh_size = 158`, `sh_type = SHT_GNU_HASH`, and `sh_addralign = 0x2020202020202020`."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "dwarf_begin_elf",
+      "line": 595,
+      "code": "return global_read (result, elf, shstrndx);",
+      "description": "Parser admission. `gelf_getehdr()` and `elf_getshdrstrndx()` have already accepted the malformed file as ELF64 with `shstrndx = 1`, and `dwarf_begin_elf()` now enters `global_read()` to iterate every section and call `check_section()` on the misnamed `SHT_GNU_HASH` section."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "dwarf_begin_elf / global_read / scn_dwarf_type / check_section",
+      "summary": "libdw accepts the witness as an ELF file, resolves section 2's name through shstrtab section 1 as `.debug_line_str` during the type-discovery scan, promotes `result->type` to `TYPE_PLAIN`, and then the later `check_section()` pass classifies that same GNU-hash section as DWARF string data worth loading with `elf_getdata()`."
+    },
+    {
+      "step": 2,
+      "file": "libelf/elf_getdata.c",
+      "function": "__libelf_set_rawdata_wrlock / __libelf_set_data_list_rdlock / convert_data",
+      "summary": "libelf materializes section 2's `sh_offset = 32`, `sh_size = 158`, and `sh_type = SHT_GNU_HASH`, accepts the odd 158-byte size on ELF64 by assigning `entsize = 1`, tags the section as `ELF_T_GNUHASH`, and allocates a 158-byte conversion buffer."
+    },
+    {
+      "step": 3,
+      "file": "libelf/gnuhash_xlate.h",
+      "function": "elf_cvt_gnuhash",
+      "summary": "The exact GNU-hash converter swaps only full words; for this witness `bitmask_words = 0`, the trailing loop leaves `len = 2`, and the final two destination bytes remain uninitialized because the vulnerable helper has no tail copy."
+    },
+    {
+      "step": 4,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "check_section",
+      "summary": "The partially initialized `Elf_Data` buffer is published back to libdw, `.debug_line_str` maps to a string-section index, and the trailing-NUL trim loop reads the uninitialized last byte, triggering the saved MSAN report."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "scn_dwarf_type",
+      "line": 105,
+      "line_end": 106,
+      "var": "scnname, shstrndx, shdr->sh_name",
+      "code": "const char *scnname = elf_strptr (result->elf, shstrndx, shdr->sh_name);",
+      "note": "Source. In `global_read()`'s type-discovery scan, section 2's attacker-controlled `sh_name = 0` is resolved through the attacker-controlled shstrtab at `shstrndx = 1`, and the resulting section name is exactly `.debug_line_str`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "scn_dwarf_type",
+      "line": 111,
+      "line_end": 117,
+      "var": "scnname, len",
+      "code": "else if (startswith (scnname, \".debug_\") || startswith (scnname, \".zdebug_\")) { size_t len = strlen (scnname); if (strcmp (scnname + len - 4, \".dwo\") == 0) return TYPE_DWO; else return TYPE_PLAIN; }",
+      "note": "Because `.debug_line_str` starts with `.debug_` and does not end in `.dwo`, `scn_dwarf_type()` classifies section 2 as `TYPE_PLAIN` rather than `TYPE_UNKNOWN`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "scnname"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "global_read",
+      "line": 437,
+      "line_end": 439,
+      "var": "type, result->type",
+      "code": "enum dwarf_type type = scn_dwarf_type (result, shstrndx, scn); if (type > result->type) result->type = type;",
+      "note": "The type-discovery scan stores this classification into parser state. `result` came from `calloc`, so `result->type` starts at `TYPE_UNKNOWN`, and seeing section 2's `TYPE_PLAIN` value promotes `result->type` to `TYPE_PLAIN` for the later section-loading pass.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "type = TYPE_PLAIN"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "check_section",
+      "line": 153,
+      "line_end": 154,
+      "var": "scnname, shstrndx, shdr->sh_name",
+      "code": "const char *scnname = elf_strptr (result->elf, shstrndx, shdr->sh_name);",
+      "note": "In the later section-loading scan, `check_section()` resolves the same section-2 `sh_name = 0` through the same shstrtab and again obtains `.debug_line_str`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "shstrndx, shdr->sh_name"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "check_section",
+      "line": 177,
+      "line_end": 185,
+      "var": "cnt, scnname, gnu_compressed",
+      "code": "if (strncmp (scnname, dwarf_scnnames[cnt], dbglen) == 0 && (dbglen == scnlen || (scnlen == dbglen + 4 && strstr (scnname, \".dwo\") == scnname + dbglen))) { if (dbglen == scnlen) { if (result->type == TYPE_PLAIN) break; } }",
+      "note": "With `scnname = \".debug_line_str\"` and parser state `result->type == TYPE_PLAIN` from step 3, the name-match loop breaks on `cnt = IDX_debug_line_str`. `gnu_compressed` stays false and the section remains eligible for the later `elf_getdata()` load.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "scnname"
+        },
+        {
+          "on": 3,
+          "type": "control",
+          "via": "result->type == TYPE_PLAIN"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "libelf/elf_getdata.c",
+      "function": "__libelf_set_rawdata_wrlock",
+      "line": 247,
+      "line_end": 251,
+      "var": "offset, size, type, align, flags",
+      "code": "offset = shdr->sh_offset; size = shdr->sh_size; type = shdr->sh_type; align = shdr->sh_addralign; flags = shdr->sh_flags;",
+      "note": "libelf materializes the attacker-controlled section-2 header tuple `offset = 32`, `size = 158`, `type = 0x6ffffff6 (SHT_GNU_HASH)`, `align = 0x2020202020202020`, and `flags = 0x2020ff2020202020`. Those values identify the exact 158-byte section body at file bytes `[0x20, 0xbe)` and determine how it will be typed and converted.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "control",
+          "via": "cnt < ndwarf_scnnames"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "libelf/elf_getdata.c",
+      "function": "__libelf_set_rawdata_wrlock",
+      "line": 280,
+      "line_end": 295,
+      "var": "t, entsize, size",
+      "code": "Elf_Type t = shtype_map[TYPEIDX (type)]; ... if (t == ELF_T_VDEF || t == ELF_T_NHDR || t == ELF_T_NHDR8 || (t == ELF_T_GNUHASH && elf->class == ELFCLASS64)) entsize = 1; ... if (unlikely (size % entsize != 0))",
+      "note": "The section-admission logic maps `SHT_GNU_HASH` to `t = ELF_T_GNUHASH` and, on ELFCLASS64, forces `entsize = 1`. That means the odd length `size = 158` is accepted instead of being rejected as a malformed partial structured record.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "type, size"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "size % entsize == 0"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "libelf/elf_getdata.c",
+      "function": "__libelf_set_rawdata_wrlock",
+      "line": 368,
+      "line_end": 372,
+      "var": "type, align, scn->rawdata.d.d_type",
+      "code": "scn->rawdata.d.d_type = __libelf_data_type (ehdr, type, align);",
+      "note": "Because the section is not `SHF_COMPRESSED`, libelf classifies it by section type. `__libelf_data_type()` therefore stores `scn->rawdata.d.d_type = ELF_T_GNUHASH` for this `SHT_GNU_HASH` section.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "type, align"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "libelf/elf_getdata.c",
+      "function": "__libelf_set_data_list_rdlock",
+      "line": 455,
+      "line_end": 461,
+      "var": "data, size, type",
+      "code": "convert_data (scn, elf->class, (elf->class == ELFCLASS32 || (offsetof (struct Elf, state.elf32.ehdr) == offsetof (struct Elf, state.elf64.ehdr)) ? elf->state.elf32.ehdr->e_ident[EI_DATA] : elf->state.elf64.ehdr->e_ident[EI_DATA]), scn->rawdata.d.d_size, scn->rawdata.d.d_type);",
+      "note": "Before conversion, libelf passes the file's endianness and the typed raw-section state into `convert_data()`: for this witness `data = ELFDATA2MSB`, `size = 158`, and `type = ELF_T_GNUHASH`.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "control",
+          "via": "size % entsize == 0"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "scn->rawdata.d.d_type"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "libelf/elf_getdata.c",
+      "function": "convert_data",
+      "line": 144,
+      "var": "data, type",
+      "code": "if (data == MY_ELFDATA || type == ELF_T_BYTE)",
+      "note": "This fast-path predicate is false. The witness file is big-endian (`ELFDATA2MSB`), the saved x86_64 build uses `MY_ELFDATA = ELFDATA2LSB`, and step 9 passed `type = ELF_T_GNUHASH`, so `convert_data()` must take the structured conversion branch instead of aliasing or byte-copying the section buffer.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "data = ELFDATA2MSB, type = ELF_T_GNUHASH"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "libelf/elf_getdata.c",
+      "function": "convert_data",
+      "line": 166,
+      "var": "scn->data_base, size",
+      "code": "scn->data_base = malloc (size);",
+      "note": "MSAN allocation origin. `convert_data()` allocates a fresh 158-byte destination buffer for the converted section data, and `malloc` leaves all 158 bytes uninitialized until later writes define them.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "control",
+          "via": "data != MY_ELFDATA && type != ELF_T_BYTE"
+        },
+        {
+          "on": 9,
+          "type": "data",
+          "via": "size = 158"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "libelf/elf_getdata.c",
+      "function": "convert_data",
+      "line": 192,
+      "line_end": 194,
+      "var": "fp, eclass, type, scn->data_base, rawdata_source, size",
+      "code": "fp = __elf_xfctstom[eclass - 1][type]; fp (scn->data_base, rawdata_source, size, 0);",
+      "note": "With `eclass = ELFCLASS64` and `type = ELF_T_GNUHASH`, `fp` resolves exactly to `elf_cvt_gnuhash`, and `convert_data()` calls that helper with `len = 158` on the freshly allocated heap buffer from step 11.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "type = ELF_T_GNUHASH"
+        },
+        {
+          "on": 11,
+          "type": "data",
+          "via": "dest = scn->data_base"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "libelf/gnuhash_xlate.h",
+      "function": "elf_cvt_gnuhash",
+      "line": 69,
+      "line_end": 72,
+      "var": "len, dest32, src32",
+      "code": "while (len >= 4) { *dest32++ = bswap_32 (*src32++); len -= 4; }",
+      "note": "Root cause. On the exact 158-byte section body, the earlier control-word phase stores `bitmask_words = 0`, so the 64-bit loop is skipped. This trailing loop then converts 35 full 32-bit words and exits with `len = 2`; the vulnerable function has no trailing-byte copy, so `dest[156]` and `dest[157]` stay uninitialized.",
+      "depends_on": [
+        {
+          "on": 12,
+          "type": "data",
+          "via": "fp = elf_cvt_gnuhash, len = 158"
+        },
+        {
+          "on": 11,
+          "type": "data",
+          "via": "dest = scn->data_base"
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "file": "libelf/elf_getdata.c",
+      "function": "convert_data",
+      "line": 200,
+      "line_end": 202,
+      "var": "scn->data_list.data.d.d_buf, scn->data_list.data.d.d_size, scn->data_list.data.d.d_type",
+      "code": "scn->data_list.data.d.d_buf = scn->data_base; scn->data_list.data.d.d_size = size; scn->data_list.data.d.d_type = type;",
+      "note": "After `elf_cvt_gnuhash()` returns, `convert_data()` publishes the same 158-byte heap allocation as the `Elf_Data` buffer for section 2. The last two bytes of that buffer are still uninitialized from step 13.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "scn->data_base"
+        },
+        {
+          "on": 13,
+          "type": "data",
+          "via": "dest[156..157] remain uninitialized"
+        }
+      ]
+    },
+    {
+      "step": 15,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "check_section",
+      "line": 259,
+      "line_end": 260,
+      "var": "string_section_idx, cnt",
+      "code": "enum string_section_index string_section_idx = scn_to_string_section_idx[cnt]; if (string_section_idx < STR_SCN_IDX_last)",
+      "note": "Because step 5 selected `cnt = IDX_debug_line_str`, the section maps to `STR_SCN_IDX_debug_line_str` rather than `STR_SCN_IDX_last`. That control decision makes `check_section()` run the backward trailing-NUL scan for this section's data buffer.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "cnt = IDX_debug_line_str"
+        }
+      ]
+    },
+    {
+      "step": 16,
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "check_section",
+      "line": 265,
+      "var": "size, data->d_buf",
+      "code": "while (size > 0 && *((const char *) data->d_buf + size - 1) != '\\0')",
+      "note": "Sink. `size` is initialized from `data->d_size = 158`, so the first loop test reads `*((const char *) data->d_buf + 157)`. Step 13 left `data->d_buf[156..157]` undefined, so this first-byte check triggers the saved `MemorySanitizer: use-of-uninitialized-value` report.",
+      "depends_on": [
+        {
+          "on": 14,
+          "type": "data",
+          "via": "data->d_buf, data->d_size"
+        },
+        {
+          "on": 15,
+          "type": "control",
+          "via": "string_section_idx < STR_SCN_IDX_last"
+        },
+        {
+          "on": 13,
+          "type": "order",
+          "via": "use_before_init",
+          "obj": "data->d_buf[156..157]"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "memory",
+    "trace_format": "msan",
+    "sanitizer": "MemorySanitizer",
+    "crash_type": "use-of-uninitialized-value",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "libdw/dwarf_begin_elf.c",
+      "function": "check_section",
+      "line": 265
+    },
+    "allocation_context": {
+      "file": "libelf/elf_getdata.c",
+      "function": "convert_data",
+      "line": 166
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "check_section",
+        "file": "libdw/dwarf_begin_elf.c",
+        "line": 265
+      },
+      {
+        "frame": 1,
+        "function": "global_read",
+        "file": "libdw/dwarf_begin_elf.c",
+        "line": 444
+      },
+      {
+        "frame": 2,
+        "function": "dwarf_begin_elf",
+        "file": "libdw/dwarf_begin_elf.c",
+        "line": 595
+      },
+      {
+        "frame": 3,
+        "function": "load_dw",
+        "file": "libdwfl/dwfl_module_getdwarf.c",
+        "line": 1341
+      },
+      {
+        "frame": 4,
+        "function": "find_dw",
+        "file": "libdwfl/dwfl_module_getdwarf.c",
+        "line": 1391
+      },
+      {
+        "frame": 5,
+        "function": "dwfl_module_getdwarf",
+        "file": "libdwfl/dwfl_module_getdwarf.c",
+        "line": 1446
+      },
+      {
+        "frame": 6,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz-libdwfl.c",
+        "line": 54
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "convert_data",
+        "file": "libelf/elf_getdata.c",
+        "line": 166
+      },
+      {
+        "frame": 1,
+        "function": "__libelf_set_data_list_rdlock",
+        "file": "libelf/elf_getdata.c",
+        "line": 455
+      },
+      {
+        "frame": 2,
+        "function": "__elf_getdata_rdlock",
+        "file": "libelf/elf_getdata.c",
+        "line": 562
+      },
+      {
+        "frame": 3,
+        "function": "elf_getdata",
+        "file": "libelf/elf_getdata.c",
+        "line": 580
+      },
+      {
+        "frame": 4,
+        "function": "check_section",
+        "file": "libdw/dwarf_begin_elf.c",
+        "line": 246
+      },
+      {
+        "frame": 5,
+        "function": "global_read",
+        "file": "libdw/dwarf_begin_elf.c",
+        "line": 444
+      },
+      {
+        "frame": 6,
+        "function": "dwarf_begin_elf",
+        "file": "libdw/dwarf_begin_elf.c",
+        "line": 595
+      },
+      {
+        "frame": 7,
+        "function": "load_dw",
+        "file": "libdwfl/dwfl_module_getdwarf.c",
+        "line": 1341
+      },
+      {
+        "frame": 8,
+        "function": "find_dw",
+        "file": "libdwfl/dwfl_module_getdwarf.c",
+        "line": 1391
+      },
+      {
+        "frame": 9,
+        "function": "dwfl_module_getdwarf",
+        "file": "libdwfl/dwfl_module_getdwarf.c",
+        "line": 1446
+      },
+      {
+        "frame": 10,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz-libdwfl.c",
+        "line": 54
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": "Yes. The saved MSAN trace and `reproduction_report.json` both identify `check_section` at `libdw/dwarf_begin_elf.c:265` as the crashing read, which is the exact sink anchored at fine-trace step 16.",
+      "root_cause_matches_allocation_context": "Yes. MSAN attributes the poisoned bytes to the heap allocation at `convert_data:166` (fine-trace step 11), and fine-trace steps 12 through 14 show the exact `elf_cvt_gnuhash` conversion path that leaves bytes `156..157` of that allocation undefined before step 16 reads them.",
+      "trace_consistent_with_stack": "Yes. The saved crash stack `check_section -> global_read -> dwarf_begin_elf -> load_dw -> find_dw -> dwfl_module_getdwarf -> LLVMFuzzerTestOneInput` matches fine-trace step 16 plus the parser-admission path, and the saved allocation stack `convert_data -> __libelf_set_data_list_rdlock -> __elf_getdata_rdlock -> elf_getdata -> check_section` matches the libelf and sink portion of fine-trace steps 9 through 16.",
+      "tainted_value_reaches_sink": "Yes. Step 1 materializes section 2's deceptive name `.debug_line_str`, step 3 stores `result->type = TYPE_PLAIN`, step 5 uses that state to set `cnt = IDX_debug_line_str`, step 6 imports the section's `size = 158` and `type = SHT_GNU_HASH`, step 8 stores `ELF_T_GNUHASH`, step 9 passes `ELFDATA2MSB` plus that typed 158-byte section into `convert_data()`, step 11 allocates the destination buffer, step 13 leaves the final two bytes undefined, step 14 publishes that buffer as `data->d_buf`, and step 16 reads `data->d_buf[157]` in the string-tail scan."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01 reproduced the crash by running `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_42521280 run --version vulnerable --expect crash`, which produced `MemorySanitizer: use-of-uninitialized-value` in `check_section` at `libdw/dwarf_begin_elf.c:265`.",
+    "format": {
+      "name": "malformed ELF64 big-endian file",
+      "contract": "The available evidence establishes only the exact staged 192-byte witness and the concrete layout libelf derives from it. In the vulnerable parser path, libelf uses `e_shoff = 0`, `e_shnum = 3`, and fixed 64-byte section headers; section 1 is `SHT_STRTAB` at file offset 8 with first string `.debug_line_str`, and section 2 has `sh_name = 0`, `sh_type = SHT_GNU_HASH`, `sh_offset = 32`, and `sh_size = 158`. `scn_dwarf_type()` resolves section 2 as `.debug_line_str`, `global_read()` promotes `result->type` to `TYPE_PLAIN`, and the later `check_section()` pass therefore treats the section as `.debug_line_str`; `elf_getdata()` then converts its 158 bytes through `elf_cvt_gnuhash`, and the vulnerable helper leaves the last two bytes undefined before the backward trailing-NUL scan reads `data->d_buf[157]`. The staged artifacts do not justify a broader class of ELF files or all GNU-hash sections."
+    }
+  }
+}

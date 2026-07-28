@@ -1,0 +1,470 @@
+{
+  "sample_id": "arvo_42537169",
+  "vuln_id": "OSS-Fuzz issue 42537169 / ARVO arvo:42537169",
+  "project": {
+    "id": "flac",
+    "name": "FLAC",
+    "repo": "https://github.com/xiph/flac.git",
+    "vulnerable_commit": "8c244b838914c12bed506ec5724455f8da75ca91",
+    "fixed_commit": "defad5b5442550a9bd678076fe7ad125edb9f087",
+    "fuzz_target": "fuzzer_tool_flac (libFuzzer, MSAN)"
+  },
+  "staged_source_snapshot": {
+    "path": "gt_results/arvo_42537169/_work/src/flac",
+    "commit": "08f8af084593fc5667cadbb1883b6e5004908917",
+    "description": "Stage 01 reproduced against this staged checkout. It differs from the metadata vulnerable commit `8c244b838914c12bed506ec5724455f8da75ca91`, but this tree still contains the vulnerable `metadata_callback()` `bps == 0` ReplayGain branch and matches the saved MemorySanitizer line numbers."
+  },
+  "classification": {
+    "class": "use-of-uninitialized-value",
+    "cwe": "CWE-457",
+    "access": "READ",
+    "detector": "MemorySanitizer",
+    "classification_note": "The saved MemorySanitizer report names the stack allocation of `decoder_session` as the origin, but the fix hunk shows the actionable source-level bug is later control flow in `metadata_callback()`: the code leaves `replaygain.apply` true after deciding that the same session still has no valid bits-per-sample and therefore no initialized dither context."
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42537169 (flac): Use-of-uninitialized-value found by fuzz target fuzzer_tool_flac [msan]. https://issues.oss-fuzz.com/issues/42537169",
+    "original_source": "sample_info.json / reproduction_report.json / sanitizer_trace.txt / default_crash_trace.txt / patch.diff / staged vulnerable source / staged poc",
+    "normalized": "Stage 01's authoritative saved MemorySanitizer trace reports `use-of-uninitialized-value` in `dither_output_` on the stack `dither_output_ -> FLAC__replaygain_synthesis__apply_gain -> write_callback -> FLAC__stream_decoder_process_until_end_of_stream -> DecoderSession_process -> flac__decode_file`. The staged 8487-byte witness is a `fuzzer_tool_flac` testcase whose zero-delimited argv prefix yields `--apply-r` and `-d`, so FLAC decodes the remaining bytes with ReplayGain synthesis enabled. `flac__decode_file()` stack-allocates `DecoderSession decoder_session`; `DecoderSession_construct()` copies the ReplayGain request into `decoder_session.replaygain.spec`, sets `decoder_session.replaygain.apply = false`, leaves `decoder_session.replaygain.dither_context` for later initialization, and initializes `decoder_session.bps = 0`. Later, the witness's VORBIS_COMMENT metadata contains ReplayGain tags, so `grabbag__replaygain_load_from_vorbiscomment()` succeeds and flips `decoder_session.replaygain.apply` to true. Vulnerable `metadata_callback()` then takes the `decoder_session->bps == 0` warning path, which recognizes that ReplayGain cannot be applied because the sample resolution is still unknown but forgets to clear `replaygain.apply`; it also skips the only `FLAC__replaygain_synthesis__init_dither_context()` call. When frames later reach `write_callback()`, the still-true `replaygain.apply` flag makes the decoder call `FLAC__replaygain_synthesis__apply_gain()` with the never-initialized embedded `DitherContext`. `apply_gain()` reads `LastHistoryIndex` and `ShapingType` from that stack object and passes them into `dither_output_`, where the saved MSAN crash fires on `if(shapingtype == 0)`. The patch resolves this exact obligation by adding `decoder_session->replaygain.apply = false;` in the `bps == 0` warning branch so `write_callback()` no longer enters ReplayGain synthesis on an uninitialized dither context."
+  },
+  "source": {
+    "file": "src/flac/main.c",
+    "function": "parse_options",
+    "line": 631,
+    "var": "short_option, option_index, argv",
+    "code": "while ((short_option = share__getopt_long(argc, argv, short_opts, long_options_, &option_index)) != -1) {",
+    "description": "First project-side parser step on the vulnerable path. `parse_options()` consumes the zero-delimited CLI prefix recovered from the staged witness and materializes the option events that later enable ReplayGain synthesis and decoder mode.",
+    "value_from": "The staged `poc` is 8487 bytes with SHA-256 `72afc00561a0cb83b6482dbc8ffcdffa4761720e0c25f269343ccd0537338f8c`. In `oss-fuzz/tool_flac.c:63-99`, byte 0 is `0x03`, so the harness sets `maxarg = 3`, preloads `argv[0] = exename`, then admits exactly two attacker-controlled zero-delimited argv strings before `numarg < maxarg` stops the loop. Those strings are `--apply-r` and `-d`, and the remaining 8473 bytes are written to a temp file that becomes the positional input because `use_stdin` is false. `src/share/getopt/getopt.c:657-675` accepts unique abbreviated long options, so `--apply-r` is resolved to `apply-replaygain-which-is-not-lossless` before `parse_option()` handles it.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "src/flac/decode.c",
+    "function": "metadata_callback",
+    "line": 1548,
+    "var": "decoder_session->bps, decoder_session->replaygain.apply",
+    "code": "else if(decoder_session->bps == 0) {\n\tflac__utils_printf(stderr, 1, \"%s: WARNING: can't apply ReplayGain, bit-per-sample value is invalid\\n\", decoder_session->inbasefilename);\n\tif(decoder_session->treat_warnings_as_errors) {\n\t\tdecoder_session->abort_flag = true;\n\t\treturn;\n\t}\n}",
+    "description": "Root cause. After ReplayGain tags were parsed successfully, this warning branch acknowledges that the session still has no valid bits-per-sample and therefore cannot initialize ReplayGain synthesis, but it leaves `decoder_session->replaygain.apply` true and falls through to later frame decoding.",
+    "note": "The staged patch adds `decoder_session->replaygain.apply = false;` in this exact branch. Without that reset, the later `write_callback()` path treats ReplayGain as ready even though `FLAC__replaygain_synthesis__init_dither_context()` at line 1560 never ran.",
+    "trace_step": 7
+  },
+  "sink": {
+    "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+    "function": "dither_output_",
+    "line": 250,
+    "var": "shapingtype",
+    "code": "if(shapingtype == 0) {",
+    "description": "Saved MemorySanitizer crash site. `dither_output_()` branches on the `shapingtype` argument after `apply_gain()` sourced it from the uninitialized `DitherContext` embedded in stack `decoder_session`.",
+    "note": "Both `default_crash_trace.txt` and `sanitizer_trace.txt` report `MemorySanitizer: use-of-uninitialized-value` at this line with the stack `dither_output_ -> FLAC__replaygain_synthesis__apply_gain -> write_callback`.",
+    "trace_step": 11
+  },
+  "tainted_value_origin": {
+    "file": "src/flac/decode.c",
+    "function": "flac__decode_file",
+    "line": 137,
+    "var": "decoder_session.replaygain.dither_context",
+    "code": "DecoderSession decoder_session;",
+    "description": "The uninitialized state later consumed at the sink lives inside the embedded `decoder_session.replaygain.dither_context` of this stack object. The constructor initializes adjacent ReplayGain scalars but explicitly defers dither-context initialization until metadata proves the sample resolution."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/flac/main.c",
+      "function": "decode_file",
+      "line": 2320,
+      "code": "retval = flac__decode_file(infilename, option_values.test_only? 0 : outfilename, option_values.analyze, option_values.aopts, decode_options);",
+      "description": "CLI parsing has finished and the temp file is admitted to the vulnerable decoder core.",
+      "condition": "Because the staged witness supplies `-d`, `do_it()` takes the decode loop instead of the encode path. Immediately before this call, line 2301 copies the attacker-enabled `option_values.replaygain_synthesis_spec` into `decode_options`, so the temp file bytes and ReplayGain request both enter `flac__decode_file()` together."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "oss-fuzz/tool_flac.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness splits the witness into a zero-delimited argv prefix (`--apply-r`, `-d`) and a temp file whose remaining bytes begin `fLaC` and contain ReplayGain strings."
+    },
+    {
+      "step": 2,
+      "file": "src/flac/main.c",
+      "function": "parse_options / parse_option",
+      "summary": "Project option parsing enables ReplayGain synthesis and decode mode, then `decode_file()` forwards those settings into `flac__decode_file()`."
+    },
+    {
+      "step": 3,
+      "file": "src/flac/decode.c",
+      "function": "flac__decode_file / DecoderSession_construct / metadata_callback",
+      "summary": "The decoder stack-allocates `decoder_session`, leaves its ReplayGain dither context uninitialized until later metadata setup, successfully parses ReplayGain tags from VORBIS_COMMENT metadata, and then takes the `bps == 0` warning branch that forgets to clear `replaygain.apply`."
+    },
+    {
+      "step": 4,
+      "file": "src/flac/decode.c",
+      "function": "write_callback",
+      "summary": "Later audio frames still see `replaygain.apply == true`, so `write_callback()` calls ReplayGain synthesis on the uninitialized embedded dither context."
+    },
+    {
+      "step": 5,
+      "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+      "function": "FLAC__replaygain_synthesis__apply_gain / dither_output_",
+      "summary": "`apply_gain()` reads poisoned `LastHistoryIndex` and `ShapingType` from that context and passes them into `dither_output_`, where MSAN reports `use-of-uninitialized-value` at `if(shapingtype == 0)`."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 0,
+      "file": "oss-fuzz/tool_flac.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 63,
+      "line_end": 99,
+      "var": "data, maxarg, argv, size_left, filename",
+      "code": "maxarg = data[0] & 63;\nuse_stdin = data[0] & 64;\n...\nwhile((arglen = strnlen((char *)data+(size-size_left),size_left)) < size_left && numarg < maxarg) {\n\targv[numarg++] = (char *)data+(size-size_left);\n\tsize_left -= arglen + 1;\n}\n...\nwrite(file_to_fuzz,data+(size-size_left),size_left);\n...\nargv[numarg++] = filename;\nmain_to_fuzz(numarg,argv);",
+      "note": "The harness consumes the staged witness as two kinds of attacker-controlled input. With leading byte `0x03`, it sets `maxarg = 3`, uses `argv[0]` for `exename`, then decodes exactly two zero-delimited attacker-controlled argv fragments, `--apply-r` and `-d`, before the loop stops. It writes the remaining 8473 bytes to the temp file passed to `main_to_fuzz()`. Those remaining bytes begin `fLaC` and their visible strings include `REPLAYGAIN_REFERENCE_LOUDNESS=89.0 dB`, `REPLAYGAIN_ALBUM_GAIN=+5`, and `REPLAYGAIN_ALBUM_PEAK=0.12911987`."
+    },
+    {
+      "step": 1,
+      "file": "src/flac/main.c",
+      "function": "parse_options",
+      "line": 631,
+      "line_end": 634,
+      "var": "short_option, option_index, argv",
+      "code": "while ((short_option = share__getopt_long(argc, argv, short_opts, long_options_, &option_index)) != -1) {\n\tswitch (short_option) {\n\t\tcase 0: /* long option with no equivalent short option */\n\t\t\thad_error |= (parse_option(short_option, long_options_[option_index].name, share__optarg) != 0);",
+      "note": "Source. This is the first project parser that consumes the harness-built argv array. It turns the zero-delimited witness prefix from step 0 into concrete short/long option events that later become ReplayGain-enabled decode state.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "data",
+          "via": "argv"
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "file": "src/flac/main.c",
+      "function": "parse_option",
+      "line": 717,
+      "line_end": 723,
+      "var": "option_values.replaygain_synthesis_spec.apply, option_argument",
+      "code": "else if(0 == strcmp(long_option, \"apply-replaygain-which-is-not-lossless\")) {\n\toption_values.replaygain_synthesis_spec.apply = true;\n\tif (0 != option_argument) {\n\t\tchar *p;\n\t\toption_values.replaygain_synthesis_spec.limiter = RGSS_LIMIT__NONE;\n\t\toption_values.replaygain_synthesis_spec.noise_shaping = NOISE_SHAPING_NONE;\n\t\toption_values.replaygain_synthesis_spec.preamp = strtod(option_argument, &p);",
+      "note": "The unique long-option abbreviation `--apply-r` from step 0 resolves to `apply-replaygain-which-is-not-lossless`, so this branch sets ReplayGain synthesis requested. Because the witness uses the bare option with no argument, `init_options()`'s defaults remain in force: `use_album_gain = true` and `noise_shaping = NOISE_SHAPING_LOW`.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "data",
+          "via": "argv[1]"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "short_option == 0"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/flac/main.c",
+      "function": "parse_options",
+      "line": 953,
+      "line_end": 954,
+      "var": "option_values.mode_decode",
+      "code": "case 'd':\n\toption_values.mode_decode = true;",
+      "note": "The second zero-delimited argv fragment from step 0 is the short option `-d`, so CLI parsing switches the program into decode mode. That control state is what later makes `do_it()` call `decode_file()` on the temp file instead of taking the encode path.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "data",
+          "via": "argv[2]"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "short_option == 'd'"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/flac/decode.c",
+      "function": "flac__decode_file",
+      "line": 137,
+      "var": "decoder_session",
+      "code": "DecoderSession decoder_session;",
+      "note": "Ordinary call plumbing is omitted here: after step 3 makes `do_it()` enter the decode loop, `decode_file()` copies step 2's `option_values.replaygain_synthesis_spec` into `decode_options` at `main.c:2301` and then calls `flac__decode_file()` at line 2320. This function stack-allocates `decoder_session`, and the saved MemorySanitizer origin names this stack object as the source of the later uninitialized state.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "option_values.replaygain_synthesis_spec"
+        },
+        {
+          "on": 3,
+          "type": "control",
+          "via": "option_values.mode_decode"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/flac/decode.c",
+      "function": "DecoderSession_construct",
+      "line": 212,
+      "line_end": 243,
+      "var": "d->replaygain.spec, d->replaygain.apply, d->replaygain.scale, d->replaygain.dither_context, d->bps",
+      "code": "d->replaygain.spec = replaygain_synthesis_spec;\nd->replaygain.apply = false;\nd->replaygain.scale = 0.0;\n/* d->replaygain.dither_context gets initialized later once we know the sample resolution */\n...\nd->bps = 0;",
+      "note": "The constructor copies the ReplayGain request from step 2 into the live decoder session, resets the runtime `replaygain.apply` flag to false, initializes `scale` to `0.0`, and records that `dither_context` is intentionally deferred until later metadata confirms the sample resolution. It also initializes `d->bps = 0`, so until a STREAMINFO callback runs the session still has no valid bits-per-sample.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "replaygain_synthesis_spec"
+        },
+        {
+          "on": 4,
+          "type": "order",
+          "via": "use_before_init",
+          "obj": "decoder_session.replaygain.dither_context"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/flac/decode.c",
+      "function": "metadata_callback",
+      "line": 1541,
+      "var": "decoder_session->replaygain.apply, reference, gain, peak",
+      "code": "if (!(decoder_session->replaygain.apply = grabbag__replaygain_load_from_vorbiscomment(metadata, decoder_session->replaygain.spec.use_album_gain, /*strict=*/false, &reference, &gain, &peak))) {",
+      "note": "When the temp file from step 0 reaches a VORBIS_COMMENT metadata block, the visible ReplayGain strings satisfy `grabbag__replaygain_load_from_vorbiscomment()`: with step 2's bare ReplayGain option, `use_album_gain` is still true, and the witness contains `REPLAYGAIN_ALBUM_GAIN` plus `REPLAYGAIN_ALBUM_PEAK`. This assignment therefore flips the live runtime flag `decoder_session->replaygain.apply` from false to true and materializes parsed `reference`, `gain`, and `peak` values for later synthesis.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "data",
+          "via": "temp file bytes / VORBIS_COMMENT ReplayGain tags"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "decoder_session->replaygain.spec.apply"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/flac/decode.c",
+      "function": "metadata_callback",
+      "line": 1548,
+      "line_end": 1554,
+      "var": "decoder_session->bps, decoder_session->replaygain.apply, decoder_session->replaygain.dither_context",
+      "code": "else if(decoder_session->bps == 0) {\n\tflac__utils_printf(stderr, 1, \"%s: WARNING: can't apply ReplayGain, bit-per-sample value is invalid\\n\", decoder_session->inbasefilename);\n\tif(decoder_session->treat_warnings_as_errors) {\n\t\tdecoder_session->abort_flag = true;\n\t\treturn;\n\t}\n}",
+      "note": "Root cause. Because step 5 left `decoder_session->bps = 0` and no earlier STREAMINFO callback has populated it, this warning branch decides that ReplayGain cannot yet be initialized. However, with the default `treat_warnings_as_errors = false`, it falls through without calling `FLAC__replaygain_synthesis__init_dither_context()` and without undoing step 6's `decoder_session->replaygain.apply = true`. The staged patch fixes exactly this state transition by adding `decoder_session->replaygain.apply = false;` here.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "control",
+          "via": "decoder_session->bps == 0"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "decoder_session->replaygain.apply"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/flac/decode.c",
+      "function": "write_callback",
+      "line": 1258,
+      "line_end": 1271,
+      "var": "decoder_session->replaygain.apply, decoder_session->replaygain.spec.noise_shaping, decoder_session->replaygain.dither_context",
+      "code": "if(decoder_session->replaygain.apply) {\n\tbytes_to_write = FLAC__replaygain_synthesis__apply_gain(\n\t\tubuf.u8buffer,\n\t\t!is_big_endian,\n\t\tis_unsigned_samples,\n\t\tbuffer,\n\t\twide_samples,\n\t\tchannels,\n\t\tbps, /* source_bps */\n\t\tbps+shift, /* target_bps */\n\t\tdecoder_session->replaygain.scale,\n\t\tdecoder_session->replaygain.spec.limiter == RGSS_LIMIT__HARD, /* hard_limit */\n\t\tdecoder_session->replaygain.spec.noise_shaping != NOISE_SHAPING_NONE, /* do_dithering */\n\t\t&decoder_session->replaygain.dither_context\n\t);",
+      "note": "Later, real audio frames still reach `write_callback()`. Earlier in this callback, if the session `bps` is still zero, line 1154 simply copies the frame header's bits-per-sample and continues; it does not initialize the dither context that step 7 skipped. Because `decoder_session->replaygain.apply` is still true, this branch calls ReplayGain synthesis on `&decoder_session->replaygain.dither_context`. Step 2's default low noise-shaping setting also makes the `do_dithering` argument true.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "control",
+          "via": "decoder_session->replaygain.apply"
+        },
+        {
+          "on": 5,
+          "type": "order",
+          "via": "use_before_init",
+          "obj": "decoder_session.replaygain.dither_context"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+      "function": "FLAC__replaygain_synthesis__apply_gain",
+      "line": 353,
+      "line_end": 354,
+      "var": "last_history_index, noise_shaping, dither_context",
+      "code": "const uint32_t last_history_index = dither_context->LastHistoryIndex;\nNoiseShaping noise_shaping = dither_context->ShapingType;",
+      "note": "The ReplayGain worker immediately reads state out of the embedded `DitherContext`. Because step 7 never ran `FLAC__replaygain_synthesis__init_dither_context()`, both `LastHistoryIndex` and `ShapingType` still contain indeterminate stack bytes from step 4's `decoder_session` allocation.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "dither_context"
+        },
+        {
+          "on": 5,
+          "type": "order",
+          "via": "use_before_init",
+          "obj": "decoder_session.replaygain.dither_context"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+      "function": "FLAC__replaygain_synthesis__apply_gain",
+      "line": 383,
+      "var": "last_history_index, noise_shaping, shapingtype",
+      "code": "val64 = dither_output_(dither_context, do_dithering, noise_shaping, (i + last_history_index) % 32, sample, channel) >> conv_shift;",
+      "note": "The poisoned locals from step 9 are consumed here: `noise_shaping` is forwarded as `dither_output_()`'s `shapingtype` argument, and `last_history_index` participates in the modulo index expression for the same call. This is the `apply_gain` frame named in the saved MSAN stack just below `dither_output_()`.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "last_history_index, noise_shaping"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+      "function": "dither_output_",
+      "line": 250,
+      "var": "shapingtype",
+      "code": "if(shapingtype == 0) {",
+      "note": "MSAN sink. `dither_output_()` branches on the uninitialized `shapingtype` argument passed from step 10, and the saved MemorySanitizer trace reports `use-of-uninitialized-value` at this exact line with origin `decoder_session` from `flac__decode_file`.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "noise_shaping -> shapingtype"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "memory",
+    "trace_format": "msan",
+    "sanitizer": "MemorySanitizer",
+    "crash_type": "use-of-uninitialized-value",
+    "access_type": "READ",
+    "access_size": null,
+    "crash_location": {
+      "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+      "function": "dither_output_",
+      "line": 250
+    },
+    "runtime_crash_location": {
+      "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+      "function": "dither_output_",
+      "line": 250
+    },
+    "allocation_context": {
+      "file": "src/flac/decode.c",
+      "function": "flac__decode_file",
+      "line": 136,
+      "note": "The saved MSAN origin says the uninitialized value was created by allocation of `decoder_session` in the stack frame of `flac__decode_file` at line 136; the declaration itself is at line 137."
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "dither_output_",
+        "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+        "line": 250
+      },
+      {
+        "frame": 1,
+        "function": "FLAC__replaygain_synthesis__apply_gain",
+        "file": "src/share/replaygain_synthesis/replaygain_synthesis.c",
+        "line": 383
+      },
+      {
+        "frame": 2,
+        "function": "write_callback",
+        "file": "src/flac/decode.c",
+        "line": 1259
+      },
+      {
+        "frame": 4,
+        "function": "read_frame_",
+        "file": "src/libFLAC/stream_decoder.c",
+        "line": 2266
+      },
+      {
+        "frame": 5,
+        "function": "FLAC__stream_decoder_process_until_end_of_stream",
+        "file": "src/libFLAC/stream_decoder.c",
+        "line": 1075
+      },
+      {
+        "frame": 6,
+        "function": "DecoderSession_process",
+        "file": "src/flac/decode.c",
+        "line": 474
+      },
+      {
+        "frame": 7,
+        "function": "flac__decode_file",
+        "file": "src/flac/decode.c",
+        "line": 188
+      },
+      {
+        "frame": 9,
+        "function": "do_it",
+        "file": "src/flac/main.c",
+        "line": 500
+      },
+      {
+        "frame": 10,
+        "function": "main_to_fuzz",
+        "file": "src/flac/main.c",
+        "line": 343
+      },
+      {
+        "frame": 11,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "oss-fuzz/tool_flac.c",
+        "line": 99
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "flac__decode_file",
+        "file": "src/flac/decode.c",
+        "line": 136
+      }
+    ],
+    "free_stack": [],
+    "dedup_token": "dither_output_--FLAC__replaygain_synthesis__apply_gain--write_callback",
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "source": "parsed from staged default_crash_trace.txt, sanitizer_trace.txt, reproduction_report.json, patch.diff, staged vulnerable source, and staged poc",
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "Indirectly. MemorySanitizer names the earlier stack allocation of `decoder_session`, while the source-level missing obligation is later in `metadata_callback()`: the `bps == 0` warning branch leaves `replaygain.apply` true, which is what causes the still-uninitialized embedded `dither_context` from that allocated session to reach the sink.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true,
+      "patch_resolves_note": "The staged patch adds `decoder_session->replaygain.apply = false;` exactly in the `bps == 0` warning branch from step 7. That prevents `write_callback()` from entering `FLAC__replaygain_synthesis__apply_gain()` on the never-initialized dither context. Stage 02 did not perform fixed-version dynamic validation."
+    }
+  },
+  "poc": {
+    "path": "gt_results/arvo_42537169/poc",
+    "trigger": "Stage 01 ran `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_42537169 run --version vulnerable --expect crash`. The rebuilt workspace only produced raw `SIGSEGV`, so the authoritative bug evidence is the staged `default_crash_trace.txt` / `sanitizer_trace.txt`, which report `MemorySanitizer: use-of-uninitialized-value` in `dither_output_` with the ReplayGain decode stack.",
+    "format": {
+      "name": "Zero-delimited `tool_flac` argv prefix plus FLAC file bytes",
+      "contract": "The witnessed trigger is the exact staged 8487-byte `poc` (SHA-256 `72afc00561a0cb83b6482dbc8ffcdffa4761720e0c25f269343ccd0537338f8c`). Under `oss-fuzz/tool_flac.c`, byte 0 is `0x03`, so the next zero-delimited strings become argv entries and the remaining bytes are written to the temp input file. On the saved path the relevant argv strings are exactly `--apply-r` and `-d`; `share__getopt_long()` accepts `--apply-r` as the unique abbreviation for `--apply-replaygain-which-is-not-lossless`, and `-d` forces decode mode. The remaining file bytes begin `fLaC` and contain visible ReplayGain strings including `REPLAYGAIN_ALBUM_GAIN=+5` and `REPLAYGAIN_ALBUM_PEAK=0.12911987`, so `metadata_callback()` reaches `grabbag__replaygain_load_from_vorbiscomment()` and sets `decoder_session->replaygain.apply = true`. The saved trigger further requires the exact malformed metadata/order state of this witness that leaves `decoder_session->bps == 0` at that callback, so the warning branch skips dither-context initialization but, before the fix, leaves `replaygain.apply` true. This contract is limited to the staged witness and observed path; Stage 02 did not prove a broader class of abbreviated options, ReplayGain tags, or malformed FLAC metadata orders."
+    }
+  },
+  "evidence_limitations": [
+    "`run_flags.json` sets `runtime_disambiguation` to `false`, and the present `trace_feedback.json` does not request runtime disambiguation. Stage 02 therefore stayed source-grounded and did not add instrumentation or take runtime measurements beyond the saved Stage 01 artifacts.",
+    "Stage 01's rebuilt workspace lost MSAN fidelity: `reproduction_report.json` says compilation failed in `/src/ogg` and the rebuilt run only produced raw `SIGSEGV`. The authoritative issue-grounding evidence is therefore the staged `default_crash_trace.txt` preserved as `sanitizer_trace.txt`.",
+    "The staged vulnerable checkout at `gt_results/arvo_42537169/_work/src/flac` is commit `08f8af084593fc5667cadbb1883b6e5004908917`, not the metadata vulnerable commit `8c244b838914c12bed506ec5724455f8da75ca91`. All line anchors in this GT are resolved against the staged checkout because that is the exact source snapshot used for Stage 01 reproduction.",
+    "The saved artifacts prove that ReplayGain tags were present in the witness and that the patch fixes the `bps == 0` warning branch, but they do not print the exact malformed metadata block order that kept `decoder_session->bps` at zero. The trace therefore grounds that state in the staged source semantics (`d->bps = 0`, later ReplayGain-tag load, and the patch hunk) rather than asserting a byte-by-byte metadata layout beyond what the witness strings expose."
+  ]
+}

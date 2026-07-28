@@ -1,0 +1,632 @@
+{
+  "sample_id": "arvo_42533504",
+  "vuln_id": "OSS-Fuzz issue 42533504 / ARVO arvo:42533504",
+  "project": {
+    "id": "aom",
+    "name": "aom",
+    "repo": "https://aomedia.googlesource.com/aom",
+    "vulnerable_commit": "cc9e46cb0da9323ecacf679772f6f5b21934a363",
+    "fixed_commit": "08efc1491525624dc5f5ebf0e450227524a7db4f",
+    "fuzz_target": "av1_dec_fuzzer"
+  },
+  "staged_source_snapshot": {
+    "path": "gt_results/arvo_42533504/_work/src/aom",
+    "commit": "cae8fbe572bec3443b89d9be858ff0abb7020f1b",
+    "description": "Stage 01 reproduced against this staged vulnerable checkout. The metadata vulnerable commit differs, but this local snapshot is the exact source whose line numbers match `patch.diff`, `sanitizer_trace.txt`, and the saved ASan stack."
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "READ",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42533504 (aom): Heap-buffer-overflow READ 1 found by fuzz target av1_dec_fuzzer [asan]. https://issues.oss-fuzz.com/issues/42533504",
+    "original_source": "sample metadata / patch.diff / sanitizer_trace.txt / default_crash_trace.txt / reproduction_report.json / staged vulnerable source",
+    "normalized": "Stage 01 reproduced AddressSanitizer's heap-buffer-overflow against the staged checkout `cae8fbe572bec3443b89d9be858ff0abb7020f1b`. In the exact 194-byte witness, `LLVMFuzzerTestOneInput()` sets `tile_mode=1`, `ext_tile_debug=1`, `is_annexb=0`, and `threads=31`, so `av1_decode_tg_tiles_and_wrapup()` takes the large-scale row-mt path. `read_ext_tile_info()` then materializes `tile_col_size_bytes = 1` and `tile_size_bytes = 1` from attacker-controlled frame bits. Inside `get_ls_tile_buffers()`, the first non-last column length byte at `frame + 23` is `0x3c`, so after `data += 1` the vulnerable assignment publishes `tile_col_data_end[0] = frame + 84` even though the real tile-group end for this OBU is `frame + 47`. The same unchecked size advances `data` to `frame + 84`, reinterprets out-of-group byte `0x0f` as the second column length, and publishes `tile_col_data_end[1] = frame + 100`. Last-column parsing then restarts from `frame + 100`; the four one-byte tile headers there are `0x01`, `0x01`, `0x28`, and `0x02`, whose top bits are clear, so `get_ls_tile_buffer()` takes the direct publication arm and stores `tile_buffers[3][2] = { data = frame + 149, size = 3 }`, i.e. file offset 193 with length 3. A row-mt worker passes that exact slice together with the real tile-group boundary `thread_data->data_end = frame + 47` into `setup_bool_decoder()`. Because `read_is_valid()` is `len != 0 && len <= (size_t)(end - start)`, `start > end` underflows the subtraction, accepts the invalid slice, and lets `aom_reader_init()`/`od_ec_dec_init()` seed `od_ec_dec_refill()` with `buffer = file + 193` and `end = file + 196`; the second byte fetch is the saved 1-byte out-of-bounds read at file offset 194. The staged patch fixes the bug by checking both that the column-length field fits in the remaining payload and that the decoded `tile_col_size` does not move `tile_col_data_end[c]` past `data_end`."
+  },
+  "source": {
+    "file": "av1/decoder/decodeframe.c",
+    "function": "read_ext_tile_info",
+    "line": 2195,
+    "var": "pbi->tile_col_size_bytes, pbi->tile_size_bytes",
+    "code": "pbi->tile_col_size_bytes = aom_rb_read_literal(rb, 2) + 1;\npbi->tile_size_bytes = aom_rb_read_literal(rb, 2) + 1;",
+    "description": "Source. In the large-scale ext-tile header for the crashing witness, attacker-controlled bits materialize the widths of the later tile-column and per-tile size fields.",
+    "value_from": "In the exact PoC, IVF control byte `0xb7` makes `LLVMFuzzerTestOneInput()` set `tile_mode=1` and `ext_tile_debug=1`, and the saved stack later reaches `decode_tiles_row_mt()`. In that large-scale path, this `read_ext_tile_info()` parse yields `tile_col_size_bytes = 1` and `tile_size_bytes = 1` before `get_ls_tile_buffers()` consumes the tile-group payload.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "aom_dsp/entdec.c",
+    "function": "od_ec_dec_refill",
+    "line": 94,
+    "var": "bptr[0], dec->bptr, dec->end",
+    "code": "dif ^= (od_ec_window)bptr[0] << s;",
+    "description": "ASan sink. Entropy-decoder initialization dereferences the invalid worker slice published for the exact last-column tile and performs the observed out-of-bounds read.",
+    "note": "The saved AddressSanitizer trace reports `heap-buffer-overflow READ of size 1` at `aom_dsp/entdec.c:94:26` on address `0x611000000382`, exactly 0 bytes past the 194-byte region `[0x6110000002c0,0x611000000382)` allocated by libFuzzer. Static reconstruction of the exact witness shows this is the second byte read from the published slice `{ data = file + 193, size = 3 }`.",
+    "trace_step": 19
+  },
+  "root_cause": {
+    "file": "av1/decoder/decodeframe.c",
+    "function": "get_ls_tile_buffers",
+    "line": 2308,
+    "var": "tile_col_size, tile_col_data_end[c], data, data_end",
+    "code": "tile_col_data_end[c] = data + tile_col_size;",
+    "description": "Root cause. After decoding a non-last tile-column length, the vulnerable code turns it into a column end pointer without first checking that `tile_col_size` fits in the remaining bytes `data_end - data`.",
+    "note": "For the exact witness, this unchecked assignment turns `frame[23] = 0x3c` into `tile_col_data_end[0] = frame + 84` even though the real tile-group end is `frame + 47`. The staged patch inserts both the missing pre-read guard for `tile_col_size_bytes` and the post-read guard `tile_col_size > (size_t)(data_end - data)` immediately before this assignment.",
+    "trace_step": 4
+  },
+  "tainted_value_origin": {
+    "file": "av1/decoder/decodeframe.c",
+    "function": "get_ls_tile_buffers",
+    "line": 2306,
+    "var": "tile_col_size",
+    "code": "tile_col_size = mem_get_varsize(data, tile_col_size_bytes);",
+    "description": "Concrete tainted column length. At the start of the exact tile-group payload, this statement reads the first non-last tile-column length byte later trusted to derive `tile_col_data_end[0]`.",
+    "value_from": "Step 1 fixes `tile_col_size_bytes = 1`, so this call consumes exactly byte `frame[23] = 0x3c` (file offset 67) and materializes `tile_col_size = 60`."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "av1/decoder/obu.c",
+      "function": "read_one_tile_group_obu",
+      "line": 361,
+      "code": "av1_decode_tg_tiles_and_wrapup(pbi, data, data_end, p_data_end, start_tile,\n                               end_tile, is_first_tg);",
+      "description": "The exact witness sets `tile_mode=1`, `ext_tile_debug=1`, `is_annexb=0`, and `threads=31`, so `av1_decode_tg_tiles_and_wrapup()` takes the large-scale row-mt decoder path. This `read_one_tile_group_obu()` call admits the OBU_FRAME tile-group payload whose bytes later reach `get_ls_tile_buffers()` as `data = frame + 23` and `data_end = frame + 47`."
+    }
+  },
+  "evidence_limitations": [
+    "`run_flags.json` sets `runtime_disambiguation` to `false`, so Stage 02 relies entirely on static reconstruction of the saved witness and staged source; it did not add any new runtime measurement beyond Stage 01's saved crash artifacts.",
+    "The staged vulnerable checkout at `gt_results/arvo_42533504/_work/src/aom` is on commit `cae8fbe572bec3443b89d9be858ff0abb7020f1b`, not the metadata `vulnerable_commit`. All line anchors below are resolved against the staged checkout because that is the exact source snapshot used for Stage 01 reproduction.",
+    "The PoC contract is intentionally witness-specific. The saved artifacts prove only the exact 194-byte file and its reconstructed offsets and header bytes; they do not justify a broader claim about neighboring AV1 layouts or all oversized tile-column lengths."
+  ],
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "read_ext_tile_info",
+      "summary": "The large-scale ext-tile header reads the one-byte width fields later used for non-last column lengths and per-tile headers."
+    },
+    {
+      "step": 2,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "summary": "The first non-last column length `0x3c` is trusted without bounds checking, so `tile_col_data_end[0]` is published beyond the real tile-group payload and the parser state jumps out of that payload."
+    },
+    {
+      "step": 3,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "summary": "An out-of-group byte is reinterpreted as the second column length, `tile_col_data_end[1]` becomes `frame + 100`, and last-column parsing restarts from that corrupted pointer while the true last-column end stays at `frame + 47`."
+    },
+    {
+      "step": 4,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffer",
+      "summary": "The exact last-column headers `0x01, 0x01, 0x28, 0x02` all take the direct arm, and the helper publishes `tile_buffers[3][2] = { data = file + 193, size = 3 }`."
+    },
+    {
+      "step": 5,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "tile_worker_hook_init",
+      "summary": "A row-mt worker passes that exact tile slice together with the real tile-group boundary into `setup_bool_decoder()`, where `read_is_valid()` accepts it through unsigned underflow."
+    },
+    {
+      "step": 6,
+      "file": "aom_dsp/bitreader.c",
+      "function": "aom_reader_init",
+      "summary": "Reader initialization seeds `od_ec_dec_init()` on the invalid 3-byte slice, setting the entropy-decoder end pointer past the 194-byte witness."
+    },
+    {
+      "step": 7,
+      "file": "aom_dsp/entdec.c",
+      "function": "od_ec_dec_refill",
+      "summary": "`od_ec_dec_refill()` reads byte 193 and then byte 194, producing the saved 1-byte heap-buffer-overflow."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "read_ext_tile_info",
+      "line": 2195,
+      "line_end": 2196,
+      "var": "pbi->tile_col_size_bytes, pbi->tile_size_bytes",
+      "code": "pbi->tile_col_size_bytes = aom_rb_read_literal(rb, 2) + 1;\npbi->tile_size_bytes = aom_rb_read_literal(rb, 2) + 1;",
+      "note": "Source. In the crashing large-scale ext-tile frame, attacker-controlled header bits materialize `tile_col_size_bytes = 1` and `tile_size_bytes = 1` for later column-length and tile-header parsing.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2306,
+      "line_end": 2306,
+      "var": "tile_col_size",
+      "code": "tile_col_size = mem_get_varsize(data, tile_col_size_bytes);",
+      "note": "At tile-group entry `data = frame + 23` (file offset 67), this reads the first non-last column length byte `0x3c`, so `tile_col_size = 60` for column 0.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "tile_col_size_bytes"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "!is_last"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2307,
+      "line_end": 2307,
+      "var": "data",
+      "code": "data += tile_col_size_bytes;",
+      "note": "`data` advances to `frame + 24`, the first byte after the length field and the exact base pointer later used by the root-cause arithmetic.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "tile_col_size_bytes"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "tile_col_size"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2308,
+      "line_end": 2308,
+      "var": "tile_col_data_end[0]",
+      "code": "tile_col_data_end[c] = data + tile_col_size;",
+      "note": "Root cause. Without checking `tile_col_size <= (size_t)(data_end - data)`, the code publishes `tile_col_data_end[0] = frame + 84` even though the real tile-group end for this OBU is only `frame + 47`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "tile_col_size"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "data"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "!is_last"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2313,
+      "line_end": 2313,
+      "var": "data",
+      "code": "data += tile_col_size;",
+      "note": "The same unchecked `tile_col_size` advances the initial column-size pass to `frame + 84`, outside the real tile-group payload.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "tile_col_size"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "data"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2306,
+      "line_end": 2306,
+      "var": "tile_col_size",
+      "code": "tile_col_size = mem_get_varsize(data, tile_col_size_bytes);",
+      "note": "At the out-of-group pointer from step 5, this reinterprets byte `frame[84] = 0x0f` as the second non-last column length, so `tile_col_size = 15` for column 1.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "tile_col_size_bytes"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "data"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "!is_last"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2307,
+      "line_end": 2307,
+      "var": "data",
+      "code": "data += tile_col_size_bytes;",
+      "note": "`data` advances to `frame + 85`, the base pointer used for the second out-of-range column-end calculation.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "tile_col_size_bytes"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "tile_col_size"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2308,
+      "line_end": 2308,
+      "var": "tile_col_data_end[1]",
+      "code": "tile_col_data_end[c] = data + tile_col_size;",
+      "note": "Using the out-of-group length from step 6, the same unchecked assignment publishes `tile_col_data_end[1] = frame + 100` for column 1.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "tile_col_size"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "data"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "!is_last"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2311,
+      "line_end": 2311,
+      "var": "tile_col_data_end[2], data_end",
+      "code": "tile_col_data_end[c] = data_end;",
+      "note": "For the last column `c = 2`, the helper keeps the true extent: `tile_col_data_end[2] = data_end = frame + 47` (file offset 91, exclusive).",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "control",
+          "via": "is_last"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffers",
+      "line": 2322,
+      "line_end": 2322,
+      "var": "data",
+      "code": "if (c > 0) data = tile_col_data_end[c - 1];",
+      "note": "When the second pass reaches last-column `c = 2`, parsing restarts from the corrupted pointer `tile_col_data_end[1]`, so `data = frame + 100` while the last-column limit from step 9 remains `frame + 47`.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "tile_col_data_end[1]"
+        },
+        {
+          "on": 9,
+          "type": "data",
+          "via": "tile_col_data_end[2]"
+        },
+        {
+          "on": 8,
+          "type": "control",
+          "via": "c > 0"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffer",
+      "line": 2224,
+      "line_end": 2257,
+      "var": "*data, size",
+      "code": "if (!read_is_valid(*data, tile_size_bytes, data_end))\n  aom_internal_error(error_info, AOM_CODEC_CORRUPT_FRAME,\n                     \"Truncated packet or corrupt tile length\");\nsize = mem_get_varsize(*data, tile_size_bytes);\n\nif (tile_copy_mode && (size >> (tile_size_bytes * 8 - 1)) == 1) {\n  int offset = (size >> (tile_size_bytes - 1) * 8) & 0x7f;\n  copy_data = tile_buffers[row - offset][col].data;\n  copy_size = tile_buffers[row - offset][col].size;\n  size = 0;\n} else {\n  size += AV1_MIN_TILE_SIZE_BYTES;\n}\n\n*data += tile_size_bytes;\n\nif (size > (size_t)(data_end - *data))\n  aom_internal_error(error_info, AOM_CODEC_CORRUPT_FRAME,\n                     \"Truncated packet or corrupt tile size\");\n\nif (size > 0) {\n  tile_buffers[row][col].data = *data;\n  tile_buffers[row][col].size = size;\n} else {\n  tile_buffers[row][col].data = copy_data;\n  tile_buffers[row][col].size = copy_size;\n}\n\n*data += size;",
+      "note": "From the corrupted last-column start in step 10, the earlier row iterations read headers `0x01`, `0x01`, and `0x28`. Their top bits are clear, so the copy predicate is false each time; under the underflowed checks against step 9's real `data_end`, the helper direct-publishes rows 0-2 of column 2 and advances `*data` to `frame + 148`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "tile_size_bytes"
+        },
+        {
+          "on": 9,
+          "type": "data",
+          "via": "tile_col_data_end[2]"
+        },
+        {
+          "on": 10,
+          "type": "data",
+          "via": "data"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffer",
+      "line": 2227,
+      "line_end": 2243,
+      "var": "size, *data",
+      "code": "size = mem_get_varsize(*data, tile_size_bytes);\n\nif (tile_copy_mode && (size >> (tile_size_bytes * 8 - 1)) == 1) {\n  int offset = (size >> (tile_size_bytes - 1) * 8) & 0x7f;\n  copy_data = tile_buffers[row - offset][col].data;\n  copy_size = tile_buffers[row - offset][col].size;\n  size = 0;\n} else {\n  size += AV1_MIN_TILE_SIZE_BYTES;\n}\n\n*data += tile_size_bytes;",
+      "note": "At `*data = frame + 148`, the row-3 header byte is `0x02`. Its top bit is clear, so the copy-mode condition is false and the direct arm yields `size = 3` with the tile payload starting at `frame + 149`.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "*data"
+        },
+        {
+          "on": 1,
+          "type": "data",
+          "via": "tile_size_bytes"
+        },
+        {
+          "on": 11,
+          "type": "control",
+          "via": "read_is_valid(*data, tile_size_bytes, data_end)"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffer",
+      "line": 2245,
+      "line_end": 2247,
+      "var": "size, data_end, *data",
+      "code": "if (size > (size_t)(data_end - *data))\n  aom_internal_error(error_info, AOM_CODEC_CORRUPT_FRAME,\n                     \"Truncated packet or corrupt tile size\");",
+      "note": "With `size = 3`, `*data = frame + 149`, and the real last-column `data_end = frame + 47`, the subtraction `data_end - *data` underflows when cast to `size_t`. The guard therefore does not reject the 3-byte slice.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "tile_col_data_end[2]"
+        },
+        {
+          "on": 12,
+          "type": "data",
+          "via": "size, *data"
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "get_ls_tile_buffer",
+      "line": 2249,
+      "line_end": 2257,
+      "var": "tile_buffers[3][2].data, tile_buffers[3][2].size, *data",
+      "code": "if (size > 0) {\n  tile_buffers[row][col].data = *data;\n  tile_buffers[row][col].size = size;\n} else {\n  tile_buffers[row][col].data = copy_data;\n  tile_buffers[row][col].size = copy_size;\n}\n\n*data += size;",
+      "note": "Because step 12 stayed on the direct arm and step 13 did not reject it, row 3 column 2 is published as `tile_buffers[3][2] = { data = frame + 149, size = 3 }`. This maps to file offset 193 with the post-publication parser pointer advanced to file offset 196.",
+      "depends_on": [
+        {
+          "on": 12,
+          "type": "data",
+          "via": "*data, size"
+        },
+        {
+          "on": 13,
+          "type": "control",
+          "via": "!(size > (size_t)(data_end - *data))"
+        }
+      ]
+    },
+    {
+      "step": 15,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "launch_dec_workers",
+      "line": 3445,
+      "line_end": 3445,
+      "var": "thread_data->data_end",
+      "code": "thread_data->data_end = data_end;",
+      "note": "Each row-mt worker receives the real tile-group boundary from `decode_tiles_row_mt()`. For the exact OBU payload, this `data_end` is the same `frame + 47` limit captured in step 9.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "data_end"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "pbi->max_threads > 1 && !(tiles->large_scale && !pbi->ext_tile_debug) && pbi->row_mt"
+        }
+      ]
+    },
+    {
+      "step": 16,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "tile_worker_hook_init",
+      "line": 2906,
+      "line_end": 2908,
+      "var": "tile_buffer->data, thread_data->data_end, tile_buffer->size",
+      "code": "setup_bool_decoder(xd, tile_buffer->data, thread_data->data_end,\n                   tile_buffer->size, &thread_data->error_info,\n                   td->bit_reader, allow_update_cdf);",
+      "note": "The crashing worker passes the exact published slice from step 14 together with the real boundary from step 15 into `setup_bool_decoder()`. Among all published cells, only `tile_buffers[3][2]` has `data = file + 193` and `size = 3`, so it is the unique `tile_buffer` consistent with the saved ASan crash.",
+      "depends_on": [
+        {
+          "on": 14,
+          "type": "data",
+          "via": "tile_buffers[3][2].data, tile_buffers[3][2].size"
+        },
+        {
+          "on": 15,
+          "type": "data",
+          "via": "thread_data->data_end"
+        }
+      ]
+    },
+    {
+      "step": 17,
+      "file": "av1/decoder/decodeframe.c",
+      "function": "read_is_valid",
+      "line": 126,
+      "line_end": 126,
+      "var": "len, start, end",
+      "code": "return len != 0 && len <= (size_t)(end - start);",
+      "note": "For the worker slice from step 16, `start = file + 193`, `len = 3`, and `end = file + 91`. Because `start > end`, the pointer subtraction underflows when cast to `size_t`, so this predicate incorrectly returns true.",
+      "depends_on": [
+        {
+          "on": 16,
+          "type": "data",
+          "via": "tile_buffer->data, tile_buffer->size, thread_data->data_end"
+        }
+      ]
+    },
+    {
+      "step": 18,
+      "file": "aom_dsp/bitreader.c",
+      "function": "aom_reader_init",
+      "line": 18,
+      "line_end": 20,
+      "var": "r->buffer_end, r->buffer",
+      "code": "r->buffer_end = buffer + size;\nr->buffer = buffer;\nod_ec_dec_init(&r->ec, buffer, (uint32_t)size);",
+      "note": "Because step 17 accepts the slice, reader initialization sets `buffer = file + 193`, `buffer_end = file + 196`, and `dec->end = file + 196` before immediately calling `od_ec_dec_refill()`.",
+      "depends_on": [
+        {
+          "on": 16,
+          "type": "data",
+          "via": "tile_buffer->data, tile_buffer->size"
+        },
+        {
+          "on": 17,
+          "type": "control",
+          "via": "len != 0 && len <= (size_t)(end - start)"
+        }
+      ]
+    },
+    {
+      "step": 19,
+      "file": "aom_dsp/entdec.c",
+      "function": "od_ec_dec_refill",
+      "line": 94,
+      "line_end": 94,
+      "var": "bptr[0], dec->bptr, dec->end",
+      "code": "dif ^= (od_ec_window)bptr[0] << s;",
+      "note": "Sink. `od_ec_dec_refill()` first reads file byte 193 and then advances to read file byte 194, which matches AddressSanitizer's report of a 1-byte read exactly past the 194-byte allocation.",
+      "depends_on": [
+        {
+          "on": 18,
+          "type": "data",
+          "via": "buffer, size"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "asan",
+    "trace_format": "text",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "aom_dsp/entdec.c",
+      "function": "od_ec_dec_refill",
+      "line": 94
+    },
+    "allocation_context": null,
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "od_ec_dec_refill",
+        "file": "aom_dsp/entdec.c",
+        "line": 94
+      },
+      {
+        "frame": 1,
+        "function": "od_ec_dec_init",
+        "file": "aom_dsp/entdec.c",
+        "line": 152
+      },
+      {
+        "frame": 2,
+        "function": "aom_reader_init",
+        "file": "aom_dsp/bitreader.c",
+        "line": 20
+      },
+      {
+        "frame": 3,
+        "function": "setup_bool_decoder",
+        "file": "av1/decoder/decodeframe.c",
+        "line": 1412
+      },
+      {
+        "frame": 4,
+        "function": "tile_worker_hook_init",
+        "file": "av1/decoder/decodeframe.c",
+        "line": 2906
+      },
+      {
+        "frame": 5,
+        "function": "row_mt_worker_hook",
+        "file": "av1/decoder/decodeframe.c",
+        "line": 3212
+      },
+      {
+        "frame": 6,
+        "function": "execute",
+        "file": "aom_util/aom_thread.c",
+        "line": 195
+      },
+      {
+        "frame": 7,
+        "function": "thread_loop",
+        "file": "aom_util/aom_thread.c",
+        "line": 82
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "crash_summary": "AddressSanitizer: heap-buffer-overflow READ of size 1 in od_ec_dec_refill at /src/aom/aom_dsp/entdec.c:94:26, with stack od_ec_dec_refill -> od_ec_dec_init -> aom_reader_init -> setup_bool_decoder -> tile_worker_hook_init -> row_mt_worker_hook.",
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": "Static reconstruction of the exact witness shows that `get_ls_tile_buffer()` direct-publishes `tile_buffers[3][2] = { data = frame + 149, size = 3 }`, `tile_worker_hook_init()` passes that slice together with `thread_data->data_end = frame + 47` into `setup_bool_decoder()`, `read_is_valid()` accepts it through unsigned underflow, and `aom_reader_init()` seeds `od_ec_dec_refill()` on the resulting `[file + 193, file + 196)` range."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run `docker exec gt-arvo_42533504-workspace /bin/bash -lc '/bin/arvo run'` fed `poc` to `/out/av1_dec_fuzzer` and reproduced `AddressSanitizer: heap-buffer-overflow READ of size 1` in `od_ec_dec_refill` with stack `od_ec_dec_refill -> od_ec_dec_init -> aom_reader_init -> setup_bool_decoder -> tile_worker_hook_init -> row_mt_worker_hook`.",
+    "format": {
+      "name": "exact staged AV1 witness",
+      "contract": "Grounded only for the exact 194-byte file `gt_results/arvo_42533504/poc` with sha256 `a42d6fc3a708e418fd47bfceff0551861bd60bc5e4e9e66280216671903fe37b`. In this witness, IVF control byte `0xb7` makes the fuzzer set `tile_mode=1`, `ext_tile_debug=1`, `is_annexb=0`, and byte `0x9e` makes `threads=31`. The admitted OBU_FRAME tile-group payload reaches `get_ls_tile_buffers()` as `data = frame + 23` and `data_end = frame + 47`; the vulnerable first non-last column length `0x3c` moves `tile_col_data_end[0]` to `frame + 84`, an out-of-group byte `0x0f` becomes the second column length, and last-column parsing restarts from `frame + 100`. The last-column headers `0x01`, `0x01`, `0x28`, and `0x02` all take the direct arm, so the exact crashing publication is `tile_buffers[3][2] = { data = file + 193, size = 3 }`. The row-mt worker then passes that slice together with the real tile-group end `file + 91` into `setup_bool_decoder()`, `read_is_valid()` underflows, and `od_ec_dec_refill()` performs the saved read at file offset 194. No broader AV1 input class is claimed."
+    }
+  }
+}

@@ -1,0 +1,370 @@
+{
+  "sample_id": "arvo_54246",
+  "vuln_id": "OSS-Fuzz issue 54246 / ARVO arvo:54246",
+  "project": {
+    "id": "kimageformats",
+    "name": "KImageFormats",
+    "repo": "https://github.com/KDE/kimageformats.git",
+    "vulnerable_commit": "a30f043e5d99fa4be5e0c2f0b690d4aadf216549",
+    "fixed_commit": "f4ca3f6783bb3d78a9f158efe4874d426b75ae72",
+    "fuzz_target": "kimgio_heif_fuzzer (libFuzzer, AddressSanitizer)"
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416",
+    "access": "read",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=4542532443045888\n\nProject: kimageformats\nFuzzing Engine: libFuzzer\nFuzz Target: kimgio_heif_fuzzer\nJob Type: libfuzzer_asan_kimageformats\nPlatform Id: linux\n\nCrash Type: Heap-use-after-free READ 3\nCrash Address: 0x6080000002a0\nCrash State:\n  HEIFHandler::ensureDecoder\n  HEIFHandler::read\n  kimgio_fuzzer.cc\n  \nSanitizer: address",
+    "original_source": "sample_info.json issue_description / sanitizer_trace.txt / reproduction_report.json / patch.diff",
+    "normalized": "The exact staged `poc` is 28 bytes: four spaces, `ftypheic`, then 16 spaces (`20 20 20 20 66 74 79 70 68 65 69 63 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20`). `HEIFHandler::ensureDecoder()` reads those bytes into `buffer`; `HEIFHandler::isSupportedBMFFType()` admits them because the 28-byte header contains `ftyp` at offset 4 and major brand `heic` at offset 8. `heif_context_read_from_memory()` then rejects the malformed, header-only payload and returns `struct heif_error err`. In libheif, `heif_context_read_from_memory()` returns `err.error_struct(ctx->context.get())`, and `Error::error_struct()` stores `err.message = error_buffer->get_error()`, so `err.message` aliases the `HeifContext`'s inherited `ErrorBuffer` string instead of a copied buffer. Vulnerable `ensureDecoder()` takes the `if (err.code)` branch, executes `heif_context_free(ctx)` first, and only then logs `err.message` with `qWarning()`. Because `heif_context_free()` deletes the wrapper holding the last `shared_ptr<HeifContext>`, the `ErrorBuffer` backing `err.message` is freed before the log call. Qt's logging path converts that dangling `const char *` through `operator<<` -> `QString::fromUtf8` -> `strlen`, and Stage 01's saved run reports `AddressSanitizer: heap-use-after-free READ of size 3` at `kimageformats/src/imageformats/heif.cpp:437`. The patch fixes this exact lifetime error by moving each `qWarning() << err.message` before the corresponding `heif_context_free(ctx)` and handle-release sequence."
+  },
+  "source": {
+    "file": "kimageformats/src/imageformats/heif.cpp",
+    "function": "HEIFHandler::ensureDecoder",
+    "line": 426,
+    "var": "buffer",
+    "code": "const QByteArray buffer = device()->readAll();",
+    "description": "First project-code statement that consumes the attacker-controlled QIODevice bytes and materializes them into the QByteArray used by the BMFF probe and the later libheif parse call.",
+    "value_from": "The saved `poc` is exactly 28 bytes: `20 20 20 20 66 74 79 70 68 65 69 63 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20`. This line copies those bytes from the fuzz harness's QBuffer into `buffer`.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "kimageformats/src/imageformats/heif.cpp",
+    "function": "HEIFHandler::ensureDecoder",
+    "line": 437,
+    "var": "err.message",
+    "code": "qWarning() << \"heif_context_read_from_memory error:\" << err.message;",
+    "description": "Project-level sink. The error logger consumes `err.message` after its backing storage was freed, and Qt's `QDebug` path reaches the saved `strlen` read.",
+    "note": "Stage 01's ASan trace is `__interceptor_strlen -> fromUtf8 -> operator<< -> HEIFHandler::ensureDecoder` at this exact statement.",
+    "trace_step": 8
+  },
+  "root_cause": {
+    "file": "kimageformats/src/imageformats/heif.cpp",
+    "function": "HEIFHandler::ensureDecoder",
+    "line": 436,
+    "var": "ctx, err.message",
+    "code": "heif_context_free(ctx);",
+    "description": "Root cause. In the `err.code` error path, vulnerable code frees `ctx` before the last use of `err.message`, even though libheif made `err.message` point into `ctx->context`'s `ErrorBuffer`.",
+    "note": "The fix hunk moves the `qWarning() << err.message` calls above `heif_context_free(ctx)` in this branch and the analogous `heif_context_get_primary_image_handle` and `heif_decode_image` error branches.",
+    "trace_step": 7
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::isSupportedBMFFType",
+      "line": 320,
+      "code": "if (qstrncmp(buffer + 4, \"ftyp\", 4) == 0) {\n    if (qstrncmp(buffer + 8, \"heic\", 4) == 0) {\n        return true;\n    }\n}",
+      "description": "The saved 28-byte witness is exactly long enough for the BMFF probe and contains `ftypheic` at offsets 4..11, so `isSupportedBMFFType()` returns true and `ensureDecoder()` reaches the failing libheif parse path."
+    }
+  },
+  "tainted_value_origin": {
+    "file": "libheif/libheif/error.cc",
+    "function": "heif::Error::error_struct",
+    "line": 245,
+    "var": "err.message",
+    "code": "err.message = error_buffer->get_error();",
+    "description": "Libheif materializes the later-dangling pointer here by making `heif_error.message` alias the `HeifContext`'s inherited `ErrorBuffer`. `HEIFHandler::ensureDecoder` then carries this pointer across `heif_context_free(ctx)`."
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder / HEIFHandler::isSupportedBMFFType",
+      "summary": "The handler reads the 28-byte witness into `buffer`, the BMFF gate accepts it because offsets 4..11 are `ftypheic`, and the admitted bytes are passed to libheif through a fresh `heif_context`."
+    },
+    {
+      "step": 2,
+      "file": "libheif/libheif/heif.cc / libheif/libheif/error.cc",
+      "function": "heif_context_read_from_memory / heif::Error::error_struct",
+      "summary": "Libheif rejects the malformed header-only payload and returns `struct heif_error err`; its `message` field is not a copy, but a pointer into the live `HeifContext::ErrorBuffer` owned by `ctx`."
+    },
+    {
+      "step": 3,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "summary": "The `if (err.code)` branch frees `ctx` first and then logs `err.message`, so Qt reads the freed error string and ASan reports heap-use-after-free in `strlen`."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "line": 426,
+      "var": "buffer",
+      "code": "const QByteArray buffer = device()->readAll();",
+      "note": "Source. `buffer` receives the exact 28-byte witness `20 20 20 20 66 74 79 70 68 65 69 63 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::isSupportedBMFFType",
+      "line": 315,
+      "line_end": 322,
+      "var": "header",
+      "code": "if (header.size() < 28) {\n    return false;\n}\n...\nif (qstrncmp(buffer + 4, \"ftyp\", 4) == 0) {\n    if (qstrncmp(buffer + 8, \"heic\", 4) == 0) {\n        return true;\n    }\n}",
+      "note": "The format gate admits this witness because `header.size() == 28`, bytes 4..7 are `ftyp`, and bytes 8..11 are `heic`, so `ensureDecoder()` does not return early at the unsupported-type check.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "buffer"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "line": 432,
+      "var": "ctx",
+      "code": "struct heif_context *ctx = heif_context_alloc();",
+      "note": "Allocates the libheif wrapper object later invalidated on the error path. `heif_context_alloc()` initializes `ctx->context = std::make_shared<HeifContext>()`, so this `ctx` owns the `HeifContext` and its inherited `ErrorBuffer`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "!HEIFHandler::isSupportedBMFFType(buffer)"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "line": 433,
+      "var": "err",
+      "code": "struct heif_error err = heif_context_read_from_memory(ctx, static_cast<const void *>(buffer.constData()), buffer.size(), nullptr);",
+      "note": "The admitted 28-byte header stub is handed to libheif. On the saved witness this parse call fails, so `err.code` becomes nonzero and the returned `heif_error` is prepared for the error-handling path.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "buffer.constData(), buffer.size()"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "!HEIFHandler::isSupportedBMFFType(buffer)"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "ctx"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "libheif/libheif/error.cc",
+      "function": "heif::Error::error_struct",
+      "line": 245,
+      "var": "err.message",
+      "code": "err.message = error_buffer->get_error();",
+      "note": "Libheif materializes the pointer later used by kimageformats. `heif_context_read_from_memory()` returns `err.error_struct(ctx->context.get())`, `HeifContext` inherits `ErrorBuffer`, and `ErrorBuffer::set_error()` stores the formatted message in an internal `std::string`, so `err.message` aliases `ctx->context` storage instead of an independent copy.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "ctx->context"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "err"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "line": 435,
+      "var": "err.code",
+      "code": "if (err.code) {",
+      "note": "Because libheif rejected the malformed payload, the error branch is taken and the function proceeds into the free-then-log sequence.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "err.code"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "line": 436,
+      "var": "ctx, err.message",
+      "code": "heif_context_free(ctx);",
+      "note": "Root cause. `heif_context_free()` is a thin `delete ctx;`, and `heif_context`'s only field is the `shared_ptr<HeifContext>` from step 3. That delete releases the `ErrorBuffer` string backing `err.message`, so the pointer established in step 5 becomes dangling before its last use.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "ctx"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "err.message"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "err.code"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "line": 437,
+      "var": "err.message",
+      "code": "qWarning() << \"heif_context_read_from_memory error:\" << err.message;",
+      "note": "Sink. Qt converts `err.message` through `QDebug` and `QString::fromUtf8`, which immediately sizes the dangling C string with `strlen`. Stage 01's saved ASan report is `heap-use-after-free READ of size 3` with stack `__interceptor_strlen -> fromUtf8 -> operator<< -> HEIFHandler::ensureDecoder`.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "err.message"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "err.code"
+        },
+        {
+          "on": 7,
+          "type": "order",
+          "via": "free_before_use"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "libFuzzer + AddressSanitizer text",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-use-after-free",
+    "access_type": "READ",
+    "access_size": 3,
+    "crash_location": {
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "line": 437
+    },
+    "runtime_crash_location": {
+      "file": "llvm-project/compiler-rt/lib/asan/../sanitizer_common/sanitizer_common_interceptors.inc",
+      "function": "__interceptor_strlen",
+      "line": 389
+    },
+    "allocation_context": null,
+    "free_context": {
+      "file": "kimageformats/src/imageformats/heif.cpp",
+      "function": "HEIFHandler::ensureDecoder",
+      "line": 436,
+      "description": "Closest project-level free site. The saved ASan free stack then descends through `heif_context_free` -> `delete ctx` -> `HeifContext::~HeifContext` / `~ErrorBuffer`."
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "__interceptor_strlen",
+        "file": "llvm-project/compiler-rt/lib/asan/../sanitizer_common/sanitizer_common_interceptors.inc",
+        "line": 389
+      },
+      {
+        "frame": 1,
+        "function": "fromUtf8",
+        "file": "qtbase/include/QtCore/../../src/corelib/text/qstring.h",
+        "line": 706
+      },
+      {
+        "frame": 2,
+        "function": "operator<<",
+        "file": "qtbase/include/QtCore/../../src/corelib/io/qdebug.h",
+        "line": 159
+      },
+      {
+        "frame": 3,
+        "function": "HEIFHandler::ensureDecoder",
+        "file": "kimageformats/src/imageformats/heif.cpp",
+        "line": 437
+      },
+      {
+        "frame": 4,
+        "function": "HEIFHandler::ensureParsed",
+        "file": "kimageformats/src/imageformats/heif.cpp",
+        "line": 409
+      },
+      {
+        "frame": 5,
+        "function": "HEIFHandler::read",
+        "file": "kimageformats/src/imageformats/heif.cpp",
+        "line": 75
+      },
+      {
+        "frame": 6,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "kimgio_fuzzer.cc",
+        "line": 59
+      }
+    ],
+    "allocation_stack": [],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "operator delete(void*)",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp",
+        "line": 152
+      },
+      {
+        "frame": 1,
+        "function": "~ErrorBuffer",
+        "file": "libheif/libheif/error.h",
+        "line": 48
+      },
+      {
+        "frame": 2,
+        "function": "heif::HeifContext::~HeifContext",
+        "file": "libheif/libheif/heif_context.cc",
+        "line": 407
+      },
+      {
+        "frame": 3,
+        "function": "heif_context_free",
+        "file": "libheif/libheif/heif.cc",
+        "line": 423
+      },
+      {
+        "frame": 4,
+        "function": "HEIFHandler::ensureDecoder",
+        "file": "kimageformats/src/imageformats/heif.cpp",
+        "line": 436
+      }
+    ],
+    "patch_resolves": false,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "The saved allocation stack resolves only into libc++ string storage, but the source-level free-before-use at `heif.cpp:436-437` matches the saved free stack and the patch hunk exactly.",
+      "trace_consistent_with_stack": "Yes. The saved stack is `__interceptor_strlen -> fromUtf8 -> operator<< -> HEIFHandler::ensureDecoder -> HEIFHandler::read -> LLVMFuzzerTestOneInput`, and the fine trace refines the same project path with the in-function HEIF brand gate, libheif error-message aliasing, and the free-before-log lifetime break at `heif.cpp:436-437`.",
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run executed `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_54246 run --version vulnerable --expect crash`, which fed the staged 28-byte file to `/out/kimgio_heif_fuzzer` and reproduced `AddressSanitizer: heap-use-after-free READ of size 3` with stack `__interceptor_strlen -> fromUtf8 -> operator<< -> HEIFHandler::ensureDecoder`.",
+    "format": {
+      "name": "HEIF/BMFF header stub",
+      "contract": "This exact staged `poc` is the 28-byte buffer `20 20 20 20 66 74 79 70 68 65 69 63 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20`. The only verified trigger facts are that `HEIFHandler::isSupportedBMFFType()` accepts it as `ftyp` / `heic`, `heif_context_read_from_memory()` returns an error on the malformed header-only payload, and vulnerable `HEIFHandler::ensureDecoder()` logs `err.message` after `heif_context_free(ctx)`, reproducing the saved heap-use-after-free read."
+    }
+  }
+}

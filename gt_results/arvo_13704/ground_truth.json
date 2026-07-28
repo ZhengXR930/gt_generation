@@ -1,0 +1,449 @@
+{
+  "sample_id": "arvo_13704",
+  "vuln_id": "OSS-Fuzz issue 13704",
+  "project": {
+    "id": "radare2",
+    "repo": "https://github.com/radare/radare2",
+    "vulnerable_commit": "d9a15aa661c367b45cdbd6dd57035a19fc35780a",
+    "fixed_commit": "5d65cbe1f7d677a22c0fca593dcae1aebf8cf35b"
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416"
+  },
+  "bug_description": {
+    "original": "Crash Type: Heap-use-after-free READ 8; Crash State: sdb_free / ns_free / sdb_ns_free; Sanitizer: address (ASAN)",
+    "original_source": "ARVO-Meta.report.comments[0].content",
+    "normalized": "In radare2's ART bin plugin, a 4-byte input equal to `art\\n` is enough to select `bin_art`. `load_buffer()` allocates an `Sdb` object for ART metadata, stores it as the `info` namespace under the binfile Sdb, and `r_bin_object_set_items()` then moves that same pointer into `RBinObject::kv` via `get_sdb()`. The plugin `destroy()` callback still calls `sdb_free(obj->kv)`, even though ownership has already moved to `RBinObject`. `object_delete_items()` later calls `sdb_free(o->kv)` on the same shared `Sdb *`, freeing it while the binfile `info` namespace still retains the raw pointer. During recursive namespace teardown, `ns_free()` passes that stale pointer back into `sdb_free()`, which reads freed `Sdb` fields and triggers the ASan heap-use-after-free."
+  },
+  "source": {
+    "file": "libr/bin/p/bin_art.c",
+    "function": "check_buffer",
+    "line": 136,
+    "code": "int r = r_buf_read_at (buf, 0, (ut8 *)tmp, sizeof (tmp));",
+    "var": "tmp",
+    "description": "Reads the first four attacker-controlled bytes into `tmp`; these bytes are the dispatch key that decides whether the ART plugin path, and its vulnerable teardown logic, will be used.",
+    "value_from": "The staged PoC is exactly 4 bytes `61 72 74 0a` (`art\\n`), passed to `r_bin_get_binplugin_by_bytes()` and then to `bin_art::check_bytes()` / `check_buffer()`.",
+    "note": "For the witness, the entire buffer is copied into `tmp` and the next line compares it against `\"art\\n\"`.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "shlr/sdb/src/sdb.c",
+    "function": "sdb_free",
+    "line": 217,
+    "code": "if (s && s->ht && s->refs) {",
+    "var": "s->ht, s->refs",
+    "description": "The stale `Sdb *` retained in the `info` namespace is passed back into `sdb_free()` after the object has already been freed, so `sdb_free` reads freed `Sdb` fields.",
+    "note": "ASan reports a heap-use-after-free READ of size 8 at this conditional while evaluating the freed `Sdb` object.",
+    "trace_step": 9
+  },
+  "root_cause": {
+    "file": "libr/bin/p/bin_art.c",
+    "function": "destroy",
+    "line": 86,
+    "code": "sdb_free (obj->kv);",
+    "var": "obj->kv",
+    "description": "The ART plugin destroy callback still releases `obj->kv` even though `r_bin_object_set_items()` has already moved the same `Sdb *` into `RBinObject::kv` and the binfile `info` namespace still references it. This premature extra release is the ownership bug fixed by the patch.",
+    "note": "The fix deletes this line; after `get_sdb()` the `Sdb *` is owned by `RBinObject`, not by the plugin-private `ArtObj`.",
+    "trace_step": 6
+  },
+  "tainted_value_origin": {
+    "file": "targets/ia_fuzz.cc",
+    "function": "LLVMFuzzerTestOneInput",
+    "line": 11,
+    "code": "r_io_write_at(r->io, 0, Data, Size);",
+    "var": "Data",
+    "description": "The fuzzer writes the raw attacker-controlled bytes into the memory-backed file that the later `oba 0` / `ia` command sequence opens and probes as a binary.",
+    "note": "The staged witness is exactly 4 bytes long and contains only `art\\n`."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "libr/bin/p/bin_art.c",
+      "function": "check_buffer",
+      "line": 137,
+      "code": "return r == 4 && !strncmp (tmp, \"art\\n\", 4);",
+      "description": "For the 4-byte PoC, this ART magic check returns true, so `r_bin_get_binplugin_by_bytes()` selects the ART plugin and the vulnerable load/teardown path executes."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "libr/bin/p/bin_art.c",
+      "function": "check_buffer",
+      "summary": "Consumes the probed bytes and accepts the 4-byte witness as an ART file because it starts with `art\\n`, selecting the ART bin plugin."
+    },
+    {
+      "step": 2,
+      "file": "libr/bin/p/bin_art.c",
+      "function": "load_buffer",
+      "summary": "Allocates `ao->kv` for ART metadata, ignores the short-input failure from `art_header_load()`, and stores the same `Sdb *` in the binfile `info` namespace."
+    },
+    {
+      "step": 3,
+      "file": "libr/bin/obj.c",
+      "function": "r_bin_object_set_items",
+      "summary": "Calls the plugin `get_sdb()` hook and assigns the returned `ao->kv` pointer to `RBinObject::kv`, so the plugin object, the bin object, and the namespace all alias the same `Sdb` allocation."
+    },
+    {
+      "step": 4,
+      "file": "libr/bin/p/bin_art.c",
+      "function": "destroy",
+      "summary": "During binfile teardown, the plugin destroy callback still calls `sdb_free(obj->kv)` even though ownership has already moved to `RBinObject`."
+    },
+    {
+      "step": 5,
+      "file": "libr/bin/obj.c",
+      "function": "object_delete_items",
+      "summary": "The later `sdb_free(o->kv)` in `object_delete_items()` releases the same `Sdb *` again and frees it while the `info` namespace still keeps the raw pointer."
+    },
+    {
+      "step": 6,
+      "file": "shlr/sdb/src/ns.c",
+      "function": "ns_free",
+      "summary": "Recursive namespace cleanup later walks the stale `info` namespace entry and passes its freed `Sdb *` back into `sdb_free()`, producing the ASan heap-use-after-free read."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "libr/bin/p/bin_art.c",
+      "function": "check_buffer",
+      "line": 136,
+      "var": "tmp",
+      "code": "int r = r_buf_read_at (buf, 0, (ut8 *)tmp, sizeof (tmp));",
+      "note": "Copies the first four attacker-controlled bytes from the probed buffer into `tmp`. For the staged witness, `tmp` becomes the entire 4-byte file: `art\\n`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "libr/bin/p/bin_art.c",
+      "function": "check_buffer",
+      "line": 137,
+      "var": "r, tmp",
+      "code": "return r == 4 && !strncmp (tmp, \"art\\n\", 4);",
+      "note": "Evaluates true for the witness, so the plugin probe accepts the input as ART and `r_bin_get_binplugin_by_bytes()` selects `bin_art`. This control decision is the only input-dependent gate needed for the bug path.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "tmp"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "libr/bin/p/bin_art.c",
+      "function": "load_buffer",
+      "line": 73,
+      "var": "ao->kv",
+      "code": "ao->kv = sdb_new0 ();",
+      "note": "After the ART plugin is selected, `load_buffer()` allocates the `Sdb` object that will hold ART metadata and later become the freed object reported by ASan.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "r == 4 && !strncmp (tmp, \"art\\n\", 4)"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "libr/bin/p/bin_art.c",
+      "function": "load_buffer",
+      "line": 80,
+      "var": "ao->kv",
+      "code": "sdb_ns_set (sdb, \"info\", ao->kv);",
+      "note": "Stores the newly allocated `ao->kv` under the binfile `info` namespace and increments its Sdb reference count. The 4-byte PoC still reaches this step because `load_buffer()` ignores the false return from `art_header_load()` on short input and returns `ao` anyway.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "ao->kv"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "libr/bin/obj.c",
+      "function": "r_bin_object_set_items",
+      "line": 436,
+      "line_end": 441,
+      "var": "o->kv",
+      "code": "if (cp->get_sdb) { Sdb* new_kv = cp->get_sdb (binfile); if (new_kv != o->kv) { sdb_free (o->kv); } o->kv = new_kv; }",
+      "note": "The plugin `get_sdb()` hook returns `ao->kv`, and `r_bin_object_set_items()` assigns that same pointer to `o->kv` after freeing the old placeholder `o->kv`. From this point, `obj->kv`, `o->kv`, and the namespace entry created in step 4 all alias the same `Sdb *`.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "ao->kv"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "libr/bin/p/bin_art.c",
+      "function": "destroy",
+      "line": 86,
+      "var": "obj->kv",
+      "code": "sdb_free (obj->kv);",
+      "note": "The plugin destroy callback releases the shared `Sdb *` even though ownership has already moved to `o->kv` and the `info` namespace still points to it. Because the namespace still holds a reference, this call does not free the object yet; it only drops the refcount one step early.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "obj->kv"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "libr/bin/obj.c",
+      "function": "object_delete_items",
+      "line": 52,
+      "var": "o->kv",
+      "code": "sdb_free (o->kv);",
+      "note": "Teardown later releases the same aliased `Sdb *` through `RBinObject::kv`. Because step 6 already consumed the extra owner, this second release drops the shared object to zero references and frees it, while the `info` namespace entry from step 4 still stores the raw pointer because no `sdb_ns_unset()` removes it.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "o->kv"
+        },
+        {
+          "on": 6,
+          "type": "order",
+          "via": "double_free",
+          "obj": "ao->kv"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "shlr/sdb/src/ns.c",
+      "function": "ns_free",
+      "line": 50,
+      "var": "ns->sdb",
+      "code": "if (sdb_free (ns->sdb)) {",
+      "note": "Later, recursive namespace teardown reaches the stale `info` namespace entry and loads its stored pointer into `ns->sdb`. The Stage 01 stack shows this happens during nested `ns_free` / `sdb_ns_free` calls from `r_core_fini()`.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "ao->kv"
+        },
+        {
+          "on": 7,
+          "type": "order",
+          "via": "free_before_use",
+          "obj": "ns->sdb"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "shlr/sdb/src/sdb.c",
+      "function": "sdb_free",
+      "line": 217,
+      "var": "s->ht, s->refs",
+      "code": "if (s && s->ht && s->refs) {",
+      "note": "Called with the freed pointer from step 8, `sdb_free()` dereferences the dead `Sdb` object while checking `s->ht` and `s->refs`. ASan reports the resulting heap-use-after-free READ of size 8 at this line.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "ns->sdb"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "AddressSanitizer",
+    "trace_format": "AddressSanitizer",
+    "sanitizer": "address",
+    "crash_type": "heap-use-after-free",
+    "access_type": "READ",
+    "access_size": 8,
+    "crash_location": {
+      "file": "shlr/sdb/src/sdb.c",
+      "function": "sdb_free",
+      "line": 217
+    },
+    "allocation_context": {
+      "file": "libr/bin/p/bin_art.c",
+      "function": "load_buffer",
+      "line": 73
+    },
+    "free_context": {
+      "file": "libr/bin/obj.c",
+      "function": "object_delete_items",
+      "line": 52
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "sdb_free",
+        "file": "shlr/sdb/src/sdb.c",
+        "line": 217
+      },
+      {
+        "frame": 1,
+        "function": "ns_free",
+        "file": "shlr/sdb/src/ns.c",
+        "line": 50
+      },
+      {
+        "frame": 2,
+        "function": "sdb_ns_free",
+        "file": "shlr/sdb/src/ns.c",
+        "line": 80
+      },
+      {
+        "frame": 3,
+        "function": "sdb_fini",
+        "file": "shlr/sdb/src/sdb.c",
+        "line": 196
+      },
+      {
+        "frame": 4,
+        "function": "sdb_free",
+        "file": "shlr/sdb/src/sdb.c",
+        "line": 221
+      },
+      {
+        "frame": 5,
+        "function": "r_core_fini",
+        "file": "libr/core/core.c",
+        "line": 2796
+      },
+      {
+        "frame": 6,
+        "function": "r_core_free",
+        "file": "libr/core/core.c",
+        "line": 2806
+      },
+      {
+        "frame": 7,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "targets/ia_fuzz.cc",
+        "line": 16
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "calloc",
+        "file": "asan_malloc_linux.cc",
+        "line": 154
+      },
+      {
+        "frame": 1,
+        "function": "sdb_new",
+        "file": "shlr/sdb/src/sdb.c",
+        "line": 56
+      },
+      {
+        "frame": 2,
+        "function": "sdb_new0",
+        "file": "shlr/sdb/src/sdb.c",
+        "line": 52
+      },
+      {
+        "frame": 3,
+        "function": "load_buffer",
+        "file": "libr/bin/p/bin_art.c",
+        "line": 73
+      },
+      {
+        "frame": 4,
+        "function": "r_bin_object_new",
+        "file": "libr/bin/obj.c",
+        "line": 180
+      },
+      {
+        "frame": 5,
+        "function": "r_bin_file_new_from_bytes",
+        "file": "libr/bin/bfile.c",
+        "line": 469
+      },
+      {
+        "frame": 6,
+        "function": "r_bin_open_io",
+        "file": "libr/bin/bin.c",
+        "line": 407
+      },
+      {
+        "frame": 7,
+        "function": "cmd_open_bin",
+        "file": "libr/core/cmd_open.c",
+        "line": 302
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "__interceptor_free",
+        "file": "asan_malloc_linux.cc",
+        "line": 123
+      },
+      {
+        "frame": 1,
+        "function": "sdb_free",
+        "file": "shlr/sdb/src/sdb.c",
+        "line": 223
+      },
+      {
+        "frame": 2,
+        "function": "object_delete_items",
+        "file": "libr/bin/obj.c",
+        "line": 52
+      },
+      {
+        "frame": 3,
+        "function": "r_bin_object_free",
+        "file": "libr/bin/obj.c",
+        "line": 69
+      },
+      {
+        "frame": 4,
+        "function": "r_list_delete",
+        "file": "libr/util/list.c",
+        "line": 107
+      },
+      {
+        "frame": 5,
+        "function": "r_list_purge",
+        "file": "libr/util/list.c",
+        "line": 74
+      },
+      {
+        "frame": 6,
+        "function": "r_list_free",
+        "file": "libr/util/list.c",
+        "line": 83
+      },
+      {
+        "frame": 7,
+        "function": "r_bin_file_free",
+        "file": "libr/bin/bfile.c",
+        "line": 694
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "ia_fuzz <poc>",
+    "format": {
+      "name": "ART",
+      "contract": "A 4-byte file whose entire contents are exactly `61 72 74 0a` (`art\\n`). These bytes make `bin_art::check_buffer()` return true and select the ART plugin. No additional ART structure is required for this bug path because `load_buffer()` still allocates `ao->kv`, inserts it into the `info` namespace, and returns success even when `art_header_load()` fails on the short input."
+    }
+  }
+}

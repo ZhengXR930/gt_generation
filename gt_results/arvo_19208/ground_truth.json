@@ -1,0 +1,531 @@
+{
+  "sample_id": "arvo_19208",
+  "vuln_id": "OSS-Fuzz issue 19208 / ARVO arvo:19208",
+  "project": {
+    "id": "opensc",
+    "name": "OpenSC",
+    "repo": "https://github.com/OpenSC/OpenSC",
+    "vulnerable_commit": "32b49894c5991a63fcb913c3e5bc6dc3af9c3c22",
+    "fixed_commit": "c246f6f69a749d4f68626b40795a4f69168008f4",
+    "fuzz_target": "fuzz_pkcs15_reader (libfuzzer_asan_opensc, ASan)"
+  },
+  "classification": {
+    "class": "heap-double-free",
+    "cwe": "CWE-415",
+    "access": "FREE",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=5766799933308928 Project: opensc Fuzzing Engine: libFuzzer Fuzz Target: fuzz_pkcs15_reader Job Type: libfuzzer_asan_opensc Platform Id: linux Crash Type: Heap-double-free Crash Address: 0x62c0001c0200 Crash State: coolkey_free_private_data coolkey_finish sc_disconnect_card Sanitizer: address (ASAN) Recommended Security Severity: High Regressed: https://oss-fuzz.com/revisions?job=libfuzzer_asan_opensc&range=201911010208:201911060307 Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=5766799933308928 Issue filed automatically. See https://google.github.io/oss-fuzz/advanced-topics/reproducing for instructions to reproduce this bug locally. When you fix this bug, please * mention the fix revision(s). * state whether the bug was a short-lived regression or an old bug in any stable releases. * add any other useful information. This information can help downstream consumers. If you need to contact the OSS-Fuzz team with a question, concern, or any other feedback, please file an issue at https://github.com/google/oss-fuzz/issues. Comments on individual Monorail issues are not monitored. This bug is subject to a 90 day disclosure deadline. If 90 days elapse without an upstream patch, then the bug report will automatically become visible to the public.",
+    "original_source": "ARVO-Meta.report.comments[0].content / staged sanitizer_trace.txt / staged patch.diff / local vulnerable-checkout git history",
+    "normalized": "The staged `fuzz_pkcs15_reader` witness is a little-endian uint16 length-prefixed smartcard APDU-response stream. Early `COOLKEY_INS_LIST_OBJECTS` replies materialize many placeholder `sc_cardctl_coolkey_object_t` entries, including repeated descriptors whose first 14 bytes decode to `object_id = 0x20202020` and `object_length = 0x202020ff`, plus additional distinct IDs such as `0x62f40600`; `coolkey_initialize()` truncates `0x202020ff` to `object_len = 8447` when building `priv->objects_list`. During PKCS#15 certificate matching, `coolkey_find_object_by_template()` reaches `coolkey_fill_object()` for a candidate whose cached `data` is still NULL and allocates 8447 bytes. The vulnerable source then executes `obj_entry = coolkey_find_object_by_id(&priv->objects_list, obj->id);`, but the registered SimCList comparator is inverted: `coolkey_compare_id()` returns `1` when two IDs are equal while `list_locate()` treats comparator result `0` as a match. The lookup can therefore return another non-matching list element. If that peer's `data` is also NULL, lines 1420-1421 store the same `new_obj_data` pointer in both list nodes. During `sc_disconnect_card()`, `coolkey_free_private_data()` frees `o->data` for every element in `priv->objects_list`, so the shared 8447-byte buffer is freed twice at `src/libopensc/card-coolkey.c:819`. AddressSanitizer reports both frees at that line and the allocation at `coolkey_fill_object` line 1401. The provided `patch.diff` adds a later duplicate-ID guard, but the exact staged source also contains the earlier comparator/list-lookup defect that directly creates the shared-pointer alias on this witness."
+  },
+  "source": {
+    "file": "src/libopensc/card-coolkey.c",
+    "function": "coolkey_list_object",
+    "line": 2119,
+    "var": "object_info",
+    "code": "return coolkey_apdu_io(card, COOLKEY_CLASS, COOLKEY_INS_LIST_OBJECTS, seq, 0, NULL, 0, &rbuf, &rbuflen, NULL, 0);",
+    "description": "First project-side materialization of attacker-controlled state on the crashing path: the LIST_OBJECTS APDU copies one fuzzed reader-response chunk into `object_info`, the structure later parsed into object IDs and lengths for `priv->objects_list`.",
+    "value_from": "The staged `poc` is consumed by `fuzz_pkcs15_reader` as a sequence of little-endian uint16 length-prefixed reader-response chunks. Parsing the saved file shows many early 18-byte chunks whose first 14 bytes are `20 20 20 20 20 20 20 ff 20 20 ff 20 20 20`, plus distinct descriptors such as `62 f4 06 00 20 20 7a ff 20 20 20 ff 20 20`; those exact bytes are what OpenSC reads into `object_info` here.",
+    "note": "This is earlier than the later `bebytes2ulong` parses in `coolkey_initialize()`: it is the first project statement that turns the fuzzed chunk stream into the `coolkey_object_info` structure used by the vulnerable path.",
+    "trace_step": 1
+  },
+  "tainted_value_origin": {
+    "file": "src/libopensc/card-coolkey.c",
+    "function": "coolkey_initialize",
+    "line": 2165,
+    "var": "object_id",
+    "code": "unsigned long object_id = bebytes2ulong(object_info.object_id);",
+    "description": "The first concrete vulnerability-relevant key parsed from attacker input is `object_id`. It is later passed back into the broken `coolkey_find_object_by_id()` lookup; the adjacent `object_len` parse at line 2166 separately supplies the 8447-byte allocation size seen by ASAN."
+  },
+  "root_cause": {
+    "file": "src/libopensc/card-coolkey.c",
+    "function": "coolkey_fill_object",
+    "line": 1411,
+    "var": "obj_entry",
+    "code": "obj_entry = coolkey_find_object_by_id(&priv->objects_list, obj->id);",
+    "description": "Executed root cause on the witnessed path. `coolkey_fill_object()` assumes this lookup returns the list entry corresponding to `obj->id`, but the registered comparator is inverted for SimCList's `== 0` match contract, so the call can return a different list node. The next assignment then aliases one heap buffer into two objects.",
+    "note": "Later upstream fixes first flip the comparator and then add extra hardening checks (same-length validation and duplicate-ID rejection). The provided `patch.diff` only shows the final duplicate-ID guard, so it is not the sole causal evidence for this staged source.",
+    "trace_step": 8
+  },
+  "sink": {
+    "file": "src/libopensc/card-coolkey.c",
+    "function": "coolkey_free_private_data",
+    "line": 819,
+    "var": "o->data",
+    "code": "free(o->data);",
+    "description": "ASAN sink. During disconnect cleanup, the list walk frees `o->data` for every object entry; after the aliasing in `coolkey_fill_object()`, this line re-frees the same 8447-byte buffer from the second aliased node.",
+    "note": "The saved ASAN trace reports both the previous free and the crashing free at this line, with the same call chain `coolkey_free_private_data -> coolkey_finish -> sc_disconnect_card` and the allocation at `coolkey_fill_object:1401`.",
+    "trace_step": 12
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_initialize",
+      "line": 2163,
+      "code": "for(r=coolkey_list_object(card, COOLKEY_LIST_RESET, &object_info); r >= 0; r= coolkey_list_object(card, COOLKEY_LIST_NEXT, &object_info)) {",
+      "description": "After applet selection and lifecycle reads succeed, `coolkey_initialize()` enters the LIST_OBJECTS enumeration loop and starts parsing attacker-controlled object descriptors from the staged chunk stream."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "The staged `poc` reproduces the saved AddressSanitizer double-free. It is a little-endian uint16 length-prefixed APDU-response stream whose early CoolKey LIST_OBJECTS replies create many placeholder objects, including numerous 8447-byte entries and additional different IDs. During PKCS#15 binding, `coolkey_find_object_by_template()` reaches `coolkey_fill_object()` for one 8447-byte candidate, and the inverted SimCList comparator lets `coolkey_find_object_by_id()` return another list node. `coolkey_fill_object()` then stores one heap allocation into both objects, and `sc_disconnect_card()` later frees that address twice.",
+    "format": {
+      "name": "length-prefixed CoolKey APDU-response stream",
+      "contract": "The input is the harness's little-endian uint16 length-prefixed APDU-response stream. To preserve the witnessed trigger, the early chunks consumed by `COOLKEY_INS_LIST_OBJECTS` must leave `priv->objects_list` with at least one placeholder object whose parsed `length` is 8447 and at least one additional placeholder node with a different `id` and `data == NULL`; the staged witness does this with many 18-byte replies whose first 14 bytes include `20202020202020ff2020ff202020` and also distinct descriptors such as `62f4060020207aff202020ff2020`. Later chunks must still let `sc_pkcs15_bind()` reach `coolkey_find_object_by_template()` and final `sc_disconnect_card()` cleanup."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_initialize",
+      "summary": "LIST_OBJECTS enumeration parses attacker-controlled object descriptors into persistent placeholder nodes in `priv->objects_list`, preserving both their IDs and lengths while leaving `data == NULL`."
+    },
+    {
+      "step": 2,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_find_object_by_template / coolkey_fill_object",
+      "summary": "PKCS#15 certificate matching iterates `priv->objects_list`, reaches a candidate object with `data == NULL`, and allocates its 8447-byte payload in `coolkey_fill_object()`."
+    },
+    {
+      "step": 3,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_fill_object",
+      "summary": "The buggy ID lookup inside `coolkey_fill_object()` resolves the candidate against a different list element, and because the peer's `data` is still NULL, the same heap pointer is stored into both objects."
+    },
+    {
+      "step": 4,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_free_private_data",
+      "summary": "Disconnect cleanup walks the aliased list and frees `o->data` from one node and then again from the other, producing the ASAN double-free."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_list_object",
+      "line": 2119,
+      "var": "object_info",
+      "code": "return coolkey_apdu_io(card, COOLKEY_CLASS, COOLKEY_INS_LIST_OBJECTS, seq, 0, NULL, 0, &rbuf, &rbuflen, NULL, 0);",
+      "note": "LIST_OBJECTS copies one attacker-controlled reader-response chunk into `object_info`. Parsing the saved `poc` as the harness's little-endian uint16 chunk stream shows many early 18-byte replies whose first 14 bytes are `20 20 20 20 20 20 20 ff 20 20 ff 20 20 20`, plus distinct descriptors such as `62 f4 06 00 20 20 7a ff ...`; these are the exact bytes later parsed into object IDs and lengths.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_initialize",
+      "line": 2165,
+      "var": "object_id",
+      "code": "unsigned long object_id = bebytes2ulong(object_info.object_id);",
+      "note": "Initialization parses the descriptor's `object_id` field into the list key. On the staged witness, early iterations yield repeated `object_id = 0x20202020` and other attacker-chosen IDs including `0x62f40600` and `0x202020ff`, so later lookups can encounter both same-ID and different-ID elements.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "object_info.object_id"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_initialize",
+      "line": 2166,
+      "var": "object_len",
+      "code": "unsigned short object_len = bebytes2ulong(object_info.object_length);",
+      "note": "Initialization separately parses `object_length` and truncates the 32-bit big-endian value into `unsigned short object_len`. For the repeated `20 20 20 ff` descriptors this becomes `0x20ff = 8447`, the same allocation size AddressSanitizer later reports from `coolkey_fill_object:1401`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "object_info.object_length"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_initialize",
+      "line": 2196,
+      "var": "object_id, object_len",
+      "code": "r = coolkey_add_object(priv, object_id, NULL, object_len, 0);",
+      "note": "Because these IDs are not the special combined-object ID `0x7a300000`, initialization takes the non-combined path and forwards each parsed `object_id` and `object_len` into placeholder-object creation while leaving `object_data` absent.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "object_id"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "object_len"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "object_id == COOLKEY_COMBINED_OBJECT_ID"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_add_object",
+      "line": 1985,
+      "var": "priv->objects_list",
+      "code": "r = coolkey_add_object_to_list(&priv->objects_list, &new_object);",
+      "note": "SimCList autocopy duplicates `new_object` into `priv->objects_list`, so each iteration leaves a persistent `sc_cardctl_coolkey_object_t` node with attacker-controlled `id`, attacker-controlled/truncated `length`, and `data == NULL`. After the early LIST_OBJECTS replies, the list contains many still-unfilled nodes, including 8447-byte entries and nodes with different IDs.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "object_id, object_len"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_find_object_by_template",
+      "line": 1528,
+      "line_end": 1533,
+      "var": "current, attribute.object",
+      "code": "current = list_iterator_next(list); attribute.object = current; r = coolkey_find_attribute(card, &attribute);",
+      "note": "During `sc_pkcs15_bind()`, `coolkey_find_matching_cert()` searches for a certificate with the current object's `CKA_ID`. `coolkey_find_object_by_template()` walks `priv->objects_list` and asks `coolkey_find_attribute()` to inspect each candidate. The ASAN allocation stack proves the crashing `coolkey_fill_object()` call enters through this iterator path, but the saved static artifacts do not identify which exact candidate node was selected.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "priv->objects_list"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_fill_object",
+      "line": 1401,
+      "var": "new_obj_data, buf_len",
+      "code": "new_obj_data = malloc(buf_len);",
+      "note": "For the selected candidate, `obj->data` is still NULL, so `coolkey_fill_object()` skips the early return and allocates `buf_len = obj->length` bytes. AddressSanitizer records the double-freed region as an 8447-byte allocation from this exact line, so the chosen candidate's cached length on the witnessed path is 8447.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "obj"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "obj->length"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "obj->data != NULL"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_fill_object",
+      "line": 1411,
+      "var": "obj_entry",
+      "code": "obj_entry = coolkey_find_object_by_id(&priv->objects_list, obj->id);",
+      "note": "Root cause. `coolkey_find_object_by_id()` delegates to `list_locate()`, which treats comparator result `0` as a match. But the registered `coolkey_compare_id()` returns `1` when IDs are equal and `0` when they differ. This call therefore resolves `obj->id` to the first non-equal list element rather than the intended matching entry whenever another ID exists. The saved artifacts do not identify that peer node precisely, only that it comes from `priv->objects_list` through this lookup.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "obj->id"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "priv->objects_list"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_fill_object",
+      "line": 1416,
+      "line_end": 1418,
+      "var": "obj_entry->data",
+      "code": "if (obj_entry->data != NULL) { free(new_obj_data); return SC_ERROR_INTERNAL; }",
+      "note": "On the witnessed path the misresolved peer's `data` field is still NULL, so this cleanup branch is not taken. If the guard were true, `coolkey_fill_object()` would free `new_obj_data` immediately and no shared ownership would be created.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "obj_entry->data"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_fill_object",
+      "line": 1420,
+      "line_end": 1421,
+      "var": "obj_entry->data, obj->data",
+      "code": "obj_entry->data = new_obj_data; obj->data = new_obj_data;",
+      "note": "The same heap pointer is written into both list elements: the current candidate `obj` and the different `obj_entry` returned by step 8. This creates shared ownership of one 8447-byte allocation inside `priv->objects_list`.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "new_obj_data"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "obj_entry"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "obj_entry->data != NULL"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_free_private_data",
+      "line": 819,
+      "var": "o->data",
+      "code": "free(o->data);",
+      "note": "During `sc_disconnect_card()`, `coolkey_finish()` calls `coolkey_free_private_data()`, which iterates every list node and frees each `o->data`. When the loop reaches one of the aliased entries first, this `free()` releases the shared buffer and leaves the other node's `data` pointer dangling.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "priv->objects_list"
+        },
+        {
+          "on": 10,
+          "type": "data",
+          "via": "o->data"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_free_private_data",
+      "line": 819,
+      "var": "o->data",
+      "code": "free(o->data);",
+      "note": "Sink. The same cleanup loop later reaches the second aliased node and executes `free(o->data)` on the already freed address. AddressSanitizer reports both the crash and previous free at this line, with the allocation at `coolkey_fill_object:1401`.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "priv->objects_list"
+        },
+        {
+          "on": 10,
+          "type": "data",
+          "via": "o->data"
+        },
+        {
+          "on": 11,
+          "type": "order",
+          "via": "double_free"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan_trace",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "double-free",
+    "access_type": "FREE",
+    "access_size": null,
+    "crash_location": {
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_free_private_data",
+      "line": 819
+    },
+    "allocation_context": {
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_fill_object",
+      "line": 1401,
+      "note": "ASAN attributes the double-freed region to `malloc(buf_len)` here. The fine trace records the same executed allocation after `coolkey_find_object_by_template()` picks a candidate whose cached `length` is 8447."
+    },
+    "free_context": {
+      "file": "src/libopensc/card-coolkey.c",
+      "function": "coolkey_free_private_data",
+      "line": 819,
+      "note": "The previous-free stack is identical to the crash stack at the application frames because the same cleanup loop reaches two different list nodes that now alias one `data` pointer."
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "free",
+        "file": "llvm/projects/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 123
+      },
+      {
+        "frame": 1,
+        "function": "coolkey_free_private_data",
+        "file": "src/libopensc/card-coolkey.c",
+        "line": 819
+      },
+      {
+        "frame": 2,
+        "function": "coolkey_finish",
+        "file": "src/libopensc/card-coolkey.c",
+        "line": 1955
+      },
+      {
+        "frame": 3,
+        "function": "sc_disconnect_card",
+        "file": "src/libopensc/card.c",
+        "line": 421
+      },
+      {
+        "frame": 4,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "src/tests/fuzzing/fuzz_pkcs15_reader.c",
+        "line": 273
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "llvm/projects/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 145
+      },
+      {
+        "frame": 1,
+        "function": "coolkey_fill_object",
+        "file": "src/libopensc/card-coolkey.c",
+        "line": 1401
+      },
+      {
+        "frame": 2,
+        "function": "coolkey_find_attribute",
+        "file": "src/libopensc/card-coolkey.c",
+        "line": 1446
+      },
+      {
+        "frame": 3,
+        "function": "coolkey_find_object_by_template",
+        "file": "src/libopensc/card-coolkey.c",
+        "line": 1533
+      },
+      {
+        "frame": 4,
+        "function": "coolkey_find_object",
+        "file": "src/libopensc/card-coolkey.c",
+        "line": 1577
+      },
+      {
+        "frame": 5,
+        "function": "sc_card_ctl",
+        "file": "src/libopensc/card.c",
+        "line": 1019
+      },
+      {
+        "frame": 6,
+        "function": "coolkey_find_matching_cert",
+        "file": "src/libopensc/pkcs15-coolkey.c",
+        "line": 139
+      },
+      {
+        "frame": 7,
+        "function": "coolkey_get_certificate",
+        "file": "src/libopensc/pkcs15-coolkey.c",
+        "line": 274
+      },
+      {
+        "frame": 8,
+        "function": "coolkey_get_public_key_from_certificate",
+        "file": "src/libopensc/pkcs15-coolkey.c",
+        "line": 429
+      },
+      {
+        "frame": 9,
+        "function": "sc_pkcs15emu_coolkey_init",
+        "file": "src/libopensc/pkcs15-coolkey.c",
+        "line": 618
+      },
+      {
+        "frame": 10,
+        "function": "sc_pkcs15emu_coolkey_init_ex",
+        "file": "src/libopensc/pkcs15-coolkey.c",
+        "line": 727
+      },
+      {
+        "frame": 11,
+        "function": "sc_pkcs15_bind_synthetic",
+        "file": "src/libopensc/pkcs15-syn.c",
+        "line": 121
+      },
+      {
+        "frame": 12,
+        "function": "sc_pkcs15_bind",
+        "file": "src/libopensc/pkcs15.c",
+        "line": 1269
+      },
+      {
+        "frame": 13,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "src/tests/fuzzing/fuzz_pkcs15_reader.c",
+        "line": 210
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "free",
+        "file": "llvm/projects/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 123
+      },
+      {
+        "frame": 1,
+        "function": "coolkey_free_private_data",
+        "file": "src/libopensc/card-coolkey.c",
+        "line": 819
+      },
+      {
+        "frame": 2,
+        "function": "coolkey_finish",
+        "file": "src/libopensc/card-coolkey.c",
+        "line": 1955
+      },
+      {
+        "frame": 3,
+        "function": "sc_disconnect_card",
+        "file": "src/libopensc/card.c",
+        "line": 421
+      },
+      {
+        "frame": 4,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "src/tests/fuzzing/fuzz_pkcs15_reader.c",
+        "line": 273
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "ASAN's 8447-byte region is allocated in `coolkey_fill_object` and then later double-freed in `coolkey_free_private_data`. The fine trace's root cause is the immediately following ID-lookup misuse at `coolkey_fill_object:1411`: because the comparator is inverted for SimCList's `== 0` contract, the fresh allocation can be attached to a second list node and later freed twice.",
+      "trace_consistent_with_stack": "The saved allocation stack matches fine-trace steps 6-12: `coolkey_find_matching_cert -> coolkey_find_object_by_template -> coolkey_find_attribute -> coolkey_fill_object` allocates the buffer, and `coolkey_free_private_data -> coolkey_finish -> sc_disconnect_card` later frees it twice. The static artifacts do not identify which exact peer node step 8 selected, so the trace keeps that peer abstract.",
+      "tainted_value_reaches_sink": "The APDU stream controls the object IDs and cached lengths stored in `priv->objects_list`. Once the broken lookup in step 8 aliases `new_obj_data` into two list nodes, that attacker-derived `o->data` value is the same pointer that cleanup frees twice at the sink."
+    }
+  }
+}

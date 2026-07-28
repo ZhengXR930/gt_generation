@@ -1,0 +1,470 @@
+{
+  "sample_id": "arvo_385773651",
+  "vuln_id": "OSS-Fuzz issue 385773651 / ARVO arvo:385773651",
+  "project": {
+    "id": "grok",
+    "name": "grok",
+    "repo": "https://github.com/GrokImageCompression/grok.git",
+    "vulnerable_commit": "c7ca527abe087068f4798e4c507731be656806ef",
+    "fixed_commit": "91ea5352a01937612c2b7a9749d93802f42d027f",
+    "staged_checkout_commit": "87e10814f24cdad5f33d8f3786fa97a44cf1b6bd",
+    "fuzz_target": "grk_decompress_fuzzer",
+    "commit_note": "The staged checkout under `gt_results/arvo_385773651/_work/src/grok` is newer than the metadata vulnerable commit, but at the traced sites it still contains the pre-fix `ResIncludeBuffers` / `IncludeTracker` implementation shown in `patch.diff`. This GT is grounded in that staged vulnerable source."
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "READ",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 385773651 (grok): Heap-buffer-overflow READ 1 found by fuzz target grk_decompress_fuzzer [asan]. https://issues.oss-fuzz.com/issues/385773651",
+    "original_source": "ARVO-Meta / OSS-Fuzz report",
+    "normalized": "The staged 138-byte witness is a raw JPEG 2000 codestream whose SIZ marker sets `Xsiz=0x00002020`, `Ysiz=0x20202020`, `X0siz=0x00000320`, `Y0siz=0x00022020`, `XTsiz=0x20202020`, `YTsiz=0x20002020`, `XT0siz=0x00000020`, `YT0siz=0x00002020`, and `Csiz=4`, and whose component descriptors make component 0 use subsampling `(dx,dy)=(32,1)` while components 1-3 use `(32,32)`. The COD payload `00002020000000002000` selects LRCP with one resolution and no custom precinct sizes, so each component inherits the default precinct exponents `(15,15)`. The 7-byte POC payload `00002020202000` appends one extra LRCP progression, which makes `PacketIter::init` set `singleProgression_ = false` and forces `update_include()` down the vulnerable include-tracker path. `PacketManager::getParams` then derives `numPrecinctsPerRes[0] = 16381` from the attacker-controlled geometry. `IncludeTracker::get_include` uses that value and `numcomps = 4` to compute `len = 16381 * 4 + 7 = 65531`, then calls `ResIncludeBuffers::get_byte(resno, 65530)`. `get_byte` allocates a single 1024-byte chunk for `byteIndex = 8191`, returns `chunks[7] + 1023` (the last byte of that chunk), and `IncludeTracker::update` later treats that pointer as a buffer base. On the same added LRCP progression, the ninth packet visit reaches `compno = 0`, `resno = 0`, `layno = 0`, `precinctIndex = 8`, so `include_index = (0 * 16381 + 8) >> 3 = 1`; `uint8_t val = include[1]` reads one byte past the chunk and matches the saved AddressSanitizer heap-buffer-overflow read at `PacketIter.h:131`. The patch text removes the `get_include()->get_byte()` pointer-returning path in favor of chunk-local update logic, which is the missing obligation this trace identifies, but Stage 02 did not perform fixed-version dynamic validation."
+  },
+  "source": {
+    "file": "src/lib/core/codestream/markers/SIZMarker.cpp",
+    "function": "SIZMarker::read",
+    "line": 116,
+    "code": "grk_read(headerData, &image->x1); /* Xsiz */\ngrk_read(headerData, &image->y1); /* Ysiz */\ngrk_read(headerData, &image->x0); /* X0siz */\ngrk_read(headerData, &image->y0); /* Y0siz */\ngrk_read(headerData, &cp->t_width); /* XTsiz */\ngrk_read(headerData, &cp->t_height); /* YTsiz */\ngrk_read(headerData, &cp->tx0); /* XT0siz */\ngrk_read(headerData, &cp->ty0); /* YT0siz */\ngrk_read(headerData, &tmp); /* Csiz */\n...\nif(tmp <= maxNumComponentsJ2K)\n   image->numcomps = tmp;",
+    "var": "image->x1, image->y1, image->x0, image->y0, cp->t_width, cp->t_height, cp->tx0, cp->ty0, image->numcomps",
+    "description": "First project-side materialization of the attacker-controlled JPEG 2000 geometry and component count that later determine the tile-component precinct grids and the IncludeTracker width.",
+    "value_from": "In the saved 138-byte `poc` (sha256 `50baab0917cc0cec5d5ab803767eba14946fa691dee108dd0203139bbd75a561`), the SIZ payload after `FF51 0032` encodes `Xsiz=0x00002020`, `Ysiz=0x20202020`, `X0siz=0x00000320`, `Y0siz=0x00022020`, `XTsiz=0x20202020`, `YTsiz=0x20002020`, `XT0siz=0x00000020`, `YT0siz=0x00002020`, and `Csiz=4`.",
+    "trace_step": 1
+  },
+  "tainted_value_origin": {
+    "file": "src/lib/core/t2/PacketManager.cpp",
+    "function": "PacketManager::getParams",
+    "line": 171,
+    "code": "uint64_t num_precincts = (uint64_t)precinctGridWidth * precinctGridHeight;\nif(includeTracker)\n   includeTracker->updateNumPrecinctsPerRes(resno, num_precincts);",
+    "var": "num_precincts, includeTracker->numPrecinctsPerRes[resno]",
+    "description": "Derived attacker-controlled precinct count later used as `numprecs` inside `IncludeTracker::get_include()` and `IncludeTracker::update()`.",
+    "note": "For component 0 / resolution 0, the staged geometry and subsampling produce `precinctGridWidth = 1`, `precinctGridHeight = 16381`, and `num_precincts = 16381`; components 1-3 each produce only 513 precincts, so the stored maximum for `numPrecinctsPerRes[0]` remains 16381."
+  },
+  "root_cause": {
+    "file": "src/lib/core/t2/PacketIter.h",
+    "function": "ResIncludeBuffers::get_byte",
+    "line": 84,
+    "code": "return chunks[chunkIndex] + offset;",
+    "var": "chunks[chunkIndex], offset",
+    "description": "The helper returns a pointer to one specific byte inside the lazily allocated 1024-byte chunk, but the caller later treats that interior pointer as the base of an addressable include buffer and indexes it with the global `include_index`.",
+    "note": "For the staged witness, step 9 calls `get_byte(resno, 65530)`, so this statement returns `chunks[7] + 1023`, i.e. the last byte of the only allocated chunk. The next packet whose `include_index` becomes `1` therefore dereferences one byte past that chunk.",
+    "trace_step": 10
+  },
+  "sink": {
+    "file": "src/lib/core/t2/PacketIter.h",
+    "function": "IncludeTracker::update",
+    "line": 131,
+    "code": "uint8_t val = include[include_index];",
+    "var": "include, include_index, val",
+    "description": "ASan crash site. `include` is the interior pointer returned by `get_include()`, but this statement indexes it as though it were a full buffer base.",
+    "note": "On the ninth packet visit of the added LRCP progression, `index = 0 * 16381 + 8 = 8`, so `include_index = 1`; because `include` already points to `chunks[7] + 1023`, `include[1]` reads the first byte beyond the 1024-byte allocation. The saved ASan trace reports `AddressSanitizer: heap-buffer-overflow READ of size 1` at this exact line, and its allocation context points back to `ResIncludeBuffers::get_byte` line 81.",
+    "trace_step": 12
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/lib/core/t2/T2Decompress.cpp",
+      "function": "T2Decompress::decompressPackets",
+      "line": 41,
+      "code": "while(currPi->next(markers ? src : nullptr))",
+      "description": "By this loop, the witness has already passed codestream header parsing, accepted the crafted SIZ/COD/POC/SOT/SOD markers, and entered Tier-2 packet iteration on tile 0.",
+      "note": "The saved stack reaches `TileProcessor::decompressT2T1 -> T2Decompress::decompressPackets -> PacketIter::next_lrcp`, so the malformed codestream is admitted far enough to exercise the include-tracker logic before any packet payload parsing or later truncation handling stops execution."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/lib/core/codestream/markers/SIZMarker.cpp",
+      "function": "SIZMarker::read",
+      "summary": "The SIZ parser materializes oversized image/tile geometry, `Csiz = 4`, and component subsampling values that later determine the precinct grid sizes."
+    },
+    {
+      "step": 2,
+      "file": "src/lib/core/codestream/CodeStreamDecompress_Markers.cpp",
+      "function": "CodeStreamDecompress::read_cod",
+      "summary": "The COD parser selects LRCP, one resolution, and default `(15,15)` precinct exponents for all four components."
+    },
+    {
+      "step": 3,
+      "file": "src/lib/core/codestream/CodeStreamDecompress_Markers.cpp",
+      "function": "CodeStreamDecompress::read_poc",
+      "summary": "The POC parser appends a second LRCP progression, so packet iteration no longer takes the `singleProgression_` fast path."
+    },
+    {
+      "step": 4,
+      "file": "src/lib/core/t2/PacketManager.cpp",
+      "function": "PacketManager::PacketManager",
+      "summary": "PacketManager constructs `IncludeTracker(numcomps = 4)` and computes `numPrecinctsPerRes[0] = 16381` from the crafted geometry and subsampling."
+    },
+    {
+      "step": 5,
+      "file": "src/lib/core/t2/PacketIter.cpp",
+      "function": "PacketIter::init",
+      "summary": "The second LRCP progression is selected for `pino = 1`, `singleProgression_` is false because `numpocs = 1`, and the iterator is configured to visit component 0 / resolution 0 packets."
+    },
+    {
+      "step": 6,
+      "file": "src/lib/core/t2/PacketIter.h",
+      "function": "IncludeTracker::get_include",
+      "summary": "The include tracker turns `numprecs = 16381` and `numcomps = 4` into `len = 65531` and calls `get_byte(resno, len - 1)`, which allocates only the chunk containing the final byte."
+    },
+    {
+      "step": 7,
+      "file": "src/lib/core/t2/PacketIter.cpp",
+      "function": "PacketIter::next_lrcp",
+      "summary": "During the added LRCP progression, the iterator advances to the ninth packet (`precinctIndex = 8`) for component 0 / resolution 0 / layer 0 and calls `update_include()` again."
+    },
+    {
+      "step": 8,
+      "file": "src/lib/core/t2/PacketIter.h",
+      "function": "IncludeTracker::update",
+      "summary": "With `include` already pointing at the last byte of a single 1024-byte chunk, `include_index = 1` makes `include[1]` read one byte out of bounds, matching the saved ASan crash at `PacketIter.h:131`."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/lib/core/codestream/markers/SIZMarker.cpp",
+      "function": "SIZMarker::read",
+      "line": 116,
+      "line_end": 140,
+      "var": "image->x1, image->y1, image->x0, image->y0, cp->t_width, cp->t_height, cp->tx0, cp->ty0, image->numcomps",
+      "code": "grk_read(headerData, &image->x1); /* Xsiz */\ngrk_read(headerData, &image->y1); /* Ysiz */\ngrk_read(headerData, &image->x0); /* X0siz */\ngrk_read(headerData, &image->y0); /* Y0siz */\ngrk_read(headerData, &cp->t_width); /* XTsiz */\ngrk_read(headerData, &cp->t_height); /* YTsiz */\ngrk_read(headerData, &cp->tx0); /* XT0siz */\ngrk_read(headerData, &cp->ty0); /* YT0siz */\ngrk_read(headerData, &tmp); /* Csiz */\n...\nif(tmp <= maxNumComponentsJ2K)\n   image->numcomps = tmp;",
+      "note": "The crafted SIZ marker is the first project-side source of the geometry that later sizes the include tracker. It sets `image->x1 = 8224`, `image->y1 = 0x20202020`, `image->x0 = 800`, `image->y0 = 0x22020`, `cp->t_width = 0x20202020`, `cp->t_height = 0x20002020`, `cp->tx0 = 32`, `cp->ty0 = 0x2020`, and `image->numcomps = 4`."
+    },
+    {
+      "step": 2,
+      "file": "src/lib/core/codestream/markers/SIZMarker.cpp",
+      "function": "SIZMarker::read",
+      "line": 191,
+      "line_end": 200,
+      "var": "image->comps[0].dx, image->comps[0].dy, image->comps[1].dx, image->comps[1].dy, image->comps[2].dx, image->comps[2].dy, image->comps[3].dx, image->comps[3].dy",
+      "code": "for(uint16_t i = 0; i < image->numcomps; ++i)\n{\n   ...\n   grk_read(headerData++, &val); /* XRsiz_i */\n   img_comp->dx = val;\n   grk_read(headerData++, &val); /* YRsiz_i */\n   img_comp->dy = val;\n}",
+      "note": "The component descriptors immediately following `Csiz` materialize the subsampling factors used later in tile-component grid math: component 0 gets `(dx,dy) = (32,1)`, while components 1-3 each get `(32,32)` from the byte triples `00 20 01 07 20 20 07 20 20 07 20 20`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "image->numcomps"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/lib/core/codestream/CodeStreamDecompress_Markers.cpp",
+      "function": "CodeStreamDecompress::read_cod",
+      "line": 1722,
+      "line_end": 1742,
+      "var": "tcp->csty, tcp->prg, tcp->num_layers_, tcp->numLayersToDecompress",
+      "code": "grk_read<uint8_t>(headerData++, &tmp); /* SGcod (A) */\n...\ntcp->prg = (GRK_PROG_ORDER)tmp;\ngrk_read<uint16_t>(headerData, &tcp->num_layers_); /* SGcod (B) */\n...\ntcp->numLayersToDecompress = cp->coding_params_.dec_.layers_to_decompress_\n                                ? cp->coding_params_.dec_.layers_to_decompress_\n                                : tcp->num_layers_;",
+      "note": "The COD payload `00002020000000002000` stores `tcp->csty = 0`, `tcp->prg = GRK_LRCP`, and `tcp->num_layers_ = 8224`. That establishes LRCP packet iteration and a large layer bound, but because `csty = 0` there are no custom precinct-size bytes in this marker.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "headerData"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/lib/core/codestream/CodeStreamDecompress_Markers.cpp",
+      "function": "CodeStreamDecompress::read_SPCod_SPCoc",
+      "line": 1150,
+      "line_end": 1261,
+      "var": "tccp->numresolutions, tccp->precWidthExp[0], tccp->precHeightExp[0]",
+      "code": "grk_read<uint8_t>(current_ptr++, &tccp->numresolutions);\n++tccp->numresolutions;\n...\nif(tccp->csty & J2K_CCP_CSTY_PRT) {\n   ...\n} else {\n   for(i = 0; i < tccp->numresolutions; ++i) {\n      tccp->precWidthExp[i] = 15;\n      tccp->precHeightExp[i] = 15;\n   }\n}",
+      "note": "The same COD marker turns `ndecomp = 0` into `tccp->numresolutions = 1`. Because `tccp->csty & J2K_CCP_CSTY_PRT` is false, the helper assigns the default precinct exponents `(15,15)` for resolution 0, and `read_cod` then copies those same settings to the other three components.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "tcp->csty"
+        },
+        {
+          "on": 3,
+          "type": "control",
+          "via": "tccp->csty & J2K_CCP_CSTY_PRT"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/lib/core/codestream/CodeStreamDecompress_Markers.cpp",
+      "function": "CodeStreamDecompress::read_poc",
+      "line": 431,
+      "line_end": 503,
+      "var": "currentNumProgressions, tcp->progressionOrderChange[1], tcp->numpocs",
+      "code": "uint32_t currentNumProgressions = header_size / chunkSize;\n...\ncurrentNumProgressions += oldNumProgressions;\n...\nfor(uint32_t i = oldNumProgressions; i < currentNumProgressions; ++i)\n{\n   auto current_prog = tcp->progressionOrderChange + i;\n   ...\n   current_prog->lay_e = std::min<uint16_t>(current_prog->lay_e, tcp->num_layers_);\n   ...\n   current_prog->res_e = std::min<uint8_t>(current_prog->res_e, maxNumResLevels);\n   ...\n   current_prog->comp_e = std::min<uint16_t>(current_prog->comp_e, numComps);\n   ...\n   current_prog->progression = (GRK_PROG_ORDER)tmp;\n}\ntcp->numpocs = currentNumProgressions - 1;",
+      "note": "The POC payload `00002020202000` has exactly one 7-byte progression entry because `header_size = chunkSize = 7`. It appends `progressionOrderChange[1] = {res_s = 0, comp_s = 0, lay_e = 8224, res_e = 1, comp_e = 4, progression = GRK_LRCP}` and sets `tcp->numpocs = 1`, so packet processing now has two progressions instead of one.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "image->numcomps"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "tccp->numresolutions"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/lib/core/t2/PacketManager.cpp",
+      "function": "PacketManager::PacketManager",
+      "line": 25,
+      "var": "includeTracker, IncludeTracker::numcomps",
+      "code": "includeTracker(new IncludeTracker(image->numcomps))",
+      "note": "PacketManager stores the SIZ-derived component count inside `IncludeTracker`. For this witness, the tracker is created with `numcomps = 4`, which later multiplies the per-resolution precinct count in `get_include()`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "image->numcomps"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/lib/core/t2/PacketManager.cpp",
+      "function": "PacketManager::getParams",
+      "line": 156,
+      "line_end": 173,
+      "var": "precinctGridWidth, precinctGridHeight, num_precincts, includeTracker->numPrecinctsPerRes[0]",
+      "code": "auto resBounds = tileCompBounds.scaleDownCeilPow2(tccp->numresolutions - 1U - resno);\nauto resBoundsAdjusted =\n    grk_rect32(floordivpow2(resBounds.x0, precWidthExp) << precWidthExp,\n               floordivpow2(resBounds.y0, precHeightExp) << precHeightExp,\n               ceildivpow2<uint32_t>(resBounds.x1, precWidthExp) << precWidthExp,\n               ceildivpow2<uint32_t>(resBounds.y1, precHeightExp) << precHeightExp);\nuint32_t precinctGridWidth =\n    resBounds.width() == 0 ? 0 : (resBoundsAdjusted.width() >> precWidthExp);\nuint32_t precinctGridHeight =\n    resBounds.height() == 0 ? 0 : (resBoundsAdjusted.height() >> precHeightExp);\nuint64_t num_precincts = (uint64_t)precinctGridWidth * precinctGridHeight;\nif(includeTracker)\n   includeTracker->updateNumPrecinctsPerRes(resno, num_precincts);",
+      "note": "Using the geometry from step 1, subsampling from step 2, and precinct exponents from step 4, component 0 / resolution 0 gets `tileCompBounds = [25,139296,257,536887360]`, `precinctGridWidth = 1`, `precinctGridHeight = 16381`, and `num_precincts = 16381`. Components 1-3 each compute only `1 * 513 = 513` precincts, so `updateNumPrecinctsPerRes(0, ...)` leaves the tracked maximum at `numPrecinctsPerRes[0] = 16381`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "image->x1, image->y1, image->x0, image->y0, cp->t_width, cp->t_height, cp->tx0, cp->ty0"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "image->comps[0].dx, image->comps[0].dy, image->comps[1..3].dx, image->comps[1..3].dy"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "tccp->numresolutions, tccp->precWidthExp[0], tccp->precHeightExp[0]"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/lib/core/t2/PacketIter.cpp",
+      "function": "PacketIter::init",
+      "line": 702,
+      "line_end": 729,
+      "var": "singleProgression_, numcomps, prog.progression, prog.lay_e, prog.res_e, prog.comp_e",
+      "code": "singleProgression_ = packetManager->getNumProgressions() == 1;\n...\nnumcomps = image->numcomps;\n...\nauto poc = tcp->progressionOrderChange + pino;\nprog.progression = hasPoc ? poc->progression : tcp->prg;\nprog.lay_e = hasPoc ? std::min<uint16_t>(poc->lay_e, tcp->num_layers_) : tcp->num_layers_;\nprog.res_s = hasPoc ? poc->res_s : 0;\nprog.res_e = hasPoc ? poc->res_e : max_res;\nprog.comp_s = hasPoc ? poc->comp_s : 0;\nprog.comp_e = std::min<uint16_t>(hasPoc ? poc->comp_e : numcomps, image->numcomps);",
+      "note": "For `pino = 1`, the extra POC entry from step 5 is selected. Because `packetManager->getNumProgressions() == 1` is false (`numpocs = 1`), `singleProgression_` stays false and `update_include()` will call the vulnerable include tracker instead of returning immediately. The active packet range for this iterator is LRCP over `layno < 8224`, `resno < 1`, and `compno < 4`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "image->numcomps"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "packetManager->getNumProgressions(), progressionOrderChange[1]"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "packetManager->getNumProgressions() == 1"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/lib/core/t2/PacketIter.h",
+      "function": "IncludeTracker::get_include",
+      "line": 190,
+      "line_end": 196,
+      "var": "numprecs, numcomps, len",
+      "code": "auto numprecs = numPrecinctsPerRes[resno];\nauto len = (numprecs * numcomps + 7);\nassert(len <= std::numeric_limits<size_t>::max());\nreturn resBuf->get_byte(resno,\n                        len - 1);",
+      "note": "On the crashing path `resno = 0`, so this helper reads `numprecs = 16381` from step 7 and `numcomps = 4` from step 6, computes `len = 65531`, and calls `get_byte(resno, 65530)` only to force allocation. That argument corresponds to the final tracked byte position, not to a chunk base.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "numcomps"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "numPrecinctsPerRes[resno]"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/lib/core/t2/PacketIter.h",
+      "function": "ResIncludeBuffers::get_byte",
+      "line": 72,
+      "line_end": 84,
+      "var": "byteIndex, chunkIndex, offset, chunks[chunkIndex]",
+      "code": "uint64_t byteIndex = index / 8;\nuint64_t chunkIndex =\n    byteIndex / GRK_INCLUDE_TRACKER_CHUNK_SIZE;\nuint64_t offset = byteIndex % GRK_INCLUDE_TRACKER_CHUNK_SIZE;\n...\nif(chunks.find(chunkIndex) == chunks.end())\n{\n   chunks[chunkIndex] =\n       new uint8_t[GRK_INCLUDE_TRACKER_CHUNK_SIZE]();\n}\nreturn chunks[chunkIndex] + offset;",
+      "note": "With `index = 65530` from step 9, this code derives `byteIndex = 8191`, `chunkIndex = 7`, and `offset = 1023`. It allocates only `chunks[7]`, a single 1024-byte chunk, and returns `chunks[7] + 1023`, i.e. a pointer to the last byte inside that chunk.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "len - 1"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/lib/core/t2/PacketIter.cpp",
+      "function": "PacketIter::next_lrcp",
+      "line": 936,
+      "line_end": 941,
+      "var": "precinctIndex, prec_e",
+      "code": "if(incrementInner)\n   precinctIndex++;\nif(precinctIndex < prec_e)\n{\n   incrementInner = true;\n   if(update_include())\n      return true;\n}",
+      "note": "On the active POC-added LRCP iterator from step 8, component 0 / resolution 0 has `prec_e = 16381`. The first eight visits to this block set bits 0..7 in the byte from step 10. On the ninth visit, `incrementInner` advances `precinctIndex` from 7 to 8, `8 < 16381` still holds, and `update_include()` is called again before any packet payload parsing changes control flow.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "prec_e"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "prog.progression, prog.comp_e, prog.res_e, prog.lay_e"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "precinctIndex < prec_e"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/lib/core/t2/PacketIter.h",
+      "function": "IncludeTracker::update",
+      "line": 128,
+      "line_end": 131,
+      "var": "index, include_index, shift, include",
+      "code": "uint64_t index = compno * numprecs + precno;\nuint64_t include_index = (index >> 3);\nuint32_t shift = (index & 7);\nuint8_t val = include[include_index];",
+      "note": "At the crashing visit, `compno = 0`, `precno = precinctIndex = 8`, and `numprecs = 16381`, so this statement computes `index = 8`, `include_index = 1`, and `shift = 0`. Because step 10 returned `include = chunks[7] + 1023`, `include[1]` dereferences address `chunks[7] + 1024`, which is exactly the first byte past the 1024-byte allocation reported by ASan.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "numprecs"
+        },
+        {
+          "on": 10,
+          "type": "data",
+          "via": "include"
+        },
+        {
+          "on": 11,
+          "type": "data",
+          "via": "compno, precinctIndex"
+        },
+        {
+          "on": 11,
+          "type": "control",
+          "via": "precinctIndex < prec_e"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "libFuzzer + AddressSanitizer text",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "src/lib/core/t2/PacketIter.h",
+      "function": "update",
+      "line": 131
+    },
+    "allocation_context": {
+      "file": "src/lib/core/t2/PacketIter.h",
+      "function": "grk::ResIncludeBuffers::get_byte",
+      "line": 81
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "update",
+        "file": "src/lib/core/t2/PacketIter.h",
+        "line": 131
+      },
+      {
+        "frame": 1,
+        "function": "update_include",
+        "file": "src/lib/core/t2/PacketIter.cpp",
+        "line": 625
+      },
+      {
+        "frame": 2,
+        "function": "grk::PacketIter::next_lrcp(grk::SparseBuffer*)",
+        "file": "src/lib/core/t2/PacketIter.cpp",
+        "line": 941
+      },
+      {
+        "frame": 3,
+        "function": "grk::T2Decompress::decompressPackets(unsigned short, grk::SparseBuffer*, bool*)",
+        "file": "src/lib/core/t2/T2Decompress.cpp",
+        "line": 41
+      },
+      {
+        "frame": 4,
+        "function": "grk::TileProcessor::decompressT2T1(grk::GrkImage*)",
+        "file": "src/lib/core/tile/TileProcessor.cpp",
+        "line": 465
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "grk::ResIncludeBuffers::get_byte(unsigned char, unsigned long)",
+        "file": "src/lib/core/t2/PacketIter.h",
+        "line": 81
+      },
+      {
+        "frame": 1,
+        "function": "update",
+        "file": "src/lib/core/t2/PacketIter.h",
+        "line": 126
+      },
+      {
+        "frame": 2,
+        "function": "update_include",
+        "file": "src/lib/core/t2/PacketIter.cpp",
+        "line": 625
+      }
+    ],
+    "patch_resolves": false,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run fed the staged 138-byte raw J2K `poc` (sha256 `50baab0917cc0cec5d5ab803767eba14946fa691dee108dd0203139bbd75a561`) to `grk_decompress_fuzzer`, which called `grk_decompress_read_header`, `grk_decompress_set_window`, and `grk_decompress`, and reproduced `AddressSanitizer: heap-buffer-overflow READ of size 1` in `PacketIter.h:131`.",
+    "format": {
+      "name": "raw JPEG 2000 codestream",
+      "contract": "The verified trigger contract is the exact staged 138-byte raw J2K codestream at `poc`, with sha256 `50baab0917cc0cec5d5ab803767eba14946fa691dee108dd0203139bbd75a561` and bytes `ff4fff510032200100002020202020200000032000022020202020202000202000000020000020200004002001072020072020072020ff52000c00002020000000002000ff5f000900002020202000ff5c0023222020202020202020202020202020ff202020202020202020ffffffffff202020ff90000a0000202020200020ff932020202020202020`. This GT does not claim that other codestreams sharing only the same SIZ/COD/POC header fields will also survive the first eight packet iterations and reach the ninth `PacketIter::next_lrcp` visit; Stage 01 preserved only this single crashing witness."
+    }
+  }
+}

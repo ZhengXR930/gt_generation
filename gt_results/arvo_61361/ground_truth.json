@@ -1,0 +1,369 @@
+{
+  "sample_id": "arvo_61361",
+  "vuln_id": "OSS-Fuzz issue 61361 / ARVO arvo:61361",
+  "project": {
+    "id": "ntopng",
+    "name": "ntopng",
+    "repo": "https://github.com/ntop/ntopng.git",
+    "vulnerable_commit": "809a4b4daaa42149fe88a906306085816e298247",
+    "fixed_commit": "139ac17a0c927224a87c4772bc5abaca1931e608",
+    "fuzz_target": "fuzz_dissect_packet (libfuzzer_asan_ntopng, ASan)"
+  },
+  "classification": {
+    "class": "invalid-free",
+    "cwe": "CWE-590/CWE-763",
+    "access": "free",
+    "detector": "AddressSanitizer",
+    "classification_note": "The crash is not a second free of already released storage. `Flow::~Flow()` calls `free()` on `protos.dns.last_query`, but that field aliases `ndpiFlow->host_server_name`, an interior pointer inside the still-live `ndpiFlow` allocation, so ASan reports an invalid-free / bad-free."
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=5342063137521664\n\nProject: ntopng\nFuzzing Engine: libFuzzer\nFuzz Target: fuzz_dissect_packet\nJob Type: libfuzzer_asan_ntopng\nPlatform Id: linux\n\nCrash Type: Invalid-free\nCrash Address: 0x61900000295c\nCrash State:\n  Flow::~Flow\n  Flow::~Flow\n  GenericHash::cleanup\n  \nSanitizer: address (ASAN)\n\nRegressed: https://oss-fuzz.com/revisions?job=libfuzzer_asan_ntopng&range=202308090611:202308100625\n\nReproducer Testcase: https://oss-fuzz.com/download?testcase_id=5342063137521664\n\nIssue filed automatically.\n\nSee https://google.github.io/oss-fuzz/advanced-topics/reproducing for instructions to reproduce this bug locally.\nWhen you fix this bug, please\n  * mention the fix revision(s).\n  * state whether the bug was a short-lived regression or an old bug in any stable releases.\n  * add any other useful information.\nThis information can help downstream consumers.\n\nIf you need to contact the OSS-Fuzz team with a question, concern, or any other feedback, please file an issue at https://github.com/google/oss-fuzz/issues. Comments on individual Monorail issues are not monitored.\n\nThis bug is subject to a 90 day disclosure deadline. If 90 days elapse\nwithout an upstream patch, then the bug report will automatically\nbecome visible to the public.",
+    "original_source": "sample_info.json issue_description / patch.diff / sanitizer_trace.txt / reproduction_report.json / staged vulnerable source / staged poc",
+    "normalized": "Stage 01 reproduced an AddressSanitizer invalid-free in `Flow::~Flow()` while `fuzz_dissect_packet` processed the exact staged 252-byte PCAP witness. Creating the flow first allocates a 960-byte `ndpiFlow` region in `allocDPIMemory()`. The witness's first complete packet is a UDP/53 DNS packet, so `Flow::processPacket()` classifies the flow as DNS and `Flow::processDNSPacket()` performs extra nDPI dissection, which populates a non-empty `ndpiFlow->host_server_name`. Vulnerable `processDNSPacket()` then calls `setDNSQuery(ndpiFlow->host_server_name)`. In `Flow::setDNSQuery()`, the update block stores that borrowed nDPI pointer directly into `protos.dns.last_query` with `protos.dns.last_query = v; /* No need to strdup */`, even though `Flow::~Flow()` later frees `protos.dns.last_query` in the DNS cleanup branch. During `iface->cleanup()` -> `GenericHash::cleanup()` -> `Flow::~Flow()`, the destructor executes `free(protos.dns.last_query)` before `freeDPIMemory()` releases `ndpiFlow`; the staged ASan trace reports the argument `0x61900000335c` is 220 bytes inside the 960-byte `allocDPIMemory()` region rather than a separately allocated string. The fix changes the DNS packet path to call `setDNSQuery(ndpiFlow->host_server_name, true)` and changes `setDNSQuery()` to duplicate strings when ownership is not transferred, so the destructor frees only `Flow`-owned memory."
+  },
+  "source": {
+    "file": "src/Flow.cpp",
+    "function": "Flow::processDNSPacket",
+    "line": 1071,
+    "code": "proto_id = ndpi_detection_process_packet(\n    iface->get_ndpi_struct(), ndpiFlow, ip_packet, ip_len, packet_time, NULL);",
+    "var": "ip_packet, ip_len, ndpiFlow->host_server_name, proto_id",
+    "description": "First project-side materialization of the attacker-controlled DNS name into the nDPI flow state later mis-owned and freed. On the crashing witness this extra DNS dissection fills `ndpiFlow->host_server_name`.",
+    "value_from": "The staged `poc` is a 252-byte little-endian Ethernet PCAP. Its first complete packet is IPv4/UDP to port 53 and the packet bytes visibly contain DNS-name label data such as `proxy`, `intel`, and `network0`; these attacker-controlled bytes are what nDPI parses into `ndpiFlow->host_server_name` here.",
+    "note": "This is the first project statement on the scored path that consumes the attacker-controlled packet bytes and creates the specific string state later freed incorrectly. The libFuzzer entry and PCAP loop are harness context, not the scored source.",
+    "trace_step": 3
+  },
+  "root_cause": {
+    "file": "src/Flow.cpp",
+    "function": "Flow::setDNSQuery",
+    "line": 5665,
+    "code": "protos.dns.last_query = v; /* No need to strdup */",
+    "var": "protos.dns.last_query, v",
+    "description": "Stores the nDPI-owned DNS-name pointer as if `Flow` owned it. The caller passes `ndpiFlow->host_server_name`, but the setter does not duplicate the string before saving it for destructor cleanup.",
+    "note": "The fix commit introduces `copy_memory` and changes this store to `copy_memory ? strdup(v) : v`, so `processDNSPacket()` can copy nDPI-owned strings while the ZMQ path can still transfer ownership explicitly.",
+    "trace_step": 6
+  },
+  "sink": {
+    "file": "src/Flow.cpp",
+    "function": "Flow::~Flow",
+    "line": 437,
+    "code": "if (protos.dns.last_query) free(protos.dns.last_query);",
+    "var": "protos.dns.last_query",
+    "description": "Destructor sink. The DNS cleanup branch passes the borrowed interior pointer to `free()`, and AddressSanitizer reports `attempting free on address which was not malloc()-ed` at this statement.",
+    "note": "ASan reports the freed address is 220 bytes inside the 960-byte `ndpiFlow` region allocated in `allocDPIMemory()` rather than a standalone allocation, so this `free()` is invalid.",
+    "trace_step": 7
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/NetworkInterface.cpp",
+      "function": "NetworkInterface::dissectPacket",
+      "line": 2879,
+      "code": "pass_verdict = processPacket(",
+      "description": "After Ethernet/IP parsing, the staged PCAP's first complete packet is admitted into ntopng's per-flow packet-processing path.",
+      "note": "The witness PCAP contains two complete 90-byte records followed by a truncated trailing record header; Stage 01 established only that this exact capture reaches `processPacket()` and reproduces the crash."
+    }
+  },
+  "tainted_value_origin": {
+    "file": "src/Flow.cpp",
+    "function": "Flow::processDNSPacket",
+    "line": 1089,
+    "code": "setDNSQuery(ndpiFlow->host_server_name);",
+    "var": "ndpiFlow->host_server_name",
+    "description": "Concrete pointer later freed. The DNS handler forwards the nDPI-owned `host_server_name` storage directly into `setDNSQuery()`.",
+    "value_from": "On the exact staged PCAP, the first complete UDP/53 packet makes `ndpiFlow->host_server_name` non-empty before this call; the visible packet bytes include labels such as `proxy`, `intel`, and `network0`.",
+    "note": "The bad-free address reported by ASan lies inside the `ndpiFlow` allocation from `allocDPIMemory()`, matching this borrowed pointer's storage provenance."
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/Flow.cpp",
+      "function": "Flow::allocDPIMemory",
+      "summary": "Creating the flow for the parsed UDP packet allocates an `ndpiFlow` region that owns nDPI DNS state and later contains the address ASan says was freed incorrectly."
+    },
+    {
+      "step": 2,
+      "file": "src/Flow.cpp",
+      "function": "Flow::processPacket",
+      "summary": "The first nDPI pass classifies the attacker packet as DNS, so the flow takes the extra DNS-dissection path."
+    },
+    {
+      "step": 3,
+      "file": "src/Flow.cpp",
+      "function": "Flow::processDNSPacket / Flow::setDNSQuery",
+      "summary": "Extra DNS dissection fills `ndpiFlow->host_server_name`, and vulnerable `setDNSQuery()` stores that borrowed nDPI pointer in `protos.dns.last_query` without copying it."
+    },
+    {
+      "step": 4,
+      "file": "src/Flow.cpp",
+      "function": "Flow::~Flow",
+      "summary": "During interface cleanup, the DNS branch of `Flow::~Flow()` frees `protos.dns.last_query` before `freeDPIMemory()`, so `free()` receives an interior pointer inside the still-owned `ndpiFlow` allocation and ASan reports invalid-free."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/Flow.cpp",
+      "function": "Flow::allocDPIMemory",
+      "line": 311,
+      "line_end": 313,
+      "var": "ndpiFlow, iface->get_flow_size()",
+      "code": "if ((ndpiFlow = (ndpi_flow_struct *)calloc(1, iface->get_flow_size())) == NULL)\n  throw \"Not enough memory\";",
+      "note": "Flow creation allocates the `ndpiFlow` region that owns nDPI per-flow state. The staged ASan allocation stack identifies this `calloc` as the origin of the 960-byte region `[0x619000003280, 0x619000003640)` containing the later bad-free address `0x61900000335c`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/Flow.cpp",
+      "function": "Flow::processPacket",
+      "line": 953,
+      "line_end": 954,
+      "var": "ip_packet, ip_len, proto_id",
+      "code": "proto_id = ndpi_detection_process_packet(\n    iface->get_ndpi_struct(), ndpiFlow, ip_packet, ip_len, packet_time, NULL);",
+      "note": "The first nDPI pass consumes the packet bytes into `ndpiFlow` and determines the flow protocol. On the crashing witness it identifies DNS, so `Flow::processPacket()` later takes the `if (isDNS()) processDNSPacket(...)` branch.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "ndpiFlow"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/Flow.cpp",
+      "function": "Flow::processDNSPacket",
+      "line": 1071,
+      "line_end": 1072,
+      "var": "ip_packet, ip_len, ndpiFlow->host_server_name, proto_id",
+      "code": "proto_id = ndpi_detection_process_packet(\n    iface->get_ndpi_struct(), ndpiFlow, ip_packet, ip_len, packet_time, NULL);",
+      "note": "Source. Because step 2 has already classified the flow as DNS, the extra DNS dissection re-consumes the attacker-controlled packet bytes and populates DNS metadata inside `ndpiFlow`. On the crashing witness this produces the non-empty `ndpiFlow->host_server_name` consumed immediately afterward.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "ndpiFlow"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "isDNS()"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/Flow.cpp",
+      "function": "Flow::processDNSPacket",
+      "line": 1083,
+      "line_end": 1089,
+      "var": "ndpiFlow->host_server_name",
+      "code": "if (ndpiFlow->host_server_name[0] != '\\0') {\n  ...\n  setDNSQuery(ndpiFlow->host_server_name);\n}",
+      "note": "The parsed DNS name is non-empty on the reproduced path, so `processDNSPacket()` passes `ndpiFlow->host_server_name` directly to `setDNSQuery()`. That argument is borrowed storage inside the `ndpiFlow` allocation from step 1, not a heap duplicate owned by `Flow`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "ndpiFlow"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "ndpiFlow->host_server_name"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/Flow.cpp",
+      "function": "Flow::setDNSQuery",
+      "line": 5659,
+      "line_end": 5662,
+      "var": "protos.dns.last_query_shadow, protos.dns.last_query_update_time, last_pkt_rcvd",
+      "code": "if (!protos.dns.last_query_shadow /* The first time the swap is done */\n    ||\n    protos.dns.last_query_update_time + 1 <\n        last_pkt_rcvd /* Latest swap occurred at least one second ago */) {",
+      "note": "The call from step 4 reaches the setter's update block on the crashing execution. This control decision allows the saved DNS-query pointer to be rewritten.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "isDNS()"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "v"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/Flow.cpp",
+      "function": "Flow::setDNSQuery",
+      "line": 5665,
+      "var": "protos.dns.last_query, v",
+      "code": "protos.dns.last_query = v; /* No need to strdup */",
+      "note": "Root cause. `setDNSQuery()` records the borrowed `ndpiFlow->host_server_name` pointer as `protos.dns.last_query` without copying it, even though `Flow::~Flow()` later frees that field. The fix adds `copy_memory ? strdup(v) : v` here so nDPI-owned strings are duplicated before cleanup.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "v"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "!protos.dns.last_query_shadow || protos.dns.last_query_update_time + 1 < last_pkt_rcvd"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/Flow.cpp",
+      "function": "Flow::~Flow",
+      "line": 437,
+      "var": "protos.dns.last_query",
+      "code": "if (protos.dns.last_query) free(protos.dns.last_query);",
+      "note": "Sink. During interface cleanup the flow is deleted, `Flow::~Flow()` enters the DNS branch, and this `free()` receives the pointer stored in step 6. ASan reports that address `0x61900000335c` is 220 bytes inside the still-owned 960-byte `ndpiFlow` region from step 1, so freeing it here is an invalid free/bad-free. `freeDPIMemory()` does not run until line 468, after this erroneous `free()`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "ndpiFlow"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "isDNS()"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "protos.dns.last_query"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "invalid-free",
+    "access_type": "FREE",
+    "access_size": null,
+    "crash_location": {
+      "file": "src/Flow.cpp",
+      "function": "Flow::~Flow",
+      "line": 437
+    },
+    "runtime_crash_location": {
+      "file": "src/Flow.cpp",
+      "function": "Flow::~Flow",
+      "line": 437
+    },
+    "allocation_context": {
+      "file": "src/Flow.cpp",
+      "function": "allocDPIMemory",
+      "line": 311,
+      "note": "The staged ASan trace says the bad-free address is 220 bytes inside the 960-byte region allocated here via `calloc`."
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "free",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 52
+      },
+      {
+        "frame": 1,
+        "function": "Flow::~Flow()",
+        "file": "src/Flow.cpp",
+        "line": 437
+      },
+      {
+        "frame": 2,
+        "function": "Flow::~Flow()",
+        "file": "src/Flow.cpp",
+        "line": 327
+      },
+      {
+        "frame": 3,
+        "function": "GenericHash::cleanup()",
+        "file": "src/GenericHash.cpp",
+        "line": 105
+      },
+      {
+        "frame": 4,
+        "function": "NetworkInterface::cleanup()",
+        "file": "src/NetworkInterface.cpp",
+        "line": 3746
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/fuzz_dissect_packet.cpp",
+        "line": 203
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "__interceptor_calloc",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 77
+      },
+      {
+        "frame": 1,
+        "function": "allocDPIMemory",
+        "file": "src/Flow.cpp",
+        "line": 311
+      },
+      {
+        "frame": 2,
+        "function": "Flow::Flow(NetworkInterface*, unsigned short, unsigned short, unsigned int, unsigned char, Mac*, IpAddress*, unsigned short, Mac*, IpAddress*, unsigned short, ICMPinfo const*, long, long, unsigned char*, unsigned char*)",
+        "file": "src/Flow.cpp",
+        "line": 239
+      },
+      {
+        "frame": 3,
+        "function": "NetworkInterface::getFlow(Mac*, Mac*, unsigned short, unsigned short, unsigned int, unsigned int, unsigned int, unsigned int, ICMPinfo const*, IpAddress*, IpAddress*, unsigned short, unsigned short, unsigned char, bool*, long, long, unsigned int, bool*, bool, unsigned char*, unsigned char*)",
+        "file": "src/NetworkInterface.cpp",
+        "line": 1335
+      },
+      {
+        "frame": 4,
+        "function": "NetworkInterface::processPacket(unsigned int, bool, timeval const*, unsigned long, ndpi_ethhdr*, unsigned short, ndpi_iphdr*, ndpi_ipv6hdr*, unsigned short, unsigned short, unsigned int, pcap_pkthdr const*, unsigned char const*, unsigned short*, Host**, Host**, Flow**)",
+        "file": "src/NetworkInterface.cpp",
+        "line": 1920
+      },
+      {
+        "frame": 5,
+        "function": "NetworkInterface::dissectPacket(unsigned int, bool, unsigned char*, pcap_pkthdr const*, unsigned char const*, unsigned short*, Host**, Host**, Flow**)",
+        "file": "src/NetworkInterface.cpp",
+        "line": 2879
+      },
+      {
+        "frame": 6,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/fuzz_dissect_packet.cpp",
+        "line": 197
+      }
+    ],
+    "dedup_token": "free--Flow::~Flow()--Flow::~Flow()",
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "ASan says the freed address lies inside the `allocDPIMemory()` region from step 1. The fine trace shows `processDNSPacket()` passing `ndpiFlow->host_server_name` into `setDNSQuery()` and step 6 storing that borrowed interior pointer directly in `protos.dns.last_query`, so the allocation context and the ownership bug describe the same object.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "The staged `poc` is the exact 252-byte little-endian Ethernet PCAP consumed by `pcap_fopen_offline()` in `fuzz_dissect_packet`. It contains two complete 90-byte records followed by a truncated trailing record header; the first complete packet is a UDP/53 DNS packet, and feeding this exact capture to the harness reaches `setDNSQuery(ndpiFlow->host_server_name)` and later reproduces the ASan invalid-free in `Flow::~Flow()` during `iface->cleanup()`.",
+    "format": {
+      "name": "Little-endian Ethernet PCAP for fuzz_dissect_packet",
+      "contract": "Exactly the staged 252-byte `poc` file as read by `pcap_fopen_offline()` and `pcap_next_ex()`. The only verified trigger semantics are this witness's source-level effects: at least one parsed packet reaches `Flow::processDNSPacket()` as a DNS flow, produces a non-empty `ndpiFlow->host_server_name`, and leaves `protos.dns.last_query` aliasing that nDPI-owned storage until `iface->cleanup()` destroys the flow. Do not generalize beyond this exact capture."
+    }
+  }
+}

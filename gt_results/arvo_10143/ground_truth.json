@@ -1,0 +1,412 @@
+{
+  "sample_id": "arvo_10143",
+  "vuln_id": "OSS-Fuzz issue 10143 / ARVO arvo:10143",
+  "project": {
+    "id": "gnutls",
+    "repo": "https://gitlab.com/gnutls/gnutls.git",
+    "vulnerable_commit": "90a71b2e53e9696bd4c07ff98a12d06ecd2e424d",
+    "fixed_commit": "470a4e82449bb3920adb554151cf763722ff472e"
+  },
+  "classification": {
+    "class": "use-of-uninitialized-value",
+    "cwe": "CWE-457",
+    "access": "read",
+    "detector": "MemorySanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed report: https://oss-fuzz.com/testcase?key=5642279797129216 Project: gnutls Fuzzer: libFuzzer_gnutls_pkcs8_key_parser_fuzzer Fuzz target binary: gnutls_pkcs8_key_parser_fuzzer Job Type: libfuzzer_msan_gnutls Platform Id: linux Crash Type: Use-of-uninitialized-value Crash Address: Crash State: read_pbkdf2_params _gnutls_read_pkcs_schema_params pkcs8_key_decrypt Sanitizer: memory (MSAN) Recommended Security Severity: Medium Regressed: https://oss-fuzz.com/revisions?job=libfuzzer_msan_gnutls&range=201808300152:201808310152 Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=5642279797129216 Issue filed automatically. See https://github.com/google/oss-fuzz/blob/master/docs/reproducing.md for more information. This bug is subject to a 90 day disclosure deadline. If 90 days elapse without an upstream patch, then the bug report will automatically become visible to the public. When you fix this bug, please * mention the fix revision(s). * state whether the bug was a short-lived regression or an old bug in any stable releases. * add any other useful information. This information can help downstream consumers. If you need to contact the OSS-Fuzz team with a question, concern, or any other feedback, please file an issue at https://github.com/google/oss-fuzz/issues.",
+    "original_source": "ARVO-Meta.report.comments[0].content",
+    "normalized": "Importing the staged 444-byte DER `EncryptedPrivateKeyInfo` through `gnutls_x509_privkey_import_pkcs8` reaches `pkcs8_key_decrypt`, which reads the outer `encryptionAlgorithm.algorithm`, classifies it as `PBES2_GENERIC`, and passes the `encryptionAlgorithm.parameters` subspan into `_gnutls_read_pkcs_schema_params`' PBES2 branch. `read_pbkdf2_params` then allocates `char oid[MAX_OID_SIZE]` without initialization and asks `asn1_read_value` for the nested `keyDerivationFunc.algorithm`. In the staged build, `_work/src/build.sh` installs external `/src/libtasn1` into `$DEPS_PATH` before configuring GnuTLS, so the executed decoder is `../libtasn1/lib/decoding.c` plus `../libtasn1/lib/element.c`: the witness OID bytes `06 09 20 20 20 ff ff 20 ff ff ff` become the short text `0.32.32.32.2097056`, and only `strlen(...)+1 = 19` bytes are copied into `oid`. Line 668 then compares `oid` against the 22-byte `PBKDF2_OID` literal with `strcmp`, and MemorySanitizer reports a use-of-uninitialized-value originating from `oid`'s stack allocation."
+  },
+  "source": {
+    "file": "lib/x509/privkey_pkcs8.c",
+    "function": "gnutls_x509_privkey_import_pkcs8",
+    "line": 1510,
+    "var": "_data",
+    "code": "_data.data = data->data; _data.size = data->size;",
+    "description": "First project-code consumption on the vulnerable path: the raw witness buffer pointer and length are aliased into local datum `_data`, which is then parsed as encrypted PKCS#8.",
+    "value_from": "The staged witness file `poc` is a 444-byte DER blob. The harness passes it as `raw.data/raw.size` into `gnutls_x509_privkey_import_pkcs8(key, &raw, GNUTLS_X509_FMT_DER, \"password\", 0)`, and lines 1510-1511 alias those exact bytes into `_data` for the later PKCS#8 and PBES2 decoders.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "lib/x509/pkcs7-crypt.c",
+    "function": "read_pbkdf2_params",
+    "line": 651,
+    "var": "oid",
+    "code": "char oid[MAX_OID_SIZE];",
+    "description": "The stack buffer `oid` is created uninitialized, but later logic treats it as a fully initialized C string after `asn1_read_value` fills only a short prefix.",
+    "note": "The staged build installs external `/src/libtasn1` into `$DEPS_PATH` before configuring GnuTLS (`_work/src/build.sh`:23-26,45), so `asn1_read_value` uses `../libtasn1/lib/decoding.c` and `../libtasn1/lib/element.c`, not the bundled minitasn1 fallback. That path can materialize a short textual OID and copy only `strlen(...)+1` bytes into `oid`; because `oid` is never pre-zeroed and line 668 ignores the returned `len`, bytes after the copied NUL remain indeterminate. The staged `patch.diff` and `fixed_commit` do not modify this path.",
+    "trace_step": 10
+  },
+  "sink": {
+    "file": "lib/x509/pkcs7-crypt.c",
+    "function": "read_pbkdf2_params",
+    "line": 668,
+    "var": "oid",
+    "code": "if (strcmp(oid, PBKDF2_OID) != 0) {",
+    "description": "MSAN crash site. `strcmp` compares `oid` against the 21-character `PBKDF2_OID` string plus its NUL terminator; only 19 bytes of `oid` were initialized from the decoded inner OID text.",
+    "note": "The sanitizer trace reports uninitialized bytes in `__interceptor_memcmp` at offset 19 inside a 22-byte region and attributes the poisoned data to the stack allocation of `oid` in `read_pbkdf2_params`.",
+    "trace_step": 13
+  },
+  "tainted_value_origin": {
+    "file": "../libtasn1/lib/element.c",
+    "function": "asn1_read_value_type",
+    "line": 962,
+    "var": "value",
+    "code": "PUT_STR_VALUE (value, value_size, node->value);",
+    "description": "The vulnerability-relevant bytes are created when external libtasn1 copies only the short textual OID into caller buffer `oid`, leaving the rest of the preallocated 128-byte stack buffer untouched."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "lib/x509/privkey_pkcs8.c",
+      "function": "pkcs8_key_decode",
+      "line": 949,
+      "code": "result = _asn1_strict_der_decode(&pkcs8_asn, raw_key->data, raw_key->size, NULL);",
+      "description": "The staged witness is accepted as DER `EncryptedPrivateKeyInfo`; on the witnessed path the caller requested decryption, so the code continues into the encrypted-key parser."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "lib/x509/privkey_pkcs8.c",
+      "function": "gnutls_x509_privkey_import_pkcs8",
+      "summary": "Aliases the attacker-controlled DER bytes into `_data` and routes the encrypted witness into `pkcs8_key_decode`."
+    },
+    {
+      "step": 2,
+      "file": "lib/x509/privkey_pkcs8.c",
+      "function": "pkcs8_key_decrypt",
+      "summary": "Reads the outer PKCS#8 encryption-algorithm OID, classifies it as `PBES2_GENERIC`, and finds the DER subspan for `encryptionAlgorithm.parameters`."
+    },
+    {
+      "step": 3,
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "_gnutls_read_pkcs_schema_params",
+      "summary": "Uses the saved schema state to enter the PBES2 branch and decodes the PBES2 parameter block into ASN.1 object `pasn`."
+    },
+    {
+      "step": 4,
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "read_pbkdf2_params",
+      "summary": "Allocates `oid` without initialization, external libtasn1 copies only the short inner-OID string into it, and `strcmp` reads the untouched tail."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "lib/x509/privkey_pkcs8.c",
+      "function": "gnutls_x509_privkey_import_pkcs8",
+      "line": 1510,
+      "line_end": 1511,
+      "var": "_data",
+      "code": "_data.data = data->data; _data.size = data->size;",
+      "note": "Copies the attacker-controlled DER pointer and byte count into local datum `_data`, creating the exact byte span later decoded on the crashing path."
+    },
+    {
+      "step": 2,
+      "file": "lib/x509/privkey_pkcs8.c",
+      "function": "pkcs8_key_decode",
+      "line": 948,
+      "line_end": 950,
+      "var": "pkcs8_asn",
+      "code": "result = _asn1_strict_der_decode(&pkcs8_asn, raw_key->data, raw_key->size, NULL);",
+      "note": "Decodes that byte span as `EncryptedPrivateKeyInfo`. On the witnessed path the caller requested decryption, so the admitted ASN.1 object proceeds into `pkcs8_key_decrypt`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "_data"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "lib/x509/privkey_pkcs8.c",
+      "function": "pkcs8_key_decrypt",
+      "line": 733,
+      "line_end": 734,
+      "var": "enc_oid",
+      "code": "result = asn1_read_value(pkcs8_asn, \"encryptionAlgorithm.algorithm\", enc_oid, &len);",
+      "note": "Reads the outer PKCS#8 `encryptionAlgorithm.algorithm` OID into `enc_oid`. In the witness blob this field is the PBES2 OID `1.2.840.113549.1.5.13`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "pkcs8_asn"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "_gnutls_check_pkcs_cipher_schema",
+      "line": 288,
+      "var": "oid",
+      "code": "if (strcmp(oid, PBES2_OID) == 0)",
+      "note": "Compares `enc_oid` with `PBES2_OID` and returns `PBES2_GENERIC` on the witnessed path.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "enc_oid"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "lib/x509/privkey_pkcs8.c",
+      "function": "pkcs8_key_decrypt",
+      "line": 745,
+      "var": "schema",
+      "code": "schema = result;",
+      "note": "Stores the classifier result in local `schema`, so later parameter parsing branches on this saved state rather than on `enc_oid` directly.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "result"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "lib/x509/privkey_pkcs8.c",
+      "function": "pkcs8_key_decrypt",
+      "line": 749,
+      "line_end": 759,
+      "var": "params_start, params_end, params_len",
+      "code": "result = asn1_der_decoding_startEnd(pkcs8_asn, raw_key->data, raw_key->size, \"encryptionAlgorithm.parameters\", &params_start, &params_end); params_len = params_end - params_start + 1;",
+      "note": "Locates the DER subspan for `encryptionAlgorithm.parameters` inside the attacker-controlled PKCS#8 blob and computes `params_len`, producing the exact bytes later parsed as PBES2 parameters.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "_data"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "pkcs8_asn"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "_gnutls_read_pkcs_schema_params",
+      "line": 995,
+      "var": "*schema",
+      "code": "if (*schema == PBES2_GENERIC) {",
+      "note": "Gates PBES2 parsing on the saved schema state. Because step 5 stored `PBES2_GENERIC`, the function enters the PBES2-specific branch on the witnessed path.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "*schema"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "_gnutls_read_pkcs_schema_params",
+      "line": 1010,
+      "var": "pasn",
+      "code": "result = _asn1_strict_der_decode(&pasn, data, data_size, NULL);",
+      "note": "Decodes the `encryptionAlgorithm.parameters` subspan as `PKIX1.pkcs-5-PBES2-params`, materializing ASN.1 object `pasn` that contains the nested `keyDerivationFunc.algorithm` field.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "data,data_size"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "*schema == PBES2_GENERIC"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "../libtasn1/lib/decoding.c",
+      "function": "asn1_der_decoding2",
+      "line": 1132,
+      "line_end": 1145,
+      "var": "temp",
+      "code": "result = asn1_get_object_id_der(der + counter, ider_len, &len2, temp, sizeof(temp)); tlen = strlen(temp); if (tlen > 0) _asn1_set_value(p, temp, tlen + 1);",
+      "note": "During step 8's decode, external libtasn1 converts the inner OID bytes `20 20 20 ff ff 20 ff ff ff` into the textual value `0.32.32.32.2097056` and stores that short string in the ASN.1 node. The final `ff ff ff` continuation run never terminates with a byte lacking bit 0x80, so it contributes no appended arc.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "pasn"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "read_pbkdf2_params",
+      "line": 651,
+      "var": "oid",
+      "code": "char oid[MAX_OID_SIZE];",
+      "note": "Allocates the 128-byte stack buffer that will receive the textual KDF OID, but leaves every byte indeterminate until later writes initialize them.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "pasn"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "read_pbkdf2_params",
+      "line": 659,
+      "line_end": 661,
+      "var": "oid",
+      "code": "len = sizeof(oid); result = asn1_read_value(pasn, \"keyDerivationFunc.algorithm\", oid, &len);",
+      "note": "Requests the nested `keyDerivationFunc.algorithm` string from `pasn` and offers the whole `oid` buffer as the destination.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "pasn"
+        },
+        {
+          "on": 10,
+          "type": "data",
+          "via": "oid"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "../libtasn1/lib/element.c",
+      "function": "asn1_read_value_type",
+      "line": 962,
+      "var": "value",
+      "code": "PUT_STR_VALUE (value, value_size, node->value);",
+      "note": "External libtasn1's `PUT_STR_VALUE` macro sets `*len = strlen(node->value) + 1` and copies exactly that many bytes via `_asn1_strcpy`. On this call `node->value` is the 18-character string from step 9 and `value == oid`, so only 19 bytes including the NUL are initialized and bytes 19..127 of `oid` stay indeterminate.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "node->value"
+        },
+        {
+          "on": 11,
+          "type": "data",
+          "via": "value_size,value"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "read_pbkdf2_params",
+      "line": 668,
+      "var": "oid",
+      "code": "if (strcmp(oid, PBKDF2_OID) != 0) {",
+      "note": "Compares `oid` with the 22-byte `PBKDF2_OID` literal (21 characters plus NUL). Because step 12 initialized only 19 bytes including NUL, `strcmp` reads three poisoned tail bytes; MSAN reports the first uninitialized byte at offset 19 inside that 22-byte region and attributes it to `oid`'s stack allocation.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "oid"
+        },
+        {
+          "on": 12,
+          "type": "data",
+          "via": "oid,len"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "memory",
+    "trace_format": "msan",
+    "sanitizer": "MemorySanitizer",
+    "crash_type": "use-of-uninitialized-value",
+    "access_type": "READ",
+    "access_size": 22,
+    "crash_location": {
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "read_pbkdf2_params",
+      "line": 668
+    },
+    "allocation_context": {
+      "file": "lib/x509/pkcs7-crypt.c",
+      "function": "read_pbkdf2_params",
+      "line": 647,
+      "note": "The sanitizer reports the uninitialized value as created by allocation of `oid` in the stack frame at line 647; the actual `oid` declaration in the vulnerable source is line 651."
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "read_pbkdf2_params",
+        "file": "lib/x509/pkcs7-crypt.c",
+        "line": 668
+      },
+      {
+        "frame": 1,
+        "function": "_gnutls_read_pkcs_schema_params",
+        "file": "lib/x509/pkcs7-crypt.c",
+        "line": 1020
+      },
+      {
+        "frame": 2,
+        "function": "pkcs8_key_decrypt",
+        "file": "lib/x509/privkey_pkcs8.c",
+        "line": 762
+      },
+      {
+        "frame": 3,
+        "function": "pkcs8_key_decode",
+        "file": "lib/x509/privkey_pkcs8.c",
+        "line": 959
+      },
+      {
+        "frame": 4,
+        "function": "gnutls_x509_privkey_import_pkcs8",
+        "file": "lib/x509/privkey_pkcs8.c",
+        "line": 1556
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/gnutls_pkcs8_key_parser_fuzzer.c",
+        "line": 40
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "read_pbkdf2_params",
+        "file": "lib/x509/pkcs7-crypt.c",
+        "line": 647
+      }
+    ],
+    "patch_resolves": false,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "The staged witness file `poc` reproduces the MemorySanitizer crash recorded in `sanitizer_trace.txt`: importing the raw DER blob through `gnutls_x509_privkey_import_pkcs8(key, &raw, GNUTLS_X509_FMT_DER, \"password\", 0)` reaches `read_pbkdf2_params` and triggers the uninitialized read in `strcmp(oid, PBKDF2_OID)`.",
+    "format": {
+      "name": "DER EncryptedPrivateKeyInfo (PKCS#8)",
+      "contract": "A 444-byte DER `EncryptedPrivateKeyInfo` whose outer `encryptionAlgorithm.algorithm` field is the PBES2 OID `06 09 2a 86 48 86 f7 0d 01 05 0d`, and whose nested `keyDerivationFunc.algorithm` field is the exact malformed OBJECT IDENTIFIER `06 09 20 20 20 ff ff 20 ff ff ff`. In the staged build, external `../libtasn1/lib/decoding.c` stores that inner OID as `0.32.32.32.2097056`, and external `../libtasn1/lib/element.c` therefore copies only 19 bytes including the NUL into `char oid[MAX_OID_SIZE]` before `strcmp(oid, PBKDF2_OID)` consumes a 22-byte compare window."
+    }
+  }
+}

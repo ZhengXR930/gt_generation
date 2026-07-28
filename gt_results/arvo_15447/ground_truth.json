@@ -1,0 +1,442 @@
+{
+  "sample_id": "arvo_15447",
+  "vuln_id": "OSS-Fuzz issue 15447 / ARVO arvo:15447",
+  "project": {
+    "id": "openthread",
+    "name": "openthread",
+    "repo": "https://github.com/openthread/openthread",
+    "vulnerable_commit": "03fac0ff48c8152e9bcc8cfeed4a6eddb3b0e17f",
+    "fixed_commit": "016b1b152327c27b2f46accd272b49da8a16ed9f",
+    "fuzz_target": "ncp-uart-received-fuzzer"
+  },
+  "classification": {
+    "class": "stack-buffer-overread",
+    "cwe": "CWE-787",
+    "access": "read",
+    "detector": "AddressSanitizer",
+    "classification_note": "OpenThread reuses a parsed inbound `ThreadTargetTlv` stack object as an outbound TLV. `ThreadTlv::GetTlv()` copies only the fixed 18-byte object while preserving the inbound TLV header length, and vulnerable `HandleAddressQuery()` validates but does not reset that header before `AppendTlv()` serializes from it. On the reproduced run, `Message::Write()` then reached `memcpy` on that reused stack TLV region and ASan reported a 118-byte over-read."
+  },
+  "bug_description": {
+    "original": "Detailed report: https://oss-fuzz.com/testcase?key=5734126906245120 Project: openthread Fuzzer: afl_openthread_ncp-uart-received-fuzzer Fuzz target binary: ncp-uart-received-fuzzer Job Type: afl_asan_openthread Platform Id: linux Crash Type: Stack-buffer-overflow READ {*} Crash Address: 0x7fce54ba9f32 Crash State: ot::Message::Write ot::Message::Append ot::AddressResolver::SendAddressQueryResponse Sanitizer: address (ASAN) Recommended Security Severity: Medium Regressed: https://oss-fuzz.com/revisions?job=afl_asan_openthread&range=201906180307:201906190240 Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=5734126906245120 Issue filed automatically. See https://github.com/google/oss-fuzz/blob/master/docs/reproducing.md for instructions to reproduce this bug locally. This bug is subject to a 90 day disclosure deadline. If 90 days elapse without an upstream patch, then the bug report will automatically become visible to the public.",
+    "original_source": "ARVO-Meta.report.comments[0].content",
+    "normalized": "Stage 01 reproduced `AddressSanitizer: stack-buffer-overflow READ of size 118` in `ot::Message::Write`. The saved 102-byte `poc` contains two HDLC frames. After HDLC strips frame delimiters and 2-byte FCS values, the second frame reaches `HandlePropertySet<(spinel_prop_key_t)5412>()`; bytes `28 00` make `ReadDataWithLen()` expose a 40-byte forwarded UDP payload, and trailing bytes `bf f0` make `sockPort = 61631`, so `otUdpForwardReceive()` injects that blob into the UDP/CoAP receive path. `Coap::Message::ParseHeader()` interprets the blob as a non-confirmable POST with token length 6, option walking advances through five zero-length `0x20` headers to a URI-Path option encoded by `0x15` plus `61 2f 61 71 00`, and `MoveOffset()` leaves 18 body bytes `00 ff 00 00 ...` for `AddressResolver::HandleAddressQuery()`. There, `Tlv::GetOffset()` accepts the body start as `ThreadTlv::kTarget` because it sees type `0x00`, extended-length marker `0xff`, and zero extended length; `Tlv::Get()` then copies only the 18-byte `ThreadTargetTlv` object, leaving `targetTlv` with length byte `0xff` and a 16-byte all-zero target address. Vulnerable `HandleAddressQuery()` only checks `targetTlv.IsValid()` and never reinitializes the TLV header with `targetTlv.Init()`, which the fix adds immediately after that check. The saved ASan stack then shows the reproduced run took line 605 into `SendAddressQueryResponse()` and later crashed at `Message::Write()`. The staged static artifacts do not explain why `Get<ThreadNetif>().IsUnicastAddress(targetTlv.GetTarget())` was true for this exact all-zero target or what total append length `AppendTlv()` computed, so those late states are grounded only by the saved crash trace."
+  },
+  "source": {
+    "file": "src/ncp/ncp_base_mtd.cpp",
+    "function": "ot::Ncp::NcpBase::HandlePropertySet<(spinel_prop_key_t)5412>()",
+    "line": 3453,
+    "code": "SuccessOrExit(error = mDecoder.ReadDataWithLen(framePtr, frameLen));",
+    "var": "framePtr, frameLen",
+    "description": "First non-harness project statement that materializes the second HDLC frame's forwarded UDP payload into parser-visible pointer/length state used by the crashing path.",
+    "value_from": "In the saved `poc`, the second HDLC frame reaches this handler after HDLC FCS stripping. Its length bytes are `28 00`, so this read produces `frameLen = 40` and `framePtr` to the following 40-byte blob beginning `16 02 20 20 ...`.",
+    "note": "Scored source because it is the first project parser read that turns the attacker-controlled frame bytes into the exact forwarded payload later copied into an `otMessage` and delivered to CoAP.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "src/core/thread/address_resolver.cpp",
+    "function": "ot::AddressResolver::HandleAddressQuery",
+    "line": 593,
+    "code": "VerifyOrExit(targetTlv.IsValid());",
+    "var": "targetTlv.GetLength()",
+    "description": "The parsed `targetTlv` is only lower-bound validated, and vulnerable `HandleAddressQuery()` does not reset the TLV header before later reusing the same stack object as an outbound TLV.",
+    "note": "The fixing commit inserts `targetTlv.Init(); // reset TLV length` immediately after this line in `HandleAddressQuery()`, preventing inbound TLV header state from controlling the later response append size.",
+    "trace_step": 8
+  },
+  "sink": {
+    "file": "src/core/common/message.cpp",
+    "function": "ot::Message::Write",
+    "line": 595,
+    "code": "memcpy(curBuffer->GetData() + aOffset, aBuf, bytesToCopy);",
+    "var": "aBuf, bytesToCopy",
+    "description": "ASan crash site. On the reproduced run `Message::Write()` executes `memcpy` on data sourced from the reused stack TLV region, and the copy reads past `targetTlv` into adjacent stack locals.",
+    "note": "The saved sanitizer trace reports `READ of size 118` at this exact line and places the faulting source address at offset 50 in the crashing `HandleAddressQuery()` frame, immediately after `targetTlv` and before `mlIidTlv`, with `lastTransactionTimeTlv` and `iter` also in the over-read span. Because `Write()` copies in `bytesToCopy` chunks, 118 is sink-level read evidence, not by itself the full outbound TLV size.",
+    "trace_step": 12
+  },
+  "tainted_value_origin": {
+    "file": "src/core/common/tlvs.cpp",
+    "function": "ot::Tlv::Get",
+    "line": 54,
+    "code": "aMessage.Read(offset, aMaxLength, &aTlv);",
+    "var": "targetTlv",
+    "description": "This read materializes the stack `targetTlv` object from the post-CoAP body bytes that later get reused in the response path.",
+    "value_from": "After `ParseHeader()` moves the message offset to 22, `Tlv::GetOffset()` reads body bytes `00 ff 00 00 ...`, treats `0xff` as the extended-length marker with `extLength = 0x0000`, and returns the current body offset as the target TLV. `aMessage.Read(offset, sizeof(targetTlv), &targetTlv)` then materializes an 18-byte `ThreadTargetTlv` with `GetLength() == 0xff` and a 16-byte all-zero `GetTarget()`.",
+    "note": "This is the precise parsed object state later validated, left unreset, and passed into the response serializer."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/core/coap/coap.cpp",
+      "function": "ot::Coap::CoapBase::ProcessReceivedRequest",
+      "line": 635,
+      "code": "resource->HandleRequest(aMessage, aMessageInfo);",
+      "description": "Five zero-length `0x20` options advance the option number to 10, then `0x15` encodes URI-Path option 11 with value `a/aq\\0`, so `resource->HandleRequest()` dispatches into `AddressResolver::HandleAddressQuery()`."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/ncp/ncp_base_mtd.cpp",
+      "function": "ot::Ncp::NcpBase::HandlePropertySet<(spinel_prop_key_t)5412>() / otUdpForwardReceive",
+      "summary": "The crashing HDLC frame is decoded as Spinel property 5412 with a 40-byte forwarded UDP payload and destination port 61631, and that payload is handed directly into OpenThread's UDP receive path."
+    },
+    {
+      "step": 2,
+      "file": "src/core/coap/coap_message.cpp",
+      "function": "ot::Coap::Message::ParseHeader / ot::Coap::CoapBase::ProcessReceivedRequest",
+      "summary": "CoAP parsing treats the 40-byte blob as a POST request, reconstructs URI path `a/aq`, and advances the message offset past the payload marker to an 18-byte body beginning `00 ff 00 00...`."
+    },
+    {
+      "step": 3,
+      "file": "src/core/thread/address_resolver.cpp",
+      "function": "ot::AddressResolver::HandleAddressQuery",
+      "summary": "`HandleAddressQuery()` parses `targetTlv` from that body start, preserving length byte `0xff` while materializing a 16-byte all-zero target address; it accepts that state via `targetTlv.IsValid()` and never calls `targetTlv.Init()` before later reuse."
+    },
+    {
+      "step": 4,
+      "file": "src/core/thread/address_resolver.cpp",
+      "function": "ot::AddressResolver::SendAddressQueryResponse / ot::Message::AppendTlv / ot::Message::Write",
+      "summary": "The saved ASan stack shows the reproduced run then took the line-605 unicast-response path, reused that stack object in `AppendTlv()`, and triggered the witnessed 118-byte stack over-read in `Message::Write()`. The staged artifacts do not reveal why the all-zero target satisfied `IsUnicastAddress()` or what full append length was computed."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/ncp/ncp_base_mtd.cpp",
+      "function": "ot::Ncp::NcpBase::HandlePropertySet<(spinel_prop_key_t)5412>()",
+      "line": 3453,
+      "var": "framePtr, frameLen",
+      "code": "SuccessOrExit(error = mDecoder.ReadDataWithLen(framePtr, frameLen));",
+      "note": "Source. After HDLC strips delimiters and FCS, this read consumes the second Spinel frame's `28 00` length field and materializes `frameLen = 40` plus `framePtr` to the forwarded UDP payload beginning `16 02 20 20 ...`."
+    },
+    {
+      "step": 2,
+      "file": "src/ncp/ncp_base_mtd.cpp",
+      "function": "ot::Ncp::NcpBase::HandlePropertySet<(spinel_prop_key_t)5412>()",
+      "line": 3456,
+      "var": "sockPort",
+      "code": "SuccessOrExit(error = mDecoder.ReadUint16(sockPort));",
+      "note": "The trailing two bytes of the same Spinel frame are `bf f0`, so this read sets `sockPort = 61631` (`kCoapUdpPort`). That destination-port state is what routes the forwarded payload into the CoAP receive path.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "framePtr, frameLen"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/core/api/udp_api.cpp",
+      "function": "otUdpForwardReceive",
+      "line": 125,
+      "var": "aMessage, messageInfo.mSockPort",
+      "code": "instance.Get<Ip6::Udp>().HandlePayload(*static_cast<ot::Message *>(aMessage), messageInfo);",
+      "note": "With `messageInfo.mSockPort = 61631`, this call hands the attacker-controlled 40-byte blob to the UDP receiver. The saved ASan stack shows the same flow continuing into `Coap::CoapBase::ProcessReceivedRequest()`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "framePtr, frameLen"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "sockPort"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/core/coap/coap_message.cpp",
+      "function": "ot::Coap::Message::ParseHeader",
+      "line": 350,
+      "var": "GetHelpData().mHeaderLength, aMessage.GetOffset()",
+      "code": "MoveOffset(GetHelpData().mHeaderLength);",
+      "note": "CoAP header parsing treats the 40-byte blob as a request: first byte `0x16` yields token length 6 and non-confirmable type bits, `code = 0x02` is POST, and option walking begins at payload byte 10. Five successive `0x20` headers contribute zero-length deltas that advance the option number to 10; `0x15` then yields URI-Path option 11 with length 5, value bytes `61 2f 61 71 00`, and the next byte `0xff` is the payload marker. `MoveOffset()` therefore advances the message offset to 22, leaving an 18-byte body beginning `00 ff 00 00...`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "aMessage"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/core/coap/coap.cpp",
+      "function": "ot::Coap::CoapBase::ProcessReceivedRequest",
+      "line": 635,
+      "var": "uriPath",
+      "code": "resource->HandleRequest(aMessage, aMessageInfo);",
+      "note": "`ProcessReceivedRequest()` copies the step-4 URI-Path option value into `uriPath`, so `uriPath == \"a/aq\"` and the request is dispatched into `AddressResolver::HandleAddressQuery()`.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "GetHelpData().mHeaderLength"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/core/common/tlvs.cpp",
+      "function": "ot::Tlv::Get",
+      "line": 46,
+      "var": "offset, tlv.GetLength(), extLength",
+      "code": "SuccessOrExit(error = GetOffset(aMessage, aType, offset));",
+      "note": "`HandleAddressQuery()` asks `ThreadTlv::GetTlv(..., ThreadTlv::kTarget, sizeof(targetTlv), targetTlv)` for a target TLV. Starting from `aMessage.GetOffset() == 22`, `Tlv::GetOffset()` reads header bytes `00 ff`; because the length byte is `kExtendedLength`, it reads the next two bytes as `extLength = 0x0000` and accepts the current body offset as the `kTarget` TLV.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "aMessage.GetOffset()"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "strcmp(resource->mUriPath, uriPath) == 0"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/core/common/tlvs.cpp",
+      "function": "ot::Tlv::Get",
+      "line": 54,
+      "var": "targetTlv.GetLength(), targetTlv.GetTarget()",
+      "code": "aMessage.Read(offset, aMaxLength, &aTlv);",
+      "note": "`Tlv::Get()` first preserves the parsed header byte `mLength = 0xff`, then `aMessage.Read(offset, aMaxLength, &aTlv)` copies only the fixed 18-byte `ThreadTargetTlv` object. The resulting stack object therefore carries attacker-controlled length `0xff` but materializes a 16-byte all-zero `targetTlv.GetTarget()`.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "offset"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/core/thread/address_resolver.cpp",
+      "function": "ot::AddressResolver::HandleAddressQuery",
+      "line": 593,
+      "var": "targetTlv.GetLength()",
+      "code": "VerifyOrExit(targetTlv.IsValid());",
+      "note": "Root cause. `ThreadTargetTlv::IsValid()` only checks `GetLength() >= 16`, so the `0xff` header from step 7 passes. Vulnerable `HandleAddressQuery()` then proceeds without `targetTlv.Init()`, leaving that inbound TLV header live for later serialization; the fix inserts the missing reset immediately after this line.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "targetTlv.GetLength()"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/core/thread/address_resolver.cpp",
+      "function": "ot::AddressResolver::HandleAddressQuery",
+      "line": 602,
+      "var": "targetTlv.GetTarget()",
+      "code": "if (Get<ThreadNetif>().IsUnicastAddress(targetTlv.GetTarget()))",
+      "note": "This guard determines whether the unicast response path is taken. The source-grounded state from step 7 is the all-zero IPv6 address, and `Netif::IsUnicastAddress()` only scans the current unicast list for equality. The saved ASan stack nevertheless places the reproduced run at line 605, so this guard evaluated true at runtime, but the staged artifacts do not reveal which unicast-list state made it true.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "targetTlv.GetTarget()"
+        },
+        {
+          "on": 8,
+          "type": "control",
+          "via": "targetTlv.IsValid()"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/core/thread/address_resolver.cpp",
+      "function": "ot::AddressResolver::HandleAddressQuery",
+      "line": 605,
+      "var": "targetTlv, mlIidTlv",
+      "code": "SendAddressQueryResponse(targetTlv, mlIidTlv, NULL, aMessageInfo.GetPeerAddr());",
+      "note": "Because step 9's guard passed on the reproduced run, line 605 passes the same stack `targetTlv` by reference into `SendAddressQueryResponse()` without any intervening `targetTlv.Init()`.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "targetTlv"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "Get<ThreadNetif>().IsUnicastAddress(targetTlv.GetTarget())"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/core/common/message.cpp",
+      "function": "ot::Message::AppendTlv",
+      "line": 401,
+      "var": "aTlv.GetSize()",
+      "code": "return Append(&aTlv, aTlv.GetSize());",
+      "note": "At `SendAddressQueryResponse()` line 647, the same object reaches `message->AppendTlv(aTargetTlv)`. `AppendTlv()` passes `aTlv.GetSize()` to `Append()`, so the outbound copy length is derived from the preserved TLV header length rather than the fixed `ThreadTargetTlv` C++ size.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "targetTlv.GetLength()"
+        },
+        {
+          "on": 10,
+          "type": "data",
+          "via": "aTargetTlv"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/core/common/message.cpp",
+      "function": "ot::Message::Write",
+      "line": 595,
+      "var": "aBuf, bytesToCopy",
+      "code": "memcpy(curBuffer->GetData() + aOffset, aBuf, bytesToCopy);",
+      "note": "Sink. On the reproduced run, `Write()` reached this `memcpy` while copying bytes from the reused stack TLV region, and ASan reported `READ of size 118` here. That chunk size is runtime sink evidence only: `Write()` copies in `bytesToCopy` chunks, so the saved 118-byte read does not by itself establish the full `AppendTlv()` size.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "aTargetTlv"
+        },
+        {
+          "on": 11,
+          "type": "data",
+          "via": "aTlv.GetSize()"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "stack-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 118,
+    "crash_location": {
+      "file": "src/core/common/message.cpp",
+      "function": "ot::Message::Write",
+      "line": 595
+    },
+    "allocation_context": null,
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "__asan_memcpy",
+        "file": "/src/llvm/projects/compiler-rt/lib/asan/asan_interceptors_memintrinsics.cc",
+        "line": 22
+      },
+      {
+        "frame": 1,
+        "function": "ot::Message::Write",
+        "file": "src/core/common/message.cpp",
+        "line": 595
+      },
+      {
+        "frame": 2,
+        "function": "ot::Message::Append",
+        "file": "src/core/common/message.cpp",
+        "line": 390
+      },
+      {
+        "frame": 3,
+        "function": "ot::AddressResolver::SendAddressQueryResponse",
+        "file": "src/core/thread/address_resolver.cpp",
+        "line": 647
+      },
+      {
+        "frame": 4,
+        "function": "ot::AddressResolver::HandleAddressQuery",
+        "file": "src/core/thread/address_resolver.cpp",
+        "line": 605
+      },
+      {
+        "frame": 5,
+        "function": "ot::Coap::CoapBase::ProcessReceivedRequest",
+        "file": "src/core/coap/coap.cpp",
+        "line": 635
+      },
+      {
+        "frame": 6,
+        "function": "otUdpForwardReceive",
+        "file": "src/core/api/udp_api.cpp",
+        "line": 125
+      },
+      {
+        "frame": 7,
+        "function": "ot::Ncp::NcpBase::HandlePropertySet<(spinel_prop_key_t)5412>()",
+        "file": "src/ncp/ncp_base_mtd.cpp",
+        "line": 3460
+      },
+      {
+        "frame": 8,
+        "function": "ot::Ncp::NcpBase::HandleCommandPropertySet",
+        "file": "src/ncp/ncp_base.cpp",
+        "line": 952
+      },
+      {
+        "frame": 9,
+        "function": "ot::Ncp::NcpBase::CommandHandler_PROP_VALUE_update",
+        "file": "src/ncp/ncp_base.cpp",
+        "line": 1194
+      },
+      {
+        "frame": 10,
+        "function": "ot::Ncp::NcpBase::HandleCommand",
+        "file": "src/ncp/ncp_base.cpp",
+        "line": 857
+      },
+      {
+        "frame": 11,
+        "function": "ot::Ncp::NcpBase::HandleReceive",
+        "file": "src/ncp/ncp_base.cpp",
+        "line": 341
+      },
+      {
+        "frame": 12,
+        "function": "ot::Ncp::NcpUart::HandleFrame",
+        "file": "src/ncp/ncp_uart.cpp",
+        "line": 267
+      },
+      {
+        "frame": 13,
+        "function": "ot::Hdlc::Decoder::Decode",
+        "file": "src/ncp/hdlc.cpp",
+        "line": 256
+      },
+      {
+        "frame": 14,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "tests/fuzz/ncp_uart_received.cpp",
+        "line": 70
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": "Yes. The saved ASan report names `ot::Message::Write` at `src/core/common/message.cpp:595`, which is the exact fine-trace sink, and the preceding saved frames also match `SendAddressQueryResponse` line 647 and `HandleAddressQuery` line 605.",
+      "trace_consistent_with_stack": "Partially. The saved stack matches the trace's runtime-observed control and sink steps at `ProcessReceivedRequest`, `HandleAddressQuery` line 605, `SendAddressQueryResponse` line 647, and `Message::Write`. The static trace independently closes the parser path to a `targetTlv` with length byte `0xff` and an all-zero target address; what it cannot close without runtime disambiguation is why that state satisfied `IsUnicastAddress()` on this run or what total append length underlay the 118-byte `memcpy` chunk.",
+      "tainted_value_reaches_sink": "Partially. The staged bytes are source-grounded through Spinel payload decoding, CoAP option parsing, and `ThreadTlv::GetTlv`, yielding a stack `targetTlv` with length byte `0xff` and an all-zero target address. The saved crash stack proves that same stack object later flowed into `SendAddressQueryResponse()` line 647 and the crashing `Message::Write()` call. The unresolved part is the runtime state behind the line-602 unicast predicate and the exact total size passed through `AppendTlv()`.",
+      "root_cause_matches_allocation_context": "Not applicable: the crash is a stack over-read from `targetTlv`, not a heap allocation or lifetime bug."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "/out/ncp-uart-received-fuzzer {poc}",
+    "format": {
+      "name": "HDLC-framed Spinel UDP-forward command carrying a CoAP address query",
+      "contract": "The verified trigger is the exact staged 102-byte `poc` file. Its source-grounded static semantics are limited to the saved layout: after HDLC FCS stripping, the second frame reaches `HandlePropertySet<(spinel_prop_key_t)5412>()`, `ReadDataWithLen()` decodes a 40-byte forwarded UDP payload from length bytes `28 00`, `ReadUint16(sockPort)` decodes `bf f0` as destination port 61631, CoAP option parsing on that blob yields URI path `a/aq`, and `ThreadTlv::GetTlv()` materializes `targetTlv` from body bytes `00 ff 00 00 ...` with length byte `0xff` and a 16-byte all-zero target address. Stage 01's saved ASan run on this exact file then reaches `HandleAddressQuery()` line 605 and crashes in `Message::Write()` with a 118-byte stack read. The staged artifacts do not justify a broader claim about why that all-zero target satisfied `IsUnicastAddress()` or about the exact total size computed by `AppendTlv()`."
+    }
+  }
+}

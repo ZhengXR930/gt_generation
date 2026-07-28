@@ -1,0 +1,418 @@
+{
+  "sample_id": "arvo_38359",
+  "vuln_id": "OSS-Fuzz issue 38359",
+  "project": {
+    "id": "libsrtp",
+    "name": "libsrtp",
+    "repo": "https://github.com/cisco/libsrtp",
+    "vulnerable_commit": "19e6a05567db3b16f98eee5c199dc063ed1f6f37",
+    "fixed_commit": "f1d1e57a49dca345e086e01b5fccc44e723221e0",
+    "fuzz_target": "srtp-fuzzer (honggfuzz, AddressSanitizer)"
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "READ",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed Report: https://oss-fuzz.com/testcase?key=5725303486414848 Project: libsrtp Fuzzing Engine: honggfuzz Fuzz Target: srtp-fuzzer Job Type: honggfuzz_asan_libsrtp Platform Id: linux Crash Type: Heap-buffer-overflow READ {*} Crash Address: 0x602000000180 Crash State: srtp_stream_init_keys srtp_stream_init srtp_add_stream Sanitizer: address (ASAN) Recommended Security Severity: Medium Regressed: https://oss-fuzz.com/revisions?job=honggfuzz_asan_libsrtp&range=202109090600:202109100611 Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=5725303486414848",
+    "original_source": "ARVO-Meta.report.comments[0].content",
+    "normalized": "The staged 85-byte witness lets `extract_policy()` copy a first 32-byte policy record from the input. Its selector byte `0xf1` is reduced modulo the `fuzz_srtp_crypto_policies` table length, and both the 9-entry and 18-entry variants yield index `7`, selecting `srtp_crypto_policy_set_null_cipher_hmac_null` for both RTP and RTCP. That helper sets `cipher_type = SRTP_NULL_CIPHER` but incorrectly records `cipher_key_len = 16` instead of the 30-byte key-plus-salt length that `full_key_length(SRTP_NULL_CIPHER)` later expects. Because the same first record carries even `do_extract_key`, `extract_key()` allocates only a 16-byte `policy->key` buffer and copies 16 input bytes into it. The harness only reaches `srtp_create()` after a second `extract_policies()` call returns non-NULL; the saved witness leaves a trailing second 32-byte policy record for that gate. When `srtp_add_stream()` processes the first policy, it validates only key presence and MKI bounds, not the required key length for the chosen cipher. `srtp_stream_alloc()` then allocates null-cipher session objects for RTP and RTCP, so `session_keys->rtp_cipher->type` and `session_keys->rtcp_cipher->type` both resolve to `SRTP_NULL_CIPHER`. `srtp_stream_init_all_master_keys()` aliases the 16-byte heap buffer into `master_key->key`, `srtp_stream_init_keys()` computes `input_keylen = full_key_length(SRTP_NULL_CIPHER) = 30`, and `memcpy(tmp_key, key, input_keylen)` over-reads 30 bytes from the 16-byte allocation. The fix corrects both null-cipher policy helpers to use `SRTP_AES_ICM_128_KEY_LEN_WSALT` instead of `16`."
+  },
+  "evidence_note": "This pass rebuilt the GT after applying the concrete issues recorded in `trace_feedback.json`. `run_flags.json` sets `runtime_disambiguation` to false, so no instrumentation was added. The selector proof stays source-grounded without any build-mode assumption because `0xf1 % 9 = 7` and `0xf1 % 18 = 7`, so the first policy selects `srtp_crypto_policy_set_null_cipher_hmac_null` whether or not the optional OpenSSL-only table entries are compiled in.",
+  "evidence_limitations": [
+    "Stage 02 rebuilt the trace from the saved vulnerable source tree, patch, PoC bytes, compile/run logs, sanitizer trace, and reviewer feedback; it did not rerun the PoC or dynamically validate the fixed build.",
+    "Because `runtime_disambiguation` is disabled in `run_flags.json`, no extra instrumentation was added; the trace stays source-grounded and uses the saved crash only as runtime evidence that the documented path was actually reached."
+  ],
+  "source": {
+    "file": "fuzzer/fuzzer.c",
+    "function": "extract_policy",
+    "line": 427,
+    "var": "params",
+    "code": "EXTRACT_IF(&params, *data, *size, sizeof(params));",
+    "description": "First non-harness project statement that copies attacker-controlled bytes into the policy-parameter struct later used to select the vulnerable null-cipher helper and the direct-key extraction path.",
+    "value_from": "The staged `poc` is an 85-byte raw testcase. After `LLVMFuzzerTestOneInput()` consumes the first 4 bytes as little-endian `randseed = 0x20202020`, this statement copies the first 32-byte policy record into `params`. In the staged witness, that record begins with selector byte `0xf1`, carries `num_xtn_hdr = 0`, `do_extract_key = 0x20`, and `do_extract_master_keys = 0x20`, and the next 16 bytes at offsets 36..51 are all `0x20` and later become the undersized heap key buffer.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "srtp/srtp.c",
+    "function": "srtp_crypto_policy_set_null_cipher_hmac_null",
+    "line": 3294,
+    "var": "p->cipher_type, p->cipher_key_len",
+    "code": "p->cipher_type = SRTP_NULL_CIPHER;\n    p->cipher_key_len = 16;",
+    "description": "The null-cipher policy helper stores a 16-byte key length even though null-cipher SRTP still expects the AES-ICM key-plus-salt length. This incorrect policy state is later trusted by the fuzzer's key extraction logic.",
+    "note": "The selected helper runs for both `policy->rtp` and `policy->rtcp`. The staged patch changes this exact field from `16` to `SRTP_AES_ICM_128_KEY_LEN_WSALT`, i.e. 30 bytes.",
+    "trace_step": 3
+  },
+  "sink": {
+    "file": "srtp/srtp.c",
+    "function": "srtp_stream_init_keys",
+    "line": 965,
+    "var": "key, input_keylen",
+    "code": "memcpy(tmp_key, key, input_keylen);",
+    "description": "ASan crash site. `srtp_stream_init_keys()` copies `input_keylen` bytes from the caller-supplied master-key buffer into a large local `tmp_key` array; with the staged witness, `input_keylen` is 30 while `key` points to a 16-byte heap allocation.",
+    "note": "The saved sanitizer trace reports `AddressSanitizer: heap-buffer-overflow READ of size 30` at `srtp/srtp.c:965:5`, and its allocation stack identifies the 16-byte source region allocated in `extract_key()`.",
+    "trace_step": 10
+  },
+  "tainted_value_origin": {
+    "file": "fuzzer/fuzzer.c",
+    "function": "extract_key",
+    "line": 302,
+    "var": "ret, key_size",
+    "code": "ret = fuzz_alloc_succeed(key_size, false);\n    EXTRACT(ret, *data, *size, key_size);",
+    "description": "This call materializes the over-read source buffer. The caller supplies `key_size = 16`, so `extract_key()` allocates a 16-byte heap region and copies exactly 16 attacker-controlled bytes into it.",
+    "note": "ASan's allocation stack points at this exact allocation path: `fuzz_alloc -> fuzz_alloc_succeed -> extract_key -> extract_policy`."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "fuzzer/fuzzer.c",
+      "function": "extract_policy",
+      "line": 427,
+      "code": "EXTRACT_IF(&params, *data, *size, sizeof(params));",
+      "description": "The first policy record is present in the staged witness, so `extract_policy()` does not take its early `goto end;` path and commits to building a live `srtp_policy_t` from attacker-controlled bytes.",
+      "note": "Bytes 4..35 are present, so the first root-cause policy is materialized instead of taking the parser's early `goto end` path."
+    },
+    "second_policy_chain_present": {
+      "file": "fuzzer/fuzzer.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 823,
+      "code": "if ((policy_chain_2 = extract_policies(&data, &size)) == NULL) {",
+      "description": "The harness only calls `srtp_create()` after a second `extract_policies()` call succeeds, so the witness must also preserve a second non-NULL policy chain after the first root-cause policy has been parsed.",
+      "note": "After the first chain consumes the 32-byte params record and the 16-byte direct key, byte 52 ends that chain. The saved crash stack reaches `srtp_create()` and `srtp_add_stream()`, and source-wise bytes 53..84 provide the second call's required 32-byte `params` record at `extract_policy()`."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "fuzzer/fuzzer.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness consumes a 4-byte randseed, parses a first policy whose selector and direct-key bytes drive the bug, and requires a trailing second policy record so the `policy_chain_2` gate passes before `srtp_create()`."
+    },
+    {
+      "step": 2,
+      "file": "fuzzer/fuzzer.c",
+      "function": "extract_policy",
+      "summary": "Policy extraction reduces selector byte `0xf1` to index `7`, selects `srtp_crypto_policy_set_null_cipher_hmac_null` for RTP and RTCP, and extracts only a 16-byte heap key buffer."
+    },
+    {
+      "step": 3,
+      "file": "srtp/srtp.c",
+      "function": "srtp_add_stream",
+      "summary": "libsrtp accepts the malformed null-cipher policy, allocates session cipher objects from its null-cipher type, and carries the same 16-byte `policy->key` into stream-key initialization."
+    },
+    {
+      "step": 4,
+      "file": "srtp/srtp.c",
+      "function": "srtp_stream_init_keys",
+      "summary": "Key initialization derives a required length of 30 bytes from `SRTP_NULL_CIPHER` and `memcpy`s 30 bytes from the 16-byte heap key, triggering the saved ASan heap-buffer-overflow read."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "fuzzer/fuzzer.c",
+      "function": "extract_policy",
+      "line": 427,
+      "var": "params",
+      "code": "EXTRACT_IF(&params, *data, *size, sizeof(params));",
+      "note": "Copies the first policy record from the attacker-controlled byte stream into `params`, making the policy selector, `do_extract_key`, and the later key bytes live parser state."
+    },
+    {
+      "step": 2,
+      "file": "fuzzer/fuzzer.c",
+      "function": "extract_policy",
+      "line": 429,
+      "line_end": 430,
+      "var": "params.srtp_crypto_policy_func",
+      "code": "params.srtp_crypto_policy_func %= sizeof(fuzz_srtp_crypto_policies) /\n                                      sizeof(fuzz_srtp_crypto_policies[0]);",
+      "note": "This normalization maps selector byte `0xf1` to index `7` whether `fuzz_srtp_crypto_policies` has 9 entries or 18, so the first policy selects `fuzz_srtp_crypto_policies[7]`, `srtp_crypto_policy_set_null_cipher_hmac_null`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "params.srtp_crypto_policy_func"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "srtp/srtp.c",
+      "function": "srtp_crypto_policy_set_null_cipher_hmac_null",
+      "line": 3293,
+      "line_end": 3294,
+      "var": "p->cipher_type, p->cipher_key_len",
+      "code": "p->cipher_type = SRTP_NULL_CIPHER;\n    p->cipher_key_len = 16;",
+      "note": "The selected helper writes inconsistent policy state: both RTP and RTCP become `SRTP_NULL_CIPHER`, but their required application-supplied key length is recorded as only 16 bytes instead of the 30-byte key-plus-salt length later expected by libsrtp.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "fuzz_srtp_crypto_policies[params.srtp_crypto_policy_func].crypto_policy_func"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "fuzzer/fuzzer.c",
+      "function": "extract_policy",
+      "line": 450,
+      "var": "params.do_extract_key",
+      "code": "if ((params.do_extract_key % 2) == 0) {",
+      "note": "Witness byte `0x20` is even, so the first policy takes the direct-key path and will populate `policy->key` instead of leaving it `NULL`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "params.do_extract_key"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "fuzzer/fuzzer.c",
+      "function": "extract_key",
+      "line": 302,
+      "line_end": 303,
+      "var": "ret, key_size",
+      "code": "ret = fuzz_alloc_succeed(key_size, false);\n    EXTRACT(ret, *data, *size, key_size);",
+      "note": "Called from step 4 with `key_size = policy->rtp.cipher_key_len = 16`, `extract_key()` allocates a 16-byte heap buffer and copies the next 16 witness bytes into it. This is the exact 16-byte region later named by ASan as the over-read source.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "policy->rtp.cipher_key_len"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "((params.do_extract_key % 2) == 0)"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "srtp/srtp.c",
+      "function": "srtp_add_stream",
+      "line": 2860,
+      "line_end": 2868,
+      "var": "policy->key, policy->rtp.cipher_type, policy->rtp.cipher_key_len",
+      "code": "status = srtp_valid_policy(policy);\n    if (status != srtp_err_status_ok) {\n        return status;\n    }\n    if ((session == NULL) || (policy == NULL) ||\n        (!srtp_validate_policy_master_keys(policy)))\n        return srtp_err_status_bad_param;",
+      "note": "The malformed null-cipher policy is accepted here. `srtp_valid_policy()` only rejects `deprecated_ekt`, and `srtp_validate_policy_master_keys()` checks only that a key pointer exists and MKI sizes are bounded. No guard compares the supplied 16-byte key buffer against the 30-byte length later required for `SRTP_NULL_CIPHER`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "policy->rtp.cipher_type, policy->rtp.cipher_key_len"
+        },
+        {
+          "on": 5,
+          "type": "data",
+          "via": "policy->key"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "srtp/srtp.c",
+      "function": "srtp_stream_alloc",
+      "line": 340,
+      "line_end": 363,
+      "var": "p->rtp.cipher_type, p->rtcp.cipher_type, session_keys->rtp_cipher, session_keys->rtcp_cipher",
+      "code": "stat = srtp_crypto_kernel_alloc_cipher(\n            p->rtp.cipher_type, &session_keys->rtp_cipher,\n            p->rtp.cipher_key_len, p->rtp.auth_tag_len);\n...\n        stat = srtp_crypto_kernel_alloc_cipher(\n            p->rtcp.cipher_type, &session_keys->rtcp_cipher,\n            p->rtcp.cipher_key_len, p->rtcp.auth_tag_len);",
+      "note": "Stream allocation materializes the policy's null-cipher choice into session state. For `SRTP_NULL_CIPHER`, the callee `srtp_null_cipher_alloc()` stores `(*c)->type = &srtp_null_cipher`, so both `session_keys->rtp_cipher->type` and `session_keys->rtcp_cipher->type` now identify the null cipher that step 9 queries.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "p->rtp.cipher_type, p->rtcp.cipher_type"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "status == srtp_err_status_ok"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "srtp/srtp.c",
+      "function": "srtp_stream_init_all_master_keys",
+      "line": 862,
+      "line_end": 867,
+      "var": "key, single_master_key.key",
+      "code": "if (key != NULL) {\n        srtp->num_master_keys = 1;\n        single_master_key.key = key;\n        single_master_key.mki_id = NULL;\n        single_master_key.mki_size = 0;\n        status = srtp_stream_init_keys(srtp, &single_master_key, 0);\n    }",
+      "note": "Because step 5 produced a non-NULL `policy->key`, initialization takes the direct-key branch, aliases that same 16-byte heap buffer as `single_master_key.key`, and passes it into `srtp_stream_init_keys()` for the session state created in step 7.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "policy->key"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "stat == srtp_err_status_ok"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "srtp/srtp.c",
+      "function": "srtp_stream_init_keys",
+      "line": 928,
+      "line_end": 932,
+      "var": "input_keylen, input_keylen_rtcp",
+      "code": "input_keylen = full_key_length(session_keys->rtp_cipher->type);\n    input_keylen_rtcp = full_key_length(session_keys->rtcp_cipher->type);\n    if (input_keylen_rtcp > input_keylen) {\n        input_keylen = input_keylen_rtcp;\n    }",
+      "note": "Because the session-level cipher objects from step 7 both point at `srtp_null_cipher`, `full_key_length(...)` takes the `SRTP_NULL_CIPHER` case and derives `input_keylen = 30`.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "session_keys->rtp_cipher->type, session_keys->rtcp_cipher->type"
+        },
+        {
+          "on": 8,
+          "type": "control",
+          "via": "key != NULL"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "srtp/srtp.c",
+      "function": "srtp_stream_init_keys",
+      "line": 964,
+      "line_end": 965,
+      "var": "tmp_key, key, input_keylen",
+      "code": "memset(tmp_key, 0x0, MAX_SRTP_KEY_LEN);\n    memcpy(tmp_key, key, input_keylen);",
+      "note": "The destination `tmp_key` is a 256-byte stack array, so the fault is entirely on the source side: this `memcpy` reads `input_keylen = 30` bytes from the 16-byte heap buffer aliased in step 8. ASan reports the resulting heap-buffer-overflow read of size 30 at this exact statement.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "key"
+        },
+        {
+          "on": 9,
+          "type": "data",
+          "via": "input_keylen"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 30,
+    "crash_location": {
+      "file": "srtp/srtp.c",
+      "function": "srtp_stream_init_keys",
+      "line": 965
+    },
+    "allocation_context": {
+      "file": "fuzzer/fuzzer.c",
+      "function": "extract_key",
+      "line": 302
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "srtp_stream_init_keys",
+        "file": "srtp/srtp.c",
+        "line": 965
+      },
+      {
+        "frame": 1,
+        "function": "srtp_stream_init_all_master_keys",
+        "file": "srtp/srtp.c",
+        "line": 867
+      },
+      {
+        "frame": 2,
+        "function": "srtp_stream_init",
+        "file": "srtp/srtp.c",
+        "line": 1309
+      },
+      {
+        "frame": 3,
+        "function": "srtp_add_stream",
+        "file": "srtp/srtp.c",
+        "line": 2877
+      },
+      {
+        "frame": 4,
+        "function": "srtp_create",
+        "file": "srtp/srtp.c",
+        "line": 2950
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzzer/fuzzer.c",
+        "line": 828
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "fuzz_alloc",
+        "file": "fuzzer/fuzzer.c",
+        "line": 107
+      },
+      {
+        "frame": 1,
+        "function": "fuzz_alloc_succeed",
+        "file": "fuzzer/fuzzer.c",
+        "line": 126
+      },
+      {
+        "frame": 2,
+        "function": "extract_key",
+        "file": "fuzzer/fuzzer.c",
+        "line": 302
+      },
+      {
+        "frame": 3,
+        "function": "extract_policy",
+        "file": "fuzzer/fuzzer.c",
+        "line": 451
+      },
+      {
+        "frame": 4,
+        "function": "extract_policies",
+        "file": "fuzzer/fuzzer.c",
+        "line": 494
+      },
+      {
+        "frame": 5,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzzer/fuzzer.c",
+        "line": 819
+      }
+    ],
+    "patch_resolves": true,
+    "patch_resolves_note": "The staged patch replaces `cipher_key_len = 16` in both null-cipher helper functions with `SRTP_AES_ICM_128_KEY_LEN_WSALT`, so the same witness drives `extract_key()` to allocate a 30-byte master-key buffer that matches `full_key_length(SRTP_NULL_CIPHER)`.",
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "The allocation context is the 16-byte fuzzer-side key buffer, while the earlier logical root cause is the null-cipher helper's incorrect `cipher_key_len = 16`.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run executed `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_38359 run --version vulnerable --expect crash`, which fed the staged `poc` file to `/out/srtp-fuzzer` and reproduced `AddressSanitizer: heap-buffer-overflow READ of size 30` in `srtp_stream_init_keys`.",
+    "format": {
+      "name": "libsrtp srtp-fuzzer raw testcase",
+      "contract": "The staged witness is exactly the 85-byte `poc` file. Bytes 0..3 are the little-endian randseed `0x20202020`. Bytes 4..35 form the first policy record; selector byte `0xf1` reduces to index `7` for either the 9-entry or 18-entry `fuzz_srtp_crypto_policies` table, selecting `srtp_crypto_policy_set_null_cipher_hmac_null`. The same first record carries even `do_extract_key = 0x20`, so `extract_policy()` calls `extract_key()` with `key_size = 16`, and bytes 36..51 become the 16-byte `policy->key` buffer later over-read. The staged harness also requires a second non-NULL `policy_chain_2`: byte 52 stops additional policies in the first chain, and bytes 53..84 supply the second call's 32-byte `params` record before `LLVMFuzzerTestOneInput()` reaches `srtp_create()`."
+    }
+  }
+}

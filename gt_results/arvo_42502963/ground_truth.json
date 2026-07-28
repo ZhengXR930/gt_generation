@@ -1,0 +1,470 @@
+{
+  "sample_id": "arvo_42502963",
+  "vuln_id": "OSS-Fuzz issue 42502963 / ARVO arvo:42502963",
+  "project": {
+    "id": "freeradius-server",
+    "name": "FreeRADIUS",
+    "repo": "https://github.com/FreeRADIUS/freeradius-server.git",
+    "vulnerable_commit": "90284231653fc167b80572499199632511f2cd7a",
+    "fixed_commit": "66e59da0336526c1f2d2d49aa12838b26d0e8240",
+    "staged_checkout_commit": "3bb7cd828f502473dc533572a4b3ef33694a9568",
+    "commit_note": "Stage 01 reproduced against the staged vulnerable checkout at `_work/src/freeradius-server` on commit `3bb7cd828f502473dc533572a4b3ef33694a9568`, not the metadata `vulnerable_commit`. This staged tree still contains the unfixed `dns_label_decode()` helper at `src/lib/util/dns.c:1153-1166` and matches the saved ASan line numbers.",
+    "fuzz_target": "fuzzer_dns"
+  },
+  "staged_source_snapshot": {
+    "path": "_work/src/freeradius-server",
+    "commit": "3bb7cd828f502473dc533572a4b3ef33694a9568",
+    "description": "Stage 01 reproduced against this staged vulnerable source snapshot. The `decode.c` and `dns.c` line anchors below were resolved against that checkout and agree with the staged `patch.diff` hunk plus the saved sanitizer trace."
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "READ",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "OSS-Fuzz issue 42502963 (freeradius-server): Heap-buffer-overflow READ 1 found by fuzz target fuzzer_dns [asan]. https://issues.oss-fuzz.com/issues/42502963",
+    "original_source": "sample_info.json issue_description / sanitizer_trace.txt / default_crash_trace.txt / patch.diff / reproduction_report.json / staged vulnerable source",
+    "normalized": "In the staged vulnerable FreeRADIUS checkout `3bb7cd828f502473dc533572a4b3ef33694a9568`, the exact 64-byte witness `20 20 20 20 00 00 20 20 20 20 20 20 01 2d 00 00 0c 20 20 20 20 20 20 00 25 20 20 20 20 20 ff 20 20 20 20 20 20 20 ff 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 ff 20 20 c0 0d` gives `fr_dns_decode()` `QDCOUNT == 0` and `ANCOUNT == 0x2020`, so `decode_record()` enters answer-RR parsing at offset 12. The first RR begins with the name `01 2d 00`; its successful decode both records label block `12..15` in `packet_ctx->lb` and consumes bytes `12..61`, leaving the second RR name as the trailing `c0 0d` at offsets `62..63`. For that second RR, `decode_dns_labels()` first calls `fr_dns_label_uncompressed_length(packet, buf = packet + 62, buf_len = 64, &next, lb)`. The compression pointer resolves to offset `13`, which passes `dns_pointer_valid()` because it lies inside the saved first-name block. After the helper jumps to `packet + 13`, the label-content loop reaches byte `0x00` at offset `14`, and `return -(q - buf)` becomes the positive value `48` because `q = packet + 14` and `buf = packet + 62`. Since that first call returns `48 > 0`, `decode_dns_labels()` skips `goto raw` and keeps `labels_len = next - data = 2`. `fr_dns_label_to_value_box()` immediately repeats the same length probe with `len == 2`; it reaches the same invalid byte `0x00`, returns `48` again, and leaves `after = packet + 64`, so the decode loop still runs. The first vulnerable `dns_label_decode()` call then treats byte `0x2d` at offset `13` as a 45-byte label length and returns `next = packet + 59`. The loop resumes inside prior RR data at bytes `59..60 == ff 20`; a second `dns_label_decode()` interprets those two bytes as compression offset `0x3f20`, assigns `p = packet + 0x3f20` without validating that target, and dereferences `*p` in `*next = p + *p + 1`, producing the saved AddressSanitizer heap-buffer-overflow READ at `src/lib/util/dns.c:1166`. The patch resolves this crash path by passing packet/end into `dns_label_decode()`, rejecting invalid pointer targets before dereference, and propagating negative `slen` returns in `fr_dns_label_to_value_box()`."
+  },
+  "source": {
+    "file": "src/protocols/dns/decode.c",
+    "function": "decode_record",
+    "line": 429,
+    "var": "p, end - p, packet_ctx",
+    "code": "slen = fr_struct_from_network(ctx, cursor, attr, p, end - p, true,\n\t\t\t      packet_ctx, decode_value_trampoline, NULL);",
+    "description": "First project-side handoff of the exact malformed second RR slice into structured RR decoding. On iteration 1 this call presents `p = packet + 62`, `end - p = 2`, and trailing bytes `c0 0d`, while `packet_ctx` still carries the full packet and the label blocks accumulated from earlier RR names.",
+    "value_from": "RR iteration 0 returned `slen == 50`, which advanced `p` from `packet + 12` to `packet + 62` and left `packet_ctx->lb` containing the first RR name block `12..15`. The staged witness ends with `c0 0d`, so this call is where that two-byte compressed name becomes the current RR input.",
+    "trace_step": 3
+  },
+  "tainted_value_origin": {
+    "file": "src/protocols/dns/decode.c",
+    "function": "decode_dns_labels",
+    "line": 392,
+    "var": "data, labels_len, data + total",
+    "code": "slen = fr_dns_label_to_value_box(vp, &vp->data, data, labels_len, data + total, true, packet_ctx->lb);",
+    "description": "This call turns the second RR name into the exact helper input that later reaches the sink: after the first positive length-probe return, `decode_dns_labels()` has `labels_len = 2`, so it passes `src = packet + 62`, `label = data + total = packet + 62`, and the accumulated `lb` state into `fr_dns_label_to_value_box()`."
+  },
+  "root_cause": {
+    "file": "src/lib/util/dns.c",
+    "function": "dns_label_decode",
+    "line": 1159,
+    "var": "offset, p",
+    "code": "offset = p[1];\noffset += ((*p & ~0xc0) << 8);\np = buf + offset;",
+    "description": "Root cause. On the second decode pass, only reachable because both prior length probes returned positive `48`, `dns_label_decode()` treats bytes `ff 20` as a compressed-label pointer, computes attacker-controlled offset `0x3f20`, and assigns `p = buf + offset` without checking that the target is backward and within the current packet extent. The patch adds packet/end arguments and rejects exactly these invalid targets before `*p` is used.",
+    "note": "This location is the unfixed hunk in `patch.diff`: the vulnerable helper has no equivalent of the patch's `q >= p`, `*p >= 0xc0`, or `(p + *p + 1) > end` checks, and the caller at `fr_dns_label_to_value_box()` now returns immediately on negative `slen`.",
+    "trace_step": 11
+  },
+  "sink": {
+    "file": "src/lib/util/dns.c",
+    "function": "dns_label_decode",
+    "line": 1166,
+    "var": "*p, *next",
+    "code": "*next = p + *p + 1;",
+    "description": "ASan crash site. After step 11 sets `p` to `packet + 0x3f20`, this statement dereferences `*p` at that wild address to compute the next label pointer.",
+    "note": "The saved ASan trace reports `heap-buffer-overflow READ of size 1` in `dns_label_decode` at `src/lib/util/dns.c:1166:14`, with stack `dns_label_decode -> fr_dns_label_to_value_box -> decode_dns_labels`.",
+    "trace_step": 12
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/protocols/dns/decode.c",
+      "function": "fr_dns_decode",
+      "line": 474,
+      "code": "slen = decode_record(ctx, cursor, attr_dns_rr, p, end - p, packet_ctx, packet + 6);",
+      "description": "The exact 64-byte witness passes the fixed-header decode and enters the answer-record parser with `p = packet + 12`, `end - p = 52`, and `counter = packet + 6`; that parser path is the only one that reaches the malformed second RR name."
+    }
+  },
+  "evidence_limitations": [
+    "Runtime disambiguation is disabled in `run_flags.json`, so the chain is grounded only in the staged vulnerable source, `patch.diff`, the saved AddressSanitizer traces, `reproduction_report.json`, and the exact staged `poc` bytes. Those artifacts are sufficient here because both the pointer-manipulation logic and the crashing dereference are visible in source.",
+    "Stage 02 did not execute a fixed build. `sanitizer_ground_truth.patch_resolves` below is source-grounded from the patch text matching the vulnerable helper and caller, not from dynamic differential validation."
+  ],
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "src/protocols/dns/decode.c",
+      "function": "decode_record",
+      "summary": "Answer-count bytes `0x20 0x20` make `decode_record()` iterate through answer RRs; the first RR consumes bytes `12..61`, advances `p` to `62`, and leaves `packet_ctx->lb` tracking the first RR name block `12..15`."
+    },
+    {
+      "step": 2,
+      "file": "src/protocols/dns/decode.c / src/lib/util/dns.c",
+      "function": "decode_dns_labels / fr_dns_label_uncompressed_length",
+      "summary": "For the second RR name `c0 0d`, the first `fr_dns_label_uncompressed_length()` call jumps to offset `13`, reaches invalid byte `0x00` at offset `14`, and returns positive `48`, so `decode_dns_labels()` keeps `labels_len = 2` instead of falling back to raw bytes."
+    },
+    {
+      "step": 3,
+      "file": "src/protocols/dns/decode.c / src/lib/util/dns.c",
+      "function": "decode_dns_labels / fr_dns_label_to_value_box / dns_label_decode",
+      "summary": "`fr_dns_label_to_value_box()` repeats the same length probe, again gets positive `48` and `after = packet + 64`, then the first `dns_label_decode()` treats byte `0x2d` as length 45 and advances `current` into prior RR data at offset `59`, where the bytes are `ff 20`."
+    },
+    {
+      "step": 4,
+      "file": "src/lib/util/dns.c",
+      "function": "dns_label_decode",
+      "summary": "A second `dns_label_decode()` call interprets `ff 20` as compression-pointer offset `0x3f20`, assigns `p = packet + 0x3f20` with no target validation, and dereferences `*p` at line 1166, matching the saved ASan heap-buffer-overflow."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/protocols/dns/decode.c",
+      "function": "decode_record",
+      "line": 417,
+      "line_end": 419,
+      "var": "count, i",
+      "code": "count = fr_net_to_uint16(counter);\nfor (i = 0; i < count; i++) {",
+      "note": "For the answer-record decoder, `counter = packet + 6`, so bytes `[6,7] == 0x20 0x20` become `count == 0x2020` (`8224`). That makes the loop attempt at least two RR decodes, which is necessary to reach the trailing `c0 0d` name at offsets `62..63`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "src/protocols/dns/decode.c",
+      "function": "decode_record",
+      "line": 429,
+      "line_end": 432,
+      "var": "slen, p, packet_ctx->lb",
+      "code": "slen = fr_struct_from_network(ctx, cursor, attr, p, end - p, true,\n\t\t\t      packet_ctx, decode_value_trampoline, NULL);\nif (slen < 0) return slen;\np += slen;",
+      "note": "On RR iteration 0, `fr_struct_from_network()` accepts the first RR beginning at offset 12 and returns `slen == 50`: name `01 2d 00` (3 bytes), RR header `00 0c ... 00 25` (10 bytes), and `RDLENGTH == 0x0025` bytes of RDATA (37 bytes). Advancing `p` by 50 moves iteration 1 to offset 62. During that same first RR name decode, `packet_ctx->lb` records block `12..15`, so later pointer offset 13 is treated as landing inside a known DNS-label block.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "count == 0x2020"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "i < count"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/protocols/dns/decode.c",
+      "function": "decode_record",
+      "line": 429,
+      "line_end": 430,
+      "var": "p, end - p, packet_ctx",
+      "code": "slen = fr_struct_from_network(ctx, cursor, attr, p, end - p, true,\n\t\t\t      packet_ctx, decode_value_trampoline, NULL);",
+      "note": "Source. On RR iteration 1, `p = packet + 62`, `end - p = 2`, and the remaining two bytes are exactly `c0 0d`. This call is the first project-side handoff of that malformed RR slice, along with the full-packet context and the prior label blocks, into the RR decoder.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "p == packet + 62"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "packet_ctx->lb"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "i < count"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/lib/util/dns.c",
+      "function": "fr_dns_label_uncompressed_length",
+      "line": 992,
+      "line_end": 1048,
+      "var": "offset, q, *next",
+      "code": "if (!dns_pointer_valid(lb, offset)) {\n\t...\n}\nq = packet + offset;\nif (*q > 63) {\n\t...\n}\nif (!*q) {\n\t...\n}\nif (current == start) {\n\t*next = p + 2;\n\talready_set_next = true;\n}\np = current = q;",
+      "note": "Called from `decode_dns_labels()` with `packet = packet_ctx->packet`, `buf = data = packet + 62`, and `buf_len = data + data_len - packet_ctx->packet = 64`, this helper interprets `c0 0d` as pointer offset `13`. `dns_pointer_valid(lb, 13)` succeeds because step 2 left block `12..15`, `q = packet + 13` points to byte `0x2d` (nonzero and `< 64`), and the first jump therefore sets `*next = packet + 64`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "data == packet + 62"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "lb->blocks include 12..15"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/protocols/dns/decode.c",
+      "function": "decode_dns_labels",
+      "line": 354,
+      "line_end": 360,
+      "var": "slen, next, labels_len",
+      "code": "slen = fr_dns_label_uncompressed_length(packet_ctx->packet, data, data + data_len - packet_ctx->packet, &next, packet_ctx->lb);\nif (slen <= 0) {\n\t...\n\tgoto raw;\n}\nlabels_len = next - data;",
+      "note": "After step 4 jumps to offset 13, the helper's label-character loop reaches byte `0x00` at offset 14 and executes `return -(q - buf)` at `dns.c:1089`. Because `q = packet + 14` and `buf = packet + 62`, that return value is the positive `48`, not an error. `decode_dns_labels()` therefore sees `slen > 0`, skips `goto raw`, and keeps `labels_len = next - data = 2`.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "q == packet + 13, next == packet + 64"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "data == packet + 62"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/protocols/dns/decode.c",
+      "function": "decode_dns_labels",
+      "line": 392,
+      "line_end": 392,
+      "var": "data, labels_len, data + total",
+      "code": "slen = fr_dns_label_to_value_box(vp, &vp->data, data, labels_len, data + total, true, packet_ctx->lb);",
+      "note": "Tainted value origin. With `labels_len == 2` from step 5, this call hands `fr_dns_label_to_value_box()` the exact crashing RR-name slice: `src = data = packet + 62`, `label = data + total = packet + 62`, and the accumulated `packet_ctx->lb` state.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "labels_len == 2"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "data == packet + 62"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "packet_ctx->lb"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/lib/util/dns.c",
+      "function": "fr_dns_label_uncompressed_length",
+      "line": 992,
+      "line_end": 1048,
+      "var": "offset, q, *next",
+      "code": "if (!dns_pointer_valid(lb, offset)) {\n\t...\n}\nq = packet + offset;\nif (*q > 63) {\n\t...\n}\nif (!*q) {\n\t...\n}\nif (current == start) {\n\t*next = p + 2;\n\talready_set_next = true;\n}\np = current = q;",
+      "note": "Called again from `fr_dns_label_to_value_box()` with `buf = src = packet + 62` and `buf_len = len = 2`, the same `c0 0d` pointer again resolves to offset `13`. As in step 4, `dns_pointer_valid(lb, 13)` succeeds and the first jump updates the caller's `after` pointer to `packet + 64`.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "src == packet + 62"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "lb->blocks include 12..15"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/lib/util/dns.c",
+      "function": "fr_dns_label_to_value_box",
+      "line": 1206,
+      "line_end": 1209,
+      "var": "slen, after",
+      "code": "slen = fr_dns_label_uncompressed_length(packet, src, len, &after, lb);\nif (slen <= 0) {\n\tFR_PROTO_TRACE(\"dns_label_to_value_box - Failed getting length\");\n\treturn slen;\n}",
+      "note": "This second length probe reaches the same invalid byte `0x00` at offset 14 and returns `48` again via `return -(q - buf)`. Because `slen <= 0` is false at line 1207, `fr_dns_label_to_value_box()` does not return and keeps `after = packet + 64`; that is the second load-bearing positive return needed for the later `dns_label_decode()` calls.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "q == packet + 13, after == packet + 64"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "src == packet + 62"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/lib/util/dns.c",
+      "function": "dns_label_decode",
+      "line": 1153,
+      "line_end": 1167,
+      "var": "offset, p, next",
+      "code": "if (*p > 63) {\n\tuint16_t offset;\n\n\toffset = p[1];\n\toffset += ((*p & ~0xc0) << 8);\n\n\tp = buf + offset;\n}\n*start = p;\n*next = p + *p + 1;\nreturn *p;",
+      "note": "The first `dns_label_decode()` call sees the two RR-name bytes `c0 0d`, computes `offset == 13`, sets `p = packet + 13`, and immediately trusts `*p == 0x2d` as a label length. It returns `slen == 45` and `next == packet + 59`, so the `'-'` byte inside the first RR name is reinterpreted as a 45-byte label header.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "label == packet + 62"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "after == packet + 64"
+        },
+        {
+          "on": 8,
+          "type": "control",
+          "via": "slen > 0"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/lib/util/dns.c",
+      "function": "fr_dns_label_to_value_box",
+      "line": 1267,
+      "line_end": 1274,
+      "var": "slen, current, next, after",
+      "code": "memcpy(p, current + 1, slen);\np += slen;\ncurrent = next;",
+      "note": "With step 9's by-reference updates, `current` was first redirected to offset 13 and `next` to offset 59. This copy reads bytes `14..58`, then advances the loop state to `current = packet + 59`. Because step 8 left `after = packet + 64` and byte 59 is `0xff`, the loop condition remains true for one more `dns_label_decode()` call.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "data",
+          "via": "current == packet + 13, slen == 45, next == packet + 59"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "after == packet + 64"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "src/lib/util/dns.c",
+      "function": "dns_label_decode",
+      "line": 1156,
+      "line_end": 1159,
+      "var": "offset, p",
+      "code": "offset = p[1];\noffset += ((*p & ~0xc0) << 8);\np = buf + offset;",
+      "note": "Root cause. The second `dns_label_decode()` call starts at bytes `59..60 == ff 20`, so it computes `offset == 0x3f20` and sets `p = packet + 0x3f20`. The vulnerable helper performs this pointer-target resolution with no check that the target is backward or within the packet/label extent; the patch adds those validations and returns an error here instead.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "current == packet + 59"
+        },
+        {
+          "on": 10,
+          "type": "control",
+          "via": "((current < after) && (*current != 0x00))"
+        },
+        {
+          "on": 10,
+          "type": "control",
+          "via": "*current > 63"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "src/lib/util/dns.c",
+      "function": "dns_label_decode",
+      "line": 1165,
+      "line_end": 1167,
+      "var": "*p, *next",
+      "code": "*start = p;\n*next = p + *p + 1;\nreturn *p;",
+      "note": "Sink. After step 11 makes `p` a wild pointer far beyond the 64-byte packet, this statement dereferences `*p` to compute `*next` and return the label length, matching the saved ASan crash at line 1166.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "p = buf + offset"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 1,
+    "crash_location": {
+      "file": "src/lib/util/dns.c",
+      "function": "dns_label_decode",
+      "line": 1166
+    },
+    "allocation_context": null,
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "dns_label_decode",
+        "file": "src/lib/util/dns.c",
+        "line": 1166
+      },
+      {
+        "frame": 1,
+        "function": "fr_dns_label_to_value_box",
+        "file": "src/lib/util/dns.c",
+        "line": 1242
+      },
+      {
+        "frame": 2,
+        "function": "decode_dns_labels",
+        "file": "src/protocols/dns/decode.c",
+        "line": 392
+      },
+      {
+        "frame": 3,
+        "function": "decode_value_trampoline",
+        "file": "src/protocols/dns/decode.c",
+        "line": 108
+      },
+      {
+        "frame": 4,
+        "function": "fr_struct_from_network",
+        "file": "src/lib/util/struct.c",
+        "line": 248
+      },
+      {
+        "frame": 5,
+        "function": "decode_record",
+        "file": "src/protocols/dns/decode.c",
+        "line": 429
+      },
+      {
+        "frame": 6,
+        "function": "fr_dns_decode",
+        "file": "src/protocols/dns/decode.c",
+        "line": 474
+      },
+      {
+        "frame": 7,
+        "function": "fr_dns_decode_proto",
+        "file": "src/protocols/dns/decode.c",
+        "line": 599
+      },
+      {
+        "frame": 8,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "src/bin/fuzzer.c",
+        "line": 217
+      }
+    ],
+    "allocation_stack": [],
+    "free_stack": [],
+    "dedup_token": "dns_label_decode--fr_dns_label_to_value_box--decode_dns_labels",
+    "patch_resolves": true,
+    "patch_resolves_note": "Source-grounded only: `patch.diff` changes `dns_label_decode()` to accept packet/end, adds pointer-target validation before any `*p` dereference, and makes `fr_dns_label_to_value_box()` return immediately on negative `slen`. Stage 02 did not execute the fixed image.",
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "source": "sanitizer_trace.txt / default_crash_trace.txt / reproduction_report.json / patch.diff / staged vulnerable source",
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved vulnerable run executed `PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir /mnt/datastore/gt_generation/gt_results/arvo_42502963 run --version vulnerable --expect crash`, which fed the staged `poc` into `fuzzer_dns` and reproduced `AddressSanitizer: heap-buffer-overflow READ of size 1` in `dns_label_decode` with stack `fr_dns_label_to_value_box -> decode_dns_labels`.",
+    "format": {
+      "name": "64-byte DNS RR pointer witness",
+      "contract": "The staged evidence proves the exact 64-byte witness `20 20 20 20 00 00 20 20 20 20 20 20 01 2d 00 00 0c 20 20 20 20 20 20 00 25 20 20 20 20 20 ff 20 20 20 20 20 20 20 ff 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 ff 20 20 c0 0d`. In that exact layout, bytes `[6,7] == 0x20 0x20` make `decode_record()` parse answer RRs; the first RR occupies offsets `12..61` and records label block `12..15`; the trailing `c0 0d` pointer then makes both `fr_dns_label_uncompressed_length()` calls jump to offset `13`, reach invalid byte `0x00` at offset `14`, and return positive `48`; that keeps `labels_len == 2` and `after == packet + 64`, so `dns_label_decode()` later reaches bytes `59..60 == ff 20` and turns them into the wild offset `0x3f20`. The staged artifacts do not prove a broader input class."
+    }
+  }
+}

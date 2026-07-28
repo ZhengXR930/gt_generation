@@ -1,0 +1,402 @@
+{
+  "sample_id": "arvo_11248",
+  "vuln_id": "OSS-Fuzz issue 11248 / ARVO arvo:11248",
+  "project": {
+    "id": "poppler",
+    "name": "Poppler",
+    "repo": "https://anongit.freedesktop.org/git/poppler/poppler.git",
+    "vulnerable_commit": "d1223ff2890a028834d1bdccb8984dc58575eda1",
+    "fixed_commit": "97bbfd67d7fa4d633e10e3dc90fd523051607836",
+    "fuzz_target": "pdf_fuzzer (libFuzzer_poppler_pdf_fuzzer, MSAN)"
+  },
+  "classification": {
+    "class": "use-of-uninitialized-value",
+    "cwe": "CWE-457",
+    "access": "READ",
+    "detector": "MemorySanitizer"
+  },
+  "bug_description": {
+    "original": "Detailed report: https://oss-fuzz.com/testcase?key=5732071763345408 Project: poppler Fuzzer: libFuzzer_poppler_pdf_fuzzer Fuzz target binary: pdf_fuzzer Job Type: libfuzzer_msan_poppler Platform Id: linux Crash Type: Use-of-uninitialized-value Crash Address: Crash State: Parser::makeStream Parser::getObj Hints::readTables Sanitizer: memory (MSAN) Recommended Security Severity: Medium Regressed: https://oss-fuzz.com/revisions?job=libfuzzer_msan_poppler&range=201811020302:201811030258 Reproducer Testcase: https://oss-fuzz.com/download?testcase_id=5732071763345408 Issue filed automatically. See https://github.com/google/oss-fuzz/blob/master/docs/reproducing.md for more information. This bug is subject to a 90 day disclosure deadline. If 90 days elapse without an upstream patch, then the bug report will automatically become visible to the public. When you fix this bug, please * mention the fix revision(s). * state whether the bug was a short-lived regression or an old bug in any stable releases. * add any other useful information. This information can help downstream consumers. If you need to contact the OSS-Fuzz team with a question, concern, or any other feedback, please file an issue at https://github.com/google/oss-fuzz/issues.",
+    "original_source": "ARVO-Meta / OSS-Fuzz issue metadata",
+    "normalized": "When Poppler opens the staged linearized PDF, PDFDoc::setup constructs an XRef with the file's linearization-derived main xref offset. The witness xref text contains subsection header `xref 3 8`, so XRef::readXRefTable resizes the logical table to 11 entries while reserve rounds capacity up to 1024; entries above index 10 therefore remain heap-uninitialized. Later, Hints::readTables copies the attacker-controlled hint bytes (`/H [726 529]`) and parses them as `20 0 obj ... stream`, so Parser::getObj requests object 20 0 as a stream. Vulnerable XRef::getEntry uses the linearized fast path `mainXRefEntriesOffset + 20 * i` with `/T 2080` and `i = 20`, landing at offset 2480, beyond the 2266-byte witness. parseEntry fails without writing the slot, but getEntry only logs the error and still returns `entries[20]`. Parser::makeStream then calls `entry->getFlag(XRefEntry::Parsing)` on that reserved-but-uninitialized slot's `flags` field, and MemorySanitizer reports use-of-uninitialized-value. The fix's XRef.cc hunk returns a dummy entry on invalid/failed direct parses; the same commit's Hints.cc memset guard is not part of the witnessed stack."
+  },
+  "source": {
+    "file": "poppler/PDFDoc.cc",
+    "function": "PDFDoc::setup",
+    "line": 271,
+    "var": "xref",
+    "code": "xref = new XRef(str, getStartXRef(), getMainXRefEntriesOffset(), &wasReconstructed);",
+    "description": "First project-code materialization point on the vulnerable path. It builds the XRef object from the attacker-controlled PDF and stores the linearization-derived main xref offset used later by the direct `getEntry()` lookup.",
+    "value_from": "The exact 2266-byte witness ends with `startxref 178` and begins with a linearization dictionary containing `/T 2080`; `PDFDoc::setup` passes those file-derived offsets into `new XRef(...)`.",
+    "trace_step": 1
+  },
+  "tainted_value_origin": {
+    "file": "poppler/XRef.cc",
+    "function": "XRef::reserve",
+    "line": 400,
+    "var": "entries",
+    "code": "void *p = greallocn_checkoverflow(entries, realNewSize, sizeof(XRefEntry));",
+    "description": "MemorySanitizer attributes the poisoned value to this heap allocation. `reserve()` grows the backing array to `realNewSize`, but later `resize()` initializes only indices below the new logical `size`, so spare-capacity slots like `entries[20]` can remain uninitialized."
+  },
+  "sink": {
+    "file": "poppler/Parser.cc",
+    "function": "Parser::makeStream",
+    "line": 204,
+    "var": "entry->flags",
+    "code": "if (!entry->getFlag(XRefEntry::Parsing) ||",
+    "description": "MSAN crash site. `getFlag()` masks `entry->flags`, so when `makeStream()` receives the uninitialized xref slot returned by `getEntry()`, this predicate reads poisoned heap data.",
+    "note": "The staged reproduction report and sanitizer trace both report `MemorySanitizer: use-of-uninitialized-value` at `poppler/Parser.cc:204:45` in `Parser::makeStream`.",
+    "trace_step": 6
+  },
+  "root_cause": {
+    "file": "poppler/XRef.cc",
+    "function": "XRef::getEntry",
+    "line": 1556,
+    "var": "i, entries[i], entry->flags",
+    "code": "if (!parseEntry(mainXRefEntriesOffset + 20*i, &entries[i])) {",
+    "description": "The direct linearization-xref lookup path hands `&entries[i]` to `parseEntry()` and, if parsing fails, only logs the error before later returning that same slot. For a slot above the initialized logical size, this propagates uninitialized heap state into callers instead of returning a dummy/initialized entry.",
+    "note": "For the witness, step 4 supplies `i = 20` and step 1 supplied `mainXRefEntriesOffset = 2080`, so the fast path probes byte offset 2480. That is beyond the 2266-byte PDF, `parseEntry()` returns false without writing `flags`, and vulnerable `getEntry()` still returns `&entries[20]` at line 1583. The fix adds the missing invalid-index and parse-failure returns.",
+    "trace_step": 5
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "poppler/PDFDoc.cc",
+      "function": "PDFDoc::getPage",
+      "line": 2110,
+      "code": "if (isLinearized() && checkLinearization()) {",
+      "condition": "The witness is accepted as a linearized PDF, so rendering page 1 enters `checkLinearization()` and constructs `Hints`, which reaches the crashing `Hints::readTables -> Parser::getObj -> Parser::makeStream` path."
+    }
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "fuzz/pdf_fuzzer.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness loads the witness PDF and renders its page, driving Poppler through xref construction and the linearization hints path."
+    },
+    {
+      "step": 2,
+      "file": "poppler/XRef.cc",
+      "function": "XRef::readXRefTable",
+      "summary": "The initial xref subsection `3 8` makes Poppler resize the logical table to 11 entries while keeping spare capacity in the heap-allocated `entries` array."
+    },
+    {
+      "step": 3,
+      "file": "poppler/Hints.cc",
+      "function": "Hints::readTables",
+      "summary": "The linearization hints buffer parses as `20 0 obj ... stream`, so the hints parser requests object 20 0 as a stream on the same XRef."
+    },
+    {
+      "step": 4,
+      "file": "poppler/XRef.cc",
+      "function": "XRef::getEntry",
+      "summary": "The linearized fast path tries to parse the main xref row for object 20, fails, but still returns the reserved `entries[20]` slot."
+    },
+    {
+      "step": 5,
+      "file": "poppler/Parser.cc",
+      "function": "Parser::makeStream",
+      "summary": "`makeStream()` tests the returned entry's `Parsing` flag, reads the slot's uninitialized `flags` field, and MSAN reports use-of-uninitialized-value."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "poppler/PDFDoc.cc",
+      "function": "PDFDoc::setup",
+      "line": 271,
+      "var": "xref",
+      "code": "xref = new XRef(str, getStartXRef(), getMainXRefEntriesOffset(), &wasReconstructed);",
+      "note": "Materializes the xref state from the attacker-controlled PDF. The witness contributes both the `startxref` target and the linearization `/T 2080` value that becomes `mainXRefEntriesOffset` inside the constructed `XRef`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "poppler/XRef.cc",
+      "function": "XRef::readXRefTable",
+      "line": 519,
+      "line_end": 529,
+      "var": "first, n, size",
+      "code": "first = obj.getInt(); ... n = obj.getInt(); ... if (first + n > size) { if (resize(first + n) != first + n) {",
+      "note": "Reads the witness xref subsection header `3 8`. That makes `first + n = 11`, so Poppler grows the logical xref table to 11 objects.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "xref"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "poppler/XRef.cc",
+      "function": "XRef::resize",
+      "line": 417,
+      "line_end": 425,
+      "var": "entries, size, capacity",
+      "code": "if (reserve(newSize) < newSize) return size; for (int i = size; i < newSize; ++i) { ... entries[i].flags = 0; ... }",
+      "note": "With `newSize = 11`, `reserve()` rounds the backing array up from capacity 0 to 1024 (per lines 392-400), but `resize()` initializes only indices 0 through 10. Slots above the logical size, including `entries[20]`, stay heap-uninitialized; the sanitizer origin points back to this allocation path.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "first + n"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "first + n > size"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "poppler/Hints.cc",
+      "function": "Hints::readTables",
+      "line": 204,
+      "line_end": 215,
+      "var": "xref, num, gen, obj",
+      "code": "parser = new Parser(xref, new Lexer(xref, memStream), true); ... if ((obj = parser->getObj(), obj.isInt()) && ... (obj = parser->getObj(false, ... num, gen, 0, true), obj.isStream())) {",
+      "note": "Copies the witness hint bytes (`/H [726 529]`) into a MemStream and parses them with the same `xref`. The hint payload contains the textual object header `20 0 obj`, so this step materializes `num = 20`, `gen = 0` and requests object 20 0 as a stream.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "xref"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "poppler/XRef.cc",
+      "function": "XRef::getEntry",
+      "line": 1555,
+      "line_end": 1583,
+      "var": "i, entries[i], entry->flags",
+      "code": "if ((!xRefStream) && mainXRefEntriesOffset) { if (!parseEntry(mainXRefEntriesOffset + 20*i, &entries[i])) { error(errSyntaxError, -1, \"Failed to parse XRef entry [{0:d}].\", i); } } ... return &entries[i];",
+      "note": "Step 4 supplies `i = 20`, and step 1 supplied `mainXRefEntriesOffset = 2080`, so the linearized fast path probes byte offset `2080 + 20 * 20 = 2480`. The witness file is only 2266 bytes long, so `parseEntry()` fails without writing `entries[20].flags`. Vulnerable `getEntry()` merely logs the failure and still returns `&entries[20]`; because step 3 left that spare-capacity slot outside the initialized size, its `flags` field is still uninitialized heap data.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "mainXRefEntriesOffset"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "entries[20]"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "num"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "(!xRefStream) && mainXRefEntriesOffset"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "poppler/Parser.cc",
+      "function": "Parser::makeStream",
+      "line": 203,
+      "line_end": 204,
+      "var": "entry->flags",
+      "code": "if (xref && (entry = xref->getEntry(objNum, false))) { if (!entry->getFlag(XRefEntry::Parsing) ||",
+      "note": "MSAN sink. `makeStream()` obtains the `XRefEntry *` returned in step 5 and immediately calls `getFlag(XRefEntry::Parsing)`, which masks `entry->flags`. Because that field was never initialized for `entries[20]`, this predicate reads poisoned heap data and triggers the reported `use-of-uninitialized-value` at `Parser.cc:204:45`.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "entry"
+        },
+        {
+          "on": 5,
+          "type": "control",
+          "via": "xref && (entry = xref->getEntry(objNum, false))"
+        },
+        {
+          "on": 5,
+          "type": "order",
+          "via": "use_before_init",
+          "obj": "entry->flags"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "memory",
+    "trace_format": "msan",
+    "sanitizer": "MemorySanitizer",
+    "crash_type": "use-of-uninitialized-value",
+    "access_type": "READ",
+    "access_size": null,
+    "crash_location": {
+      "file": "poppler/Parser.cc",
+      "function": "Parser::makeStream",
+      "line": 204
+    },
+    "allocation_context": {
+      "file": "poppler/XRef.cc",
+      "function": "XRef::reserve",
+      "line": 400,
+      "note": "The staged MSAN origin stack points to the heap allocation in `XRef::reserve`, followed by `XRef::resize` and `XRef::readXRefTable`."
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "Parser::makeStream",
+        "file": "poppler/Parser.cc",
+        "line": 204
+      },
+      {
+        "frame": 1,
+        "function": "Parser::getObj",
+        "file": "poppler/Parser.cc",
+        "line": 134
+      },
+      {
+        "frame": 2,
+        "function": "Hints::readTables",
+        "file": "poppler/Hints.cc",
+        "line": 211
+      },
+      {
+        "frame": 3,
+        "function": "PDFDoc::checkLinearization",
+        "file": "poppler/PDFDoc.cc",
+        "line": 702
+      },
+      {
+        "frame": 4,
+        "function": "PDFDoc::getPage",
+        "file": "poppler/PDFDoc.cc",
+        "line": 2110
+      },
+      {
+        "frame": 5,
+        "function": "PDFDoc::displayPageSlice",
+        "file": "poppler/PDFDoc.cc",
+        "line": 663
+      },
+      {
+        "frame": 6,
+        "function": "poppler::page_renderer::render_page",
+        "file": "cpp/poppler-page-renderer.cpp",
+        "line": 300
+      },
+      {
+        "frame": 7,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/pdf_fuzzer.cc",
+        "line": 43
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "malloc",
+        "file": "llvm/projects/compiler-rt/lib/msan/msan_interceptors.cc",
+        "line": 910
+      },
+      {
+        "frame": 1,
+        "function": "grealloc",
+        "file": "goo/gmem.h",
+        "line": 73
+      },
+      {
+        "frame": 2,
+        "function": "greallocn",
+        "file": "goo/gmem.h",
+        "line": 160
+      },
+      {
+        "frame": 3,
+        "function": "XRef::reserve",
+        "file": "poppler/XRef.cc",
+        "line": 400
+      },
+      {
+        "frame": 4,
+        "function": "XRef::resize",
+        "file": "poppler/XRef.cc",
+        "line": 417
+      },
+      {
+        "frame": 5,
+        "function": "XRef::readXRefTable",
+        "file": "poppler/XRef.cc",
+        "line": 529
+      },
+      {
+        "frame": 6,
+        "function": "XRef::readXRef",
+        "file": "poppler/XRef.cc",
+        "line": 469
+      },
+      {
+        "frame": 7,
+        "function": "XRef::XRef",
+        "file": "poppler/XRef.cc",
+        "line": 281
+      },
+      {
+        "frame": 8,
+        "function": "PDFDoc::setup",
+        "file": "poppler/PDFDoc.cc",
+        "line": 271
+      },
+      {
+        "frame": 9,
+        "function": "PDFDoc::PDFDoc",
+        "file": "poppler/PDFDoc.cc",
+        "line": 240
+      },
+      {
+        "frame": 10,
+        "function": "poppler::document_private::document_private",
+        "file": "cpp/poppler-document.cpp",
+        "line": 109
+      },
+      {
+        "frame": 11,
+        "function": "poppler::document::load_from_raw_data",
+        "file": "cpp/poppler-document.cpp",
+        "line": 1100
+      },
+      {
+        "frame": 12,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/pdf_fuzzer.cc",
+        "line": 31
+      }
+    ],
+    "free_stack": [],
+    "dedup_token": "Parser::makeStream(Object&&, unsigned char*, CryptAlgorithm, int, int, int, int, bool)--Parser::getObj(bool, unsigned char*, CryptAlgorithm, int, int, int, int, bool)--Hints::readTables(BaseStream*, Linearization*, XRef*, SecurityHandler*)",
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "source": "parsed from staged default_crash_trace.txt, sanitizer_trace.txt, reproduction_report.json, patch.diff, poc, and the prepared vulnerable source checkout",
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "MSAN's origin is the reserve allocation in `XRef::reserve`, while the logical defect is `XRef::getEntry` returning that still-uninitialized spare-capacity slot after `parseEntry()` fails.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true,
+      "patch_resolves_note": "The `XRef.cc` hunk in the staged fix adds the missing invalid-index and parse-failure returns, preventing `getEntry()` from handing `Parser::makeStream` an uninitialized slot. The same commit's `Hints.cc` memset guard is extra hardening, not the observed crash path."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's authoritative `reproduction_report.json` and `sanitizer_trace.txt` show `MemorySanitizer: use-of-uninitialized-value` in `Parser::makeStream` when `/out/pdf_fuzzer` processes `poc` and renders page 1 through the linearization hints path.",
+    "format": {
+      "name": "linearized PDF witness",
+      "contract": "The staged PoC is the exact 2266-byte PDF in `gt_results/arvo_11248/poc`. The verified trigger semantics are only the witnessed combination visible in that file: the first object is accepted as a linearization dictionary containing `/L 2266`, `/H [726 529]`, and `/T 2080`; the main xref text contains subsection header `xref 3 8`, so Poppler resizes the logical xref table to 11 entries while keeping spare capacity; and the copied hint bytes parse as `20 0 obj ... stream`, so `Hints::readTables` requests object 20 0 as a stream. Vulnerable `XRef::getEntry` then probes `2080 + 20 * 20 = 2480`, past EOF, `parseEntry()` fails, and `Parser::makeStream` reads the returned slot's uninitialized `flags`. The staged artifacts do not justify any broader PDF-format contract beyond this exact witness relationship."
+    }
+  }
+}
