@@ -22,7 +22,7 @@
   "bug_description": {
     "original": "Crash Type: Heap-buffer-overflow READ 1 Crash State: ptls_asn1_read_type ptls_asn1_validation_recursive ptls_asn1_validation_recursive Sanitizer: address (ASAN)",
     "original_source": "ARVO-Meta.report.comments[0].content / staged vulnerable source snapshot / saved sanitizer_trace.txt / local picotls history",
-    "normalized": "The staged 259-byte `fuzz-asn1` witness makes the harness set `bytes_max = 0x0100` and copy the next 256 bytes into a temp file. The final byte is `0xff`, so the outer selector at `fuzz-asn1.c:64` becomes `3` and enters the `ret == 2 || ret == 3` file-loading branch, but the later `if (ret == 2)` at line 91 tests the shadowed inner `ret = write(fd, bytes, bytes_max)`, which evaluates to `256`, so control falls through to `ptls_minicrypto_load_private_key`. `ptls_get_pem_object` accepts the `-----BEGIN PRIVATE KEY-----` prefix line and, using the sparse base64 fragments on the following lines, decodes the logical DER object `30 10 02 01 00 30 00 06 7f 28 84 0a 28 32 8c 07 82 8a`. That object is stored as `pkey->vec` with `len == 18`, but because the PEM buffer starts at capacity 0 and grows through `ptls_buffer_reserve`, its backing heap allocation is 1024 bytes. In `ptls_minicrypto_asn1_decode_private_key`, the outer sequence and version are accepted, the embedded AlgorithmIdentifier sequence is declared as zero-length (`30 00`), and the OID parse still advances `byte_index` from 7 to 8 so `last_byte1 < byte_index`. The staged vulnerable source performs no `last_byte1 < byte_index` rejection before calling `ptls_asn1_validation_recursive(bytes + byte_index, last_byte1 - byte_index, ...)`, so the `size_t` span underflows from `7 - 8` to `SIZE_MAX`. Recursive ASN.1 validation then treats the remaining attacker bytes as a constructed object with forged length `0x0a28328c`, recurses again from original offset 15, and in that nested parse `ptls_asn1_read_length` consumes a second length byte from original offset 18, the first byte past the 18-byte logical DER extent. The saved ASan report later faults in `ptls_asn1_read_type` after the same recursive descent continues through the remaining backing allocation, but the staged static artifacts do not close that later pointer progression, so this GT anchors the source-grounded sink at the first proven logical-length overread."
+    "normalized": "The staged 259-byte `fuzz-asn1` witness makes the harness set `bytes_max = 0x0100` and copy the next 256 bytes into a temp file. The final byte is `0xff`, so the outer selector at `fuzz-asn1.c:64` becomes `3` and enters the `ret == 2 || ret == 3` file-loading branch, but the later `if (ret == 2)` at line 91 tests the shadowed inner `ret = write(fd, bytes, bytes_max)`, which evaluates to `256`, so control falls through to `ptls_minicrypto_load_private_key`. `ptls_get_pem_object` accepts the `-----BEGIN PRIVATE KEY-----` prefix line and, using the sparse base64 fragments on the following lines, decodes the logical DER object `30 10 02 01 00 30 00 06 7f 28 84 0a 28 32 8c 07 82 8a`. That object is stored as `pkey->vec` with `len == 18`, but because the PEM buffer starts at capacity 0 and grows through `ptls_buffer_reserve`, its backing heap allocation is 1024 bytes. In `ptls_minicrypto_asn1_decode_private_key`, the outer sequence and version are accepted, the embedded AlgorithmIdentifier sequence is declared as zero-length (`30 00`), and the OID parse still advances `byte_index` from 7 to 8 so `last_byte1 < byte_index`. The staged vulnerable source performs no `last_byte1 < byte_index` rejection before calling `ptls_asn1_validation_recursive(bytes + byte_index, last_byte1 - byte_index, ...)`, so the `size_t` span underflows from `7 - 8` to `SIZE_MAX`. Recursive ASN.1 validation then treats the remaining attacker bytes as a constructed object with forged length `0x0a28328c`, recurses again from original offset 15, and in that nested parse `ptls_asn1_read_length` consumes a second length byte from original offset 18, the first byte past the 18-byte logical DER extent. That out-of-bounds byte becomes the low byte of a nested primitive length, so the child parse returns a consumed span in `[35332, 35587]`; the parent adds that to its own `byte_index = 7`, still satisfies `byte_index < last_byte` against the forged `last_byte = 170406547`, and immediately launches another recursive parse from original offset `35347 + heap_byte`. That pointer is tens of kilobytes past the 1024-byte allocation, so the saved ASan heap-buffer-overflow occurs at `ptls_asn1_read_type` line 86 when the next recursion executes `uint8_t first_byte = bytes[0];`."
   },
   "source": {
     "file": "lib/pembase64.c",
@@ -44,12 +44,12 @@
   },
   "sink": {
     "file": "lib/asn1.c",
-    "function": "ptls_asn1_read_length",
-    "line": 154,
-    "var": "bytes[byte_index++]",
-    "code": "*length |= bytes[byte_index++];",
-    "description": "First source-grounded unsafe read. In the nested recursive parse, this second long-form length-byte load reads original DER offset 18, one byte past `pkey->vec.len == 18`. That access is still inside the 1024-byte backing allocation, so it anchors the proven logical-length overread rather than the later ASan heap-crossing read at line 86.",
-    "trace_step": 15
+    "function": "ptls_asn1_read_type",
+    "line": 86,
+    "var": "bytes[0], first_byte",
+    "code": "uint8_t first_byte = bytes[0];",
+    "description": "After the nested long-form length overread inflates the child return span, the parent recursive loop invokes `ptls_asn1_validation_recursive` again on `bytes + (35339 + heap_byte)` relative to the parameters sub-buffer, i.e. original allocation offset `35347 + heap_byte`. That pointer is far beyond the 1024-byte PEM backing allocation, and the next `ptls_asn1_read_type` immediately dereferences it here, matching the saved ASan heap-buffer-overflow.",
+    "trace_step": 18
   },
   "root_cause": {
     "file": "lib/minicrypto-pem.c",
@@ -99,7 +99,7 @@
       "step": 4,
       "file": "lib/asn1.c",
       "function": "ptls_asn1_validation_recursive",
-      "summary": "The underflowed parameters span makes recursive ASN.1 validation treat the remaining bytes as a huge constructed object, recurse again from original offset 15, and read the first byte past the logical DER extent during nested long-form length parsing. The saved ASan heap-buffer-overflow occurs later in the same recursive descent."
+      "summary": "The underflowed parameters span makes recursive ASN.1 validation treat the remaining bytes as a huge constructed object, recurse again from original offset 15, overread the next length byte past the 18-byte DER extent, convert that byte into a huge returned span, and then iterate once more into `ptls_asn1_read_type` on a pointer far past the 1024-byte allocation, matching the saved ASan heap-buffer-overflow."
     }
   ],
   "fine_trace": [
@@ -381,12 +381,77 @@
       "line": 154,
       "var": "bytes[byte_index++]",
       "code": "*length |= bytes[byte_index++];",
-      "note": "In that nested parse, tag `0x07` is treated as primitive and `0x82` at original DER offset 16 claims a two-byte long-form length. The first length byte comes from original offset 17 (`0x8a`); this second load reads original offset 18, which is the first byte past `pkey->vec.len == 18`. That is the first source-grounded out-of-bounds read relative to the logical DER extent. The saved ASan fault happens later, after the same recursive descent continues through the remaining 1024-byte backing allocation.",
+      "note": "In that nested parse, tag `0x07` is treated as primitive and `0x82` at original DER offset 16 claims a two-byte long-form length. The first length byte comes from original offset 17 (`0x8a`); this second load reads original offset 18, which is the first byte past `pkey->vec.len == 18`. That out-of-bounds byte is not source-grounded, but because it is a single byte the resulting nested `length` is necessarily `0x8a00 | heap_byte` and the nested `last_byte` becomes `35332 + heap_byte`.",
       "depends_on": [
         {
           "on": 14,
           "type": "data",
           "via": "bytes + byte_index, bytes_max"
+        }
+      ]
+    },
+    {
+      "step": 16,
+      "file": "lib/asn1.c",
+      "function": "ptls_asn1_validation_recursive",
+      "line": 276,
+      "line_end": 277,
+      "var": "byte_index, last_byte",
+      "code": "ptls_asn1_dump_content(bytes, last_byte, byte_index, log_ctx);\nbyte_index = last_byte;",
+      "note": "This crashing path passes `log_ctx == NULL`, so the dump helper does nothing and the primitive child returns `byte_index = last_byte = 35332 + heap_byte` to its caller.",
+      "depends_on": [
+        {
+          "on": 15,
+          "type": "data",
+          "via": "length, last_byte"
+        }
+      ]
+    },
+    {
+      "step": 17,
+      "file": "lib/asn1.c",
+      "function": "ptls_asn1_validation_recursive",
+      "line": 236,
+      "line_end": 255,
+      "var": "byte_index, last_byte",
+      "code": "while (byte_index < last_byte) {\n    ...\n    byte_index += ptls_asn1_validation_recursive(bytes + byte_index, last_byte - byte_index, decode_error,\n                                                 level + 1, log_ctx);\n}",
+      "note": "The parent constructed-object frame was at original offset 8 with local `byte_index = 7` and forged `last_byte = 170406547`. After adding the child return from step 16, its `byte_index` becomes `35339 + heap_byte`, which is still below the forged `last_byte`, so the loop immediately schedules another recursive parse from `bytes + byte_index`.",
+      "depends_on": [
+        {
+          "on": 13,
+          "type": "data",
+          "via": "last_byte"
+        },
+        {
+          "on": 16,
+          "type": "data",
+          "via": "returned byte_index"
+        },
+        {
+          "on": 13,
+          "type": "control",
+          "via": "structure_bit != 0"
+        }
+      ]
+    },
+    {
+      "step": 18,
+      "file": "lib/asn1.c",
+      "function": "ptls_asn1_read_type",
+      "line": 86,
+      "var": "bytes[0], first_byte",
+      "code": "uint8_t first_byte = bytes[0];",
+      "note": "That next recursion starts at original allocation offset `8 + (35339 + heap_byte) = 35347 + heap_byte`. Even the minimum case is far past the 1024-byte PEM backing allocation, so the first dereference in `ptls_asn1_read_type` becomes the saved ASan heap-buffer-overflow read.",
+      "depends_on": [
+        {
+          "on": 17,
+          "type": "data",
+          "via": "bytes + byte_index"
+        },
+        {
+          "on": 17,
+          "type": "control",
+          "via": "byte_index < last_byte"
         }
       ]
     }
@@ -456,8 +521,8 @@
     "flaky": false,
     "source": "staged sanitizer_trace.txt and reproduction_report.json",
     "cross_validation": {
-      "sink_matches_crash": "No at exact sink-step level. The saved ASan crash is later at `ptls_asn1_read_type` line 86 after recursive parsing continues through the remaining 1024-byte backing allocation; this GT intentionally narrows the source-grounded sink to the first proven logical-length overread at `ptls_asn1_read_length` line 154.",
-      "trace_consistent_with_stack": "Yes through the reviewed project frames. The saved stack `ptls_asn1_read_type -> ptls_asn1_validation_recursive -> ptls_asn1_validation_recursive -> ptls_minicrypto_asn1_decode_private_key` is the same recursive descent established by fine-trace steps 12-14, and the harness frame at `LLVMFuzzerTestOneInput` line 102 matches step 4's fallthrough into `ptls_minicrypto_load_private_key`. The exact later pointer progression from step 15 to the ASan read is not closed by the staged static artifacts.",
+      "sink_matches_crash": "Yes. Fine-trace steps 15-18 close the same recursive descent as the saved ASan stack and end at `ptls_asn1_read_type` line 86, the reported heap-buffer-overflow read.",
+      "trace_consistent_with_stack": "Yes at exact reviewed project frames. The saved stack `ptls_asn1_read_type -> ptls_asn1_validation_recursive -> ptls_asn1_validation_recursive -> ptls_minicrypto_asn1_decode_private_key` matches fine-trace steps 18 -> 17/14 -> 12, and the harness frame at `LLVMFuzzerTestOneInput` line 102 matches step 4's fallthrough into `ptls_minicrypto_load_private_key`.",
       "tainted_value_reaches_sink": true,
       "patch_resolves_note": "The staged `patch.diff` is follow-on commit `75f9c33cef261046f75c6fe3a02f9912e55211ee`, which only changes an already-present `if (last_byte1 < byte_index)` check to `if (*decode_error == 0 && last_byte1 < byte_index)`. The exact staged vulnerable source at workspace HEAD `254a1801ede6ed8f4b0c86303c0a9cb8dab9b40f` lacks that guard entirely. Local history shows commit `b1999d666e431cf2879b18076cc4218e5c3dcb74` adds the missing `last_byte1 < byte_index` rejection and is the actual source-level fix for this path."
     }

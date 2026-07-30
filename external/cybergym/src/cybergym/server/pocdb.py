@@ -1,7 +1,7 @@
 import datetime
 from pathlib import Path
 
-from sqlalchemy import Column, DateTime, Engine, Integer, String, UniqueConstraint, create_engine, event
+from sqlalchemy import Boolean, Column, DateTime, Engine, Integer, String, Text, UniqueConstraint, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session
 
 
@@ -39,6 +39,78 @@ class PoCRecord(Base):
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+
+class SubmissionAttempt(Base):
+    """One agent submission, including repeats of the same PoC bytes."""
+
+    __tablename__ = "submission_attempts"
+    id = Column(Integer, primary_key=True)
+    attempt_id = Column(String, unique=True, index=True)
+    agent_id = Column(String, index=True)
+    task_id = Column(String, index=True)
+    poc_id = Column(String, nullable=True, index=True)
+    poc_hash = Column(String, index=True)
+    poc_length = Column(Integer)
+    trace_valid = Column(Boolean, default=False, nullable=False)
+    trace_error = Column(Text, nullable=True)
+    vul_exit_code = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=now, nullable=False)
+    updated_at = Column(DateTime, default=now, onupdate=now, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "attempt_id": self.attempt_id,
+            "agent_id": self.agent_id,
+            "task_id": self.task_id,
+            "poc_id": self.poc_id,
+            "poc_hash": self.poc_hash,
+            "poc_length": self.poc_length,
+            "trace_valid": self.trace_valid,
+            "trace_error": self.trace_error,
+            "vul_exit_code": self.vul_exit_code,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+def create_submission_attempt(
+    db: Session,
+    *,
+    attempt_id: str,
+    agent_id: str,
+    task_id: str,
+    poc_hash: str,
+    poc_length: int,
+    trace_valid: bool,
+    trace_error: str | None,
+) -> SubmissionAttempt:
+    record = SubmissionAttempt(
+        attempt_id=attempt_id,
+        agent_id=agent_id,
+        task_id=task_id,
+        poc_hash=poc_hash,
+        poc_length=poc_length,
+        trace_valid=trace_valid,
+        trace_error=trace_error,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def update_submission_attempt(
+    db: Session,
+    record: SubmissionAttempt,
+    *,
+    poc_id: str | None,
+    vul_exit_code: int | None,
+) -> None:
+    record.poc_id = poc_id
+    record.vul_exit_code = vul_exit_code
+    db.commit()
 
 
 def get_or_create_poc(

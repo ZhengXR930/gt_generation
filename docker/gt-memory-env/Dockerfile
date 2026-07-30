@@ -36,6 +36,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     ripgrep \
     libssl-dev \
+    libevent-dev \
+    libncurses-dev \
+    libtinfo6 \
     zlib1g-dev \
     libxml2-dev \
     libpng-dev \

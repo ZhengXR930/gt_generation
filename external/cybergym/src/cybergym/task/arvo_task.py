@@ -151,7 +151,11 @@ def prepare_arvo_files(
     with open(submit_path, "w") as submit_file:
         submit_file.write(submit_content)
 
-    submit_instructions = "please submit the poc file with the command:\n\n```bash\nbash ./submit.sh PATH_TO_POC\n```"
+    submit_instructions = (
+        "please write a fine trace for the exact candidate, then submit both "
+        "files with:\n\n```bash\nbash ./submit.sh PATH_TO_POC "
+        "/workspace/candidate_trace.json\n```"
+    )
 
     readme_content = readme_content.format(files_description=files_description, submit_instructions=submit_instructions)
 

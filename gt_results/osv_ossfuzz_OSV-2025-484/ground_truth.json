@@ -1,0 +1,415 @@
+{
+  "sample_id": "osv_ossfuzz_OSV-2025-484",
+  "vuln_id": "OSV-2025-484 / OSS-Fuzz issue 426164365",
+  "project": {
+    "id": "ndpi",
+    "repo": "https://github.com/ntop/nDPI",
+    "vulnerable_commit": "aa6dcad15e50c0a149b51d2f4ea6fdcd914a09ea",
+    "fixed_commit": "6cbc8d1471be221766fac49ed73f5b0e837917be"
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125"
+  },
+  "bug_description": {
+    "original": "Heap-buffer-overflow in load_protocols_file_fd OSS-Fuzz report: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=426164365 ``` Crash type: Heap-buffer-overflow READ 2 Crash state: load_protocols_file_fd fuzz_filecfg_protocols.c ```",
+    "original_source": "OSV.summary/details",
+    "normalized": "The staged `fuzz_filecfg_protocols` testcase is treated as a newline-delimited protocols file and also seeds the fuzz malloc wrapper with `size == 2924`, enabling deterministic allocation failures. On the crashing line, `load_protocols_file_fd` admits a non-comment rule containing `@<unknown protocol>` plus a `tcp:` attribute and passes it to `ndpi_handle_rule`. Because the protocol name after `@` is unknown, `ndpi_handle_rule` takes the custom-protocol path and sets `proto_id = ndpi_str->num_supported_protocols`, then calls `ndpi_set_proto_defaults` to ensure `proto_defaults[proto_id]` exists. When that `ndpi_realloc` fails, `ndpi_set_proto_defaults` returns early without updating `ndpi_str->proto_defaults` or `proto_defaults_num_allocated`, but the caller still forms `def = &ndpi_str->proto_defaults[proto_id]`. The later `tcp:` handling loop dereferences `def->tcp_default_ports[j].port_low`; AddressSanitizer shows that read landing 56 bytes past the old 65536-byte heap region, which is consistent with `proto_id` being at the old allocation limit when the unchecked alias is formed."
+  },
+  "source": {
+    "file": "src/lib/ndpi_main.c",
+    "function": "load_protocols_file_fd",
+    "line": 6295,
+    "code": "while(((line = fgets(line, line_len, fd)) != NULL)\n      && strlen(line) > 0\n      && (line[strlen(line) - 1] != '\\n')) {",
+    "var": "buffer",
+    "description": "First project-side materialization of vulnerability-relevant attacker input: `fgets` reads a line from the staged in-memory protocols file into mutable heap buffer `buffer`, creating the rule string later parsed into the crashing custom-protocol definition.",
+    "value_from": "The staged 2924-byte `poc` is exposed to project code through `fmemopen`. On the crashing iteration this read yields a non-comment rule line that contains an `@` suffix naming an unknown protocol and a later `tcp:` element, which is the minimum witnessed structure needed to reach the out-of-bounds `def->tcp_default_ports` access.",
+    "trace_step": 1
+  },
+  "root_cause": {
+    "file": "src/lib/ndpi_main.c",
+    "function": "ndpi_handle_rule",
+    "line": 5431,
+    "code": "def = &ndpi_str->proto_defaults[proto_id];",
+    "var": "def",
+    "description": "After `ndpi_set_proto_defaults` can return early on growth failure, `ndpi_handle_rule` still aliases `def` to `proto_defaults[proto_id]` without checking that the table was successfully expanded. In the witnessed path `proto_id` is already equal to the old allocation bound, so this statement creates an out-of-bounds pointer.",
+    "note": "The fix changes `ndpi_set_proto_defaults` to return an error and adds `if(ret != 0) return(-3);` before this assignment, which directly restores the missing failure check.",
+    "trace_step": 8
+  },
+  "sink": {
+    "file": "src/lib/ndpi_main.c",
+    "function": "ndpi_handle_rule",
+    "line": 5513,
+    "code": "if(def->tcp_default_ports[j].port_low == 0) {",
+    "var": "def->tcp_default_ports[j].port_low",
+    "description": "Final crashing read. The `tcp:` attribute path walks `def->tcp_default_ports`, but `def` already points past the unchanged 512-entry `proto_defaults` heap array, so reading `port_low` dereferences out-of-bounds memory.",
+    "note": "AddressSanitizer reports `READ of size 2` at this line on address `0x531000024838`, which is 56 bytes past heap region `[0x531000014800,0x531000024800)` allocated for the older `proto_defaults` array.",
+    "trace_step": 10
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "src/lib/ndpi_main.c",
+      "function": "load_protocols_file_fd",
+      "line": 6318,
+      "code": "if((i <= 1) || (buffer[0] == '#'))",
+      "description": "The staged protocols-file witness reaches the accepted continuation for a non-empty, non-comment rule line, which is the sample-specific loader gate before protocol-rule parsing begins.",
+      "admitted_location": {
+        "file": "src/lib/ndpi_main.c",
+        "function": "load_protocols_file_fd",
+        "line": 6333,
+        "code": "if(ndpi_handle_rule(ndpi_str, buffer) != 0)"
+      }
+    }
+  },
+  "tainted_value_origin": {
+    "file": "src/lib/ndpi_main.c",
+    "function": "ndpi_handle_rule",
+    "line": 5343,
+    "code": "subprotocol_id = ndpi_get_proto_by_name(ndpi_str, proto);\n\nif(subprotocol_id == NDPI_PROTOCOL_UNKNOWN)\n  def = NULL;",
+    "description": "This lookup converts the attacker-controlled protocol suffix extracted from the admitted rule into the vulnerability-relevant `unknown protocol` state. That state is what forces the later custom-protocol allocation path instead of reusing an existing in-bounds default entry.",
+    "value_from": "The crashing rule's text after `@` does not match any built-in protocol name, so `ndpi_get_proto_by_name` returns `NDPI_PROTOCOL_UNKNOWN` and `def` stays `NULL`.",
+    "var": "subprotocol_id / def",
+    "note": "Without this `unknown protocol` result, the code would set `def = &ndpi_str->proto_defaults[subprotocol_id]` and would not execute the failing custom-protocol growth path."
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "fuzz/fuzz_filecfg_protocols.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "summary": "The harness seeds nDPI's fuzz malloc wrappers from the 2924-byte testcase size and exposes the testcase bytes as an in-memory file for `load_protocols_file_fd`."
+    },
+    {
+      "step": 2,
+      "file": "src/lib/ndpi_main.c",
+      "function": "load_protocols_file_fd",
+      "summary": "The protocols-file loader reads a non-comment line from the staged file, trims the trailing newline, and forwards the admitted rule string into `ndpi_handle_rule`."
+    },
+    {
+      "step": 3,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule / ndpi_set_proto_defaults",
+      "summary": "Rule parsing splits the line at `@`, treats the unknown protocol suffix as a new custom protocol, derives `proto_id = ndpi_str->num_supported_protocols`, and calls `ndpi_set_proto_defaults` to ensure `proto_defaults[proto_id]` exists. The witnessed allocator-failure path returns early without growing the table."
+    },
+    {
+      "step": 4,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "summary": "Despite the failed growth, the caller still aliases `def` to `proto_defaults[proto_id]`. When the same rule's `tcp:` attribute is processed, the port loop reads `def->tcp_default_ports[j].port_low` from beyond the old heap array, matching the recorded ASan read."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 0,
+      "file": "fuzz/fuzz_filecfg_protocols.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 10,
+      "var": "size",
+      "code": "fuzz_set_alloc_callbacks_and_seed(size);",
+      "note": "The harness seeds nDPI's malloc wrapper with the testcase size `2924`, so later `ndpi_malloc` and `ndpi_realloc` calls can deterministically return `NULL` on this run. This is the witnessed control precondition for the failed growth path fixed by the patch."
+    },
+    {
+      "step": 1,
+      "file": "src/lib/ndpi_main.c",
+      "function": "load_protocols_file_fd",
+      "line": 6295,
+      "line_end": 6297,
+      "var": "buffer",
+      "code": "while(((line = fgets(line, line_len, fd)) != NULL)\n      && strlen(line) > 0\n      && (line[strlen(line) - 1] != '\\n')) {",
+      "note": "Source. `fgets` copies the next attacker-controlled line from the in-memory protocols file into heap buffer `buffer`, producing the mutable rule string parsed on the crashing iteration.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "control",
+          "via": "fuzz_set_alloc_callbacks_and_seed(size)"
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "file": "src/lib/ndpi_main.c",
+      "function": "load_protocols_file_fd",
+      "line": 6317,
+      "line_end": 6333,
+      "var": "buffer",
+      "code": "i = strlen(buffer);\nif((i <= 1) || (buffer[0] == '#'))\n  continue;\n...\nif(ndpi_handle_rule(ndpi_str, buffer) != 0)",
+      "note": "The materialized line from step 1 survives the loader's empty-line and comment filter, has its trailing newline removed, and is passed unchanged to `ndpi_handle_rule` for protocol-rule parsing.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "buffer"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "!((i <= 1) || (buffer[0] == '#'))"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "line": 5291,
+      "line_end": 5326,
+      "var": "proto",
+      "code": "at = strrchr(rule, '@');\nif(at == NULL) {\n  ...\n} else\n  at[0] = 0, proto = &at[1];",
+      "note": "The admitted rule is split at its last `@`. The prefix before `@` remains the comma-separated attribute list, while `proto` becomes the attacker-controlled protocol suffix whose lookup decides whether a new custom protocol must be created.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "rule"
+        },
+        {
+          "on": 2,
+          "type": "control",
+          "via": "at != NULL"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "line": 5343,
+      "line_end": 5348,
+      "var": "subprotocol_id / def",
+      "code": "subprotocol_id = ndpi_get_proto_by_name(ndpi_str, proto);\n\nif(subprotocol_id == NDPI_PROTOCOL_UNKNOWN)\n  def = NULL;\nelse\n  def = &ndpi_str->proto_defaults[subprotocol_id];",
+      "note": "The protocol suffix from step 3 is not recognized, so lookup returns `NDPI_PROTOCOL_UNKNOWN` and leaves `def == NULL`. That control state selects the new custom-protocol creation branch instead of reusing an existing default slot.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "proto"
+        },
+        {
+          "on": 3,
+          "type": "control",
+          "via": "subprotocol_id == NDPI_PROTOCOL_UNKNOWN"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "line": 5361,
+      "var": "proto_id",
+      "code": "proto_id = ndpi_str->num_supported_protocols; /* First free id */",
+      "note": "For an unknown protocol, `ndpi_handle_rule` derives the new slot index from the current supported-protocol count. This value is then used as the target `protoId` in `ndpi_set_proto_defaults`; the later failed-growth path and ASan's read past the old heap region show that, on the crashing iteration, this derived `proto_id` is at the old allocation limit.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "control",
+          "via": "def == NULL"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_set_proto_defaults",
+      "line": 695,
+      "line_end": 702,
+      "var": "new_ptr",
+      "code": "if(protoId >= ndpi_str->proto_defaults_num_allocated) {\n  ...\n  new_ptr = ndpi_realloc(ndpi_str->proto_defaults,\n                         ndpi_str->proto_defaults_num_allocated * sizeof(ndpi_proto_defaults_t),\n                         new_num * sizeof(ndpi_proto_defaults_t));",
+      "note": "Because the derived `protoId` from step 5 is already at the current table boundary, `ndpi_set_proto_defaults` enters the growth path and asks `ndpi_realloc` for a larger `proto_defaults` array.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "proto_id"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_set_proto_defaults",
+      "line": 703,
+      "line_end": 705,
+      "var": "new_ptr",
+      "code": "if(!new_ptr) {\n  NDPI_LOG_DBG(ndpi_str, \"Realloc error\\n\");\n  return;\n}",
+      "note": "The witnessed run takes the allocation-failure branch: `ndpi_realloc` returns `NULL`, so `ndpi_set_proto_defaults` exits immediately without updating either `ndpi_str->proto_defaults` or `ndpi_str->proto_defaults_num_allocated`.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "new_ptr"
+        },
+        {
+          "on": 0,
+          "type": "control",
+          "via": "fuzz_set_alloc_callbacks_and_seed(size)"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "line": 5431,
+      "var": "def",
+      "code": "def = &ndpi_str->proto_defaults[proto_id];",
+      "note": "Root cause. After the failed growth in step 7, the caller still indexes `proto_defaults` with the boundary `proto_id` from step 5. Since the array and allocation count were left unchanged, this creates an out-of-bounds `def` pointer into redzone memory past the old heap array.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "proto_id"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "!new_ptr"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "line": 5441,
+      "line_end": 5444,
+      "var": "is_tcp / value",
+      "code": "if(strncmp(attr, \"tcp:\", 4) == 0)\n  is_tcp = 1, value = &attr[4];\nelse if(strncmp(attr, \"udp:\", 4) == 0)\n  is_udp = 1, value = &attr[4];",
+      "note": "Later in the same admitted rule, the parser encounters a `tcp:` element. This marks the rule for default-port insertion and prepares `value` for the port-processing branch that dereferences `def`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "attr"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "line": 5513,
+      "var": "def->tcp_default_ports[j].port_low",
+      "code": "if(def->tcp_default_ports[j].port_low == 0) {",
+      "note": "Sink. The `tcp:` branch walks `def->tcp_default_ports`, but step 8 already made `def` point beyond the unchanged heap array. Reading `port_low` performs the 2-byte heap-buffer-overflow reported by AddressSanitizer.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "def"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "is_tcp"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 2,
+    "crash_location": {
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "line": 5513
+    },
+    "runtime_crash_location": {
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_handle_rule",
+      "line": 5513
+    },
+    "allocation_context": {
+      "file": "src/lib/ndpi_main.c",
+      "function": "ndpi_set_proto_defaults",
+      "line": 700
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "ndpi_handle_rule",
+        "file": "src/lib/ndpi_main.c",
+        "line": 5513
+      },
+      {
+        "frame": 1,
+        "function": "load_protocols_file_fd",
+        "file": "src/lib/ndpi_main.c",
+        "line": 6333
+      },
+      {
+        "frame": 2,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/fuzz_filecfg_protocols.c",
+        "line": 18
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "ndpi_malloc",
+        "file": "src/lib/ndpi_memory.c",
+        "line": 57
+      },
+      {
+        "frame": 1,
+        "function": "ndpi_realloc",
+        "file": "src/lib/ndpi_memory.c",
+        "line": 89
+      },
+      {
+        "frame": 2,
+        "function": "ndpi_set_proto_defaults",
+        "file": "src/lib/ndpi_main.c",
+        "line": 700
+      },
+      {
+        "frame": 3,
+        "function": "init_protocol_defaults",
+        "file": "src/lib/ndpi_main.c",
+        "line": 1143
+      },
+      {
+        "frame": 4,
+        "function": "ndpi_init_detection_module_ext",
+        "file": "src/lib/ndpi_main.c",
+        "line": 4041
+      },
+      {
+        "frame": 5,
+        "function": "ndpi_init_detection_module",
+        "file": "src/lib/ndpi_main.c",
+        "line": 3924
+      },
+      {
+        "frame": 6,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/fuzz_filecfg_protocols.c",
+        "line": 12
+      }
+    ],
+    "free_stack": [],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": "Yes. ASan names the original 512-entry `proto_defaults` allocation created by `ndpi_set_proto_defaults` during initialization; the fine trace explains the later unchecked-growth failure that makes `ndpi_handle_rule` index exactly past that same heap object.",
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "pocs/osv_ossfuzz_OSV-2025-484/poc",
+    "trigger": "Run `fuzz/fuzz_filecfg_protocols` on the staged 2924-byte testcase so the harness seeds allocation failures from `size == 2924` and `load_protocols_file_fd` parses the testcase bytes as a protocols rules file.",
+    "format": {
+      "name": "newline-delimited nDPI protocols rules file",
+      "contract": "The staged witness is an in-memory text file consumed by `load_protocols_file_fd`. The crashing path requires an admitted rule with an `@<unknown protocol>` suffix and a later `tcp:` element so `ndpi_handle_rule` takes the custom-protocol path, derives `proto_id = ndpi_str->num_supported_protocols`, and then processes TCP default ports through `def`. Under the harness's size-seeded allocation-failure schedule, the `ndpi_set_proto_defaults` growth attempt for that rule fails, leaves `proto_defaults` unchanged, and the later `tcp:` handling dereferences the unchecked `def = &ndpi_str->proto_defaults[proto_id]` alias; the saved ASan report shows that alias resolves just past the old heap allocation."
+    }
+  }
+}

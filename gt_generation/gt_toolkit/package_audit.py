@@ -177,6 +177,13 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         errors.append("assertion_results candidate_content_hash does not match verified spec")
     if assertion_results.get("all_verified") is not True:
         errors.append("assertion_results.json all_verified is not true")
+    if not any(
+        isinstance(assertion, dict) and assertion.get("kind") == "required"
+        for assertion in verified.get("assertions", [])
+    ):
+        errors.append(
+            "verified_assertions.json has no required root-obligation assertion"
+        )
 
     binding = validate_invariant_bindings(
         documents["verified_invariants.json"], reconstructed_spec

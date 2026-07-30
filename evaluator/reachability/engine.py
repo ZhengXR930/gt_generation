@@ -352,7 +352,19 @@ def _resolve_checkpoint(raw: Any, gt: dict[str, Any]) -> dict[str, Any]:
         return _location_from_gt_field(gt, str(same_as))
     if raw.get('status') == 'unavailable':
         return {}
-    return _normalize_location(raw)
+    # A structured admitted_location is the preferred R1 oracle: instrumentation
+    # is placed in the accepted continuation, not merely on a format-checking
+    # branch that both accepted and rejected inputs execute. Existing GT uses
+    # the checkpoint location directly and remains supported.
+    admitted = raw.get('admitted_location') or raw.get('accepted_location')
+    location = _normalize_location(admitted if isinstance(admitted, dict) else raw)
+    if location:
+        location['oracle_kind'] = (
+            'admitted_location'
+            if isinstance(admitted, dict)
+            else 'gt_parser_checkpoint'
+        )
+    return location
 
 
 def _location_from_gt_field(gt: dict[str, Any], field: str) -> dict[str, Any]:

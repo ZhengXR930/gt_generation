@@ -281,8 +281,9 @@ def validate_binding_coverage(
     its events, so requiring it only guards against regression.
 
     field_bindings (WARNING): every `$event.field` operand that is not a
-    compile-time literal should map to its real vulnerable-version source
-    expression. Left as a warning, not an error, because the downstream builder
+    compile-time literal should map to its real source expression (or, for a
+    required structural obligation absent from the vulnerable program, the exact
+    expression introduced by the fix). Left as a warning, not an error, because the downstream builder
     degrades gracefully for a few operand shapes (an operand whose field is the
     root variable itself, a runtime-captured value with no better name than its
     line) -- so an unbound operand is a quality gap to review, not a structural
@@ -294,7 +295,7 @@ def validate_binding_coverage(
     warnings: list[str] = []
 
     referenced_events: set[str] = set()
-    referenced_operands: set[str] = set()
+    referenced_operands: set[tuple[str, str | None]] = set()
     for assertion in spec.get("assertions", []):
         if not isinstance(assertion, dict):
             continue
@@ -306,7 +307,9 @@ def validate_binding_coverage(
         if isinstance(check, list) and len(check) == 3:
             for side in (check[1], check[2]):
                 if isinstance(side, str) and side.startswith("$"):
-                    referenced_operands.add(side[1:])
+                    referenced_operands.add(
+                        (side[1:], str(assertion.get("at") or "") or None)
+                    )
 
     for event in sorted(referenced_events):
         loc = event_locations.get(event)
@@ -316,12 +319,20 @@ def validate_binding_coverage(
                 "referenced by an assertion at/from"
             )
 
-    for operand in sorted(referenced_operands):
+    for operand, default_event in sorted(
+        referenced_operands, key=lambda item: (item[0], item[1] or "")
+    ):
         if operand.rsplit(".", 1)[-1] in _LITERAL_FIELD_SUFFIXES:
             continue
-        if operand not in field_bindings:
+        contextual_operand = (
+            f"{default_event}.{operand}"
+            if default_event and "." not in operand
+            else operand
+        )
+        if operand not in field_bindings and contextual_operand not in field_bindings:
             warnings.append(
-                f"field_bindings has no real source expression for operand {operand!r} "
+                f"field_bindings has no real source expression for operand "
+                f"{contextual_operand!r} "
                 "(probe builder will fall back to an anonymized/positional label)"
             )
 
@@ -758,12 +769,23 @@ def format_check(check: list[Any]) -> str:
 _INEQUALITY_OPS = {"lt", "le", "gt", "ge"}
 
 
-def _resolve_operand_expr(value: Any, field_bindings: dict[str, Any]) -> str:
-    """Resolve an assertion operand to its real vulnerable-source expression."""
+def _resolve_operand_expr(
+    value: Any,
+    field_bindings: dict[str, Any],
+    default_event: str | None = None,
+) -> str:
+    """Resolve an assertion operand to its real source/patch expression."""
     if not (isinstance(value, str) and value.startswith("$")):
         return json.dumps(value, ensure_ascii=False)
     stripped = value[1:]
-    return str(field_bindings.get(stripped, stripped))
+    contextual = (
+        f"{default_event}.{stripped}"
+        if default_event and "." not in stripped
+        else stripped
+    )
+    if contextual in field_bindings:
+        return str(field_bindings[contextual])
+    return str(field_bindings.get(stripped, contextual))
 
 
 def _norm_expr(text: str) -> str:
@@ -833,8 +855,9 @@ def annotate_scored_invariants(
         # happens-before or a missing guard -- reasoning -- even when its check is an
         # eq on a single object (e.g. free-before-free of the same pointer).
         edge_type = str(edge.get("type") or "data").lower()
-        left_expr = _resolve_operand_expr(left, field_bindings)
-        right_expr = _resolve_operand_expr(right, field_bindings)
+        default_event = str(assertion.get("at") or "") or None
+        left_expr = _resolve_operand_expr(left, field_bindings, default_event)
+        right_expr = _resolve_operand_expr(right, field_bindings, default_event)
         is_identity_flow = (
             op == "eq"
             and edge_type == "data"
@@ -863,9 +886,10 @@ def annotate_scored_invariants(
         op, left, right = check
         node["scored"] = True
         node["scored_role"] = "mechanism"
+        default_event = str(assertion.get("at") or "") or None
         node["relation"] = (
-            f"{_resolve_operand_expr(left, field_bindings)} {_SYMBOLS[op]} "
-            f"{_resolve_operand_expr(right, field_bindings)}"
+            f"{_resolve_operand_expr(left, field_bindings, default_event)} {_SYMBOLS[op]} "
+            f"{_resolve_operand_expr(right, field_bindings, default_event)}"
         )
     return verified_invariants
 

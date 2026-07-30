@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score a subject's free-form vulnerability logic-chain (trace) against a
+"""Score a subject's GT-shaped final fine trace against a
 sample's VERIFIED invariants, two-tier:
 
   Tier 1 (deterministic, always): for each invariant, require the trace to
@@ -18,8 +18,8 @@ sample's VERIFIED invariants, two-tier:
 An invariant is CAPTURED iff it passes Tier 1 AND (Tier-2 judge confirms, or
 the judge is disabled). Score = captured / total verified invariants.
 
-The invariant IS the grading key; there are no probe questions. See the
-session this was built from for why this replaced generated questions.
+The invariant is the grading key; the subject trace is a first-class task
+deliverable rather than an answer to generated questions.
 """
 from __future__ import annotations
 
@@ -128,17 +128,8 @@ def build_invariant_checklist(sample_id: str) -> list[dict[str, Any]]:
 
 
 def parse_trace(response: str) -> tuple[set[str], str, list[dict]]:
-    """Extract (function-set, searchable-text-blob, steps) from the subject's
-    JSON-array trace response (tolerating ``` fences / wrappers)."""
+    """Extract function names and searchable text from a final fine-trace array."""
     body = (response or "").strip()
-    if "```" in body:
-        for chunk in body.split("```"):
-            c = chunk.strip()
-            if c.startswith("json"):
-                c = c[4:].strip()
-            if c.startswith("["):
-                body = c
-                break
     steps: list[dict] = []
     try:
         parsed = json.loads(body)
@@ -150,7 +141,12 @@ def parse_trace(response: str) -> tuple[set[str], str, list[dict]]:
         funcs, blob = set(), []
         for s in steps:
             funcs.add(str(s.get("function") or ""))
-            blob.append(" ".join(str(s.get(k, "")) for k in ("function", "code", "value_effect", "description")))
+            blob.append(
+                " ".join(
+                    str(s.get(k, ""))
+                    for k in ("function", "var", "code", "note")
+                )
+            )
         return {f for f in funcs if f}, "  ".join(blob), steps
     # Strict JSON failed (models sometimes emit invalid JSON -- e.g. a bare
     # range "line": 27-42, or an unescaped quote inside code). The scorer only
@@ -158,7 +154,9 @@ def parse_trace(response: str) -> tuple[set[str], str, list[dict]]:
     # regex-extract those string fields per object instead of dropping the
     # sample. steps stays [] to flag that strict parsing did not succeed.
     funcs = set(re.findall(r'"function"\s*:\s*"([^"]*)"', body))
-    blob_parts = re.findall(r'"(?:function|code|value_effect|description)"\s*:\s*"([^"]*)"', body)
+    blob_parts = re.findall(
+        r'"(?:function|var|code|note)"\s*:\s*"([^"]*)"', body
+    )
     return {f for f in funcs if f}, "  ".join(blob_parts), steps
 
 

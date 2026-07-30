@@ -112,15 +112,10 @@ class CodeActAgent(Agent):
         - MessageAction(content) - Message action to run (e.g. ask for clarification)
         - AgentFinishAction() - end the interaction
         """
-        probe_answering = self._evaluation_probe_answering(state)
-        # Trace mode keeps tools available during the answering phase so the
-        # subject can consult the code while laying out the vulnerability logic
-        # chain (the trace comes out as part of its reasoning, tools on). Other
-        # probe modes stay tool-free.
-        trace_tools_on = probe_answering and os.environ.get('OPENHANDS_EVAL_TRACE_MODE') == '1'
-        if probe_answering:
-            # A pre-freeze model response may have queued several actions. None of
-            # them may survive into the answering phase.
+        finalizing_fine_trace = self._finalizing_fine_trace(state)
+        if finalizing_fine_trace:
+            # The task budget has ended. Drop queued exploration actions and
+            # allow exactly one textual GT-shaped final deliverable.
             self.pending_actions.clear()
 
         # Continue with pending actions if any
@@ -156,12 +151,12 @@ class CodeActAgent(Agent):
         params: dict = {
             'messages': self.llm.format_messages_for_llm(messages),
         }
-        if not probe_answering or trace_tools_on:
+        if not finalizing_fine_trace:
             params['tools'] = self._available_tools_for_reasoning_state(
                 self.tools, reasoning_complete=reasoning_complete
             )
 
-        if self.mcp_tools and (not probe_answering or trace_tools_on):
+        if self.mcp_tools and not finalizing_fine_trace:
             # Only add tools with unique names
             existing_names = {tool['function']['name'] for tool in params['tools']}
             unique_mcp_tools = [
@@ -175,10 +170,10 @@ class CodeActAgent(Agent):
             ]
             params['tools'] += unique_mcp_tools
         force_reasoning_record = (
-            False if probe_answering else self._reasoning_record_required(state)
+            False if finalizing_fine_trace else self._reasoning_record_required(state)
         )
         forced_harness_tool = (
-            '' if probe_answering else self._harness_fsm_forced_tool(state)
+            '' if finalizing_fine_trace else self._harness_fsm_forced_tool(state)
         )
         if force_reasoning_record:
             messages.append(
@@ -272,12 +267,18 @@ class CodeActAgent(Agent):
         params['extra_body'] = {'metadata': state.to_llm_metadata(agent_name=self.name)}
         response = self.llm.completion(**params)
         logger.debug(f'Response from LLM: {response}')
-        actions = codeact_function_calling.response_to_actions(response)
-        if probe_answering and not trace_tools_on:
-            actions = self._tool_free_probe_actions(actions, response)
-        elif force_reasoning_record:
+        if finalizing_fine_trace:
+            from evaluator.reasoning.fine_trace import unwrap_final_answer_transport
+
+            content = unwrap_final_answer_transport(
+                str(response.choices[0].message.content or '')
+            )
+            actions = [AgentFinishAction(final_thought=content)]
+        else:
+            actions = codeact_function_calling.response_to_actions(response)
+        if not finalizing_fine_trace and force_reasoning_record:
             actions = self._first_reasoning_record_action_only(actions)
-        elif reasoning_complete:
+        elif not finalizing_fine_trace and reasoning_complete:
             actions = self._without_reasoning_record_actions(actions)
             if not actions:
                 actions = self._retry_without_reasoning_record(messages, params)
@@ -286,12 +287,15 @@ class CodeActAgent(Agent):
             self.pending_actions.append(action)
         return self.pending_actions.popleft()
 
-    def _evaluation_probe_answering(self, state: State) -> bool:
-        probe = state.extra_data.get('evaluation_probe')
-        return isinstance(probe, dict) and probe.get('status') == 'answering'
+    def _finalizing_fine_trace(self, state: State) -> bool:
+        finalization = state.extra_data.get('fine_trace_finalization')
+        return (
+            isinstance(finalization, dict)
+            and finalization.get('status') == 'answering'
+        )
 
-    def _tool_free_probe_actions(self, actions: list[Action], response) -> list[Action]:
-        """Permit only a textual answer after the environment is frozen."""
+    def _fine_trace_final_actions(self, actions: list[Action], response) -> list[Action]:
+        """Permit only the textual task deliverable after the iteration budget."""
         safe = [
             action
             for action in actions
@@ -304,7 +308,7 @@ class CodeActAgent(Agent):
             content = str(response.choices[0].message.content or '')
         except Exception:
             pass
-        return [MessageAction(content=content or '{"answers":[]}')]
+        return [MessageAction(content=content or '[]')]
 
     def _reasoning_record_required(self, state: State) -> bool:
         required_markers = (

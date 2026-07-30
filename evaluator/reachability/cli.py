@@ -5,6 +5,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from reachability.core import evaluate_r1_r5
 from reachability.engine import (
     extract_assertion_event_checkpoints,
     extract_reachability_checkpoints,
@@ -14,11 +15,11 @@ from reachability.engine import (
     write_breakpoint_spec,
 )
 
-from reachability.core import evaluate_r1_r5
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Evaluate PoC reachability R1-R5.')
+    parser = argparse.ArgumentParser(
+        description='Evaluate PoC reachability R1-R4 plus target crash trigger.'
+    )
     parser.add_argument('--gt', required=True, type=Path)
     parser.add_argument('--poc', type=Path)
     parser.add_argument('--debug-command', help='Debug command with optional {poc} placeholder.')
@@ -90,6 +91,7 @@ def main() -> None:
         proc = subprocess.run(
             sanitizer_command,
             shell=True,
+            check=False,
             text=True,
             capture_output=True,
             timeout=args.timeout,

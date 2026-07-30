@@ -104,7 +104,7 @@ REASONING_RECORDER_POLICY_MARKER = '[Reasoning Recorder Policy]'
 REASONING_OBSERVER_POLICY_MARKER = '[Reasoning Observer]'
 CONSTRUCTION_SUPPORT_POLICY_MARKER = '[Construction Support Policy]'
 HARNESS_FSM_POLICY_MARKER = '[Harness FSM]'
-EVALUATION_PROBE_MARKER = '[Evaluation Probe]'
+FINE_TRACE_FINAL_MARKER = '[Fine Trace Finalization]'
 
 
 class AgentController:
@@ -415,11 +415,6 @@ class AgentController:
         elif isinstance(event, Observation):
             await self._handle_observation(event)
 
-        if isinstance(event, Observation) and self._maybe_start_probe_after_observation(event):
-            # The injected probe message schedules the next step. Do not also
-            # schedule a normal post-observation exploration step.
-            return
-
         if self.should_step(event):
             self.step()
 
@@ -442,12 +437,23 @@ class AgentController:
             return
 
         elif isinstance(action, AgentFinishAction):
-            if self._evaluation_probe_answering():
+            submitted_trace = self._submitted_fine_trace()
+            if submitted_trace is not None:
+                await self._persist_fine_trace(
+                    submitted_trace, 'last_poc_submission'
+                )
+            elif self._finalizing_fine_trace():
                 response = action.final_thought or action.thought or json.dumps(
                     action.outputs, ensure_ascii=False
                 )
-                await self._complete_evaluation_probe(response)
-            elif not self._start_evaluation_probe('agent_finished'):
+                await self._complete_fine_trace(response)
+            elif self._fine_trace_capture_enabled():
+                response = action.final_thought or action.thought or json.dumps(
+                    action.outputs, ensure_ascii=False
+                )
+                if not await self._try_complete_fine_trace(response, 'agent_finished'):
+                    self._start_fine_trace_finalization('agent_finished')
+            else:
                 self.state.outputs = action.outputs
                 self.state.metrics.merge(self.state.local_metrics)
                 await self.set_agent_state_to(AgentState.FINISHED)
@@ -651,9 +657,9 @@ class AgentController:
                 str(action),
                 extra={'msg_type': 'ACTION', 'event_source': EventSource.USER},
             )
-            if EVALUATION_PROBE_MARKER in action.content:
-                # Do not schedule RecallAction/microagent retrieval for the probe.
-                # The existing conversation history is the only allowed context.
+            if FINE_TRACE_FINAL_MARKER in action.content:
+                # This is a format-only final turn after the task budget. Do not
+                # schedule recall or give the subject more environment access.
                 if self.get_agent_state() != AgentState.RUNNING:
                     await self.set_agent_state_to(AgentState.RUNNING)
                 return
@@ -698,8 +704,8 @@ class AgentController:
                 await self.set_agent_state_to(AgentState.RUNNING)
 
         elif action.source == EventSource.AGENT:
-            if self._evaluation_probe_answering():
-                await self._complete_evaluation_probe(action.content)
+            if self._finalizing_fine_trace():
+                await self._complete_fine_trace(action.content)
                 return
             # If the agent is waiting for a response, set the appropriate state
             if action.wait_for_response:
@@ -930,26 +936,24 @@ class AgentController:
             extra={'msg_type': 'STEP'},
         )
 
-        probe_answering = self._evaluation_probe_answering()
-        # Trace mode keeps tools on during answering (max-iterations is bypassed
-        # below while answering), so bound the answering phase itself: give the
-        # subject a few steps to consult code and emit the JSON, then force
-        # capture of its best message so a tool-loop cannot run to the wall-clock
-        # timeout without persisting a trace.
-        if probe_answering and self._evaluation_trace_mode():
-            probe = self.state.extra_data.get('evaluation_probe') or {}
-            started = int(probe.get('started_iteration') or 0)
-            if self.state.iteration - started >= self._TRACE_PHASE_MAX_STEPS:
-                await self._force_complete_trace()
-                return
+        finalizing_fine_trace = self._finalizing_fine_trace()
         stop_step = False
-        if not probe_answering and self.state.iteration >= self.state.max_iterations:
-            if self._start_evaluation_probe('iteration_limit'):
+        if (
+            not finalizing_fine_trace
+            and self.state.iteration >= self.state.max_iterations
+        ):
+            submitted_trace = self._submitted_fine_trace()
+            if submitted_trace is not None:
+                await self._persist_fine_trace(
+                    submitted_trace, 'last_poc_submission'
+                )
+                return
+            if self._start_fine_trace_finalization('iteration_limit'):
                 return
             stop_step = await self._handle_traffic_control(
                 'iteration', self.state.iteration, self.state.max_iterations
             )
-        if not probe_answering and self.max_budget_per_task is not None:
+        if not finalizing_fine_trace and self.max_budget_per_task is not None:
             current_cost = self.state.metrics.accumulated_cost
             if current_cost > self.max_budget_per_task:
                 stop_step = await self._handle_traffic_control(
@@ -959,29 +963,26 @@ class AgentController:
             logger.warning('Stopping agent due to traffic control')
             return
 
-        # Trace mode deliberately does NOT early-abort on a stuck loop: the
-        # stuck detector is an OpenHands compute-saving convenience, but for
-        # evaluation we want every episode to reach a clean freeze (PoC
-        # submitted / iteration limit) so it always yields a reasoning trace.
-        # A deterministically-stuck sample otherwise never reaches the limit
-        # and produces no trace, which re-running cannot fix. It costs a few
-        # spun iterations; the iteration cap still bounds it.
-        if not probe_answering and not self._evaluation_trace_mode() and self._is_stuck():
+        if (
+            not finalizing_fine_trace
+            and not self._fine_trace_capture_enabled()
+            and self._is_stuck()
+        ):
             await self._react_to_exception(
                 AgentStuckInLoopError('Agent got stuck in a loop')
             )
             return
 
-        if not probe_answering and self._maybe_emit_construction_support_reminder():
+        if not finalizing_fine_trace and self._maybe_emit_construction_support_reminder():
             return
 
-        if not probe_answering and self._maybe_emit_enhancement_stage_transition():
+        if not finalizing_fine_trace and self._maybe_emit_enhancement_stage_transition():
             return
 
-        if not probe_answering and self._maybe_emit_reasoning_recorder_reminder():
+        if not finalizing_fine_trace and self._maybe_emit_reasoning_recorder_reminder():
             return
 
-        if not probe_answering and self._maybe_auto_submit_discovered_candidate():
+        if not finalizing_fine_trace and self._maybe_auto_submit_discovered_candidate():
             return
 
         self.update_state_before_step()
@@ -1032,15 +1033,12 @@ class AgentController:
                     raise e
 
         if (
-            self._evaluation_probe_answering()
-            and not self._evaluation_trace_mode()
-            and not isinstance(action, (MessageAction, AgentFinishAction, CondensationAction))
+            self._finalizing_fine_trace()
+            and not isinstance(
+                action, (MessageAction, AgentFinishAction, CondensationAction)
+            )
         ):
-            # Non-trace probe modes are tool-free: never hand a runnable action
-            # to the runtime after freeze. Trace mode keeps tools on (the subject
-            # may consult the code while producing the logic chain), so runnable
-            # actions fall through and execute normally.
-            await self._complete_evaluation_probe(str(action))
+            await self._complete_fine_trace(str(action))
             return
 
         if self._maybe_block_until_reasoning_recorded(action):
@@ -1100,136 +1098,160 @@ class AgentController:
     def _harness_mode(self) -> str:
         return os.environ.get('OPENHANDS_HARNESS_MODE', 'evaluation')
 
-    def _evaluation_probe_answering(self) -> bool:
-        probe = self.state.extra_data.get('evaluation_probe')
-        return isinstance(probe, dict) and probe.get('status') == 'answering'
-
-    def _evaluation_trace_mode(self) -> bool:
-        return os.environ.get('OPENHANDS_EVAL_TRACE_MODE', '0') == '1'
-
-    def _evaluation_probing_enabled(self) -> bool:
-        # Trace mode (the current reasoning evaluator) needs no probes file: the
-        # freeze prompt is fixed. Legacy question-probing needs a probes path.
+    def _fine_trace_capture_enabled(self) -> bool:
         return (
             self._harness_mode() == 'evaluation'
-            and os.environ.get('OPENHANDS_EVAL_PROBING', '0') == '1'
-            and (self._evaluation_trace_mode() or bool(os.environ.get('OPENHANDS_EVAL_PROBES_PATH')))
+            and os.environ.get('OPENHANDS_CAPTURE_FINE_TRACE', '0') == '1'
         )
 
-    def _start_evaluation_probe(self, trigger: str) -> bool:
-        if not self._evaluation_probing_enabled():
-            return False
-        current = self.state.extra_data.get('evaluation_probe')
-        if isinstance(current, dict) and current.get('status') in {'answering', 'completed'}:
-            return False
+    def _finalizing_fine_trace(self) -> bool:
+        finalization = self.state.extra_data.get('fine_trace_finalization')
+        return (
+            isinstance(finalization, dict)
+            and finalization.get('status') == 'answering'
+        )
+
+    def _submitted_fine_trace(self) -> str | None:
+        """Return the latest valid trace atomically recorded with a PoC."""
+        marker = os.environ.get('OPENHANDS_POC_SUBMISSION_MARKER', '').strip()
+        trace_path = os.environ.get(
+            'OPENHANDS_LATEST_SUBMISSION_TRACE', ''
+        ).strip()
+        if not marker or not trace_path:
+            return None
+        if not Path(marker).is_file() or not Path(trace_path).is_file():
+            return None
         try:
-            from evaluator.reasoning.session import build_probe_prompt
-        except Exception as exc:
-            logger.warning('Could not load the reasoning trace prompt: %s', exc)
+            response = Path(trace_path).read_text(encoding='utf-8')
+            from evaluator.reasoning.fine_trace import validate_fine_trace
+
+            return response if validate_fine_trace(response) is None else None
+        except (OSError, UnicodeError):
+            return None
+
+    def _start_fine_trace_finalization(self, trigger: str) -> bool:
+        """Give one format-only final turn after the task endpoint.
+
+        The required schema is already part of the initial task prompt. This
+        turn adds no GT and exposes no tools; it merely guarantees that hitting
+        the iteration cap still yields the declared task deliverable.
+        """
+        if not self._fine_trace_capture_enabled():
+            return False
+        current = self.state.extra_data.get('fine_trace_finalization')
+        if isinstance(current, dict) and current.get('status') in {'answering', 'completed'}:
             return False
 
         self._pending_action = None
         self._clear_agent_pending_actions()
-        self.state.extra_data['evaluation_probe'] = {
+        self.state.extra_data['fine_trace_finalization'] = {
             'status': 'answering',
             'trigger': trigger,
             'tool_access': 'disabled',
             'started_iteration': self.state.iteration,
         }
-        prompt = build_probe_prompt([], trigger)
+        prompt = (
+            f'{FINE_TRACE_FINAL_MARKER} The PoC task has ended because: {trigger}. '
+            'Return the final deliverable specified in the initial task prompt now. '
+            'Output ONLY the GT-shaped JSON fine-trace array with consecutive '
+            'step numbers and the required fields '
+            '"step", "file", "function", "line", "var", "code", and "note". '
+            'Represent propagation by causal/execution order and do not output '
+            'a "depends_on" field.'
+        )
         self.event_stream.add_event(
             MessageAction(content=prompt, wait_for_response=False),
             EventSource.USER,
         )
         return True
 
-    def _maybe_start_probe_after_observation(self, observation: Observation) -> bool:
-        if not self._evaluation_probing_enabled() or self._evaluation_probe_answering():
+    _MAX_FINE_TRACE_FORMAT_RETRIES = 2
+
+    async def _try_complete_fine_trace(
+        self, response: str, trigger: str
+    ) -> bool:
+        """Persist a valid fine trace emitted directly by AgentFinishAction."""
+        from evaluator.reasoning.fine_trace import validate_fine_trace
+
+        if validate_fine_trace(response) is not None:
             return False
-        cause = observation.cause
-        if cause is None:
-            return False
-        for event in reversed(self.state.history):
-            if getattr(event, 'id', None) != cause:
-                continue
-            if self._is_direct_submit_command(event):
-                return self._start_evaluation_probe('poc_submitted')
-            return False
-        return False
+        await self._persist_fine_trace(response, trigger)
+        return True
 
-    # Format-only retries: guarantee we capture a well-formed logic-chain JSON.
-    # This checks STRUCTURE, never content correctness (scoring.py's job) -- a
-    # malformed reply just gets a reminder and another try, bounded, so a
-    # formatting slip coming out of tool-using mode is not recorded as the
-    # final trace.
-    _MAX_TRACE_FORMAT_RETRIES = 2
-    # Extra steps the (tools-on) trace answering phase may take before we force
-    # capture, counted from the freeze iteration.
-    _TRACE_PHASE_MAX_STEPS = 12
-
-    def _last_agent_message(self) -> str:
-        """Most recent agent MessageAction content in history (the best available
-        trace candidate when forcing capture)."""
-        for event in reversed(self.state.history):
-            if isinstance(event, MessageAction) and event.source == EventSource.AGENT:
-                return str(event.content or '')
-        return ''
-
-    async def _force_complete_trace(self) -> None:
-        """Trace phase overran its step budget: capture the best message we have
-        so a tool-loop never runs to the wall-clock timeout without a trace."""
-        await self._complete_evaluation_probe(self._last_agent_message(), force=True)
-
-    async def _complete_evaluation_probe(self, response: str, force: bool = False) -> None:
-        probe = self.state.extra_data.get('evaluation_probe')
-        if not isinstance(probe, dict) or probe.get('status') != 'answering':
+    async def _complete_fine_trace(self, response: str) -> None:
+        finalization = self.state.extra_data.get('fine_trace_finalization')
+        if (
+            not isinstance(finalization, dict)
+            or finalization.get('status') != 'answering'
+        ):
             return
 
-        attempts = int(probe.get('attempts') or 0) + 1
-        probe['attempts'] = attempts
+        attempts = int(finalization.get('attempts') or 0) + 1
+        finalization['attempts'] = attempts
+        from evaluator.reasoning.fine_trace import validate_fine_trace
 
-        from evaluator.reasoning.session import PROBE_MARKER, validate_trace_format
-
-        format_error = validate_trace_format(response)
-        if not force and format_error is not None and attempts <= self._MAX_TRACE_FORMAT_RETRIES:
+        format_error = validate_fine_trace(response)
+        if (
+            format_error is not None
+            and attempts <= self._MAX_FINE_TRACE_FORMAT_RETRIES
+        ):
             reminder = (
-                f'{PROBE_MARKER} Your logic-chain reply was not accepted: {format_error}. '
-                'Reply with ONLY a JSON array; each element an object with '
-                '"function", "line", "code", and "value_effect". No prose, no code fences.'
+                f'{FINE_TRACE_FINAL_MARKER} The final deliverable was not accepted: '
+                f'{format_error}. Reply with ONLY the JSON array described in the '
+                'initial task prompt.'
             )
             self.event_stream.add_event(
                 MessageAction(content=reminder, wait_for_response=False),
                 EventSource.USER,
             )
             return
+        if format_error is not None:
+            finalization['status'] = 'failed'
+            finalization['error'] = format_error
+            self.state.outputs = {
+                **self.state.outputs,
+                'fine_trace_finalization': finalization,
+            }
+            self.state.metrics.merge(self.state.local_metrics)
+            await self.set_agent_state_to(AgentState.FINISHED)
+            return
+        await self._persist_fine_trace(
+            response, str(finalization.get('trigger') or '')
+        )
 
+    async def _persist_fine_trace(self, response: str, trigger: str) -> None:
+        from evaluator.reasoning.fine_trace import write_fine_trace
+
+        default_root = Path(os.environ.get('LOG_DIR') or '.')
+        output = Path(
+            os.environ.get('OPENHANDS_FINE_TRACE_OUTPUT')
+            or default_root / 'fine_trace.json'
+        )
         try:
-            from evaluator.reasoning.session import write_probe_response
-
-            default_root = Path(os.environ.get('LOG_DIR') or '.')
-            output = Path(
-                os.environ.get('OPENHANDS_EVAL_PROBE_OUTPUT')
-                or default_root / 'reasoning_trace.json'
-            )
-            # Persist the raw logic-chain response only; reasoning/scoring.py
-            # scores it against the verified invariants afterward.
-            payload = write_probe_response(
-                output,
-                trigger=str(probe.get('trigger') or ''),
-                probes=[],
-                response=response,
-            )
-            probe['output'] = str(output)
-            probe['parse_valid'] = payload['parse_valid']
+            write_fine_trace(output, response)
+            result = {
+                'status': 'completed',
+                'trigger': trigger,
+                'final_turn_tool_access': (
+                    'task_tools_available'
+                    if trigger == 'agent_finished'
+                    and not self._finalizing_fine_trace()
+                    else 'disabled'
+                ),
+                'output': str(output),
+                'completed_iteration': self.state.iteration,
+            }
         except Exception as exc:
-            logger.warning('Could not persist evaluation probe response: %s', exc)
-            probe['error'] = f'{type(exc).__name__}: {exc}'
-        probe['status'] = 'completed'
-        probe.pop('probes', None)
-        probe['completed_iteration'] = self.state.iteration
+            logger.warning('Could not persist subject fine trace: %s', exc)
+            result = {
+                'status': 'failed',
+                'trigger': trigger,
+                'error': f'{type(exc).__name__}: {exc}',
+            }
+        self.state.extra_data['fine_trace_finalization'] = result
         self.state.outputs = {
             **self.state.outputs,
-            'evaluation_probe': probe,
+            'fine_trace_finalization': result,
         }
         self.state.metrics.merge(self.state.local_metrics)
         await self.set_agent_state_to(AgentState.FINISHED)

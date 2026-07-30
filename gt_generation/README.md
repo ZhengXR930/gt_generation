@@ -36,7 +36,7 @@ cp gt_generation/gt_config.example.json gt_generation/gt_config.json
 | field | meaning |
 |-------|---------|
 | `cli` | which agent CLI drives generation: `claude` \| `codex` \| `coco` (Trae). Each maps to `adapters/<cli>/`. |
-| `model` | **one** model id used for every stage (no per-stage switching). Must be valid for the CLI: `claude` → `sonnet`, `claude-opus-4-6`; `codex` → an official OpenAI model, e.g. `gpt-5.5`; `coco` → any id from `coco models` (e.g. `gpt-5.5`, `openrouter-3o`). |
+| `model` | **one** model id used for every stage (no per-stage switching). Must be valid for the CLI: `claude` → `sonnet`, `claude-opus-4-6`; `codex` → an official OpenAI model, e.g. `gpt-5.4`; `coco` → any id from `coco models` (e.g. `gpt-5.4`, `openrouter-3o`). |
 | `reasoning_effort` | Codex reasoning effort used for every agent stage: `minimal`, `low`, `medium`, `high`, or `xhigh` (default `high`). |
 | `strict_config` | Pass `--strict-config` to Codex so unknown config keys fail immediately (default `true`). |
 | `parallel_dockers` | how many samples to run at once (1–6); each holds one Docker workspace. |
@@ -56,15 +56,15 @@ complete**, so finished work is never redone. Docker routing is automatic and
 printed up front: ARVO samples use the prebuilt `n132/arvo:<id>` images; every
 other source builds/clones in the shared `gt-memory-env` image.
 
-### Example — codex with the official GPT API, model GPT-5.5
+### Example — codex with the official GPT API, model GPT-5.4
 
 ```jsonc
 // config.txt:  OPENAI_API_KEY_OFFICIAL=sk-...
 // gt_generation/gt_config.json:
 {
   "cli": "codex",
-  "model": "gpt-5.5",
-  "reasoning_effort": "high",
+  "model": "gpt-5.4",
+  "reasoning_effort": "medium",
   "strict_config": true,
   "parallel_dockers": 2,
   "repo_docker_image": "gt-memory-env:latest",

@@ -18,6 +18,13 @@ details not established by these inputs may remain private candidate evidence fo
 04; do not manufacture a Stage 02 revision merely to make Stage 03 dynamically prove
 them.
 
+If the current generation state shows that `02_runtime_disambiguation` ran for this
+version of `ground_truth.json`, also inspect that stage's existing role log and the
+workspace run log it references. Those are already-produced inputs to this review, not
+authorization to execute the target. Check that each runtime-dependent statement in the
+GT is no broader than the correlated marker observation. Do not require a new artifact
+or field merely to restate that observation.
+
 **Bounded exception — runtime disambiguation (OFF by default).** This escalation is gated:
 first read `<result_dir>/run_flags.json`. It applies **only** when `runtime_disambiguation`
 is `true` there; when it is `false` or the file is absent (the default), never set
@@ -25,17 +32,18 @@ is `true` there; when it is `false` or the file is absent (the default), never s
 leave the review incomplete, so the harness skips the sample rather than force-resolving
 or guessing it.
 
-When (and only when) the flag is enabled: if closing the global causal chain hinges on a
-single runtime fact the saved artifacts genuinely cannot establish — most often *which* of
-several polymorphic/dispatch arms executed for the crashing input (e.g.
-`CoverageFormat1::Iter::init` vs `CoverageFormat2::Iter::init`) — do not accept an
-ambiguous chain and do not guess an arm. Set `needs_runtime_disambiguation` true in
-`trace_feedback.json` and add an `observe` string naming the *exact* fact to capture; this
-authorizes the next Stage 02 session to take one targeted instrumentation measurement to
-resolve it. Use it only when the fact is **load-bearing** (the chain cannot be closed
-without it) and static analysis of the source has genuinely been exhausted; a runtime
-detail not required to close the chain still defers to Stage 04 as private candidate
-evidence and must NOT set this flag.
+When (and only when) the flag is enabled: if closing the global causal chain hinges on one
+runtime-resolvable **causal gap** that the saved artifacts genuinely cannot establish, do
+not accept an ambiguous chain and do not guess. Set `needs_runtime_disambiguation` true in
+`trace_feedback.json` and use the existing `observe` string to name the exact causal
+question plus every correlated observation needed to answer it. One gap may require
+several values or sites in the same bounded run: for example, a dispatch arm together
+with the compared pointer's poison state, or a producer record offset together with the
+consumer cursor offset. This authorizes the dedicated conditional dynamic stage, not the
+static Stage 02 author, to take one targeted instrumentation measurement and revise the
+existing GT. Do not request unrelated exploratory measurements. Use this only when the
+gap is load-bearing and static source analysis has genuinely been exhausted; a runtime
+detail not required to close the chain still defers to Stage 04.
 
 Trace steps have no `role` or `kind`. Verify each top-level `source`, `root_cause`, and
 `sink` through its explicit `trace_step` link, including the linked node's source
@@ -120,6 +128,6 @@ Also write `<result_dir>/trace_feedback.json`:
 When any review boolean is false, set `needs_revision` true and list only actionable
 objects with `location`, `problem`, and `required_change`. Set `needs_runtime_disambiguation`
 true (with a precise `observe`) only in the bounded exception above — when the sole
-remaining blocker is a load-bearing runtime fact static analysis cannot establish. The
-harness will launch a new Stage 02 CLI session and then a new reviewer session; do not
-repair the GT yourself.
+remaining blocker is one load-bearing runtime-resolvable causal gap that static analysis
+cannot establish. The harness will launch the conditional runtime-disambiguation session
+and then a new reviewer session; do not repair the GT yourself.

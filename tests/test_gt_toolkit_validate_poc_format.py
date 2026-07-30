@@ -148,6 +148,37 @@ def test_poc_format_accepts_complete_contract(tmp_path: Path) -> None:
     assert result["errors"] == []
 
 
+def test_parser_admitted_accepts_structured_admitted_location(
+    tmp_path: Path,
+) -> None:
+    gt = _base_gt()
+    gt["reachability_checkpoints"]["parser_admitted"]["admitted_location"] = {
+        "file": "parser.c",
+        "function": "parse",
+        "line": 12,
+        "code": "decode(input);",
+    }
+
+    result = _run_validate(gt, tmp_path)
+
+    assert result["ok"] is True
+    assert result["errors"] == []
+
+
+def test_parser_admitted_rejects_incomplete_admitted_location(
+    tmp_path: Path,
+) -> None:
+    gt = _base_gt()
+    gt["reachability_checkpoints"]["parser_admitted"]["admitted_location"] = {
+        "file": "parser.c",
+    }
+
+    result = _run_validate(gt, tmp_path)
+
+    assert result["ok"] is False
+    assert any("admitted_location missing function" in item for item in result["errors"])
+
+
 def test_poc_format_contract_is_required(tmp_path: Path) -> None:
     gt = _base_gt()
     del gt["poc"]["format"]["contract"]

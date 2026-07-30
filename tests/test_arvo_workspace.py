@@ -75,7 +75,11 @@ def test_fixed_compile_is_target_level_incremental_not_full(tmp_path, monkeypatc
     }
     commands = []
     monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
-    monkeypatch.setattr(arvo_workspace, "_require_frozen_spec", lambda result_dir: {})
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_require_execution_authorization",
+        lambda result_dir, runtime_disambiguation: {},
+    )
     monkeypatch.setattr(arvo_workspace, "_verify_source_fingerprint", lambda result_dir: None)
     monkeypatch.setattr(arvo_workspace, "_source_root", lambda result_dir: "/src/readstat")
 
@@ -105,7 +109,11 @@ def test_instrumented_vulnerable_compile_reuses_configured_target(tmp_path, monk
     }
     commands = []
     monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
-    monkeypatch.setattr(arvo_workspace, "_require_frozen_spec", lambda result_dir: {})
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_require_execution_authorization",
+        lambda result_dir, runtime_disambiguation: {},
+    )
     monkeypatch.setattr(arvo_workspace, "_verify_source_fingerprint", lambda result_dir: None)
     monkeypatch.setattr(arvo_workspace, "_source_root", lambda result_dir: "/src/readstat")
     monkeypatch.setattr(
@@ -132,7 +140,11 @@ def test_target_compile_falls_back_without_agent_polling(tmp_path, monkeypatch):
     }
     commands = []
     monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
-    monkeypatch.setattr(arvo_workspace, "_require_frozen_spec", lambda result_dir: {})
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_require_execution_authorization",
+        lambda result_dir, runtime_disambiguation: {},
+    )
     monkeypatch.setattr(arvo_workspace, "_verify_source_fingerprint", lambda result_dir: None)
     monkeypatch.setattr(arvo_workspace, "_source_root", lambda result_dir: "/src/readstat")
 
@@ -217,6 +229,58 @@ def test_workspace_rejects_execution_before_exact_spec_is_frozen(tmp_path):
     spec_path.write_text(spec_path.read_text() + "\n")
     with pytest.raises(RuntimeError, match="changed after freeze"):
         arvo_workspace._require_frozen_spec(tmp_path)
+
+
+def test_runtime_disambiguation_authorization_uses_existing_control_files(tmp_path):
+    arvo_workspace._write(
+        tmp_path / "run_flags.json", {"runtime_disambiguation": True}
+    )
+    arvo_workspace._write(
+        tmp_path / "trace_feedback.json",
+        {
+            "needs_runtime_disambiguation": True,
+            "observe": "correlate producer and consumer offsets",
+        },
+    )
+
+    assert (
+        arvo_workspace._require_execution_authorization(
+            tmp_path, runtime_disambiguation=True
+        )
+        is None
+    )
+    with pytest.raises(RuntimeError, match="locked until"):
+        arvo_workspace._require_execution_authorization(
+            tmp_path, runtime_disambiguation=False
+        )
+
+    arvo_workspace._write(
+        tmp_path / "trace_feedback.json",
+        {"needs_runtime_disambiguation": True, "observe": ""},
+    )
+    with pytest.raises(RuntimeError, match="no observe"):
+        arvo_workspace._require_runtime_disambiguation(tmp_path)
+
+
+def test_ensure_vulnerable_workspace_recreates_only_when_missing(tmp_path, monkeypatch):
+    context = {
+        "container": "workspace",
+        "vul_image": "n132/arvo:42-vul",
+    }
+    calls = []
+    monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_run",
+        lambda cmd, timeout=3600: calls.append(cmd) or _proc(
+            returncode=1 if cmd[:2] == ["docker", "inspect"] else 0
+        ),
+    )
+    monkeypatch.setattr(arvo_workspace, "create", lambda result_dir: 0)
+    monkeypatch.setattr(arvo_workspace, "compile_vulnerable", lambda result_dir: 0)
+
+    assert arvo_workspace.ensure_vulnerable_workspace(tmp_path) == 0
+    assert ["docker", "pull", "n132/arvo:42-vul"] in calls
 
 
 def test_workspace_rejects_unpersisted_container_source_edit(tmp_path, monkeypatch):

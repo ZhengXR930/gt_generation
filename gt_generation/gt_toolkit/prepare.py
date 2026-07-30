@@ -80,6 +80,11 @@ def _is_arvo(sample: dict[str, Any]) -> bool:
     return str(sample.get("sample_id", "")).startswith("arvo_")
 
 
+def is_arvo_sample(sample: dict[str, Any]) -> bool:
+    """Public source-family predicate used by resume orchestration."""
+    return _is_arvo(sample)
+
+
 def prepare(sample_path: str, result_dir: str) -> dict[str, Any]:
     """Two tracks, dispatched by sample source:
       ARVO         -> pull n132/arvo:<id>-vul (fixed validation applies patch in one workspace)
@@ -380,6 +385,68 @@ def _prepare_arvo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
             "patch": (d / "patch.diff").exists(), "prepared": bool(src.exists())}
 
 
+def ensure_arvo_resume_source(sample: dict[str, Any], result_dir: str | Path) -> dict[str, Any]:
+    """Restore only the exact ARVO source needed by a resumed agent stage.
+
+    Copy through a temporary directory so an interrupted Docker copy can never
+    be mistaken for a complete source tree. Public PoC, patch, and GT artifacts
+    are deliberately left untouched.
+    """
+    d = Path(result_dir)
+    src = d / "_work" / "src"
+    if src.is_dir() and any(src.iterdir()):
+        return {"prepared": True, "source": str(src), "reused": True}
+    if not _is_arvo(sample):
+        return {
+            "prepared": False,
+            "reason": "resume source hydration currently requires an ARVO sample",
+        }
+    aid = _arvo_id(sample)
+    if not aid:
+        return {"prepared": False, "reason": "no arvo/benchmark id in sample"}
+
+    image = f"n132/arvo:{aid}-vul"
+    if not _pull(image):
+        return {"prepared": False, "reason": f"pull failed: {image}"}
+
+    work = d / "_work"
+    work.mkdir(parents=True, exist_ok=True)
+    temporary = work / f".resume-src-{os.getpid()}"
+    shutil.rmtree(temporary, ignore_errors=True)
+    temporary.mkdir()
+    cid = ""
+    try:
+        created = _sh(["docker", "create", image])
+        cid = created.stdout.strip()
+        if created.returncode != 0 or not cid:
+            return {
+                "prepared": False,
+                "reason": f"docker create failed: {image}",
+                "stderr": created.stderr.strip(),
+            }
+        copied = _sh(["docker", "cp", f"{cid}:/src/.", str(temporary)])
+        if copied.returncode != 0:
+            return {
+                "prepared": False,
+                "reason": f"docker cp failed: {image}:/src",
+                "stderr": copied.stderr.strip(),
+            }
+        if not any(temporary.iterdir()):
+            return {"prepared": False, "reason": f"empty source tree: {image}:/src"}
+        shutil.rmtree(src, ignore_errors=True)
+        temporary.replace(src)
+        return {
+            "prepared": True,
+            "source": str(src),
+            "reused": False,
+            "image": image,
+        }
+    finally:
+        if cid:
+            _sh(["docker", "rm", "-f", cid])
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
 def _detect_arvo_target(image: str) -> str:
     script = _sh([
         "docker", "run", "--rm", "--entrypoint", "/bin/cat", image, "/bin/arvo"
@@ -446,12 +513,27 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     )
     (d / "build.sh").chmod(0o755)
     _init_state(sid, d)
-    return {"track": "repo/secbench", "sample_id": sid, "env": env_image,
-            "env_context": str(env_context), "env_ok": env_ok,
-            "repo": repo, "vulnerable_commit": vcommit, "source": src.exists(),
-            "poc": (d / "poc").exists(), "poc_source": staged_poc,
-            "patch": (d / "patch.diff").exists(),
-            "prepared": bool(src.exists())}
+    report = {"track": "repo/secbench", "sample_id": sid, "env": env_image,
+              "env_context": str(env_context), "env_ok": env_ok,
+              "repo": repo, "vulnerable_commit": vcommit, "source": src.exists(),
+              "poc": (d / "poc").exists(), "poc_source": staged_poc,
+              "patch": (d / "patch.diff").exists(),
+              "prepared": bool(src.exists())}
+    for key in (
+        "oss_fuzz_engine",
+        "oss_fuzz_target",
+        "oss_fuzz_job",
+        "oss_fuzz_sanitizer",
+        "oss_fuzz_platform",
+        "oss_fuzz_fixed_range",
+        "oss_fuzz_introduced_range",
+        "oss_fuzz_last_known_bad_commit",
+        "oss_fuzz_first_known_good_commit",
+        "vulnerable_commit_source",
+    ):
+        if sample.get(key):
+            report[key] = sample[key]
+    return report
 
 
 def _stage_repo_poc(sample: dict[str, Any], d: Path, sid: str) -> str:

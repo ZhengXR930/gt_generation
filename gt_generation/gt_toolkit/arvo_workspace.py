@@ -188,6 +188,33 @@ def _require_frozen_spec(result_dir: Path) -> dict[str, Any]:
     return marker
 
 
+def _require_runtime_disambiguation(result_dir: Path) -> None:
+    """Authorize bounded pre-Stage-04 execution from existing control files."""
+    flags_path = result_dir / "run_flags.json"
+    feedback_path = result_dir / "trace_feedback.json"
+    if not flags_path.is_file() or not feedback_path.is_file():
+        raise RuntimeError(
+            "runtime disambiguation requires run_flags.json and trace_feedback.json"
+        )
+    flags = _load(flags_path)
+    feedback = _load(feedback_path)
+    if not flags.get("runtime_disambiguation"):
+        raise RuntimeError("runtime disambiguation is disabled for this run")
+    if not feedback.get("needs_runtime_disambiguation"):
+        raise RuntimeError("reviewer did not request runtime disambiguation")
+    if not str(feedback.get("observe") or "").strip():
+        raise RuntimeError("runtime disambiguation request has no observe question")
+
+
+def _require_execution_authorization(
+    result_dir: Path, runtime_disambiguation: bool
+) -> dict[str, Any] | None:
+    if runtime_disambiguation:
+        _require_runtime_disambiguation(result_dir)
+        return None
+    return _require_frozen_spec(result_dir)
+
+
 def _source_fingerprint(result_dir: Path) -> str:
     context = _context(result_dir)
     root = _source_root(result_dir)
@@ -247,8 +274,31 @@ def create(result_dir: Path) -> int:
     return started.returncode
 
 
-def apply_instrumentation(result_dir: Path, patch: Path) -> int:
-    marker = _require_frozen_spec(result_dir)
+def ensure_vulnerable_workspace(result_dir: Path) -> int:
+    """Reuse a live vulnerable workspace or deterministically recreate its build."""
+    context = _context(result_dir)
+    inspected = _run([
+        "docker",
+        "inspect",
+        "-f",
+        "{{.State.Running}}",
+        context["container"],
+    ])
+    if inspected.returncode == 0 and inspected.stdout.strip() == "true":
+        _update_state(result_dir, context, container_running=True)
+        return 0
+    pulled = _run(["docker", "pull", context["vul_image"]], timeout=2400)
+    if pulled.returncode != 0:
+        return pulled.returncode
+    if create(result_dir) != 0:
+        return 1
+    return compile_vulnerable(result_dir)
+
+
+def apply_instrumentation(
+    result_dir: Path, patch: Path, *, runtime_disambiguation: bool = False
+) -> int:
+    marker = _require_execution_authorization(result_dir, runtime_disambiguation)
     patch = _require_persisted_instrumentation_patch(result_dir, patch)
     context = _context(result_dir)
     root = _source_root(result_dir)
@@ -264,16 +314,16 @@ def apply_instrumentation(result_dir: Path, patch: Path) -> int:
     )
     _write_log(result_dir, "instrumentation_apply.log", applied)
     if applied.returncode == 0:
-        _update_state(
-            result_dir,
-            context,
-            instrumentation_patch=str(patch.resolve()),
-            instrumentation_patch_sha256=(
+        updates: dict[str, Any] = {
+            "instrumentation_patch": str(patch.resolve()),
+            "instrumentation_patch_sha256": (
                 "sha256:" + hashlib.sha256(patch.read_bytes()).hexdigest()
             ),
-            instrumentation_source_sha256=_source_fingerprint(result_dir),
-            assertion_content_hash=marker["content_hash"],
-        )
+            "instrumentation_source_sha256": _source_fingerprint(result_dir),
+        }
+        if marker is not None:
+            updates["assertion_content_hash"] = marker["content_hash"]
+        _update_state(result_dir, context, **updates)
     return applied.returncode
 
 
@@ -364,9 +414,15 @@ def compile_fixed(
     return _compile_fixed_fallback(result_dir, context, instrumentation_patch)
 
 
-def compile_target(result_dir: Path, *, version: str, target: str = "") -> int:
+def compile_target(
+    result_dir: Path,
+    *,
+    version: str,
+    target: str = "",
+    runtime_disambiguation: bool = False,
+) -> int:
     """Incrementally rebuild the active target in the existing configured tree."""
-    _require_frozen_spec(result_dir)
+    _require_execution_authorization(result_dir, runtime_disambiguation)
     _verify_source_fingerprint(result_dir)
     context = _context(result_dir)
     root = _source_root(result_dir)
@@ -445,10 +501,19 @@ def _compile_fixed_fallback(
     return proc.returncode
 
 
-def run_case(result_dir: Path, version: str, expect: str) -> int:
+def run_case(
+    result_dir: Path,
+    version: str,
+    expect: str,
+    *,
+    runtime_disambiguation: bool = False,
+) -> int:
     context = _context(result_dir)
     state = _load(_state_path(result_dir))
-    if "instrumented" in str(state.get("phase") or "") or version == "fixed":
+    if runtime_disambiguation:
+        _require_runtime_disambiguation(result_dir)
+        _verify_source_fingerprint(result_dir)
+    elif "instrumented" in str(state.get("phase") or "") or version == "fixed":
         _require_frozen_spec(result_dir)
         _verify_source_fingerprint(result_dir)
     proc = _docker_exec(context["container"], "/bin/arvo run", timeout=300)
@@ -512,12 +577,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--result-dir", required=True, type=Path)
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("create")
+    sub.add_parser("ensure-vulnerable")
     p_apply = sub.add_parser("apply-instrumentation")
     p_apply.add_argument("--patch", required=True, type=Path)
+    p_apply.add_argument("--runtime-disambiguation", action="store_true")
     sub.add_parser("compile-vulnerable")
     p_target = sub.add_parser("compile-target")
     p_target.add_argument("--version", required=True, choices=["vulnerable", "fixed"])
     p_target.add_argument("--target", default="")
+    p_target.add_argument("--runtime-disambiguation", action="store_true")
     p_switch = sub.add_parser("switch-fixed")
     p_switch.add_argument("--patch", required=True, type=Path)
     sub.add_parser("reset-source")
@@ -528,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run")
     p_run.add_argument("--version", required=True, choices=["vulnerable", "fixed"])
     p_run.add_argument("--expect", default="any", choices=["crash", "clean", "any"])
+    p_run.add_argument("--runtime-disambiguation", action="store_true")
     p_cleanup = sub.add_parser("cleanup")
     p_cleanup.add_argument("--remove-images", action="store_true")
     sub.add_parser("status")
@@ -535,12 +604,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.action == "create":
         return create(args.result_dir)
+    if args.action == "ensure-vulnerable":
+        return ensure_vulnerable_workspace(args.result_dir)
     if args.action == "apply-instrumentation":
-        return apply_instrumentation(args.result_dir, args.patch)
+        return apply_instrumentation(
+            args.result_dir,
+            args.patch,
+            runtime_disambiguation=args.runtime_disambiguation,
+        )
     if args.action == "compile-vulnerable":
         return compile_vulnerable(args.result_dir)
     if args.action == "compile-target":
-        return compile_target(args.result_dir, version=args.version, target=args.target)
+        return compile_target(
+            args.result_dir,
+            version=args.version,
+            target=args.target,
+            runtime_disambiguation=args.runtime_disambiguation,
+        )
     if args.action == "switch-fixed":
         return switch_fixed(args.result_dir, args.patch)
     if args.action == "reset-source":
@@ -553,7 +633,12 @@ def main(argv: list[str] | None = None) -> int:
             instrumentation_patch=args.instrumentation_patch,
         )
     if args.action == "run":
-        return run_case(args.result_dir, args.version, args.expect)
+        return run_case(
+            args.result_dir,
+            args.version,
+            args.expect,
+            runtime_disambiguation=args.runtime_disambiguation,
+        )
     if args.action == "cleanup":
         return cleanup(args.result_dir, args.remove_images)
     if args.action == "status":

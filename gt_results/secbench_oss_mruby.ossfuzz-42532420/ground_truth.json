@@ -1,0 +1,431 @@
+{
+  "sample_id": "secbench_oss_mruby.ossfuzz-42532420",
+  "vuln_id": "mruby.ossfuzz-42532420",
+  "project": {
+    "id": "mruby",
+    "name": "mruby",
+    "repo": "https://github.com/mruby/mruby",
+    "vulnerable_commit": "219cfd63e151360efe664728e3b5dbcf6e102d44",
+    "fixed_commit": "e61a2881a7c9adc895416fdd409e7362130198d3",
+    "staged_checkout_commit": "219cfd63e151360efe664728e3b5dbcf6e102d44",
+    "commit_note": "Stage 01 reproduced against the staged checkout under `gt_results/secbench_oss_mruby.ossfuzz-42532420/_work/src`, whose `HEAD` is the metadata vulnerable commit `219cfd63e151360efe664728e3b5dbcf6e102d44`, so all locations below use this exact vulnerable line map.",
+    "fuzz_target": "mruby_fuzzer",
+    "reproduction_entry": "build/host/bin/mruby /gt/poc"
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-125",
+    "access": "READ",
+    "detector": "AddressSanitizer",
+    "classification_note": "The saved crash is an 8-byte out-of-bounds read in the SWAR substring-search helper `mrb_memsearch_ss()`. The helper scans the haystack in 64-bit chunks while only bounding the loop by logical string length, not by the remaining readable width of the 8-byte loads."
+  },
+  "bug_description": {
+    "original": "A heap-buffer-overflow in src/string.c's mrb_memsearch_ss: the function performs an 8-byte out-of-bounds read past a heap-allocated string buffer while performing substring search/split (seen via mrb_memsearch / mrb_str_split_m). This can lead to crashes or information disclosure/other undefined behavior during string search/split operations.",
+    "original_source": "sample_info.json issue_description / default_crash_trace.txt / sanitizer_trace.txt / reproduction_report.json / patch.diff / staged vulnerable source snapshot",
+    "normalized": "Stage 01 reproduced `AddressSanitizer: heap-buffer-overflow READ of size 8` at `src/string.c:609` in `mrb_memsearch_ss()` while the staged vulnerable `mruby` CLI executed the saved 40-byte Ruby program `\"                            \".split\"  \"`. `mrb_load_detect_file_cxt()` reads the file as Ruby source, not a RITE binary, and execution reaches `String#split` with an explicit two-space separator, so `mrb_str_split_m()` takes the string-delimiter branch. In that branch the vulnerable source materializes `str_len = RSTRING_LEN(str)` and `pat_len = RSTRING_LEN(spat)` as 28 and 2 for the exact witness, initializes `idx = 0`, and then calls `mrb_memsearch(..., RSTRING_PTR(str)+idx, str_len - idx)`, so the first search window length passed as haystack `n` is source-grounded at 28 bytes. `mrb_memsearch()` only checks whether the needle length exceeds the current window length and then dispatches to `mrb_memsearch_ss()`. In the vulnerable helper, `ys` and `ys + m - 1` are cast to `bitint*`, and the loop condition is only `i < n`; with `n = 28` and 8-byte strides, the loop still reaches `i = 24`, where line 609 performs a full word load from the final partial chunk. The expression `(*s0 ^ first) | (*s1 ^ last)` therefore extends past the readable haystack bytes into the heap redzone. The fix confirms this missing bound by replacing the raw word loads with bounded `memcpy()` reads under `lim = n - MAX(m, sizeof(bitint))` and a bytewise tail fallback."
+  },
+  "source": {
+    "file": "mrbgems/mruby-compiler/core/parse.y",
+    "function": "mrb_load_detect_file_cxt",
+    "line": 6958,
+    "var": "leading.b, bufsize",
+    "code": "bufsize = fread(leading.b, sizeof(char), sizeof(leading), fp);",
+    "description": "First project-side read of the attacker-controlled PoC file into mruby's source-loader buffer.",
+    "value_from": "The saved `poc` is the exact 40-byte Ruby source string `\"                            \".split\"  \"`. Because the file is shorter than `DETECT_SIZE`, this read materializes the whole witness into `leading.b` and sets `bufsize = 40`.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "src/string.c",
+    "function": "mrb_memsearch_ss",
+    "line": 609,
+    "var": "eq, *s0, *s1",
+    "code": "const bitint eq = (*s0 ^ first) | (*s1 ^ last);",
+    "description": "AddressSanitizer crash site. The SWAR compare reads 8-byte words from the current haystack and the one-byte-shifted tail pointer without checking that 8 bytes remain readable.",
+    "note": "The symbolized `default_crash_trace.txt` reports `AddressSanitizer: heap-buffer-overflow` at `src/string.c:609:24` in `mrb_memsearch_ss`, with `READ of size 8` on address `0x503000000388` at the end of a 30-byte heap region `[0x503000000370, 0x50300000038e)`. The separate saved `sanitizer_trace.txt` shows the same line reached on a different short region (29 bytes). Both artifacts support the same sink: a final 8-byte word read issued from an end-of-buffer position permitted by the loop.",
+    "trace_step": 10
+  },
+  "root_cause": {
+    "file": "src/string.c",
+    "function": "mrb_memsearch_ss",
+    "line": 608,
+    "var": "i, n, s0, s1",
+    "code": "for (mrb_int i=0; i < n; i+=sizeof(bitint), s0++, s1++) {",
+    "description": "Root cause. The SWAR loop is bounded only by logical haystack length `n`, not by the remaining readable width required for the 8-byte loads from `s0` and `s1`.",
+    "note": "The bundled fix adds `lim = n - MAX(m, sizeof(bitint))`, iterates only while `i < lim`, and handles the tail bytewise. That patch directly confirms the missing bound on the vulnerable loop.",
+    "trace_step": 9
+  },
+  "tainted_value_origin": {
+    "file": "src/string.c",
+    "function": "mrb_str_split_m",
+    "line": 2280,
+    "var": "argc, spat, lim",
+    "code": "argc = mrb_get_args(mrb, \"|oi\", &spat, &lim);",
+    "description": "The executed Ruby call `.split\"  \"` is unpacked into C locals, materializing the attacker-chosen separator string and split limit state used by the vulnerable search path.",
+    "value_from": "For the exact PoC `\"                            \".split\"  \"`, this call receives one optional argument, so `argc = 1`, `spat` is the two-space string `\"  \"`, and no explicit limit is supplied."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "mrbgems/mruby-compiler/core/parse.y",
+      "function": "mrb_load_detect_file_cxt",
+      "line": 6959,
+      "code": "if (bufsize < sizeof(leading.h) ||\n    memcmp(leading.h.binary_ident, RITE_BINARY_IDENT, sizeof(leading.h.binary_ident)) != 0 ||\n    memchr(leading.b, '\\0', bufsize) == NULL) {",
+      "description": "Sample-specific admission gate. The witness is plain Ruby source, not a RITE bytecode file, so this predicate routes it into the text parser/executor path.",
+      "admitted_location": {
+        "file": "mrbgems/mruby-compiler/core/parse.y",
+        "function": "mrb_load_detect_file_cxt",
+        "line": 6962,
+        "code": "return mrb_load_exec(mrb, mrb_parse_file_continue(mrb, fp, leading.b, bufsize, c), c);"
+      }
+    }
+  },
+  "evidence_limitations": [
+    "Stage 02 remained source-grounded and did not rerun or instrument the fixed build. `patch_resolves` below is based on the staged diff's direct repair of the missing loop bound, not on dynamic fixed-version validation.",
+    "The saved crash artifacts do not settle one unique haystack size or address for the crashing search window: `default_crash_trace.txt` records a 30-byte region with full symbols, while `sanitizer_trace.txt` records a separate 29-byte region without symbolized frames. The staged source is sufficient to ground the invariant suffix used here: once the search window is shorter than 32 bytes, the vulnerable `i < n` loop still reaches `i = 24` and line 609 issues an out-of-bounds 8-byte read."
+  ],
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "mrbgems/mruby-compiler/core/parse.y",
+      "function": "mrb_load_detect_file_cxt",
+      "summary": "The CLI reproduction reads the saved 40-byte PoC file and recognizes it as Ruby source, so mruby parses and executes the witness instead of taking the RITE bytecode loader path."
+    },
+    {
+      "step": 2,
+      "file": "src/string.c",
+      "function": "mrb_str_split_m",
+      "summary": "Executing the parsed witness invokes `String#split` with an explicit two-space separator, which keeps `split_type == string` and reaches the substring-search path."
+    },
+    {
+      "step": 3,
+      "file": "src/string.c",
+      "function": "mrb_memsearch / mrb_memsearch_ss",
+      "summary": "The split helper forwards the current receiver window and separator into the SWAR substring-search helper, which aliases the haystack as 64-bit words and iterates in 8-byte steps."
+    },
+    {
+      "step": 4,
+      "file": "src/string.c",
+      "function": "mrb_memsearch_ss",
+      "summary": "Because the loop is bounded only by logical haystack length, the final 8-byte compare runs with too few bytes remaining and AddressSanitizer reports the saved heap-buffer-overflow read at line 609."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "mrbgems/mruby-compiler/core/parse.y",
+      "function": "mrb_load_detect_file_cxt",
+      "line": 6958,
+      "var": "leading.b, bufsize",
+      "code": "bufsize = fread(leading.b, sizeof(char), sizeof(leading), fp);",
+      "note": "Source. The staged CLI reproduction opens the saved `poc` file and reads its full 40-byte Ruby program `\"                            \".split\"  \"` into `leading.b`. This is the first project statement that materializes attacker-controlled bytes on the crashing path.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "mrbgems/mruby-compiler/core/parse.y",
+      "function": "mrb_load_detect_file_cxt",
+      "line": 6959,
+      "line_end": 6962,
+      "var": "leading.h.binary_ident, leading.b, bufsize",
+      "code": "if (bufsize < sizeof(leading.h) ||\n    memcmp(leading.h.binary_ident, RITE_BINARY_IDENT, sizeof(leading.h.binary_ident)) != 0 ||\n    memchr(leading.b, '\\0', bufsize) == NULL) {\n  return mrb_load_exec(mrb, mrb_parse_file_continue(mrb, fp, leading.b, bufsize, c), c);\n}",
+      "note": "The witness is admitted as Ruby source, not a RITE binary: it is shorter than a full binary header, does not begin with `RITE`, and contains no NUL byte. Control therefore flows into `mrb_parse_file_continue(...leading.b, bufsize...)`, which is the only continuation that can execute the scripted `.split` call.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "leading.b, bufsize"
+        },
+        {
+          "on": 1,
+          "type": "control",
+          "via": "bufsize < sizeof(leading.h) || memcmp(leading.h.binary_ident, RITE_BINARY_IDENT, sizeof(leading.h.binary_ident)) != 0 || memchr(leading.b, '\\0', bufsize) == NULL"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "src/string.c",
+      "function": "mrb_str_split_m",
+      "line": 2280,
+      "var": "argc, spat, lim",
+      "code": "argc = mrb_get_args(mrb, \"|oi\", &spat, &lim);",
+      "note": "The executed Ruby method call is unpacked into C locals. For the exact witness, `mrb_str_split_m()` receives the left string as `str`, materializes one optional argument `spat = \"  \"`, and leaves `lim` unspecified, which sets up string-delimiter splitting instead of the default whitespace mode.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "mrb_parse_file_continue(..., leading.b, bufsize, c)"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "src/string.c",
+      "function": "mrb_str_split_m",
+      "line": 2291,
+      "line_end": 2299,
+      "var": "split_type, spat",
+      "code": "if (argc == 0 || mrb_nil_p(spat)) {\n  split_type = awk;\n}\nelse if (!mrb_string_p(spat)) {\n  mrb_raise(mrb, E_TYPE_ERROR, \"expected String\");\n}\nelse if (RSTRING_LEN(spat) == 1 && RSTRING_PTR(spat)[0] == ' ') {\n  split_type = awk;\n}",
+      "note": "None of the whitespace-splitting conditions fire: the PoC provides a String separator, and its length is 2 rather than the single-space special case. `split_type` therefore stays `string`, which is the branch that later calls `mrb_memsearch()`.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "data",
+          "via": "argc, spat"
+        },
+        {
+          "on": 3,
+          "type": "control",
+          "via": "argc == 0 || mrb_nil_p(spat) || !mrb_string_p(spat) || (RSTRING_LEN(spat) == 1 && RSTRING_PTR(spat)[0] == ' ')"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "src/string.c",
+      "function": "mrb_str_split_m",
+      "line": 2336,
+      "line_end": 2338,
+      "var": "str_len, pat_len, idx",
+      "code": "mrb_int str_len = RSTRING_LEN(str);\nmrb_int pat_len = RSTRING_LEN(spat);\nmrb_int idx = 0;",
+      "note": "At entry to the string-delimiter branch, the vulnerable code materializes the receiver length and separator length that define the first search window. For the exact witness, `str_len` is 28 spaces, `pat_len` is the two-byte separator, and `idx` starts at 0.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "control",
+          "via": "split_type == string"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "spat"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "src/string.c",
+      "function": "mrb_str_split_m",
+      "line": 2343,
+      "var": "RSTRING_PTR(spat), pat_len, RSTRING_PTR(str)+idx, str_len-idx",
+      "code": "end = mrb_memsearch(RSTRING_PTR(spat), pat_len, RSTRING_PTR(str)+idx, str_len - idx);",
+      "note": "The first string-search call forwards the separator bytes and the current receiver window into `mrb_memsearch()`. Because `idx` is still 0 here, the call passes `str_len - idx = 28` as the haystack length `n` used by the downstream search helper.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "str_len, pat_len, idx"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "split_type == string"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "src/string.c",
+      "function": "mrb_memsearch",
+      "line": 637,
+      "line_end": 650,
+      "var": "m, n, x0, y0",
+      "code": "if (m > n) return -1;\nelse if (m == n) {\n  return memcmp(x0, y0, m) == 0 ? 0 : -1;\n}\nelse if (m < 1) {\n  return 0;\n}\nelse if (m == 1) {\n  const unsigned char *p = (const unsigned char*)memchr(y, *x, n);\n\n  if (p) return (mrb_int)(p - y);\n  return -1;\n}\nreturn mrb_memsearch_ss((const unsigned char*)x0, m, (const unsigned char*)y0, n);",
+      "note": "The wrapper only rejects degenerate cases such as `m > n`, equal-length full compare, empty needle, or single-byte search. With the witness values `m = 2` and `n = 28`, control falls through into `mrb_memsearch_ss()` without any check that the remaining haystack can safely satisfy the helper's 8-byte word loads.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "data",
+          "via": "pat_len, str_len-idx"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "pat_len > 0"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "src/string.c",
+      "function": "mrb_memsearch_ss",
+      "line": 605,
+      "line_end": 606,
+      "var": "s0, s1, ys, m",
+      "code": "bitint *s0 = (bitint*)(ys);\nbitint *s1 = (bitint*)(ys+m-1);",
+      "note": "The SWAR helper aliases the current haystack start as `s0` and a one-byte-shifted tail pointer as `s1`. Because the PoC separator length is `m = 2`, `s1` starts at `ys + 1`, so each loop iteration will attempt to read 8 bytes from two overlapping positions near the end of the same heap string.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "y0, m"
+        },
+        {
+          "on": 7,
+          "type": "control",
+          "via": "!(m > n || m == n || m < 1 || m == 1)"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "src/string.c",
+      "function": "mrb_memsearch_ss",
+      "line": 608,
+      "var": "i, n, s0, s1",
+      "code": "for (mrb_int i=0; i < n; i+=sizeof(bitint), s0++, s1++) {",
+      "note": "Root cause. The loop bound uses only logical haystack length `n`, so it keeps advancing in 8-byte steps while any byte remains. From step 6 the executed call passes `n = 28`, so the loop runs at `i = 0`, `8`, `16`, and `24`; the final entry still executes even though fewer than 8 readable bytes remain for `*s0` and even fewer for the one-byte-shifted `*s1`.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "s0, s1"
+        },
+        {
+          "on": 7,
+          "type": "data",
+          "via": "n"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "src/string.c",
+      "function": "mrb_memsearch_ss",
+      "line": 609,
+      "var": "eq, *s0, *s1",
+      "code": "const bitint eq = (*s0 ^ first) | (*s1 ^ last);",
+      "note": "Sink. On the final iteration from step 9, this expression dereferences `s0` and `s1` as full 8-byte words near the end of the short heap search window. The symbolized saved crash trace reports the resulting `READ of size 8` at `src/string.c:609:24` on `0x503000000388`, and that 30-byte region ends at `0x50300000038e`, so the 8-byte load extends past the allocation and overlaps the right redzone. The separate raw sanitizer trace preserves the same line and access class on a 29-byte region.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "control",
+          "via": "i < n"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "s0, s1"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "READ",
+    "access_size": 8,
+    "crash_location": {
+      "file": "src/string.c",
+      "function": "mrb_memsearch_ss",
+      "line": 609
+    },
+    "allocation_context": {
+      "file": "src/string.c",
+      "function": "mrb_str_times",
+      "line": 1028,
+      "note": "The symbolized `default_crash_trace.txt` attributes one crashing short region to `mrb_str_times()` via `str_new()` / `str_init_normal_capa()`. The separate saved `sanitizer_trace.txt` preserves the same crash class at line 609 but not symbolized allocation frames, so Stage 02 does not claim more specific upstream runtime shaping than the symbolized stack supports."
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "mrb_memsearch_ss",
+        "file": "src/string.c",
+        "line": 609
+      },
+      {
+        "frame": 1,
+        "function": "mrb_memsearch",
+        "file": "src/string.c",
+        "line": 650
+      },
+      {
+        "frame": 2,
+        "function": "mrb_str_split_m",
+        "file": "src/string.c",
+        "line": 2343
+      },
+      {
+        "frame": 3,
+        "function": "mrb_vm_exec",
+        "file": "src/vm.c",
+        "line": 0
+      },
+      {
+        "frame": 4,
+        "function": "mrb_vm_run",
+        "file": "src/vm.c",
+        "line": 1331
+      },
+      {
+        "frame": 5,
+        "function": "mrb_load_exec",
+        "file": "mrbgems/mruby-compiler/core/parse.y",
+        "line": 6919
+      },
+      {
+        "frame": 6,
+        "function": "mrb_load_detect_file_cxt",
+        "file": "mrbgems/mruby-compiler/core/parse.y",
+        "line": 6962
+      },
+      {
+        "frame": 7,
+        "function": "main",
+        "file": "mrbgems/mruby-bin-mruby/tools/mruby/mruby.c",
+        "line": 353
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "realloc",
+        "file": "llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+        "line": 82
+      },
+      {
+        "frame": 1,
+        "function": "mrb_realloc_simple",
+        "file": "src/gc.c",
+        "line": 200
+      },
+      {
+        "frame": 2,
+        "function": "str_init_normal_capa",
+        "file": "src/string.c",
+        "line": 57
+      },
+      {
+        "frame": 3,
+        "function": "str_new",
+        "file": "src/string.c",
+        "line": 151
+      },
+      {
+        "frame": 4,
+        "function": "mrb_str_times",
+        "file": "src/string.c",
+        "line": 1028
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Run the saved 40-byte file through the staged vulnerable CLI reproduction `./build/host/bin/mruby /gt/poc`. mruby parses the file as Ruby source and executes the exact expression `\"                            \".split\"  \"`, which calls `String#split` with a two-space String separator and reaches the vulnerable `mrb_memsearch_ss()` fast search helper.",
+    "format": {
+      "name": "Ruby source file",
+      "contract": "The verified trigger semantics are limited to the exact saved witness `\"                            \".split\"  \"`: a 28-space receiver string literal followed by `.split` with a two-space String literal argument. The file must remain valid Ruby source that keeps the explicit separator length at 2 so `mrb_str_split_m()` stays on the string-delimiter path instead of the omitted/nil or single-space whitespace path."
+    }
+  }
+}

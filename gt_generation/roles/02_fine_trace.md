@@ -15,40 +15,10 @@ or attempt vulnerable/fixed dynamic validation in Stage 02. Record source-level 
 and witnessed states; Stage 04 is solely responsible for executable assertions,
 perturbations, ABI/runtime measurements, and differential validation.
 
-**Bounded exception — runtime disambiguation (OFF by default).** This path is gated by
-`<result_dir>/run_flags.json`: only act on it when `runtime_disambiguation` is `true`
-there AND the incoming `trace_feedback.json` has `needs_runtime_disambiguation` true (the
-reviewer only sets that flag when the run enabled it). When the flag is off or absent,
-never instrument — keep the trace source-grounded and rely on the reviewer/skip path. When
-enabled and requested, the reviewer determined the causal chain cannot be closed without
-one runtime fact the static artifacts cannot establish (named in `observe`, e.g. which
-polymorphic dispatch arm executed). Only then, and only for that one named fact, take a
-single targeted
-measurement in the ARVO workspace Stage 01 already built: add a minimal marker
-instrumentation at the candidate sites (a persisted `vulnerable-instrumentation.patch`),
-then
-
-```bash
-PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir <result_dir> \
-  apply-instrumentation --patch <result_dir>/vulnerable-instrumentation.patch
-PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir <result_dir> \
-  compile-target --version vulnerable
-PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir <result_dir> \
-  run --version vulnerable --expect crash
-```
-
-read which marker fired, record the observed arm/value in the trace, and close the chain
-with it — do not guess and do not generalize beyond what fired. Then restore the
-workspace to clean vulnerable source so Stage 04 starts from an unmodified tree:
-
-```bash
-PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace --result-dir <result_dir> \
-  reset-source
-```
-
-Do not instrument for anything beyond the named `observe`, and never do this when the
-flag is absent. For a non-ARVO sample with no prebuilt workspace, keep the chain
-source-grounded and report the residual ambiguity rather than instrumenting.
+Runtime measurements do not belong to this static author. When review identifies a
+load-bearing gap that source analysis cannot close, the runner invokes the separate
+conditional runtime-disambiguation role. Keep this role source-grounded even when
+`runtime_disambiguation` is enabled.
 
 Write `<result_dir>/ground_truth.json` and run:
 
@@ -107,6 +77,14 @@ decision, and output plus only the evidence needed to justify that transition. D
 repeat the complete downstream chain, sanitizer explanation, or the same PoC/layout
 derivation in several notes. Put execution-path background in `reachability_checkpoints`
 and keep shared facts at their single producing step so dependencies carry them forward.
+
+For R1, `reachability_checkpoints.parser_admitted` must be sample-specific and must not
+be the generic fuzz entry point. Record the format/header/container gate in its ordinary
+`file/function/line/code/description` fields. When that line is a predicate executed by
+both accepted and rejected inputs, also add `admitted_location` with
+`file/function/line/code`: an executable point in the accepted continuation after the
+predicate. Evaluation instruments `admitted_location`, so reaching the checking branch
+alone cannot receive R1 credit.
 
 Apply a removal test to every step: remove it only if it contributes no unique
 vulnerability-relevant value transformation, predicate, memory/lifetime change, or sink

@@ -17,6 +17,11 @@ lifetime dependency closure affected by the change. Confirm every requested chan
 implemented. Reject unrelated broad rewrites, a repair that only changes prose while
 leaving the semantic gap, or a change that breaks the root-cause-to-sink chain.
 
+When the current repair stage is `02_runtime_disambiguation`, read its existing matching
+role log and the workspace run log it references. Confirm that the changed GT statements
+are limited to the correlated observations requested by the existing `observe` string.
+Do not request a new output file or JSON field.
+
 Do not re-audit byte-for-byte identical objects outside the affected dependency closure.
 Do not rebuild or execute the target, run Docker, mutate the PoC, compile probes, add
 instrumentation, edit `ground_truth.json`, or create assertions.

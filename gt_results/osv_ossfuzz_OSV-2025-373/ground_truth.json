@@ -1,0 +1,400 @@
+{
+  "sample_id": "osv_ossfuzz_OSV-2025-373",
+  "vuln_id": "OSV-2025-373 / OSS-Fuzz issue 417905428",
+  "project": {
+    "id": "assimp",
+    "repo": "https://github.com/assimp/assimp",
+    "vulnerable_commit": "26e2372882d681d996566360d3fc08cb43bced92",
+    "fixed_commit": "a38ec50fd3a8189d4ec0f0e9251f4203b312b9b6"
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416"
+  },
+  "bug_description": {
+    "original": "Heap-use-after-free in aiMesh::~aiMesh OSS-Fuzz report: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=417905428 ``` Crash type: Heap-use-after-free READ 8 Crash state: aiMesh::~aiMesh aiScene::~aiScene Assimp::BaseProcess::ExecuteOnScene ```",
+    "original_source": "OSV.summary/details",
+    "normalized": "The staged 40-byte testcase is accepted as a Wavefront OBJ from memory and reaches assimp's realtime-quality post-processing pipeline, which includes `FindDegenerates` and `SortByPType`. The witness materializes at least two OBJ meshes: an earlier mesh whose parsed face data makes `createTopology` set exactly one primitive-type bit, and a later mesh that reaches `SortByPTypeProcess` with `mPrimitiveTypes == 0`, as proven by the saved ASan free site at `SortByPTypeProcess.cpp:140`. Vulnerable `SortByPTypeProcess::Execute` transfers ownership of the earlier single-primitive mesh into local vector `outMeshes` but leaves the same pointer in `pScene->mMeshes[i]`. When the later invalid mesh hits the `mPrimitiveTypes == 0` error branch, cleanup deletes every pointer already stored in `outMeshes`, freeing that earlier mesh once, and then throws. Unwinding destroys the still-live `aiScene`, whose destructor iterates the unchanged original `pScene->mMeshes` array and deletes the same mesh again. The second delete enters `aiMesh::~aiMesh` on freed storage and ASan reports the observed heap-use-after-free READ 8. The staged patch fixes this by nulling `pScene->mMeshes[i]` immediately after transferring ownership to `outMeshes`."
+  },
+  "source": {
+    "file": "code/AssetLib/Obj/ObjFileParser.cpp",
+    "function": "ObjFileParser::getFace",
+    "line": 553,
+    "code": "m_pModel->mCurrentMesh->m_Faces.emplace_back(face);",
+    "var": "m_pModel->mCurrentMesh->m_Faces",
+    "description": "First project-side materialization of the attacker-controlled OBJ face records. The staged `f` lines are converted into `ObjFile::Face` objects and stored on the current parser mesh, creating the mesh contents that later determine primitive classification and the stale-alias cleanup sequence.",
+    "value_from": "The exact 40-byte witness begins with `f 2 2 1\\n`, then `o \\xff\\n`, then another `f` record before truncated vertex lines. Those `f` records are the raw attacker-controlled tokens consumed here.",
+    "trace_step": 2
+  },
+  "root_cause": {
+    "file": "code/PostProcessing/SortByPTypeProcess.cpp",
+    "function": "Assimp::SortByPTypeProcess::Execute",
+    "line": 167,
+    "code": "outMeshes.emplace_back(mesh);",
+    "var": "mesh / pScene->mMeshes[i]",
+    "description": "When a mesh has exactly one primitive-type bit and is not removed, the process moves its pointer into `outMeshes` but does not clear `pScene->mMeshes[i]`. That leaves two live aliases to the same owned `aiMesh`, so later exceptional cleanup can free the mesh through `outMeshes` while the scene destructor still sees the stale pointer in the original array.",
+    "note": "The fix adds `pScene->mMeshes[i] = nullptr; // Indicate ownership transfer` immediately after this line.",
+    "trace_step": 6
+  },
+  "sink": {
+    "file": "include/assimp/mesh.h",
+    "function": "aiMesh::~aiMesh",
+    "line": 857,
+    "code": "delete[] mVertices;",
+    "var": "this->mVertices",
+    "description": "ASan crash site. The second destruction of the already-freed `aiMesh` re-enters its destructor and reads the freed object fields to release subarrays, producing the recorded heap-use-after-free READ 8.",
+    "note": "The saved ASan stack reports the invalid read in `aiMesh::~aiMesh` at `include/assimp/mesh.h:857`, called from `aiScene::~aiScene` during exception unwinding.",
+    "trace_step": 9
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "code/AssetLib/Obj/ObjFileImporter.cpp",
+      "function": "ObjFileImporter::CanRead",
+      "line": 95,
+      "code": "return BaseImporter::SearchFileHeaderForToken(pIOHandler, pFile, tokens, AI_COUNT_OF(tokens), 200, false, true);",
+      "description": "The staged witness is admitted as OBJ because its first 200 bytes contain the token `f ` from the opening face record, satisfying the OBJ header/token gate instead of being rejected before import.",
+      "admitted_location": {
+        "file": "code/AssetLib/Obj/ObjFileImporter.cpp",
+        "function": "ObjFileImporter::InternReadFile",
+        "line": 147,
+        "code": "ObjFileParser parser(streamedBuffer, modelName, pIOHandler, m_progress, file);"
+      }
+    }
+  },
+  "tainted_value_origin": {
+    "file": "code/AssetLib/Obj/ObjFileParser.cpp",
+    "function": "ObjFileParser::createMesh",
+    "line": 840,
+    "code": "m_pModel->mCurrentMesh = new ObjFile::Mesh(meshName);",
+    "var": "m_pModel->mCurrentMesh",
+    "description": "The witness's `o \\xff` record forces the parser to start a new object and mesh, separating the earlier preserved mesh from the later mesh that reaches the invalid-primitive cleanup branch. That mesh boundary is necessary because `outMeshes` must already contain one transferred mesh before line 140 can free it.",
+    "value_from": "The byte sequence `6f 20 ff 0a` (`o \\xff\\n`) appears between the two staged `f` records. `getObjectName` and `createObject` route subsequent face data into a new `ObjFile::Mesh` allocated here.",
+    "note": "This input-controlled mesh split is what gives `SortByPTypeProcess` two sequential mesh iterations: one that preserves a mesh in `outMeshes`, and a later one whose error cleanup frees all accumulated entries."
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "code/AssetLib/Obj/ObjFileImporter.cpp",
+      "function": "ObjFileImporter::CanRead / ObjFileImporter::InternReadFile",
+      "summary": "The memory-backed testcase is accepted as Wavefront OBJ because its header contains `f `, and the OBJ parser starts materializing face and object records from the exact staged bytes."
+    },
+    {
+      "step": 2,
+      "file": "code/AssetLib/Obj/ObjFileParser.cpp",
+      "function": "ObjFileParser::getFace / ObjFileParser::createObject / ObjFileParser::createMesh / ObjFileImporter::createTopology",
+      "summary": "The witness builds multiple parser meshes: an earlier mesh whose topology yields a single primitive-type bit and a later mesh created after the `o \\xff` separator. Those mesh objects become `aiMesh` pointers in `pScene->mMeshes`."
+    },
+    {
+      "step": 3,
+      "file": "code/PostProcessing/FindDegenerates.cpp",
+      "function": "FindDegeneratesProcess::ExecuteOnMesh / SortByPTypeProcess::Execute",
+      "summary": "Before `SortByPType`, the later mesh reaches a zero primitive-type state, while the earlier single-primitive mesh is transferred into `outMeshes` without clearing its original scene slot. The later invalid mesh then triggers line-140 cleanup, which frees every accumulated `outMeshes` entry and throws."
+    },
+    {
+      "step": 4,
+      "file": "code/Common/scene.cpp",
+      "function": "aiScene::~aiScene / aiMesh::~aiMesh",
+      "summary": "Exception unwinding destroys the still-bound scene and deletes the stale original mesh pointer a second time, re-entering `aiMesh::~aiMesh` on freed storage and producing the saved heap-use-after-free."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 0,
+      "file": "fuzz/assimp_fuzzer.cc",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 56,
+      "line_end": 57,
+      "var": "flags, data, dataSize",
+      "code": "unsigned int flags = aiProcessPreset_TargetRealtime_Quality | aiProcess_ValidateDataStructure;\nconst aiScene *sc = importer.ReadFileFromMemory(data, dataSize, flags, nullptr);",
+      "note": "The harness passes the exact 40-byte witness into assimp with realtime-quality post-processing enabled. That preset includes `aiProcess_SortByPType`, so any admitted mesh scene will later run through the vulnerable ownership-transfer code.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "control",
+          "via": "aiProcessPreset_TargetRealtime_Quality | aiProcess_ValidateDataStructure"
+        }
+      ]
+    },
+    {
+      "step": 1,
+      "file": "code/AssetLib/Obj/ObjFileImporter.cpp",
+      "function": "ObjFileImporter::CanRead",
+      "line": 95,
+      "var": "tokens / pFile",
+      "code": "return BaseImporter::SearchFileHeaderForToken(pIOHandler, pFile, tokens, AI_COUNT_OF(tokens), 200, false, true);",
+      "note": "The staged bytes are admitted as OBJ because the header scan finds the token `f ` within the first 200 bytes, so assimp dispatches the buffer to the OBJ importer rather than rejecting it.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "data",
+          "via": "data"
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "file": "code/AssetLib/Obj/ObjFileParser.cpp",
+      "function": "ObjFileParser::getFace",
+      "line": 553,
+      "line_end": 555,
+      "var": "m_pModel->mCurrentMesh->m_Faces",
+      "code": "m_pModel->mCurrentMesh->m_Faces.emplace_back(face);\nm_pModel->mCurrentMesh->m_uiNumIndices += static_cast<unsigned int>(face->m_vertices.size());\nm_pModel->mCurrentMesh->m_uiUVCoordinates[0] += static_cast<unsigned int>(face->m_texturCoords.size());",
+      "note": "Source. The accepted `f` records are stored as parser-side `ObjFile::Face` entries on the current mesh. The opening `f 2 2 1` record populates the first mesh before any object switch, and the later `f` record populates the subsequently created mesh after the `o \\xff` separator.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "OBJ face records"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "code/AssetLib/Obj/ObjFileParser.cpp",
+      "function": "ObjFileParser::createMesh",
+      "line": 840,
+      "line_end": 844,
+      "var": "m_pModel->mCurrentMesh / m_pModel->mCurrentObject->m_Meshes",
+      "code": "m_pModel->mCurrentMesh = new ObjFile::Mesh(meshName);\nm_pModel->mMeshes.push_back(m_pModel->mCurrentMesh);\nunsigned int meshId = static_cast<unsigned int>(m_pModel->mMeshes.size() - 1);\nif (nullptr != m_pModel->mCurrentObject) {\n    m_pModel->mCurrentObject->m_Meshes.push_back(meshId);",
+      "note": "The `o \\xff` line creates a new parser mesh boundary before the later face record is stored. This separates the sample into at least two mesh iterations for later post-processing: an earlier mesh that can be preserved and a later mesh that can trigger error cleanup.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "later `o`-separated face record"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "code/AssetLib/Obj/ObjFileImporter.cpp",
+      "function": "ObjFileImporter::createTopology",
+      "line": 337,
+      "line_end": 348,
+      "var": "pMesh->mPrimitiveTypes",
+      "code": "if (inp->mPrimitiveType == aiPrimitiveType_LINE) {\n    pMesh->mNumFaces += static_cast<unsigned int>(inp->m_vertices.size() - 1);\n    pMesh->mPrimitiveTypes |= aiPrimitiveType_LINE;\n} else if (inp->mPrimitiveType == aiPrimitiveType_POINT) {\n    pMesh->mNumFaces += static_cast<unsigned int>(inp->m_vertices.size());\n    pMesh->mPrimitiveTypes |= aiPrimitiveType_POINT;\n} else {\n    ++pMesh->mNumFaces;\n    if (inp->m_vertices.size() > 3) {\n        pMesh->mPrimitiveTypes |= aiPrimitiveType_POLYGON;\n    } else {\n        pMesh->mPrimitiveTypes |= aiPrimitiveType_TRIANGLE;\n    }\n}",
+      "note": "For the earlier mesh built from the first `f 2 2 1` record, `createTopology` derives a single primitive-type bit from the stored face data. That one-bit mesh is the object later transferred into `outMeshes`.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "stored face vertex count"
+        },
+        {
+          "on": 3,
+          "type": "order",
+          "via": "use_before_init"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "code/PostProcessing/FindDegenerates.cpp",
+      "function": "FindDegeneratesProcess::ExecuteOnMesh",
+      "line": 135,
+      "line_end": 217,
+      "var": "mesh->mPrimitiveTypes",
+      "code": "mesh->mPrimitiveTypes = 0;\n...\nswitch (face.mNumIndices) {\ncase 1u:\n    mesh->mPrimitiveTypes |= aiPrimitiveType_POINT;\n    break;\ncase 2u:\n    mesh->mPrimitiveTypes |= aiPrimitiveType_LINE;\n    break;\ncase 3u:\n    mesh->mPrimitiveTypes |= aiPrimitiveType_TRIANGLE;\n    break;\ndefault:\n    mesh->mPrimitiveTypes |= aiPrimitiveType_POLYGON;\n    break;\n};",
+      "note": "Before `SortByPType`, `FindDegenerates` explicitly clears each mesh's primitive-type mask and only restores bits if its face walk classifies remaining primitives. The saved ASan free site at `SortByPTypeProcess.cpp:140` proves that, for a later mesh in this witness, the recomputed mask remains `0` when `SortByPType` sees it.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "control",
+          "via": "aiProcessPreset_TargetRealtime_Quality"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "later mesh"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "code/PostProcessing/SortByPTypeProcess.cpp",
+      "function": "Assimp::SortByPTypeProcess::Execute",
+      "line": 165,
+      "line_end": 167,
+      "var": "outMeshes / pScene->mMeshes[i]",
+      "code": "if (!(mConfigRemoveMeshes & mesh->mPrimitiveTypes)) {\n    *meshIdx = static_cast<unsigned int>(outMeshes.size());\n    outMeshes.emplace_back(mesh);\n}",
+      "note": "Root cause. On the earlier one-bit mesh from step 4, `SortByPType` keeps the mesh and appends its pointer to `outMeshes`, but it does not null `pScene->mMeshes[i]`. Ownership is now duplicated between the local vector and the scene array.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "single primitive-type bit"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "!(mConfigRemoveMeshes & mesh->mPrimitiveTypes)"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "code/PostProcessing/SortByPTypeProcess.cpp",
+      "function": "Assimp::SortByPTypeProcess::Execute",
+      "line": 138,
+      "line_end": 142,
+      "var": "outMeshes[idx]",
+      "code": "if (mesh->mPrimitiveTypes == 0) {\n    for (size_t idx = 0; idx < outMeshes.size(); ++idx) {\n        delete outMeshes[idx];\n    }\n    throw DeadlyImportError(\"Mesh with invalid primitive type: \", mesh->mName.C_Str());\n}",
+      "note": "A later mesh in the same scene arrives with `mPrimitiveTypes == 0`, so the error branch frees every already-accumulated `outMeshes` entry before throwing. Because step 6 left the earlier mesh aliased in `pScene->mMeshes`, this cleanup performs the first free of that mesh while the stale scene pointer survives.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "mesh->mPrimitiveTypes == 0"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "outMeshes[0]"
+        },
+        {
+          "on": 6,
+          "type": "order",
+          "via": "free_before_use"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "code/Common/scene.cpp",
+      "function": "aiScene::~aiScene",
+      "line": 75,
+      "line_end": 77,
+      "var": "mMeshes[a]",
+      "code": "if (mNumMeshes && mMeshes) {\n    for (unsigned int a = 0; a < mNumMeshes; ++a) {\n        delete mMeshes[a];\n    }\n}",
+      "note": "The thrown `DeadlyImportError` unwinds into scene destruction. `aiScene::~aiScene` still iterates the original `mMeshes` array, so it reloads and deletes the stale pointer left by step 6 even though step 7 already freed the same `aiMesh` through `outMeshes`.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "control",
+          "via": "throw DeadlyImportError(...)"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "stale pScene->mMeshes[i]"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "include/assimp/mesh.h",
+      "function": "aiMesh::~aiMesh",
+      "line": 857,
+      "line_end": 862,
+      "var": "mVertices",
+      "code": "delete[] mVertices;\ndelete[] mNormals;\ndelete[] mTangents;\ndelete[] mBitangents;\nfor (unsigned int a = 0; a < AI_MAX_NUMBER_OF_TEXTURECOORDS; a++) {\n    delete[] mTextureCoords[a];\n}",
+      "note": "Sink. The second delete from step 8 enters `aiMesh::~aiMesh` on freed storage, so reading the freed object's member pointers to release subarrays triggers the saved heap-use-after-free READ 8.",
+      "depends_on": [
+        {
+          "on": 8,
+          "type": "data",
+          "via": "mMeshes[a]"
+        },
+        {
+          "on": 7,
+          "type": "order",
+          "via": "free_before_use"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "asan",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-use-after-free",
+    "access_type": "READ",
+    "access_size": 8,
+    "crash_location": {
+      "file": "include/assimp/mesh.h",
+      "function": "aiMesh::~aiMesh",
+      "line": 857
+    },
+    "allocation_context": {
+      "file": "code/AssetLib/Obj/ObjFileImporter.cpp",
+      "function": "ObjFileImporter::createTopology",
+      "line": 326,
+      "code": "std::unique_ptr<aiMesh> pMesh(new aiMesh);",
+      "description": "ASan reports that the object later read after free was originally allocated here while the OBJ importer materialized one of the testcase meshes."
+    },
+    "free_context": {
+      "file": "code/PostProcessing/SortByPTypeProcess.cpp",
+      "function": "Assimp::SortByPTypeProcess::Execute",
+      "line": 140,
+      "code": "delete outMeshes[idx];",
+      "description": "ASan identifies this exceptional cleanup as the first free of the mesh later read during the second destructor call."
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "aiMesh::~aiMesh",
+        "file": "include/assimp/mesh.h",
+        "line": 857
+      },
+      {
+        "frame": 1,
+        "function": "aiScene::~aiScene",
+        "file": "code/Common/scene.cpp",
+        "line": 77
+      },
+      {
+        "frame": 2,
+        "function": "Assimp::BaseProcess::ExecuteOnScene(Assimp::Importer*) (.cold)",
+        "file": "code/Common/BaseProcess.cpp",
+        "line": 90
+      },
+      {
+        "frame": 3,
+        "function": "Assimp::Importer::ApplyPostProcessing(unsigned int)",
+        "file": "code/Common/Importer.cpp",
+        "line": 842
+      },
+      {
+        "frame": 4,
+        "function": "Assimp::Importer::ReadFile(char const*, unsigned int)",
+        "file": "code/Common/Importer.cpp",
+        "line": 751
+      },
+      {
+        "frame": 5,
+        "function": "Assimp::Importer::ReadFileFromMemory(void const*, unsigned long, unsigned int, char const*)",
+        "file": "code/Common/Importer.cpp",
+        "line": 507
+      },
+      {
+        "frame": 6,
+        "function": "LLVMFuzzerTestOneInput",
+        "file": "fuzz/assimp_fuzzer.cc",
+        "line": 57
+      },
+      {
+        "frame": 7,
+        "function": "main",
+        "file": "reproduction_runner_main.cc",
+        "line": 21
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": "Yes. The saved ASan trace reports `READ of size 8` in `aiMesh::~aiMesh` at `include/assimp/mesh.h:857`, which matches fine-trace step 9 exactly.",
+      "trace_consistent_with_stack": "Yes. The reproduced stack `aiMesh::~aiMesh -> aiScene::~aiScene -> Assimp::BaseProcess::ExecuteOnScene -> Importer::ApplyPostProcessing -> Importer::ReadFileFromMemory` aligns with fine-trace steps 9, 8, 7, and the post-processing notes that describe the throw and unwind path.",
+      "tainted_value_reaches_sink": "Yes. The staged OBJ face records become parser mesh state at step 2, are separated into multiple meshes by the input-controlled object boundary at step 3, yield the preserved single-primitive mesh at step 4, create the stale alias at step 6, are freed by exceptional cleanup at step 7, and are then deleted again at step 8, causing the step-9 use-after-free."
+    }
+  },
+  "poc": {
+    "path": "poc",
+    "trigger": "Stage 01's saved run reproduces `AddressSanitizer: heap-use-after-free` `READ of size 8` in `aiMesh::~aiMesh`. The witness is accepted as OBJ, produces at least one earlier mesh preserved in `SortByPTypeProcess::outMeshes`, then drives a later mesh into the `mPrimitiveTypes == 0` error branch so cleanup frees the preserved mesh before `aiScene` later destroys the stale original pointer.",
+    "format": {
+      "name": "Wavefront OBJ memory-backed testcase",
+      "contract": "The exact staged 40-byte blob must remain an OBJ-like buffer whose first 200 bytes contain `f ` so `ObjFileImporter::CanRead` admits it. In this witness the bytes begin with `f 2 2 1\\n`, contain `o \\xff\\n` between face records, and then contain a later `f` record plus truncated vertex data. That exact arrangement is sufficient for the vulnerable build to preserve one earlier mesh in `outMeshes` and later hit `mesh->mPrimitiveTypes == 0`, which frees the preserved mesh before scene teardown double-deletes it."
+    }
+  }
+}

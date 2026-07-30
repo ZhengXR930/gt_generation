@@ -1,0 +1,476 @@
+{
+  "sample_id": "osv_ossfuzz_OSV-2025-230",
+  "vuln_id": "OSV-2025-230",
+  "project": {
+    "id": "wasm-micro-runtime",
+    "name": "wasm-micro-runtime",
+    "repo": "https://github.com/bytecodealliance/wasm-micro-runtime",
+    "vulnerable_commit": "79f26a96a47bbce8a9f17ba284be4625eca8e265",
+    "fixed_commit": "9aaf3599ec69469f6ab3b4373bfb0d8e6b3345b9",
+    "fuzz_target": "wasm_mutator_fuzz_loader (libFuzzer, ASan)"
+  },
+  "classification": {
+    "class": "heap-buffer-overflow",
+    "cwe": "CWE-122",
+    "access": "WRITE",
+    "detector": "AddressSanitizer"
+  },
+  "bug_description": {
+    "original": "Heap-buffer-overflow in wasm_loader_prepare_bytecode OSS-Fuzz report: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=404921047 ``` Crash type: Heap-buffer-overflow WRITE 8 Crash state: wasm_loader_prepare_bytecode load_from_sections wasm_loader_load ```",
+    "original_source": "OSV.summary/details",
+    "normalized": "The staged 66-byte WebAssembly module passes the wasm header and section parser, and its type section materializes a single function type `0x60 02 7c 7b 02 7c 7e` in `module->types[0]`, meaning block type 0 has parameters `[f64, v128]` and results `[f64, i64]`. The same module's function section binds the only function to that type and stores a zero-local body whose leading bytes are `00 00 00 1b 02 00`. During fast-interpreter preprocessing, the leading `unreachable` opcodes make the current block polymorphic, and `select` then synthesizes a one-cell `VALUE_TYPE_ANY` placeholder with one frame-offset entry. When the later typed `block 0` pops its first parameter, `POP_TYPE` treats that wildcard as a one-cell pop, but the vulnerable block-parameter path still decrements `loader_ctx->frame_offset` by the real width of the parsed `v128` parameter without checking `frame_offset_bottom`. The next block parameter finds no remaining concrete stack cells, so the pass-parameters loop partially restores the pointer for the available `f64` parameter and then writes dummy zero offsets for the missing `v128` parameter through a pointer that is still one `int16` slot before `frame_offset_bottom`. ASan reports that sink as a heap-buffer-overflow write 2 bytes before the 64-byte frame-offset allocation. The fix adds a lower-bound check immediately after the decrement and converts the underflow into a pending loader error."
+  },
+  "source": {
+    "file": "core/iwasm/interpreter/wasm_loader.c",
+    "function": "load_type_section",
+    "line": 1936,
+    "var": "module->types[0]->param_count, module->types[0]->result_count, module->types[0]->types[]",
+    "code": "type->param_count = (uint16)param_count;\ntype->result_count = (uint16)result_count;\nfor (j = 0; j < param_count; j++) {\n    CHECK_BUF(p, p_end, 1);\n    type->types[j] = read_uint8(p);\n}\nread_leb_uint32(p, p_end, result_count);\nfor (j = 0; j < result_count; j++) {\n    CHECK_BUF(p, p_end, 1);\n    type->types[param_count + j] = read_uint8(p);\n}",
+    "description": "First project-side materialization of attacker-controlled state that later governs the vulnerable block-parameter width logic.",
+    "value_from": "The PoC type section bytes `01 08 01 60 02 7c 7b 02 7c 7e` create exactly one function type at index 0 with two parameters `[f64, v128]` and two results `[f64, i64]`.",
+    "note": "This is the earliest scored parser statement: it turns the raw wasm type-section bytes into `module->types[0]`, which `wasm_loader_prepare_bytecode()` later resolves for the crashing typed `block 0`.",
+    "trace_step": 1
+  },
+  "sink": {
+    "file": "core/iwasm/interpreter/wasm_loader.c",
+    "function": "wasm_loader_prepare_bytecode",
+    "line": 11615,
+    "var": "*loader_ctx->frame_offset",
+    "code": "*loader_ctx->frame_offset++ = 0;",
+    "description": "ASan crash site. The dummy block-parameter loop writes through a `frame_offset` pointer that is already below `frame_offset_bottom`.",
+    "note": "The saved sanitizer trace reports `WRITE of size 2` at an address `2 bytes before` the 64-byte allocation from `wasm_loader_ctx_init()`, matching a single `int16` store through this pointer.",
+    "trace_step": 13
+  },
+  "root_cause": {
+    "file": "core/iwasm/interpreter/wasm_loader.c",
+    "function": "wasm_loader_prepare_bytecode",
+    "line": 11579,
+    "var": "loader_ctx->frame_offset, cell_num",
+    "code": "cell_num = wasm_value_type_cell_num(\n    wasm_type->types[wasm_type->param_count - i - 1]);\nloader_ctx->frame_offset -= cell_num;",
+    "description": "Root cause. The fast-interpreter block-parameter path subtracts the real parsed parameter width from `frame_offset` without checking that the pointer stays at or above `frame_offset_bottom`.",
+    "note": "The staged fix inserts `if (loader_ctx->frame_offset < loader_ctx->frame_offset_bottom) { ... pending_exception = true; break; }` immediately after this decrement, confirming the missing lower-bound check.",
+    "trace_step": 8
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "load",
+      "line": 6579,
+      "code": "if (magic_number != WASM_MAGIC_NUMBER) {\n    set_error_buf(error_buf, error_buf_size, \"magic header not detected\");\n    return false;\n}",
+      "description": "The witness is admitted as a wasm binary by passing the magic-header check; the same `load()` invocation then proceeds to version validation, section creation, and `load_from_sections()`.",
+      "admitted_location": {
+        "file": "core/iwasm/interpreter/wasm_loader.c",
+        "function": "load",
+        "line": 6596,
+        "code": "if (!create_sections(buf, size, &section_list, error_buf, error_buf_size)\n    || !load_from_sections(module, section_list, true, wasm_binary_freeable,\n                           no_resolve, error_buf, error_buf_size)) {"
+      }
+    }
+  },
+  "tainted_value_origin": {
+    "file": "core/iwasm/interpreter/wasm_loader.c",
+    "function": "load_type_section",
+    "line": 1936,
+    "var": "module->types[0]->param_count, module->types[0]->result_count, module->types[0]->types[]",
+    "code": "type->param_count = (uint16)param_count;\ntype->result_count = (uint16)result_count;\nfor (j = 0; j < param_count; j++) {\n    CHECK_BUF(p, p_end, 1);\n    type->types[j] = read_uint8(p);\n}\nread_leb_uint32(p, p_end, result_count);\nfor (j = 0; j < result_count; j++) {\n    CHECK_BUF(p, p_end, 1);\n    type->types[param_count + j] = read_uint8(p);\n}",
+    "description": "The type-section parser stores the attacker-controlled signature that later determines `param_count` and each `wasm_value_type_cell_num(...)` subtraction on the vulnerable block path.",
+    "value_from": "In the staged witness, those bytes encode type index 0 as params `[f64, v128]` and results `[f64, i64]`.",
+    "note": "The same module later binds its only function body to type index 0 in step 2, so both the signature and the code stream remain attacker-controlled on the crashing path."
+  },
+  "coarse_trace": [
+    {
+      "step": 1,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "load / load_type_section",
+      "summary": "After the wasm header is accepted, the loader parses the type section and materializes `module->types[0]` with the witness-controlled `[f64, v128] -> [f64, i64]` signature."
+    },
+    {
+      "step": 2,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "load_function_section",
+      "summary": "The function section binds the only function to type index 0 and stores the attacker-controlled zero-local function body for later preprocessing."
+    },
+    {
+      "step": 3,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_ctx_init / wasm_loader_prepare_bytecode",
+      "summary": "Fast-interpreter preparation allocates the `frame_offset` buffer, then scans the stored body until `unreachable` creates polymorphic state and `select` pushes a one-cell `VALUE_TYPE_ANY` placeholder."
+    },
+    {
+      "step": 4,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode / wasm_loader_pop_frame_ref",
+      "summary": "The later typed `block 0` resolves to `module->types[0]`; its first parameter pop consumes only the wildcard cell, but the fast-interpreter offset path still subtracts the real `v128` width without a lower-bound check."
+    },
+    {
+      "step": 5,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "summary": "The next parameter breaks into the dummy-parameter path, partially restores the pointer for the available `f64`, and then writes dummy `v128` offsets one slot before `frame_offset_bottom`."
+    }
+  ],
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "load_type_section",
+      "line": 1936,
+      "line_end": 1945,
+      "var": "module->types[0]->param_count, module->types[0]->result_count, module->types[0]->types[]",
+      "code": "type->param_count = (uint16)param_count;\ntype->result_count = (uint16)result_count;\nfor (j = 0; j < param_count; j++) {\n    CHECK_BUF(p, p_end, 1);\n    type->types[j] = read_uint8(p);\n}\nread_leb_uint32(p, p_end, result_count);\nfor (j = 0; j < result_count; j++) {\n    CHECK_BUF(p, p_end, 1);\n    type->types[param_count + j] = read_uint8(p);\n}",
+      "note": "Source. The type-section parser turns the witness bytes into `module->types[0] = [f64, v128] -> [f64, i64]`, creating the exact parameter list later used by the crashing typed `block 0`.",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "load_function_section",
+      "line": 3659,
+      "line_end": 3674,
+      "var": "func->func_type, func->code_size, func->code",
+      "code": "func->func_type = (WASMFuncType *)module->types[type_index];\nfunc->local_count = local_count;\nif (local_count > 0)\n    func->local_types = (uint8 *)func + sizeof(WASMFunction);\nfunc->code_size = code_size;\nfunc->code = (uint8 *)p_code;",
+      "note": "The function section binds the only function to type index 0 and stores the attacker-controlled zero-local body. In the PoC, that body begins `00 00 00 1b 02 00`.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "module->types[type_index]"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_ctx_init",
+      "line": 8284,
+      "line_end": 8289,
+      "var": "loader_ctx->frame_offset_bottom, loader_ctx->frame_offset_boundary",
+      "code": "loader_ctx->frame_offset_size = sizeof(int16) * 32;\nif (!(loader_ctx->frame_offset_bottom = loader_ctx->frame_offset =\n          loader_malloc(loader_ctx->frame_offset_size, error_buf,\n                        error_buf_size)))\n    goto fail;\nloader_ctx->frame_offset_boundary = loader_ctx->frame_offset_bottom + 32;",
+      "note": "Fast-interpreter preparation allocates the 32-entry `int16` frame-offset buffer that ASan later reports as a 64-byte heap object.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "control",
+          "via": "wasm_loader_prepare_bytecode(module, func, i, error_buf, error_buf_size)"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11399,
+      "line_end": 11401,
+      "var": "cur_block->is_stack_polymorphic",
+      "code": "case WASM_OP_UNREACHABLE:\n    RESET_STACK();\n    SET_CUR_BLOCK_STACK_POLYMORPHIC_STATE(true);",
+      "note": "The leading `unreachable` opcodes in the stored body reset the current block stack and leave the enclosing function block in polymorphic state.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "func->code"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 12803,
+      "line_end": 12807,
+      "var": "VALUE_TYPE_ANY, loader_ctx->frame_offset",
+      "code": "else {\n#if WASM_ENABLE_FAST_INTERP != 0\n    PUSH_OFFSET_TYPE(VALUE_TYPE_ANY);\n#endif\n    PUSH_TYPE(VALUE_TYPE_ANY);\n}",
+      "note": "The later `select` executes while the block is polymorphic and has no concrete operands, so the loader synthesizes a one-cell `VALUE_TYPE_ANY` placeholder and one matching frame-offset entry instead of real values.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "control",
+          "via": "available_stack_cell <= 0 && cur_block->is_stack_polymorphic"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "func->code"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11520,
+      "line_end": 11528,
+      "var": "type_index, block_type.u.type",
+      "code": "pb_read_leb_int32(p, p_end, type_index);\nif ((uint32)type_index >= module->type_count) {\n    set_error_buf(error_buf, error_buf_size,\n                  \"unknown type\");\n    goto fail;\n}\nblock_type.is_value_type = false;\nblock_type.u.type = (WASMFuncType *)module->types[type_index];",
+      "note": "The following `block` carries LEB type index 0, so the loader resolves it to the signature parsed in step 1. Its parameters are therefore `f64` then `v128`, and the pop loop visits them in reverse order.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "module->types[type_index]"
+        },
+        {
+          "on": 2,
+          "type": "data",
+          "via": "func->code"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_pop_frame_ref",
+      "line": 8566,
+      "line_end": 8572,
+      "var": "cell_num_to_pop, ctx->stack_cell_num",
+      "code": "if (*(ctx->frame_ref - 1) == VALUE_TYPE_ANY) {\n    type = VALUE_TYPE_ANY;\n    cell_num_to_pop = 1;\n}\n\nctx->frame_ref -= cell_num_to_pop;\nctx->stack_cell_num -= cell_num_to_pop;",
+      "note": "The first block-parameter pop asks for the last parsed parameter (`v128`), but because the top stack entry is `VALUE_TYPE_ANY`, the helper collapses the pop width to one cell and removes only the placeholder from step 5.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "VALUE_TYPE_ANY"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "wasm_type->types[wasm_type->param_count - i - 1]"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11577,
+      "line_end": 11579,
+      "var": "cell_num, loader_ctx->frame_offset",
+      "code": "cell_num = wasm_value_type_cell_num(\n    wasm_type->types[wasm_type->param_count - i - 1]);\nloader_ctx->frame_offset -= cell_num;",
+      "note": "Root cause. After step 7 removed only one wildcard cell, the fast-interpreter path still subtracts the real width of the same parsed parameter. For this witness that parameter is `v128`, so `cell_num` is 4 and the pointer moves below `frame_offset_bottom` with no lower-bound check.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "ctx->stack_cell_num"
+        },
+        {
+          "on": 6,
+          "type": "data",
+          "via": "wasm_type->types[wasm_type->param_count - i - 1]"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "loader_ctx->frame_offset_bottom"
+        }
+      ]
+    },
+    {
+      "step": 9,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11561,
+      "line_end": 11569,
+      "var": "available_params",
+      "code": "int32 available_stack_cell =\n    (int32)(loader_ctx->stack_cell_num\n            - cur_block->stack_cell_num);\nif (available_stack_cell <= 0\n    && cur_block->is_stack_polymorphic) {\n    available_params = i;\n    break;\n}",
+      "note": "On the next parameter iteration there are no concrete operand cells left, but the block is still polymorphic from step 4, so the loop records that only one parameter was available and breaks into the later dummy-parameter path.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "data",
+          "via": "loader_ctx->stack_cell_num"
+        },
+        {
+          "on": 4,
+          "type": "control",
+          "via": "available_stack_cell <= 0 && cur_block->is_stack_polymorphic"
+        }
+      ]
+    },
+    {
+      "step": 10,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11618,
+      "line_end": 11619,
+      "var": "loader_ctx->frame_offset",
+      "code": "else {\n    loader_ctx->frame_offset += cell_num;\n}",
+      "note": "In the pass-parameters loop, the first parameter (`f64`) is treated as available, so its 2-cell width is added back. That moves the already-underflowed pointer from three slots below `frame_offset_bottom` to one slot below it, aligning the later crash with ASan's `2 bytes before` report.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "control",
+          "via": "i < available_params"
+        },
+        {
+          "on": 1,
+          "type": "data",
+          "via": "func_type->types[i]"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "loader_ctx->frame_offset"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11599,
+      "line_end": 11605,
+      "var": "loader_ctx->frame_offset",
+      "code": "if (loader_ctx->p_code_compiled == NULL) {\n    loader_ctx->frame_offset += cell_num;\n    if (!check_offset_push(loader_ctx, error_buf,\n                           error_buf_size))\n        goto fail;\n    loader_ctx->frame_offset -= cell_num;\n}",
+      "note": "Before writing dummy offsets for the missing second parameter, the first traversal only checks whether temporarily moving forward would exceed the upper boundary. This precheck never rejects that step 10 left the live pointer below `frame_offset_bottom`.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "data",
+          "via": "loader_ctx->frame_offset"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "i >= available_params"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11595,
+      "line_end": 11597,
+      "var": "cell_num",
+      "code": "uint32 cell_num =\n    wasm_value_type_cell_num(func_type->types[i]);\nif (i >= available_params) {",
+      "note": "The missing parameter handled by the dummy-write path is the second parsed block parameter, `v128`, so the upcoming sink will iterate four `int16` stores starting from the still-underflowed pointer.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "func_type->types[i]"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "i >= available_params"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11614,
+      "line_end": 11615,
+      "var": "*loader_ctx->frame_offset",
+      "code": "for (uint32 n = 0; n < cell_num; n++) {\n    *loader_ctx->frame_offset++ = 0;\n}",
+      "note": "Sink. The dummy `v128` parameter write stores zero offsets through the pointer left one `int16` slot before `frame_offset_bottom`, producing the observed left-of-buffer heap write.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "loader_ctx->frame_offset"
+        },
+        {
+          "on": 12,
+          "type": "data",
+          "via": "cell_num"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "loader_ctx->frame_offset_bottom"
+        },
+        {
+          "on": 9,
+          "type": "control",
+          "via": "i >= available_params"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "ASan text trace with unsymbolized PCs plus OSS-Fuzz crash state",
+    "sanitizer": "AddressSanitizer",
+    "crash_type": "heap-buffer-overflow",
+    "access_type": "WRITE",
+    "access_size": 2,
+    "crash_location": {
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_prepare_bytecode",
+      "line": 11615
+    },
+    "allocation_context": {
+      "file": "core/iwasm/interpreter/wasm_loader.c",
+      "function": "wasm_loader_ctx_init",
+      "line": 8285
+    },
+    "free_context": null,
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "wasm_loader_prepare_bytecode",
+        "file": "core/iwasm/interpreter/wasm_loader.c",
+        "line": 11615
+      },
+      {
+        "frame": 1,
+        "function": "load_from_sections",
+        "file": "core/iwasm/interpreter/wasm_loader.c",
+        "line": 6181
+      },
+      {
+        "frame": 2,
+        "function": "wasm_loader_load",
+        "file": "core/iwasm/interpreter/wasm_loader.c",
+        "line": 6774
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "wasm_loader_ctx_init",
+        "file": "core/iwasm/interpreter/wasm_loader.c",
+        "line": 8285
+      },
+      {
+        "frame": 1,
+        "function": "wasm_loader_prepare_bytecode",
+        "file": "core/iwasm/interpreter/wasm_loader.c",
+        "line": 11262
+      },
+      {
+        "frame": 2,
+        "function": "load_from_sections",
+        "file": "core/iwasm/interpreter/wasm_loader.c",
+        "line": 6181
+      },
+      {
+        "frame": 3,
+        "function": "load",
+        "file": "core/iwasm/interpreter/wasm_loader.c",
+        "line": 6597
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "gt_results/osv_ossfuzz_OSV-2025-230/poc",
+    "trigger": "/home/xinran/gt_generation/gt_results/osv_ossfuzz_OSV-2025-230/build.sh 'cd /gt/_work/src/tests/fuzz/wasm-mutator-fuzz/build && ASAN_OPTIONS=abort_on_error=1:halt_on_error=1:symbolize=0 UBSAN_OPTIONS=print_stacktrace=0:halt_on_error=1 ./wasm_mutator_fuzz -runs=1 /gt/poc > /gt/sanitizer_trace.txt 2>&1'",
+    "format": {
+      "name": "WebAssembly binary",
+      "contract": "The witness is the exact staged 66-byte wasm module. It must pass the standard `\\0asm` magic and version-1 checks, contain a type section whose single entry is `0x60 02 7c 7b 02 7c 7e`, define one function that uses type index 0, and carry a zero-local body whose leading bytes are `00 00 00 1b 02 00`. That exact pairing of signature and body is what drives `wasm_loader_prepare_bytecode()` through polymorphic `unreachable` state, `select` wildcard synthesis, typed `block 0` resolution, the unchecked real-width decrement, and the final dummy `v128` offset write."
+    }
+  }
+}

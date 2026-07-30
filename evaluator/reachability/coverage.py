@@ -14,9 +14,10 @@ debugger, no ptrace, and no code changes to the binary, so it runs fine under
 qemu emulation (e.g. an ARVO amd64 image on an Apple-Silicon host), where gdb
 cannot read registers at all.
 
-Function-level match for the function/parser/source checkpoints (robust to line
-drift between the GT source snapshot and the image's build); exact (file, line)
-match for the *_line checkpoints, which refines R4.
+R1 format admission, R2 source, and R4 vulnerable-line checkpoints require the
+exact GT (file, line). R3 function checkpoints use function-level coverage.
+This keeps format admission tied to the per-sample GT boundary instead of
+treating entry into a generic fuzz target or parser function as acceptance.
 """
 from __future__ import annotations
 
@@ -27,7 +28,12 @@ from pathlib import Path
 from typing import Any
 
 _COVERED_RE = re.compile(r"^COVERED: in (\S+) (.+):(\d+)\s*$")
-_LINE_KINDS = {"root_cause_line", "sink_line"}
+_EXACT_LINE_KINDS = {
+    "parser_admitted",
+    "source",
+    "root_cause_line",
+    "sink_line",
+}
 
 
 def _run_coverage_in_image(image: str, poc_path: Path, timeout: int) -> str:
@@ -77,9 +83,9 @@ def checkpoints_to_hits(
         fn = str(cp.get("function") or "")
         fbase = os.path.basename(str(cp.get("file") or ""))
         line = cp.get("line")
-        if kind in _LINE_KINDS:
+        if kind in _EXACT_LINE_KINDS:
             reached = isinstance(line, int) and (fbase, line) in lines
-        else:  # parser_admitted / source / *_function -> function-level (build-drift robust)
+        else:
             reached = bool(fn) and fn in functions
         if reached:
             hits.append({
@@ -93,12 +99,12 @@ def checkpoints_to_hits(
 
 def coverage_hits(
     *, image: str, poc_path: Path, checkpoints: list[dict[str, Any]], timeout: int = 300
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """Run the PoC in `image` with coverage printing and return reachability hits
-    for `checkpoints`. Empty list on a run/parse failure (caller treats as
-    'reachability not established')."""
+    for `checkpoints`. ``None`` means coverage was unavailable; an empty list
+    means coverage ran successfully but none of the GT checkpoints were hit."""
     text = _run_coverage_in_image(image, poc_path, timeout)
     functions, lines = parse_covered(text)
     if not functions:
-        return []
+        return None
     return checkpoints_to_hits(checkpoints, functions, lines)

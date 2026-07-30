@@ -72,6 +72,14 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true", help="Skip stages already ok in the prior state file.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
     parser.add_argument("--keep-going", action="store_true", help="Continue after a failed stage.")
+    parser.add_argument(
+        "--runtime-disambiguation",
+        action="store_true",
+        help=(
+            "Enable the bounded Stage 02 runtime measurement for this sample only; "
+            "the workflow default remains unchanged."
+        ),
+    )
     args = parser.parse_args()
 
     config = load_json(args.config)
@@ -92,7 +100,9 @@ def main() -> None:
     # Stage 02 instrumentation escalation; it is OFF by default so the common path stays
     # short. Rewritten every run so a config change takes effect immediately.
     write_json(result_dir / "run_flags.json", {
-        "runtime_disambiguation": bool(config.get("runtime_disambiguation", False)),
+        "runtime_disambiguation": runtime_disambiguation_enabled(
+            config, args.runtime_disambiguation
+        ),
     })
     timing_path = result_dir / "generation_timing.json"
     prior_timing = load_json(timing_path) if timing_path.is_file() else {}
@@ -128,6 +138,31 @@ def main() -> None:
         raise SystemExit(f"No stages in config: {args.config}")
 
     should_run = make_stage_filter(stages, args.start_at, args.stop_after, args.only)
+    active_stages = [
+        stage for stage in stages
+        if should_run(str(stage.get("name") or ""))
+        and str(stage.get("name") or "") not in prior_ok
+    ]
+    if not args.dry_run and any(
+        str(stage.get("name") or "") == "03_trace_review"
+        for stage in active_stages
+    ):
+        clear_stale_feedback_control_files(logs_dir)
+    if needs_resume_source_hydration(active_stages, args.dry_run):
+        from gt_toolkit.prepare import ensure_arvo_resume_source, is_arvo_sample
+
+        if is_arvo_sample(sample):
+            hydration = ensure_arvo_resume_source(sample, result_dir)
+            write_json(result_dir / "resume_source_report.json", hydration)
+            if not hydration.get("prepared"):
+                state["status"] = "failed"
+                state["ended_at"] = now()
+                state["failure"] = "resume source hydration failed"
+                write_json(state_path, state)
+                raise SystemExit(
+                    f"Cannot run resumed agent stage for {sample_id}: "
+                    f"{hydration.get('reason', 'source unavailable')}"
+                )
     failed = False
     for stage in stages:
         name = str(stage.get("name") or "")
@@ -237,10 +272,11 @@ def run_feedback_loop(
     """Repair with a delta review, then require a fresh final full review.
 
     The reviewer writes its normal review artifact plus a feedback artifact in the
-    result directory. The producer role is responsible for reading that feedback on
-    its next isolated invocation. A delta reviewer may confirm the repair direction,
-    but only a new full reviewer can accept the resulting GT. No conversational state
-    crosses the boundary.
+    result directory. Ordinary feedback returns to the static producer. When the
+    existing feedback requests runtime disambiguation, the same repair slot instead
+    invokes the configured dynamic role. Both paths rewrite the existing GT; neither
+    adds a package artifact or schema field. A delta reviewer may confirm the repair
+    direction, but only a new full reviewer can accept the resulting GT.
     """
     producer_name = str(review_stage.get("feedback_to") or "")
     producer = next(
@@ -251,6 +287,7 @@ def run_feedback_loop(
         return initial_result
     rounds = int(review_stage.get("feedback_rounds", 1))
     incremental_role = str(review_stage.get("incremental_role") or "").strip()
+    runtime_role = str(review_stage.get("runtime_role") or "").strip()
     result_dir = Path(stage_kwargs["result_dir"])
     logs_dir = Path(stage_kwargs["logs_dir"])
     result = initial_result
@@ -260,7 +297,16 @@ def run_feedback_loop(
         if current_gt.exists():
             baseline_path.write_bytes(current_gt.read_bytes())
 
-        producer_retry = {**producer, "_log_suffix": f"feedback_{round_number}"}
+        runtime_requested = feedback_requests_runtime_disambiguation(result_dir)
+        if runtime_requested and runtime_role:
+            producer_retry = {
+                **producer,
+                "name": "02_runtime_disambiguation",
+                "role": runtime_role,
+                "_log_suffix": f"feedback_{round_number}",
+            }
+        else:
+            producer_retry = {**producer, "_log_suffix": f"feedback_{round_number}"}
         producer_result = run_stage_with_retries(
             **{**stage_kwargs, "stage": producer_retry}
         )
@@ -308,6 +354,17 @@ def run_feedback_loop(
     return result
 
 
+def feedback_requests_runtime_disambiguation(result_dir: Path) -> bool:
+    """Whether the existing review feedback authorizes the conditional dynamic stage."""
+    feedback_path = result_dir / "trace_feedback.json"
+    if not feedback_path.is_file():
+        return False
+    feedback = load_json(feedback_path)
+    return bool(feedback.get("needs_runtime_disambiguation")) and bool(
+        str(feedback.get("observe") or "").strip()
+    )
+
+
 def write_review_delta(baseline: Path, current: Path, out: Path) -> None:
     before = load_json(baseline)
     after = load_json(current)
@@ -345,6 +402,8 @@ def collect_changed_json_paths(
             changed.append(f"{path}.length")
         for index, (left, right) in enumerate(zip(before, after)):
             collect_changed_json_paths(left, right, f"{path}[{index}]", changed)
+        for index in range(min(len(before), len(after)), max(len(before), len(after))):
+            changed.append(f"{path}[{index}]")
         return
     if before != after:
         changed.append(path)
@@ -400,8 +459,10 @@ def run_stage(
     stderr_path.write_text(proc.stderr, encoding="utf-8", errors="replace")
 
     required_outputs_ok = check_required_outputs(stage, variables, started_ts)
-    success_check_ok = check_success(stage, variables) and check_validate_gt(
-        stage, variables, repo_root, code_root
+    success_check_ok = (
+        check_success(stage, variables)
+        and check_validate_gt(stage, variables, repo_root, code_root)
+        and check_runtime_disambiguation_success(stage, variables, started_ts)
     )
     return StageResult(
         name=name, command=command, returncode=proc.returncode, started_at=started_at,
@@ -552,6 +613,47 @@ def check_validate_gt(
     return proc.returncode == 0
 
 
+def check_runtime_disambiguation_success(
+    stage: dict[str, Any], variables: dict[str, str], started_ts: float
+) -> bool:
+    """Require a current apply/compile/run/reset cycle for the dynamic role."""
+    if str(stage.get("name") or "") != "02_runtime_disambiguation":
+        return True
+    result_dir = Path(variables["result_dir"])
+    state_path = result_dir / "arvo_workspace.json"
+    if not state_path.is_file():
+        return False
+    try:
+        state = load_json(state_path)
+    except Exception:
+        return False
+    if (
+        state.get("phase") != "vulnerable_source_reset"
+        or state.get("vulnerable_compile_returncode") != 0
+        or state.get("vulnerable_expectation_matched") is not True
+    ):
+        return False
+    workspace = result_dir / "arvo_workspace"
+    always_fresh = (
+        workspace / "instrumentation_apply.log",
+        workspace / "vulnerable_run.log",
+        workspace / "reset_source.log",
+    )
+    if not all(
+        path.is_file() and path.stat().st_mtime + 2 >= started_ts
+        for path in always_fresh
+    ):
+        return False
+    compile_logs = (
+        workspace / "vulnerable_incremental_compile.log",
+        workspace / "vulnerable_fallback_compile.log",
+    )
+    return any(
+        path.is_file() and path.stat().st_mtime + 2 >= started_ts
+        for path in compile_logs
+    )
+
+
 def get_nested(data: dict[str, Any], field: str) -> Any:
     current: Any = data
     for part in field.split("."):
@@ -568,6 +670,44 @@ def make_stage_filter(stages: list[dict[str, Any]], start_at: str, stop_after: s
     start_index = names.index(start_at) if start_at in names else 0
     stop_index = names.index(stop_after) if stop_after in names else len(names) - 1
     return lambda name: start_index <= names.index(name) <= stop_index
+
+
+def needs_resume_source_hydration(
+    active_stages: list[dict[str, Any]], dry_run: bool = False
+) -> bool:
+    """Whether selected work skips prepare but invokes an agent that needs source."""
+    if dry_run or not active_stages:
+        return False
+    if any(str(stage.get("name") or "") == "00_prepare" for stage in active_stages):
+        return False
+    return any(bool(stage.get("role")) for stage in active_stages)
+
+
+def runtime_disambiguation_enabled(
+    config: dict[str, Any], command_line_enabled: bool = False
+) -> bool:
+    """Resolve the default-OFF workflow gate with a per-invocation opt-in."""
+    return command_line_enabled or bool(config.get("runtime_disambiguation", False))
+
+
+def clear_stale_feedback_control_files(logs_dir: Path) -> list[Path]:
+    """Remove prior-run manifests that must never enter a new review loop.
+
+    These files are transient coordination state generated from the current
+    producer output. Keeping them across runner invocations lets an initial
+    Stage 03 reviewer mistake a previous run's round-2 delta for current
+    evidence. Human-readable role stdout/stderr and review artifacts remain.
+    """
+    removed: list[Path] = []
+    for pattern in (
+        "ground_truth.before_feedback_*.json",
+        "ground_truth.delta_feedback_*.json",
+    ):
+        for path in logs_dir.glob(pattern):
+            if path.is_file():
+                path.unlink()
+                removed.append(path)
+    return removed
 
 
 def prior_ok_stages(state_path: Path) -> set[str]:

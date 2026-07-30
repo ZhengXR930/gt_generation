@@ -29,6 +29,71 @@ def test_package_audit_accepts_string_issue_description():
     assert package_audit._public_issue({"issue_description": "exact issue"}) == "exact issue"
 
 
+def test_package_audit_requires_root_obligation_assertion(tmp_path, monkeypatch):
+    sample_id = "sample"
+    assertion = {
+        "id": "observed.node",
+        "kind": "observed",
+        "at": "point",
+        "check": ["eq", "$left", "$right"],
+        "invariants": ["node.one"],
+    }
+    spec = {
+        "schema_version": "assertion-spec-v3",
+        "sample_id": sample_id,
+        "original_case": "original",
+        "assertions": [assertion],
+    }
+    spec["content_hash"] = assertion_content_hash(spec)
+    documents = {
+        "sample_info.json": {
+            "sample_id": sample_id,
+            "original_bug_description": "exact public issue",
+            "default_crash_trace": "exact public crash trace",
+        },
+        "ground_truth.json": {"sample_id": sample_id},
+        "verified_invariants.json": {
+            "sample_id": sample_id,
+            "nodes": [{"invariant_id": "node.one", "verified": True}],
+            "edges": [],
+        },
+        "verified_assertions.json": {
+            "schema_version": "verified-assertions-v3",
+            "sample_id": sample_id,
+            "content_hash": spec["content_hash"],
+            "assertions": [assertion],
+        },
+        "assertion_results.json": {
+            "sample_id": sample_id,
+            "original_case": "original",
+            "candidate_content_hash": spec["content_hash"],
+            "all_verified": True,
+        },
+        "perturbation_results.json": {
+            "sample_id": sample_id,
+            "all_needed_witnessed": True,
+        },
+        "reachability_report.json": {
+            "sample_id": sample_id,
+            **{field: True for field in package_audit.REACHABILITY_FIELDS},
+            "artifacts": {},
+        },
+    }
+    for name in package_audit.REQUIRED_FILES:
+        path = tmp_path / name
+        path.write_text(json.dumps(documents[name]) if name.endswith(".json") else "asset")
+    monkeypatch.setattr(
+        package_audit,
+        "validate_data",
+        lambda *args, **kwargs: SimpleNamespace(errors=[], warnings=[]),
+    )
+
+    report = package_audit.audit_package(tmp_path)
+
+    assert report["ok"] is False
+    assert any("no required root-obligation" in error for error in report["errors"])
+
+
 def test_package_audit_rejects_legacy_assertions_even_when_legacy_checks_pass(
     tmp_path, monkeypatch
 ):

@@ -225,6 +225,20 @@ def validate_data(
             for key in ["file", "function", "line"]:
                 if key not in pa:
                     report.err(f"reachability_checkpoints.parser_admitted missing {key}")
+            admitted = pa.get("admitted_location")
+            if admitted is not None:
+                if not isinstance(admitted, dict):
+                    report.err(
+                        "reachability_checkpoints.parser_admitted.admitted_location "
+                        "must be an object"
+                    )
+                else:
+                    for key in ["file", "function", "line"]:
+                        if key not in admitted:
+                            report.err(
+                                "reachability_checkpoints.parser_admitted."
+                                f"admitted_location missing {key}"
+                            )
 
     coarse = data.get("coarse_trace")
     if not isinstance(coarse, list) or not coarse:
@@ -315,6 +329,23 @@ def _trace_step_matches_location(step: dict, anchor: dict) -> bool:
 
 def _check_edges(fine: list, report: Report) -> None:
     """Validate the typed depends_on edges (the source->sink association)."""
+    # A trace can legitimately have more than one root. A destination extent and
+    # attacker-controlled input, for example, are independent facts that only meet
+    # at a later operation. A root is connected when a later edge references it;
+    # requiring depends_on on every non-first step would force a false dependency.
+    referenced_steps: set[Any] = set()
+    for step in fine:
+        if not isinstance(step, dict):
+            continue
+        deps = step.get("depends_on")
+        if not isinstance(deps, list):
+            continue
+        for edge in deps:
+            if isinstance(edge, dict) and "on" in edge:
+                on = edge["on"]
+                if isinstance(on, int):
+                    referenced_steps.add(on)
+
     any_edge = False
     any_control_or_order = False
     for idx, step in enumerate(fine):
@@ -322,7 +353,8 @@ def _check_edges(fine: list, report: Report) -> None:
             continue
         deps = step.get("depends_on")
         if deps is None:
-            if idx > 0:
+            step_number = step.get("step", idx + 1)
+            if idx > 0 and step_number not in referenced_steps:
                 report.warn(f"fine_trace[{idx}] has no depends_on edge (source->sink association missing)")
             continue
         if not isinstance(deps, list):

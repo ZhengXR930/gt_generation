@@ -1,9 +1,12 @@
 import argparse
+import hashlib
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 import time
 from typing import Annotated
+from uuid import uuid4
 
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile, status
@@ -11,7 +14,12 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
-from cybergym.server.pocdb import get_poc_by_hash, init_engine
+from cybergym.server.pocdb import (
+    create_submission_attempt,
+    get_poc_by_hash,
+    init_engine,
+    update_submission_attempt,
+)
 from cybergym.server.rate_limiter import RateLimiter
 from cybergym.server.server_utils import _post_process_result, run_poc_id, submit_poc
 from cybergym.server.types import Payload, PocQuery, VerifyPocs, server_conf
@@ -128,12 +136,48 @@ def try_read_file(file: UploadFile, max_size_mb: int) -> bytes:
     return content
 
 
+def validate_candidate_trace(content: bytes | None) -> str | None:
+    if content is None:
+        return "candidate trace file is required"
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "candidate trace must be UTF-8 bare JSON"
+    required = ("step", "file", "function", "line", "var", "code", "note")
+    if not isinstance(value, list) or not value:
+        return "candidate trace must be a non-empty JSON array"
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            return f"candidate trace step {index} must be an object"
+        missing = [field for field in required if field not in item]
+        if missing:
+            return f"candidate trace step {index} missing: {', '.join(missing)}"
+        if item["step"] != index:
+            return f"candidate trace step {index} must have step={index}"
+        if "depends_on" in item:
+            return (
+                f"candidate trace step {index} must not contain depends_on; "
+                "represent propagation with consecutive trace order"
+            )
+        for field in ("file", "function", "var", "code", "note"):
+            if not str(item[field] or "").strip():
+                return f"candidate trace step {index} has empty {field}"
+        if item["line"] is not None and not isinstance(item["line"], int):
+            return f"candidate trace step {index} line must be integer or null"
+    return None
+
+
 public_router = APIRouter()
 private_router = APIRouter(dependencies=[Depends(get_api_key)])
 
 
 @public_router.post("/submit-vul")
-def submit_vul(db: SessionDep, metadata: Annotated[str, Form()], file: Annotated[UploadFile, File()]):
+def submit_vul(
+    db: SessionDep,
+    metadata: Annotated[str, Form()],
+    file: Annotated[UploadFile, File()],
+    trace: Annotated[UploadFile | None, File()] = None,
+):
     # Read and validate file size
     try:
         file_content = try_read_file(file, server_conf.max_file_size_mb)
@@ -156,13 +200,91 @@ def submit_vul(db: SessionDep, metadata: Annotated[str, Form()], file: Annotated
 
     rate_limiter.check(payload.agent_id)
 
+    trace_content = try_read_file(trace, 2) if trace is not None else None
+    trace_error = validate_candidate_trace(trace_content)
+    attempt_id = uuid4().hex
+    attempt_dir = server_conf.log_dir / "submissions" / payload.agent_id / attempt_id
+    attempt_dir.mkdir(parents=True, exist_ok=False)
+    (attempt_dir / "poc.bin").write_bytes(file_content)
+    if trace_content is not None:
+        (attempt_dir / "candidate_trace.response.txt").write_bytes(trace_content)
+        if trace_error is None:
+            parsed_trace = json.loads(trace_content.decode("utf-8"))
+            (attempt_dir / "candidate_trace.json").write_text(
+                json.dumps(parsed_trace, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+    request_record = {
+        "attempt_id": attempt_id,
+        "agent_id": payload.agent_id,
+        "task_id": payload.task_id,
+        "poc_hash": hashlib.sha256(file_content).hexdigest(),
+        "poc_length": len(file_content),
+        "trace_valid": trace_error is None,
+        "trace_error": trace_error,
+    }
+    (attempt_dir / "request.json").write_text(
+        json.dumps(request_record, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    attempt = create_submission_attempt(db, **request_record)
+
     payload.data = file_content
     binary_only_mode = bool(server_conf.binary_dir)
-    res = submit_poc(
-        db, payload, mode="vul", log_dir=server_conf.log_dir, salt=server_conf.salt, binary_only_mode=binary_only_mode
+    try:
+        res = submit_poc(
+            db,
+            payload,
+            mode="vul",
+            log_dir=server_conf.log_dir,
+            salt=server_conf.salt,
+            binary_only_mode=binary_only_mode,
+        )
+    except Exception as exc:
+        error_text = f"{type(exc).__name__}: {exc}"
+        error_record = {
+            **request_record,
+            "exit_code": None,
+            "error": error_text,
+        }
+        (attempt_dir / "runtime_output.txt").write_text(
+            error_text + "\n", encoding="utf-8"
+        )
+        (attempt_dir / "result.json").write_text(
+            json.dumps(error_record, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        raise
+    target_exit_code = res.get("exit_code")
+    runtime_output = str(res.get("output") or "")
+    (attempt_dir / "runtime_output.txt").write_text(
+        runtime_output, encoding="utf-8"
+    )
+    result_record = {
+        **request_record,
+        "poc_id": res.get("poc_id"),
+        "exit_code": target_exit_code,
+    }
+    (attempt_dir / "result.json").write_text(
+        json.dumps(result_record, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    update_submission_attempt(
+        db,
+        attempt,
+        poc_id=res.get("poc_id"),
+        vul_exit_code=target_exit_code,
     )
     res = _post_process_result(res, payload.require_flag)
-    logger.info("submit-vul done: agent=%s task=%s exit_code=%s", payload.agent_id, payload.task_id, res["exit_code"])
+    res["attempt_id"] = attempt_id
+    res["trace_valid"] = trace_error is None
+    res["trace_error"] = trace_error
+    logger.info(
+        "submit-vul done: agent=%s task=%s exit_code=%s",
+        payload.agent_id,
+        payload.task_id,
+        target_exit_code,
+    )
     return res
 
 

@@ -25,10 +25,8 @@ ENVS = [
     "DOCKER_CONFIG",
     "OPENHANDS_RUNTIME_READY_TIMEOUT",
     "OPENHANDS_HARNESS_MODE",
-    "OPENHANDS_EVAL_PROBING",
-    "OPENHANDS_EVAL_PROBES_PATH",
-    "OPENHANDS_EVAL_PROBE_OUTPUT",
-    "OPENHANDS_EVAL_TRACE_MODE",
+    "OPENHANDS_CAPTURE_FINE_TRACE",
+    "OPENHANDS_FINE_TRACE_OUTPUT",
     "OPENHANDS_TASK_WORKSPACE",
 ]
 API_KEY_ENVS = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "LLM_API_KEY"]
@@ -149,10 +147,16 @@ def validate_output(log_dir: Path):
     return True
 
 
-def model_map(model: str):
+def model_map(model: str, *, openai_compatible: bool = False):
     if model.endswith("/thinking"):
         model = model[: -len("/thinking")]
 
+    # Third-party /v1/chat/completions proxies expose models from several
+    # families through the OpenAI wire protocol. Force LiteLLM's OpenAI adapter
+    # in that case; otherwise a Claude-looking name selects the native
+    # Anthropic /v1/messages protocol and never reaches the proxy correctly.
+    if openai_compatible:
+        return model if model.startswith("openai/") else f"openai/{model}"
     if model.startswith("claude-"):
         return model
     elif len(model.split("/")) >= 2:
@@ -233,11 +237,20 @@ def run_openhands(
     enable_thinking: bool = False,
     session_name: str | None = None,
 ):
-    poetry_path = Path(shutil.which("poetry")).absolute()
-    if not poetry_path.exists():
-        raise Exception(f"[*] Poetry not found at {poetry_path}")
-    cmd = [
-        str(poetry_path), "run", "python",
+    python_override = os.getenv("OPENHANDS_PYTHON")
+    if python_override:
+        command_prefix = [python_override]
+    elif sys.prefix != sys.base_prefix:
+        # Batch runs already execute this driver in the prepared OpenHands
+        # environment. Reuse that exact interpreter; an unrelated Poetry
+        # executable on PATH may select a fresh, uninstalled environment.
+        command_prefix = [sys.executable]
+    else:
+        poetry = shutil.which("poetry")
+        if not poetry:
+            raise Exception("[*] Poetry not found")
+        command_prefix = [str(Path(poetry).absolute()), "run", "python"]
+    cmd = command_prefix + [
         "-m", "openhands.core.main",
         "--config-file", str(config_path),
         "--file", str(prompt_path),
@@ -293,6 +306,12 @@ def run_openhands(
         _cleanup_docker_container(log_dir)
 
 
+def session_name_for_task(task_id: str) -> str:
+    """Build a stable runtime name with an optionally isolated prefix."""
+    prefix = os.getenv("OPENHANDS_SESSION_PREFIX", "gtpoc").strip() or "gtpoc"
+    return f"{prefix}-{task_id.replace(':', '_')}"
+
+
 def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
     openhands_args.tmp_dir.mkdir(parents=True, exist_ok=True)
     openhands_args.log_dir.mkdir(parents=True, exist_ok=True)
@@ -342,7 +361,7 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
             "task": task,
             "agent_args": openhands_args,
             "task_args": task_args,
-            "session_name": "gtpoc-" + task_args.task_id.replace(":", "_"),
+            "session_name": session_name_for_task(task_args.task_id),
             "file_store_path": str(log_dir / "file"),
         },
         log_dir / "args.json",
@@ -352,6 +371,12 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
     logger.info(f"Saving task info to: {log_dir / 'args.json'}")
 
     os.environ["OPENHANDS_TASK_WORKSPACE"] = str(task_dir)
+    os.environ["OPENHANDS_POC_SUBMISSION_MARKER"] = str(
+        task_dir / ".poc_submission_recorded"
+    )
+    os.environ["OPENHANDS_LATEST_SUBMISSION_TRACE"] = str(
+        task_dir / ".latest_candidate_trace.json"
+    )
 
     # 3. prepare the config file
     config_path = tmp_input_dir / "template" / "config.toml"
@@ -361,7 +386,10 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
     config["core"]["cache_dir"] = str(log_dir / "cache")
     config["core"]["file_store_path"] = str(log_dir / "file")
     config["core"]["save_trajectory_path"] = str(log_dir / "trajectory")
-    config["llm"]["model"] = model_map(openhands_args.llm.model)
+    config["llm"]["model"] = model_map(
+        openhands_args.llm.model,
+        openai_compatible=bool(openhands_args.llm.base_url),
+    )
     config["llm"]["top_p"] = openhands_args.llm.top_p
     config["llm"]["temperature"] = openhands_args.llm.temperature
     config["llm"]["base_url"] = openhands_args.llm.base_url
@@ -399,7 +427,7 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
         if not prompt_override_path.exists():
             raise FileNotFoundError(f"CYBERGYM_OPENHANDS_PROMPT_FILE does not exist: {prompt_override_path}")
         shutil.copy2(prompt_override_path, tmp_input_dir / "template" / prompt_file)
-    session_name = "gtpoc-" + task_args.task_id.replace(":", "_")
+    session_name = session_name_for_task(task_args.task_id)
     run_openhands(
         config_path=config_path,
         prompt_path=tmp_input_dir / "template" / prompt_file,

@@ -16,6 +16,7 @@ from gt_generation.gt_toolkit.assertions import (
     parse_msan_uninit,
     parse_trace_matrix,
     validate_assertions,
+    validate_binding_coverage,
     validate_frozen_spec,
     validate_invariant_bindings,
 )
@@ -265,6 +266,54 @@ def test_annotate_marks_observed_sink_inequality_as_mechanism():
     assert sink["scored_role"] == "mechanism"
     # the discriminative read-length > initialized-length relation, in source terms
     assert sink["relation"] == "sizeof(DATA_OID) > len + 1"
+
+
+def test_binding_coverage_resolves_unqualified_operand_against_assertion_event():
+    spec = {
+        "assertions": [{
+            "at": "sink",
+            "check": ["gt", "$read_len", "$sink.init_len"],
+        }]
+    }
+    coverage = validate_binding_coverage(
+        spec,
+        {
+            "sink.read_len": "sizeof(marker)",
+            "sink.init_len": "written + 1",
+        },
+        {"sink": {"function": "parse", "file": "parser.c"}},
+    )
+
+    assert coverage["errors"] == []
+    assert coverage["warnings"] == []
+
+
+def test_annotate_resolves_unqualified_operand_against_assertion_event():
+    vi = {
+        "nodes": [{
+            "invariant_id": "I-SINK",
+            "verified_by": "A-SINK",
+        }],
+        "edges": [],
+    }
+    va = {
+        "assertions": [{
+            "id": "A-SINK",
+            "kind": "observed",
+            "at": "sink",
+            "check": ["gt", "$read_len", "$init_len"],
+        }]
+    }
+    annotate_scored_invariants(
+        vi,
+        va,
+        {
+            "sink.read_len": "sizeof(marker)",
+            "sink.init_len": "written + 1",
+        },
+    )
+
+    assert vi["nodes"][0]["relation"] == "sizeof(marker) > written + 1"
 
 
 def test_annotate_keeps_aliasing_eq_between_different_expressions_as_reasoning():
@@ -599,4 +648,3 @@ def test_v3_transition_cannot_claim_multiple_edges():
 
     assert result["valid"] is False
     assert any("must cover exactly one edge" in error for error in result["errors"])
-

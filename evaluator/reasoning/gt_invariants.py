@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Read a sample's verified GT and resolve its invariant operands to real
-source names -- the small, self-contained set of helpers the reasoning scorer
-needs. Kept independent of the GT-generation toolkit and of the (removed)
-probing code so the evaluator has no upstream dependency.
+source names -- the small, self-contained set of helpers the fine-trace scorer
+needs. Kept independent of the GT-generation toolkit so the evaluator has no
+upstream dependency.
 
 Consumes the Stage-04 artifacts under gt_results/<sample_id>/:
   verified_assertions.json  -- assertions {id, kind, check:[op,left,right], at, from, invariants}
