@@ -37,7 +37,13 @@ def result_is_complete(result_dir: Path) -> bool:
         return False
     if manifest.get("max_iter") != 100:
         return False
-    if manifest.get("status") not in {"success", "iteration_cap", "agent_finished"}:
+    if manifest.get("status") not in {
+        "success",
+        "iteration_cap",
+        "agent_finished",
+        "iteration_cap_trace_recovered",
+        "agent_finished_trace_recovered",
+    }:
         return False
     if not (result_dir / "fine_trace.json").is_file():
         return False

@@ -85,6 +85,7 @@ def run_arvo_gdb(
     repo_root: Path,
     timeout: int,
     debugger_image: str = "gt-memory-env:latest",
+    max_hits_per_event: int = 64,
 ) -> tuple[CommandResult, list[dict], bool]:
     """Run one PoC and return `(gdb result, hits, reachability checked)`."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +113,8 @@ def run_arvo_gdb(
         f"REACHABILITY_BREAKPOINTS={breakpoints_path}",
         "-e",
         f"REACHABILITY_OUTPUT={hits_path}",
+        "-e",
+        f"REACHABILITY_MAX_HITS_PER_BREAKPOINT={max_hits_per_event}",
         "-v",
         f"{repo_root}:{repo_root}",
         "-v",
@@ -126,7 +129,6 @@ def run_arvo_gdb(
         str(gdb_script),
         "--args",
         str(prepared.executable),
-        "-runs=0",
         str(poc_path.resolve()),
     ]
     proc = _run(command, timeout=timeout)
@@ -147,5 +149,10 @@ def run_arvo_gdb(
         + "\n",
         encoding="utf-8",
     )
-    checked = proc.returncode == 0 and hits_path.is_file()
-    return result, load_hits(hits_path) if checked else [], checked
+    loaded_hits = load_hits(hits_path) if hits_path.is_file() else []
+    checked = (
+        proc.returncode == 0
+        and hits_path.is_file()
+        and not any(hit.get("run_error") for hit in loaded_hits)
+    )
+    return result, loaded_hits, checked

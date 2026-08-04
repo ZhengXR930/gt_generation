@@ -16,17 +16,19 @@ POC_RESULTS = REPO_ROOT / "poc_generation" / "poc_results"
 GT_RESULTS = REPO_ROOT / "gt_results"
 _STAGE_RANK = {
     "reachability_not_checked": -1,
-    "parser_not_admitted": 0,
+    "input_not_admitted": 0,
     "source_not_reached": 1,
-    "vulnerable_function_not_reached": 2,
-    "vulnerable_line_not_reached": 3,
+    "root_cause_not_reached": 2,
+    "root_cause_unavailable": 2,
+    "sink_not_reached": 3,
+    "sink_unavailable": 3,
     "R4_reached": 4,
 }
 _REACHABILITY_FIELDS = (
-    "R1_parser_admitted",
+    "R1_input_admitted",
     "R2_source_reached",
-    "R3_vulnerable_function_reached",
-    "R4_vulnerable_line_reached",
+    "R3_root_cause_reached",
+    "R4_sink_reached",
 )
 
 
@@ -71,6 +73,24 @@ def _candidate_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
             "representative_runtime_output_path"
         ),
     }
+
+
+def _failure_stage(report: dict[str, Any]) -> str:
+    if report.get("R4_sink_reached") is True:
+        return "R4_reached"
+    if report.get("R3_root_cause_reached") is True:
+        if report.get("R4_sink_reached") is None:
+            return "sink_unavailable"
+        return "sink_not_reached"
+    if report.get("R2_source_reached") is True:
+        if report.get("R3_root_cause_reached") is None:
+            return "root_cause_unavailable"
+        return "root_cause_not_reached"
+    if report.get("R1_input_admitted") is True:
+        return "source_not_reached"
+    if report.get("R1_input_admitted") is False:
+        return "input_not_admitted"
+    return "reachability_not_checked"
 
 
 def summarize_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -122,6 +142,7 @@ def evaluate_model_sample(
     sample_dir: Path,
     timeout: int,
     debugger_image: str,
+    max_hits_per_event: int,
 ) -> dict[str, Any]:
     manifest = json.loads((sample_dir / "manifest.json").read_text())
     gt_path = GT_RESULTS / sample_id / "ground_truth.json"
@@ -171,6 +192,7 @@ def evaluate_model_sample(
                         repo_root=REPO_ROOT,
                         timeout=timeout,
                         debugger_image=debugger_image,
+                        max_hits_per_event=max_hits_per_event,
                     )
                     sanitizer_trace = (
                         runtime_path.read_text(
@@ -211,10 +233,7 @@ def evaluate_model_sample(
                         "target_vulnerability_triggered": report.get(
                             "target_vulnerability_triggered"
                         ),
-                        "R5_sanitizer_triggered": report.get(
-                            "R5_sanitizer_triggered"
-                        ),
-                        "failure_stage": report.get("failure_stage"),
+                        "failure_stage": _failure_stage(report),
                         "report_path": str(
                             (output_dir / "reachability_report.json").relative_to(
                                 sample_dir
@@ -242,13 +261,14 @@ def evaluate_model_sample(
         }
 
     summary = {
-        "evaluation_protocol": "reachability_per_unique_poc_v1",
+        "evaluation_protocol": "location_reachability_per_unique_poc_v3",
         "model": model,
         "sample_id": sample_id,
         "checkpoint_source": {
             "R1": "ground_truth.reachability_checkpoints.parser_admitted",
             "R2": "ground_truth.source",
-            "R3_R4": ["ground_truth.root_cause", "ground_truth.sink"],
+            "R3": "ground_truth.root_cause exact source line",
+            "R4": "ground_truth.sink exact source line",
             "target_vulnerability_triggered": (
                 "ground_truth.sanitizer_ground_truth"
             ),
@@ -271,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--debugger-image", default="gt-memory-env:latest"
     )
+    parser.add_argument("--max-hits-per-event", type=int, default=64)
     args = parser.parse_args(argv)
 
     results = []
@@ -283,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
             sample_dir=sample_dir,
             timeout=args.timeout,
             debugger_image=args.debugger_image,
+            max_hits_per_event=args.max_hits_per_event,
         )
         results.append(result)
         if "skipped" in result:

@@ -15,6 +15,19 @@ MAX_HITS_PER_BREAKPOINT = int(os.environ.get('REACHABILITY_MAX_HITS_PER_BREAKPOI
 hits = []
 
 
+def _record_inferior_exit(event):
+    """Treat dynamic-loader failure as infrastructure failure, not R0."""
+    try:
+        exit_code = event.exit_code
+    except AttributeError:
+        return
+    if exit_code == 127:
+        hits.append({
+            'run_error': 'inferior exited 127 before candidate execution',
+            'inferior_exit_code': exit_code,
+        })
+
+
 def _load_breakpoints():
     with io.open(BREAKPOINTS_PATH, 'r', encoding='utf-8', errors='replace') as handle:
         data = json.load(handle)
@@ -48,10 +61,38 @@ class ReachabilityBreakpoint(gdb.Breakpoint):
             'breakpoint_spec': self.location,
             'hit_count': self.observed_hit_count,
         }
+        fields = {}
+        capture_errors = {}
+        for name, expression in (self.checkpoint.get('captures') or {}).items():
+            try:
+                value = gdb.parse_and_eval(str(expression))
+                fields[str(name)] = _json_value(value)
+            except (gdb.error, ValueError, TypeError) as exc:
+                capture_errors[str(name)] = str(exc)
+        if fields:
+            hit['fields'] = fields
+        if capture_errors:
+            hit['capture_errors'] = capture_errors
         hits.append(hit)
         if self.observed_hit_count >= MAX_HITS_PER_BREAKPOINT:
             self.enabled = False
         return False
+
+
+def _json_value(value):
+    """Convert scalar/pointer GDB values to stable JSON primitives."""
+    text = str(value)
+    if text in ('true', 'false'):
+        return text == 'true'
+    if text in ('0x0', '(void *) 0x0', 'nullptr'):
+        return 0
+    try:
+        return int(value)
+    except (gdb.error, ValueError, TypeError):
+        try:
+            return int(text, 0)
+        except ValueError:
+            return text
 
 
 def _breakpoint_specs(checkpoint):
@@ -130,6 +171,7 @@ def main():
             'expected_line': checkpoint.get('line'),
             'breakpoint_error': '; '.join(errors),
         })
+    gdb.events.exited.connect(_record_inferior_exit)
     try:
         gdb.execute('run')
     except gdb.error as exc:

@@ -20,6 +20,7 @@ CHECKPOINT_KINDS = (
     'root_cause_line',
     'sink_line',
     'assertion_event',
+    'condition_event',
 )
 
 _ASSERTION_EVENT_RE = re.compile(r'ASSERT_EVT\s+point=([A-Za-z0-9_.:-]+)')
@@ -473,7 +474,14 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
         'free_stack': [],
         'allocation_stack': [],
     }
-    first = re.search(r'ERROR: [^:]+: ([A-Za-z0-9_-]+)', trace_text)
+    # Do not accept arbitrary application diagnostics such as
+    # ``ERROR: dwarf_srclines: ...`` as sanitizer headers.  They can precede
+    # the real ASan report by hundreds of lines.
+    first = re.search(
+        r'ERROR:\s+(?:AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer)'
+        r':\s+([A-Za-z0-9_-]+)',
+        trace_text,
+    )
     if first:
         crash_type = first.group(1)
     access = re.search(r'\b(READ|WRITE|FREE) of size\b|\b(READ|WRITE) memory access\b', trace_text)
@@ -484,10 +492,14 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
     )
     current: str | None = 'crash_stack'
     for line in trace_text.splitlines():
-        if line.startswith('freed by thread'):
+        normalized_line = line.strip().lower()
+        if normalized_line.startswith('freed by thread'):
             current = 'free_stack'
             continue
-        if line.startswith('previously allocated by thread'):
+        if (
+            normalized_line.startswith('previously allocated by thread')
+            or normalized_line.startswith('allocated by thread')
+        ):
             current = 'allocation_stack'
             continue
         if line.startswith('SUMMARY:'):
@@ -512,6 +524,8 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
             '__libc_start_main',
             'sanitizer_',
             'asan_',
+            '/usr/include/',
+            'bits/string_fortified.h',
         )
         for frame in frames:
             file = str(frame.get('file') or '')

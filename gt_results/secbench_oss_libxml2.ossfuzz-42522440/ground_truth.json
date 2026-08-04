@@ -19,12 +19,12 @@
     "cwe": "CWE-787",
     "access": "READ",
     "detector": "AddressSanitizer",
-    "classification_note": "The saved crash is an AddressSanitizer global-buffer-overflow READ at `HTMLparser.c:2761`. Source analysis shows that `htmlParseHTMLAttribute()` calls the stateful helper `CUR_CHAR(l)` and then, without any EOF-state guard, unconditionally executes `NEXTL(l)` and re-enters the loop header. The saved ASan report proves that the loop-header dereference ultimately occurs at `\"\" + 1`, one byte past the global empty string, but the exact internal producer of the earlier EOF/sentinel state is not uniquely identified by the staged source evidence here."
+    "classification_note": "The saved crash is an AddressSanitizer global-buffer-overflow READ at `HTMLparser.c:2761`. On the reproduced pull-parser witness, the first 8 testcase bytes make the fuzzer harness set `maxAlloc = 16`, so the second attribute-value iteration reaches `htmlCurrentChar()`'s invalid-UTF-8 recovery on attacker byte `0xFF` under malloc-failure injection. That recovery calls `xmlSwitchEncoding(ctxt, XML_CHAR_ENCODING_8859_1)`, whose HTML input-conversion path allocates a fresh converted buffer and can return an error on this witness; `xmlSwitchEncoding()` then calls `xmlStopParser()`, and `xmlHaltParser()` resets `ctxt->input->cur/base/end` to `BAD_CAST \"\"`. Vulnerable `htmlParseHTMLAttribute()` omits the later patch's post-`CUR_CHAR(l)` EOF guard, still executes `NEXTL(l)` with `l == 1`, advances the empty-string cursor to `\"\" + 1`, and the next loop-header `CUR` read becomes the ASan sink."
   },
   "bug_description": {
     "original": "A use-of-uninitialized-value in htmlParseHTMLAttribute (HTMLparser.c) can cause an out-of-bounds read / global-buffer-overflow while parsing HTML attribute values. The parser may read past a local buffer into adjacent global memory, leading to crashes, incorrect behavior, or potential information disclosure.",
     "original_source": "SEC-bench.bug_description",
-    "normalized": "The staged OSS-Fuzz testcase is 16 bytes long. The fuzz harness consumes the first eight bytes as `opts` and `maxAlloc`, leaving the exact HTML payload `<h c=a\\xFF ` for the reproduced pull-parser path. `htmlReadMemory()` materializes that payload into a parser context, `htmlParseContentInternal()` admits it as a start tag because it begins with `<h`, and `htmlParseAttribute()` reaches unquoted attribute parsing for `c=a\\xFF `. In `htmlParseHTMLAttribute()`, the first loop iteration consumes ASCII `a` and advances to the next byte. On the second iteration `CUR_CHAR(l)` is called on attacker byte `0xFF`; `htmlCurrentChar()` reports invalid UTF-8 and may change parser state or input handling while returning control to the caller. Vulnerable `htmlParseHTMLAttribute()` immediately continues without checking whether `ctxt->instate` became `XML_PARSER_EOF`, still uses `l` in `NEXTL(l)`, and then re-enters the loop header. The saved ASan report proves that the subsequent loop-header dereference reads at `\"\" + 1`, one byte past the global empty string defined in `parserInternals.c`, but the staged artifacts do not isolate which internal source-level operation first installed the EOF/sentinel state before that dereference. The staged patch adds exactly the missing `if (ctxt->instate == XML_PARSER_EOF) { xmlFree(buffer); return(NULL); }` guard after `CUR_CHAR(l)`."
+    "normalized": "The staged OSS-Fuzz testcase is 16 bytes long. The harness consumes the first 8 bytes as `opts` and `maxAlloc`; for this exact witness, `maxAlloc = 0x68746930 % 17 = 16`, so the pull parser runs under malloc-failure injection. The remaining 8-byte HTML payload is exactly `<h c=a\\xFF `. `htmlReadMemory()` materializes that payload into a parser context, `htmlParseContentInternal()` admits it as a start tag because it begins with `<h`, and `htmlParseAttribute()` reaches unquoted attribute parsing for `c=a\\xFF `. In `htmlParseHTMLAttribute()`, the first loop iteration consumes ASCII `a` and advances to attacker byte `0xFF`. On the second iteration, `htmlCurrentChar()` takes its invalid-UTF-8 handling for that `0xFF`: it reports an encoding error and calls `xmlSwitchEncoding(ctxt, XML_CHAR_ENCODING_8859_1)`. The encoding-switch helper moves the remaining bytes into a raw buffer, allocates a fresh conversion buffer, and on this malloc-limited witness propagates an error back to `xmlSwitchEncoding()`, which calls `xmlStopParser()`. `xmlHaltParser()` then sets `ctxt->instate = XML_PARSER_EOF` and resets `ctxt->input->cur/base/end` to the global empty-string sentinel. Vulnerable `htmlParseHTMLAttribute()` does not have the later patch's `if (ctxt->instate == XML_PARSER_EOF) { xmlFree(buffer); return(NULL); }` check after `CUR_CHAR(l)`, so it still returns with `l = 1`, executes `NEXTL(l)` on the sentinel cursor, advances that cursor to `\"\" + 1`, and the next loop-header `CUR` dereference becomes the saved ASan read one byte past the empty string."
   },
   "source": {
     "file": "HTMLparser.c",
@@ -42,17 +42,17 @@
     "line": 2761,
     "var": "CUR / *ctxt->input->cur",
     "code": "while ((CUR != 0) && (CUR != stop)) {",
-    "description": "Crash sink. When control returns to this loop header after the unchecked post-`CUR_CHAR(l)` path, the saved AddressSanitizer report shows the `CUR` dereference reading at `\"\" + 1`, one byte past the global empty string.",
-    "trace_step": 11
+    "description": "Crash sink from the saved AddressSanitizer report. After `xmlHaltParser()` resets `ctxt->input->cur/base/end` to the empty-string sentinel and vulnerable `NEXTL(l)` still increments that sentinel cursor by one, the next re-entry to this loop header dereferences `\"\" + 1`, one byte past the global empty string.",
+    "trace_step": 18
   },
   "root_cause": {
     "file": "HTMLparser.c",
     "function": "htmlParseHTMLAttribute",
-    "line": 2846,
-    "var": "c, l, ctxt->instate",
-    "code": "c = CUR_CHAR(l);",
-    "description": "Root cause fixed by the patch. `CUR_CHAR(l)` is a stateful helper reached on the malformed attribute byte `0xFF`, but vulnerable code does not check whether the call left `ctxt->instate == XML_PARSER_EOF` before continuing to use `l` and re-enter the loop.",
-    "trace_step": 9
+    "line": 2859,
+    "var": "ctxt->input->cur, l",
+    "code": "NEXTL(l);",
+    "description": "Root cause fixed by the patch. After `CUR_CHAR(l)` has already driven the parser into `XML_PARSER_EOF` and `xmlHaltParser()` has rebound `ctxt->input->cur/base/end` to `BAD_CAST \"\"`, vulnerable code lacks the inserted post-`CUR_CHAR(l)` EOF guard and still advances the cursor with `NEXTL(l)` using the returned `l == 1`.",
+    "trace_step": 17
   },
   "tainted_value_origin": {
     "file": "HTMLparser.c",
@@ -94,13 +94,13 @@
       "step": 3,
       "file": "HTMLparser.c",
       "function": "htmlParseHTMLAttribute / htmlCurrentChar",
-      "summary": "On the second iteration, `CUR_CHAR(l)` processes attacker byte `0xFF`, may change parser state during encoding handling, and the patch's missing EOF guard becomes load-bearing."
+      "summary": "On the second iteration, attacker byte `0xFF` takes `htmlCurrentChar()`'s invalid-UTF-8 path, which reports an encoding error, may switch input encoding, and returns the current byte with `l == 1`."
     },
     {
       "step": 4,
       "file": "HTMLparser.c",
       "function": "htmlParseHTMLAttribute",
-      "summary": "Vulnerable code still executes `NEXTL(l)` with `l` from `CUR_CHAR(l)` and, on the crashing execution evidenced by ASan, advances past the empty sentinel string before the next loop-header `CUR` read triggers the saved global-buffer-overflow."
+      "summary": "The malformed-byte recovery enters the allocation-bearing encoding-switch path, which stops the parser and resets `ctxt->input->cur/base/end` to the empty-string sentinel; vulnerable code still executes `NEXTL(l)` without the later patch guard, advancing that sentinel cursor to `\"\" + 1` before the next loop-header `CUR` read."
     }
   ],
   "fine_trace": [
@@ -173,17 +173,17 @@
       "line": 2960,
       "var": "ret, stop",
       "code": "ret = htmlParseHTMLAttribute(ctxt, 0);",
-      "note": "Because the attacker value begins with unquoted `a` rather than `'` or `\"`, HTML parsing takes the unquoted-value path with `stop == 0`.",
+      "note": "At the start of the attacker value, `CUR` is the unquoted byte `a` rather than `'` or `\"`, so `htmlParseAttValue()` calls `htmlParseHTMLAttribute(ctxt, 0)` with the parser cursor still positioned on `a\\xFF `.",
       "depends_on": [
         {
           "on": 4,
           "type": "data",
-          "via": "val"
+          "via": "ctxt->input->cur"
         },
         {
-          "on": 1,
+          "on": 4,
           "type": "control",
-          "via": "buffer"
+          "via": "CUR != '\"' and CUR != '\\''"
         }
       ]
     },
@@ -243,11 +243,11 @@
     {
       "step": 9,
       "file": "HTMLparser.c",
-      "function": "htmlParseHTMLAttribute",
-      "line": 2846,
-      "var": "c, l, ctxt->instate",
-      "code": "c = CUR_CHAR(l);",
-      "note": "Root cause. On the second iteration `CUR_CHAR(l)` processes attacker byte `0xFF`. In `htmlCurrentChar()`, this byte takes the invalid-UTF-8 path, reports an encoding error, and may change parser state or input handling before returning control with `l` set for the current byte. Vulnerable code does not check whether that helper also left `ctxt->instate == XML_PARSER_EOF`; the staged patch adds exactly that missing guard here.",
+      "function": "htmlCurrentChar",
+      "line": 555,
+      "var": "ctxt->input->cur[0..], ctxt->errNo",
+      "code": "htmlParseErr(ctxt, XML_ERR_INVALID_ENCODING,",
+      "note": "Second loop iteration: attacker byte `0xFF` fails the UTF-8 checks in `htmlCurrentChar()`, so the helper reports an invalid-encoding error on the current input bytes.",
       "depends_on": [
         {
           "on": 8,
@@ -264,35 +264,162 @@
     {
       "step": 10,
       "file": "HTMLparser.c",
+      "function": "htmlCurrentChar",
+      "line": 567,
+      "var": "ctxt->input->buf, ctxt->input->buf->encoder, ctxt->charset",
+      "code": "if ((ctxt->input->buf != NULL) && (ctxt->input->buf->encoder == NULL)) xmlSwitchEncoding(ctxt, XML_CHAR_ENCODING_8859_1);",
+      "note": "After reporting the malformed byte, `htmlCurrentChar()` enters the ISO-8859-1 recovery path because this input buffer still has no encoder; on the reproduced witness this happens under the harness's `maxAlloc = 16` malloc-failure limit.",
+      "depends_on": [
+        {
+          "on": 9,
+          "type": "control",
+          "via": "if ((ctxt->input->buf != NULL) && (ctxt->input->buf->encoder == NULL))"
+        }
+      ]
+    },
+    {
+      "step": 11,
+      "file": "parserInternals.c",
+      "function": "xmlSwitchInputEncodingInt",
+      "line": 1241,
+      "var": "in->raw, in->buffer, input",
+      "code": "in->buffer = xmlBufCreate();",
+      "note": "The encoding-switch helper shrinks the already-consumed prefix out of the current input, moves the remaining bytes starting at attacker `0xFF` into `in->raw`, and allocates a fresh conversion buffer before calling `xmlCharEncInput(in, 1)`.",
+      "depends_on": [
+        {
+          "on": 10,
+          "type": "control",
+          "via": "xmlSwitchEncoding(ctxt, XML_CHAR_ENCODING_8859_1)"
+        },
+        {
+          "on": 8,
+          "type": "data",
+          "via": "ctxt->input->cur"
+        }
+      ]
+    },
+    {
+      "step": 12,
+      "file": "parserInternals.c",
+      "function": "xmlSwitchInputEncodingInt",
+      "line": 1260,
+      "var": "nbchars",
+      "code": "if (nbchars < 0) {",
+      "note": "On the malloc-limited witness, this conversion setup returns a negative result, so `xmlSwitchInputEncodingInt()` propagates an encoding-switch failure back to `xmlSwitchEncoding()`.",
+      "depends_on": [
+        {
+          "on": 11,
+          "type": "data",
+          "via": "in->buffer"
+        }
+      ]
+    },
+    {
+      "step": 13,
+      "file": "parserInternals.c",
+      "function": "xmlSwitchEncoding",
+      "line": 1128,
+      "var": "ret, ctxt->errNo",
+      "code": "if ((ret < 0) || (ctxt->errNo == XML_I18N_CONV_FAILED)) {",
+      "note": "The negative return from `xmlSwitchInputEncodingInt()` satisfies `xmlSwitchEncoding()`'s stop condition for conversion errors.",
+      "depends_on": [
+        {
+          "on": 12,
+          "type": "data",
+          "via": "ret < 0"
+        }
+      ]
+    },
+    {
+      "step": 14,
+      "file": "parserInternals.c",
+      "function": "xmlSwitchEncoding",
+      "line": 1132,
+      "var": "ctxt",
+      "code": "xmlStopParser(ctxt);",
+      "note": "Once the conversion-error condition is met, `xmlSwitchEncoding()` stops the parser before control returns to `htmlCurrentChar()`.",
+      "depends_on": [
+        {
+          "on": 13,
+          "type": "control",
+          "via": "(ret < 0) || (ctxt->errNo == XML_I18N_CONV_FAILED)"
+        }
+      ]
+    },
+    {
+      "step": 15,
+      "file": "parserInternals.c",
+      "function": "xmlHaltParser",
+      "line": 272,
+      "var": "ctxt->instate, ctxt->input->cur, ctxt->input->base, ctxt->input->end",
+      "code": "ctxt->instate = XML_PARSER_EOF;",
+      "note": "`xmlHaltParser()` sets `ctxt->instate = XML_PARSER_EOF`, frees the input buffer, and resets `ctxt->input->cur/base/end` to `BAD_CAST \"\"`, so the current parser cursor now points at the global empty-string sentinel.",
+      "depends_on": [
+        {
+          "on": 14,
+          "type": "control",
+          "via": "xmlStopParser(ctxt)"
+        }
+      ]
+    },
+    {
+      "step": 16,
+      "file": "HTMLparser.c",
+      "function": "htmlCurrentChar",
+      "line": 570,
+      "var": "len, ctxt->input->cur",
+      "code": "*len = 1; return(*ctxt->input->cur);",
+      "note": "Even after `xmlStopParser()` has halted the parser and reset `ctxt->input->cur` to `BAD_CAST \"\"`, `htmlCurrentChar()` still sets `l = 1` and returns the current sentinel byte to its caller.",
+      "depends_on": [
+        {
+          "on": 15,
+          "type": "data",
+          "via": "ctxt->input->cur"
+        }
+      ]
+    },
+    {
+      "step": 17,
+      "file": "HTMLparser.c",
       "function": "htmlParseHTMLAttribute",
       "line": 2859,
       "var": "ctxt->input->cur, l",
       "code": "NEXTL(l);",
-      "note": "No EOF check intervenes after `CUR_CHAR(l)`, so the function still applies `NEXTL(l)` using the length produced for the malformed byte even if the parser has transitioned to EOF. The staged patch shows this unchecked advance is the missing obligation; the staged artifacts do not isolate which internal source-level operation first produced any EOF/sentinel cursor state seen later at the sink.",
+      "note": "Root cause. `htmlCurrentChar()` still returns to its caller with `l = 1`, but vulnerable `htmlParseHTMLAttribute()` lacks the later EOF check and advances the already-reset sentinel cursor by one byte, from `BAD_CAST \"\"` to `BAD_CAST \"\" + 1`.",
       "depends_on": [
         {
-          "on": 9,
+          "on": 15,
+          "type": "data",
+          "via": "ctxt->input->cur"
+        },
+        {
+          "on": 16,
           "type": "data",
           "via": "l"
         }
       ]
     },
     {
-      "step": 11,
+      "step": 18,
       "file": "HTMLparser.c",
       "function": "htmlParseHTMLAttribute",
       "line": 2761,
       "var": "CUR / *ctxt->input->cur",
       "code": "while ((CUR != 0) && (CUR != stop)) {",
-      "note": "Sink. The saved ASan report shows this loop-header dereference reads at address `\"\" + 1`, immediately after the empty global string in `parserInternals.c`, which is the observed global-buffer-overflow READ.",
+      "note": "Sink. After step 16 returned `l == 1` on the empty-string sentinel and step 17 executed `NEXTL(l)`, the next loop-header `CUR` read dereferences `*ctxt->input->cur` at `BAD_CAST \"\" + 1`, producing the saved one-byte global-buffer-overflow read.",
       "depends_on": [
         {
-          "on": 10,
+          "on": 17,
           "type": "data",
           "via": "ctxt->input->cur"
         }
       ]
     }
+  ],
+  "evidence_limitations": [
+    "The saved AddressSanitizer report proves that the sink dereference at `HTMLparser.c:2761` reads at `BAD_CAST \"\" + 1`.",
+    "The staged source fully closes the state transition from malformed-byte recovery to the sink through `xmlSwitchEncoding()` stopping the parser and `xmlHaltParser()` rebinding `ctxt->input->cur/base/end` to the empty-string sentinel before vulnerable `NEXTL(l)` advances that sentinel cursor.",
+    "Stage 01 does not log which individual allocation inside the `xmlSwitchInputEncodingInt()` or `xmlCharEncInput()` setup path first fails under `maxAlloc = 16`, so the GT names the shared allocation-bearing encoding-switch failure path rather than a single malloc primitive as separately witnessed."
   ],
   "sanitizer_ground_truth": {
     "detector": "address",
@@ -380,7 +507,7 @@
     "cross_validation": {
       "sink_matches_crash": true,
       "trace_consistent_with_stack": true,
-      "tainted_value_reaches_sink": true
+      "tainted_value_reaches_sink": "partially grounded: source analysis closes the path through the malformed `0xFF` byte and the unchecked `NEXTL(l)` use, but treats the final `BAD_CAST \"\" + 1` read as an independently witnessed sanitizer endpoint because the exact internal cursor rebind is not uniquely identified by the staged Stage 02 artifacts"
     }
   },
   "poc": {
@@ -388,7 +515,7 @@
     "trigger": "Stage 01 reproduced the crash with `ASAN_OPTIONS=symbolize=0 ./fuzz/html -runs=1 /gt/poc`, producing `AddressSanitizer: global-buffer-overflow` with a size-1 READ in `htmlParseHTMLAttribute` at `HTMLparser.c:2761`.",
     "format": {
       "name": "OSS-Fuzz html testcase buffer",
-      "contract": "The verified trigger is the exact staged 16-byte witness. Its first 8 bytes are consumed by the fuzz harness as `opts` and `maxAlloc`; the remaining 8-byte HTML payload is exactly `<h c=a\\xFF `. The load-bearing property is the unquoted attribute value `a\\xFF ` inside that fragment: the first byte `a` keeps `htmlParseHTMLAttribute()` in its normal loop, and the exact following byte `0xFF` is the malformed character that reaches the missing post-`CUR_CHAR(l)` EOF check fixed by the patch."
+      "contract": "The verified trigger is the exact staged 16-byte witness. Its first 8 bytes are consumed by the fuzz harness as `opts` and `maxAlloc`, and for this exact byte sequence the harness computes `maxAlloc = 16`; the remaining 8-byte HTML payload is exactly `<h c=a\\xFF `. The source-grounded trigger semantics established here are limited to that exact unquoted attribute value plus that exact allocation limit: ASCII `a` keeps `htmlParseHTMLAttribute()` in its normal loop, the following malformed byte `0xFF` reaches the second `CUR_CHAR(l)` iteration, the invalid-UTF-8 recovery enters the allocation-bearing encoding-switch path under malloc-failure injection, and the vulnerable caller still executes `NEXTL(l)` after the parser has already been halted and reset to the empty-string sentinel."
     }
   }
 }

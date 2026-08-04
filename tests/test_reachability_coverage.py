@@ -123,31 +123,34 @@ def test_missing_coverage_is_not_scored_as_model_failure():
     assert report["failure_stage"] == "reachability_not_checked"
 
 
-def test_r3_and_r4_require_both_root_and_sink():
+def test_location_stages_are_admission_source_root_and_sink():
     gt = {
         "sample_id": "sample",
         "source": {"file": "p.c", "function": "parse", "line": 5},
         "root_cause": {"file": "p.c", "function": "root", "line": 8},
         "sink": {"file": "p.c", "function": "sink", "line": 12},
+        "reachability_checkpoints": {
+            "parser_admitted": {"file": "p.c", "function": "parse", "line": 4}
+        },
     }
     root_only = evaluate_r1_r5(
         gt=gt,
         hits=[
+            {"kind": "parser_admitted"},
             {"kind": "source"},
             {"kind": "root_cause_function"},
             {"kind": "root_cause_line"},
         ],
     )
 
-    assert root_only["R3_root_cause_function_reached"] is True
-    assert root_only["R3_sink_function_reached"] is False
-    assert root_only["R3_vulnerable_function_reached"] is False
-    assert root_only["R4_vulnerable_line_reached"] is False
-    assert root_only["reachability_depth"] == "R2"
+    assert root_only["R3_root_cause_reached"] is True
+    assert root_only["R4_sink_reached"] is False
+    assert root_only["reachability_depth"] == "R3"
 
     complete = evaluate_r1_r5(
         gt=gt,
         hits=[
+            {"kind": "parser_admitted"},
             {"kind": "source"},
             {"kind": "root_cause_function"},
             {"kind": "root_cause_line"},
@@ -155,10 +158,54 @@ def test_r3_and_r4_require_both_root_and_sink():
             {"kind": "sink_line"},
         ],
     )
-    assert complete["R3_vulnerable_function_reached"] is True
-    assert complete["R4_vulnerable_line_reached"] is True
+    assert complete["R3_root_cause_reached"] is True
+    assert complete["R4_sink_reached"] is True
     assert complete["reachability_depth"] == "R4"
     assert complete["failure_stage"] == "R4_reached"
+
+
+def test_location_prefix_does_not_require_timestamp_order():
+    gt = {
+        "source": {"file": "p.c", "function": "parse", "line": 5},
+        "root_cause": {"file": "p.c", "function": "root", "line": 8},
+        "sink": {"file": "p.c", "function": "sink", "line": 12},
+        "reachability_checkpoints": {
+            "parser_admitted": {"file": "p.c", "function": "parse", "line": 4}
+        },
+    }
+    report = evaluate_r1_r5(
+        gt=gt,
+        hits=[
+            {"kind": "sink_line", "timestamp": 1},
+            {"kind": "root_cause_line", "timestamp": 2},
+            {"kind": "source", "timestamp": 3},
+            {"kind": "parser_admitted", "timestamp": 4},
+        ],
+    )
+    assert report["reachability_depth"] == "R4"
+
+
+def test_sink_hit_cannot_skip_a_missing_root_prefix():
+    gt = {
+        "source": {"file": "p.c", "function": "parse", "line": 5},
+        "root_cause": {"file": "p.c", "function": "root", "line": 8},
+        "sink": {"file": "p.c", "function": "sink", "line": 12},
+        "reachability_checkpoints": {
+            "parser_admitted": {"file": "p.c", "function": "parse", "line": 4}
+        },
+    }
+    report = evaluate_r1_r5(
+        gt=gt,
+        hits=[
+            {"kind": "parser_admitted"},
+            {"kind": "source"},
+            {"kind": "sink_line"},
+        ],
+    )
+    assert report["raw_location_hits"]["sink"] is True
+    assert report["R3_root_cause_reached"] is False
+    assert report["R4_sink_reached"] is False
+    assert report["reachability_depth"] == "R2"
 
 
 def test_r5_rejects_same_sanitizer_class_at_wrong_location():

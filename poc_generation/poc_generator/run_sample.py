@@ -161,7 +161,7 @@ def default_api_key_env(model: str) -> str:
 def native_tool_calling_for_model(model: str) -> bool | None:
     """Override old OpenHands capability tables for newer official models."""
     normalized = model.removeprefix("openai/")
-    if normalized.startswith("gpt-5.4"):
+    if normalized.startswith(("gpt-5.4", "deepseek")):
         return True
     return None
 
@@ -194,7 +194,8 @@ def runtime_server_url(server: str) -> str:
     """Use the Docker bridge gateway on Linux, where host.docker.internal
     is not guaranteed to be registered inside the OpenHands runtime."""
     if sys.platform.startswith("linux"):
-        return server.replace("host.docker.internal", "172.17.0.1")
+        gateway = os.getenv("OPENHANDS_EVAL_HOST_GATEWAY", "172.17.0.1")
+        return server.replace("host.docker.internal", gateway)
     return server
 
 
@@ -251,6 +252,51 @@ def clear_previous_result(sample_dir: Path) -> None:
         (sample_dir / name).unlink(missing_ok=True)
 
 
+def count_agent_actions(trajectory_path: Path) -> int:
+    """Count actual agent actions rather than inferring budget exhaustion from text."""
+    try:
+        events = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError):
+        return 0
+    if not isinstance(events, list):
+        return 0
+    return sum(
+        1
+        for event in events
+        if isinstance(event, dict)
+        and event.get("source") == "agent"
+        and isinstance(event.get("action"), str)
+    )
+
+
+def trajectory_has_finish_action(trajectory_path: Path) -> bool:
+    """Require an explicit terminal action before calling an early stop clean."""
+    try:
+        events = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(events, list) and any(
+        isinstance(event, dict)
+        and event.get("source") == "agent"
+        and event.get("action") == "finish"
+        for event in events
+    )
+
+
+def count_jsonl_kind(path: Path | None, kind: str) -> int:
+    if path is None or not path.is_file():
+        return 0
+    count = 0
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            record = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict) and record.get("kind") == kind:
+            count += 1
+    return count
+
+
 def run_attempt(
     args,
     task_id: str,
@@ -278,6 +324,7 @@ def run_attempt(
         llm=LLMArgs(
             model=args.model,
             base_url=args.base_url,
+            api_version=getattr(args, "api_version", None) or None,
             api_key=load_env_key(
                 args.api_key_env or default_api_key_env(args.model)
             ),
@@ -349,21 +396,52 @@ def run_attempt(
         trace_produced = (results_dir / sample_id / "fine_trace.json").exists()
         trace_response = results_dir / sample_id / "fine_trace.response.txt"
         trajectory_path = run_dir / "trajectory"
-        reached_iteration_cap = (
+        agent_action_count = count_agent_actions(trajectory_path)
+        terminal_finish_observed = trajectory_has_finish_action(trajectory_path)
+        terminal_guard_enabled = os.getenv(
+            "SUBMIT_CANDIDATE_TERMINAL_GUARD", "0"
+        ) == "1"
+        terminal_guard_log_raw = os.getenv("SUBMIT_CANDIDATE_TOOL_LOG", "").strip()
+        blocked_finish_count = count_jsonl_kind(
+            Path(terminal_guard_log_raw) if terminal_guard_log_raw else None,
+            "premature_finish_blocked",
+        )
+        # A blocked finish is returned as NullAction and consumes one controller
+        # iteration, but OpenHands does not persist it as an agent action.  Add it
+        # back when determining whether the configured global limit was reached.
+        effective_controller_iterations = agent_action_count + blocked_finish_count
+        finalization_marker_seen = (
             trajectory_path.is_file()
             and "[Fine Trace Finalization]" in trajectory_path.read_text(
                 encoding="utf-8", errors="replace"
+            )
+        )
+        reached_iteration_cap = (
+            trajectory_path.is_file()
+            and (
+                (
+                    terminal_guard_enabled
+                    and (
+                        finalization_marker_seen
+                        or effective_controller_iterations >= args.max_iter
+                    )
+                )
+                or (
+                    not terminal_guard_enabled
+                    and agent_action_count >= args.max_iter
+                    and finalization_marker_seen
+                )
             )
         )
         if success_info.get("success"):
             status = "success"
         elif trace_produced and reached_iteration_cap:
             status = "iteration_cap"
-        elif trace_produced:
+        elif trace_produced and terminal_finish_observed:
             status = "agent_finished"
         elif trace_response.is_file() and reached_iteration_cap:
             status = "iteration_cap_invalid_trace"
-        elif trace_response.is_file():
+        elif trace_response.is_file() and terminal_finish_observed:
             status = "agent_finished_invalid_trace"
         else:
             status = "incomplete"
@@ -403,8 +481,13 @@ def run_attempt(
             "cybergym_agent_id": cybergym_agent_id,
             "model": args.model,
             "base_url": args.base_url,
+            "api_version": getattr(args, "api_version", ""),
             "api_key_env": args.api_key_env or default_api_key_env(args.model),
             "max_iter": args.max_iter,
+            "agent_action_count": agent_action_count,
+            "blocked_premature_finish_count": blocked_finish_count,
+            "effective_controller_iterations": effective_controller_iterations,
+            "terminal_finish_observed": terminal_finish_observed,
             "status": status,
             "poc_generation": success_info,
             "submission_attempts": persisted_attempts,
