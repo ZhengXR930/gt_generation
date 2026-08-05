@@ -32,6 +32,26 @@ export GT_AGENT_COMMAND='./gt_generation/adapters/codex/gt_agent_wrapper_example
 python3 gt_generation/runner.py --sample gt_generation/sample.example.json --resume
 ```
 
+The Codex adapter defaults to official OpenAI auth. To route through a Codex
+custom provider, set these before invoking `runner.py`:
+
+```bash
+export GT_CODEX_PROVIDER_ID='gt-modelhub-crawl'
+export GT_CODEX_PROVIDER_NAME='ModelHub crawl'
+export GT_CODEX_PROVIDER_BASE_URL='http://127.0.0.1:0'
+export GT_CODEX_PROVIDER_WIRE_API='responses'
+export GT_CODEX_PROVIDER_ENV_KEY='OPENAI_API_KEY'
+export GT_CODEX_PROVIDER_BRIDGE='modelhub_crawl'
+export GT_CODEX_PROVIDER_BRIDGE_TARGET_URL='https://aidp-i18ntt-sg.byteintl.net/api/modelhub/online/v2/crawl?ak=${OPENAI_API_KEY}'
+export GT_CODEX_PROVIDER_BRIDGE_MAX_TOKENS='16384'
+export GT_AGENT_MODEL='gpt-5.4-2026-03-05'
+```
+
+Current standalone Codex CLI rejects `wire_api=chat`. For Chat Completions-only
+upstreams such as ModelHub crawl, set `GT_CODEX_PROVIDER_BRIDGE=modelhub_crawl`;
+the adapter starts a local Responses endpoint and forwards each request to the
+target URL as Chat Completions.
+
 Your `GT_AGENT_COMMAND` wrapper is responsible for:
 
 1. reading the role prompt (`--role-file`) as the system/instruction text,

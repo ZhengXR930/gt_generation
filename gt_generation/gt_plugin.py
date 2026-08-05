@@ -43,6 +43,7 @@ ADAPTERS = {
 }
 MAX_PARALLEL = 6  # local Docker budget ceiling
 CODEX_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+CODEX_WIRE_APIS = {"responses"}
 
 
 # --------------------------------------------------------------------------- #
@@ -72,6 +73,7 @@ def load_config(path: Path) -> dict[str, Any]:
             f"{sorted(CODEX_REASONING_EFFORTS)} for codex; got {reasoning_effort!r}"
         )
     strict_config = bool(raw.get("strict_config", True))
+    codex_provider = load_codex_provider(raw.get("codex_provider"), cli)
 
     repo_docker_image = str(raw.get("repo_docker_image") or "gt-memory-env:latest").strip()
     repo_docker_context = Path(
@@ -103,12 +105,64 @@ def load_config(path: Path) -> dict[str, Any]:
         "model": model,
         "reasoning_effort": reasoning_effort,
         "strict_config": strict_config,
+        "codex_provider": codex_provider,
         "repo_docker_image": repo_docker_image,
         "repo_docker_context": repo_docker_context,
         "parallel_dockers": parallel,
         "samples": samples,
         "selection_path": selection_path,
     }
+
+
+def load_codex_provider(raw: Any, cli: str) -> dict[str, Any]:
+    if raw in (None, {}, ""):
+        return {}
+    if cli != "codex":
+        raise SystemExit("config.codex_provider is only valid when config.cli is 'codex'")
+    if not isinstance(raw, dict):
+        raise SystemExit("config.codex_provider must be a JSON object")
+
+    provider_id = str(raw.get("id") or "").strip()
+    base_url = str(raw.get("base_url") or "").strip()
+    if not provider_id:
+        raise SystemExit("config.codex_provider.id is required")
+    if provider_id in {"openai", "azure", "oss", "chatgpt"}:
+        raise SystemExit("config.codex_provider.id must not be a reserved built-in provider id")
+    if not base_url:
+        raise SystemExit("config.codex_provider.base_url is required")
+
+    wire_api = str(raw.get("wire_api") or "responses").strip().lower()
+    if wire_api not in CODEX_WIRE_APIS:
+        raise SystemExit(
+            "config.codex_provider.wire_api must be one of "
+            f"{sorted(CODEX_WIRE_APIS)} for this Codex CLI; got {wire_api!r}"
+        )
+
+    provider = {
+        "id": provider_id,
+        "name": str(raw.get("name") or provider_id).strip(),
+        "base_url": base_url,
+        "wire_api": wire_api,
+    }
+    env_key = str(raw.get("env_key") or "").strip()
+    if env_key:
+        provider["env_key"] = env_key
+    bridge = raw.get("bridge")
+    if bridge not in (None, {}, ""):
+        if not isinstance(bridge, dict):
+            raise SystemExit("config.codex_provider.bridge must be a JSON object")
+        if bridge.get("enabled") is not True:
+            raise SystemExit("config.codex_provider.bridge.enabled must be true when bridge is set")
+        target_url = str(bridge.get("target_url") or "").strip()
+        if not target_url:
+            raise SystemExit("config.codex_provider.bridge.target_url is required")
+        provider["bridge"] = {
+            "enabled": True,
+            "target_url": target_url,
+            "max_tokens": str(int(bridge.get("max_tokens") or 16384)),
+            "timeout_seconds": str(int(bridge.get("timeout_seconds") or 600)),
+        }
+    return provider
 
 
 def load_selection(path: Path) -> dict[str, dict[str, Any]]:
@@ -139,7 +193,7 @@ def docker_track(sample: dict[str, Any]) -> str:
 def cleanup_arvo(sample_id: str) -> None:
     """Drop the per-sample ARVO container/images after a run so parallel workers
     do not exhaust local disk. No-op for repo-track samples."""
-    arvo_id = sample_id.removeprefix("arvo_")
+    arvo_id = sample_id[5:] if sample_id.startswith("arvo_") else sample_id
     subprocess.run(
         ["docker", "rm", "-f", f"gt-arvo_{arvo_id}-workspace"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -161,7 +215,9 @@ def current_stage(result_dir: Path) -> str:
 
 def _command_output(command: list[str]) -> str:
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        completed = subprocess.run(
+            command, capture_output=True, text=True, errors="replace", timeout=15
+        )
     except (OSError, subprocess.TimeoutExpired):
         return "unavailable"
     return (completed.stdout or completed.stderr).strip() or "unknown"
@@ -183,6 +239,14 @@ def write_provenance(result_dir: Path, cfg: dict[str, Any], track: str) -> None:
         "repo_docker_image": cfg["repo_docker_image"],
         "repo_docker_context": str(cfg["repo_docker_context"]),
     }
+    if cfg.get("codex_provider"):
+        provider = dict(cfg["codex_provider"])
+        data["codex_provider"] = {
+            key: value for key, value in provider.items()
+            if key != "env_key"
+        }
+        if provider.get("env_key"):
+            data["codex_provider"]["env_key"] = provider["env_key"]
     if cfg["cli"] == "codex":
         data["cli_version"] = _command_output(["codex", "--version"])
         data["authentication"] = _command_output(["codex", "login", "status"])
@@ -222,6 +286,24 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
         "GT_REPO_DOCKER_IMAGE": cfg["repo_docker_image"],
         "GT_REPO_DOCKER_CONTEXT": str(cfg["repo_docker_context"]),
     }
+    if cfg.get("codex_provider"):
+        provider = cfg["codex_provider"]
+        env.update({
+            "GT_CODEX_PROVIDER_ID": provider["id"],
+            "GT_CODEX_PROVIDER_NAME": provider["name"],
+            "GT_CODEX_PROVIDER_BASE_URL": provider["base_url"],
+            "GT_CODEX_PROVIDER_WIRE_API": provider["wire_api"],
+        })
+        if provider.get("env_key"):
+            env["GT_CODEX_PROVIDER_ENV_KEY"] = provider["env_key"]
+        bridge = provider.get("bridge") or {}
+        if bridge:
+            env.update({
+                "GT_CODEX_PROVIDER_BRIDGE": "modelhub_crawl",
+                "GT_CODEX_PROVIDER_BRIDGE_TARGET_URL": bridge["target_url"],
+                "GT_CODEX_PROVIDER_BRIDGE_MAX_TOKENS": bridge["max_tokens"],
+                "GT_CODEX_PROVIDER_BRIDGE_TIMEOUT_SECONDS": bridge["timeout_seconds"],
+            })
     command = [
         sys.executable, str(RUNNER),
         "--sample", str(input_path),
@@ -305,6 +387,10 @@ def main(argv: list[str] | None = None) -> int:
         "model": cfg["model"],
         "reasoning_effort": cfg["reasoning_effort"],
         "strict_config": cfg["strict_config"],
+        "codex_provider": (
+            {key: value for key, value in cfg["codex_provider"].items() if key != "env_key"}
+            if cfg.get("codex_provider") else None
+        ),
         "repo_docker_image": cfg["repo_docker_image"],
         "repo_docker_context": str(cfg["repo_docker_context"]),
         "parallel_dockers": cfg["parallel_dockers"],
@@ -344,6 +430,10 @@ def main(argv: list[str] | None = None) -> int:
         "batch": args.batch_name,
         "cli": cfg["cli"],
         "model": cfg["model"],
+        "codex_provider": (
+            {key: value for key, value in cfg["codex_provider"].items() if key != "env_key"}
+            if cfg.get("codex_provider") else None
+        ),
         "parallel_dockers": cfg["parallel_dockers"],
         "requested": len(cfg["samples"]),
         "succeeded": succeeded,

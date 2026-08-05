@@ -27,6 +27,11 @@ The `codex` adapter auto-loads `OPENAI_API_KEY_OFFICIAL` from `config.txt` (an
 `OPENAI_API_KEY` already in the environment wins). No other setup is needed for
 codex to use the official OpenAI API.
 
+For a Codex custom provider, set the provider's key in the environment named by
+the config's `codex_provider.env_key`, or put that `KEY=value` in repo-root
+`config.txt`. The adapter passes that provider to `codex exec` without changing
+the GT harness.
+
 **2. Copy the example config and edit it:**
 
 ```bash
@@ -39,6 +44,7 @@ cp gt_generation/gt_config.example.json gt_generation/gt_config.json
 | `model` | **one** model id used for every stage (no per-stage switching). Must be valid for the CLI: `claude` → `sonnet`, `claude-opus-4-6`; `codex` → an official OpenAI model, e.g. `gpt-5.4`; `coco` → any id from `coco models` (e.g. `gpt-5.4`, `openrouter-3o`). |
 | `reasoning_effort` | Codex reasoning effort used for every agent stage: `minimal`, `low`, `medium`, `high`, or `xhigh` (default `high`). |
 | `strict_config` | Pass `--strict-config` to Codex so unknown config keys fail immediately (default `true`). |
+| `codex_provider` | optional Codex-native custom provider (`id`, `name`, `base_url`, `wire_api`, `env_key`, optional `bridge`). Current Codex CLI accepts `wire_api: "responses"`; omit this field for official OpenAI. |
 | `parallel_dockers` | how many samples to run at once (1–6); each holds one Docker workspace. |
 | `repo_docker_image` | Image tag used for non-ARVO samples (default `gt-memory-env:latest`). |
 | `repo_docker_context` | Build context used for non-ARVO samples (default `docker/gt-memory-env`). |
@@ -75,6 +81,45 @@ other source builds/clones in the shared `gt-memory-env` image.
 ```
 ```bash
 python3 gt_generation/gt_plugin.py --config gt_generation/gt_config.json
+```
+
+### Example — codex with ModelHub
+
+`gt_generation/gt_config.modelhub_crawl.codex.json` keeps the same Codex
+harness but routes `codex exec` through a local Responses-to-Chat bridge:
+
+```jsonc
+{
+  "cli": "codex",
+  "model": "gpt-5.4-2026-03-05",
+  "codex_provider": {
+    "id": "gt-modelhub-crawl",
+    "name": "ModelHub crawl",
+    "base_url": "http://127.0.0.1:0",
+    "wire_api": "responses",
+    "env_key": "OPENAI_API_KEY",
+    "bridge": {
+      "enabled": true,
+      "target_url": "https://aidp-i18ntt-sg.byteintl.net/api/modelhub/online/v2/crawl?ak=${OPENAI_API_KEY}",
+      "max_tokens": 16384,
+      "timeout_seconds": 600
+    }
+  }
+}
+```
+
+The standalone Codex CLI version in this repo rejects `wire_api: "chat"` and
+requires `responses`. The adapter therefore starts
+`adapters/codex/modelhub_crawl_bridge.py` automatically for this config: Codex
+posts streaming Responses API requests to localhost, and the bridge forwards
+Chat Completions `messages + max_tokens` requests to the ModelHub crawl endpoint.
+The API key is read from `OPENAI_API_KEY` in the environment or repo-root
+`config.txt`; it is not written into the config.
+
+Run it with:
+
+```bash
+python3 gt_generation/gt_plugin.py --config gt_generation/gt_config.modelhub_crawl.codex.json
 ```
 
 ### Coverage status (`GT_STATUS.md`)
@@ -130,8 +175,9 @@ Every stage runs with the single model from the config (`GT_AGENT_MODEL`); there
 no per-stage model switching. Adapters read the model from `GT_AGENT_MODEL`
 (the Claude adapter falls back to the older `GT_CLAUDE_MODEL`, then `sonnet`).
 Codex also receives the configured reasoning effort and strict-config check. Each
-sample records the effective CLI, model, adapter hash, authentication method, and
-non-ARVO Docker settings in `generation_provenance.json`.
+sample records the effective CLI, model, custom Codex provider when used, adapter
+hash, authentication method, and non-ARVO Docker settings in
+`generation_provenance.json`.
 
 For ARVO, Stage 01 creates one sample workspace and performs the only default full
 vulnerable build. Stage 04 reuses it for instrumented target-level rebuilds, applies the
