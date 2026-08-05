@@ -52,6 +52,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gt", required=True, type=Path)
     parser.add_argument("--poc", type=Path)
     parser.add_argument("--debug-command", help="Debug command with optional {poc} placeholder.")
+    parser.add_argument(
+        "--debug-wrapper",
+        help="Run gdb through this command (e.g. the sample build.sh) as one shell word.",
+    )
+    parser.add_argument(
+        "--debug-path-map",
+        help="HOST=CONTAINER prefix rewrite for paths passed to --debug-wrapper.",
+    )
     parser.add_argument("--sanitizer-command", help="Sanitizer command with optional {poc} placeholder.")
     parser.add_argument("--sanitizer-trace", type=Path)
     parser.add_argument("--codebase", type=Path)
@@ -73,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     for flag, value in [
         ("--poc", args.poc),
         ("--debug-command", args.debug_command),
+        ("--debug-wrapper", args.debug_wrapper),
+        ("--debug-path-map", args.debug_path_map),
         ("--sanitizer-command", args.sanitizer_command),
         ("--sanitizer-trace", args.sanitizer_trace),
         ("--codebase", args.codebase),

@@ -156,6 +156,27 @@ Checks are `[op, left, right]` with `eq`, `ne`, `lt`, `le`, `gt`, or `ge`; `$fie
 reads an `ASSERT_EVT` field. Do not duplicate prompts, answers, provenance, expected
 matrices, or reciprocal assertion IDs.
 
+## Probe placement (required)
+
+A probe observes the statement it is placed at, not the block it sits in. Emit
+each `ASSERT_EVT` immediately before the operation it is named for, after every
+guard that can skip that operation. Do not group a block's probes together at
+the top of the block: the fixed build usually differs from the vulnerable one by
+an added guard that returns early, so probes hoisted above it fire on both sides
+and observe nothing about whether the operation ran.
+
+This matters most for the `protects` target. Its event is the evidence that the
+dangerous operation actually executed, which is what makes `guarded` -- predicate
+false, operation skipped -- the state a correct fix produces. A probe that fires
+before the guard can never produce it, and the sample fails as though the patch
+were wrong.
+
+`gt_toolkit assertions` reports this as `differential_status: probe_misplaced`
+with a `probe_placement_error` on the offending assertion, derived from a
+contradiction rather than a guess: the protected operation cannot have run with
+its safety obligation violated and still left the process clean. When you see it,
+move the probe rather than weakening the assertion.
+
 ## Field bindings (required)
 
 Every `$event.field` name you use must be a semantic view over a real, concrete
@@ -240,6 +261,49 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit reachability \
   --poc <result_dir>/poc \
   --out-dir <result_dir>/reachability
 ```
+
+## Repo-track execution lifecycle
+
+A non-ARVO sample has no `/bin/arvo` wrapper and no prebuilt tree. Everything --
+the vulnerable build, the fixed build, the instrumented rebuilds, and the
+debugger -- runs through `<result_dir>/build.sh`, which executes one shell
+command inside `gt-memory-env` with the result directory bind-mounted at `/gt`.
+Paths inside that command are therefore `/gt/...`, not host paths.
+
+Do not run the target on the host. Repo-track binaries link against the image's
+glibc and sanitizer runtime; the host has neither, so a host invocation fails
+before `main` with a loader error rather than telling you anything about the
+sample.
+
+Reuse the exact command Stage 01 recorded in `reproduction_report.json` as
+`command` -- it is already known to reproduce the crash against the vulnerable
+build. For reachability, hand that command to the tool and let it run gdb inside
+the same image:
+
+```bash
+PYTHONPATH=gt_generation python3 -m gt_toolkit reachability \
+  --gt <result_dir>/ground_truth.json \
+  --codebase <result_dir>/_work/src \
+  --assertion-spec <result_dir>/candidate_assertions.json \
+  --assertion-trace <result_dir>/vulnerable_assertion_trace.txt \
+  --verified-invariants <result_dir>/verified_invariants.json \
+  --sanitizer-trace <result_dir>/sanitizer_trace.txt \
+  --debug-command '<repro binary as /gt/... path> {poc}' \
+  --debug-wrapper '<result_dir>/build.sh' \
+  --debug-path-map '<result_dir>=/gt' \
+  --poc /gt/poc \
+  --out-dir <result_dir>/reachability
+```
+
+`--debug-wrapper` passes the whole gdb invocation to `build.sh` as one shell
+word; `--debug-path-map` rewrites host paths under the result directory to their
+`/gt` equivalents, including the gdb driver script the tool stages beside the
+outputs. Omit both for ARVO, which runs the debugger directly.
+
+`reachability_report.json` must end with `reachability_checked` true and the R
+levels resolved. `audit-package` rejects a package whose reachability was never
+executed, so a Stage 04 that skips this leaves the sample incomplete no matter
+how good the assertions are.
 
 ## ARVO execution lifecycle
 

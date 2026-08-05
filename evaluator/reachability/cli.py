@@ -23,6 +23,19 @@ def main() -> None:
     parser.add_argument('--gt', required=True, type=Path)
     parser.add_argument('--poc', type=Path)
     parser.add_argument('--debug-command', help='Debug command with optional {poc} placeholder.')
+    parser.add_argument(
+        '--debug-wrapper',
+        help=(
+            'Run the gdb invocation through this command, passed as one shell '
+            'word. Use the sample build.sh for repo-track targets, whose binaries '
+            'link against the image glibc and sanitizer runtime and cannot execute '
+            'on the host.'
+        ),
+    )
+    parser.add_argument(
+        '--debug-path-map',
+        help='HOST=CONTAINER prefix rewrite applied to paths handed to the wrapper.',
+    )
     parser.add_argument('--sanitizer-command', help='Sanitizer command with optional {poc} placeholder.')
     parser.add_argument('--sanitizer-trace', type=Path, help='Existing sanitizer trace to parse.')
     parser.add_argument('--codebase', type=Path, help='Exact Stage 04 GT source tree containing ASSERT_EVT markers.')
@@ -75,12 +88,20 @@ def main() -> None:
     gdb_result = None
     if args.debug_command:
         debug_command = _format_command(args.debug_command, args.poc)
+        path_map = None
+        if getattr(args, 'debug_path_map', None):
+            host, _, guest = str(args.debug_path_map).partition('=')
+            if not guest:
+                raise SystemExit('--debug-path-map must look like HOST=CONTAINER')
+            path_map = (host, guest)
         gdb_result = run_gdb_reachability(
             command=debug_command,
             breakpoints_path=breakpoints_path,
             hits_path=hits_path,
-            gdb_script=Path(__file__).resolve().parent / 'gdb_reachability.py',
+            gdb_script=_stage_gdb_script(out_dir),
             timeout=args.timeout,
+            wrapper=getattr(args, 'debug_wrapper', None),
+            path_map=path_map,
         )
         (out_dir / 'gdb_stdout.txt').write_text(gdb_result.stdout, encoding='utf-8')
         (out_dir / 'gdb_stderr.txt').write_text(gdb_result.stderr, encoding='utf-8')
@@ -146,6 +167,20 @@ def main() -> None:
         encoding='utf-8',
     )
     print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def _stage_gdb_script(out_dir: Path) -> Path:
+    """Place the gdb driver beside the outputs.
+
+    A wrapper only sees the result directory, so the script has to live under it
+    to be readable from inside the container. Copying keeps the direct path
+    unchanged rather than adding a second lookup rule.
+    """
+    source = Path(__file__).resolve().parent / 'gdb_reachability.py'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    staged = out_dir / 'gdb_reachability.py'
+    staged.write_bytes(source.read_bytes())
+    return staged
 
 
 def _format_command(template: str, poc: Path | None) -> str:
