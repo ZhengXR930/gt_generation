@@ -11,6 +11,8 @@ import json
 import re
 import urllib.request
 from pathlib import Path
+
+import reward_guidance
 from typing import Any
 
 
@@ -104,7 +106,7 @@ def call_mapper(
         "claims": skeleton.get("claims", {}),
         "root_hypothesis": skeleton.get("root_hypothesis", {}),
         "unknowns": skeleton.get("unknowns", []),
-        "reward_map": skeleton.get("reward_map", {}),
+        "stages": skeleton.get("stages", {}),
     }
     payload = json.dumps(
         {
@@ -407,12 +409,7 @@ def derive_read_raw_data_checkpoints(
 ) -> list[dict[str, Any]]:
     """Derive bounded call/return probes solely from public source anchors."""
     root = codebase.resolve()
-    anchors: set[tuple[str, str]] = set()
-    reward_map = (reward_spec or {}).get("reward_map") or {}
-    for stage in ("admission", "root", "propagation"):
-        for anchor in (reward_map.get(stage) or {}).get("anchors") or []:
-            if isinstance(anchor, dict):
-                anchors.add((str(anchor.get("file") or ""), str(anchor.get("function") or "")))
+    anchors: set[tuple[str, str]] = set(reward_guidance.stage_anchors(reward_spec))
     for step in trace:
         validation = step.get("anchor_validation") or {}
         resolved = str(validation.get("resolved_file") or "")
@@ -508,12 +505,7 @@ def derive_key_branch_checkpoints(
     locals such as ``info`` are unavailable to GDB.
     """
     root = codebase.resolve()
-    anchors: set[tuple[str, str]] = set()
-    reward_map = (reward_spec or {}).get("reward_map") or {}
-    for stage in ("admission", "root", "propagation"):
-        for anchor in (reward_map.get(stage) or {}).get("anchors") or []:
-            if isinstance(anchor, dict):
-                anchors.add((str(anchor.get("file") or ""), str(anchor.get("function") or "")))
+    anchors: set[tuple[str, str]] = set(reward_guidance.stage_anchors(reward_spec))
     for step in trace:
         validation = step.get("anchor_validation") or {}
         resolved = str(validation.get("resolved_file") or "")

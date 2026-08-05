@@ -30,6 +30,7 @@ from experiments.runtime_hypothesis_feedback.lightweight_reward import (  # noqa
     public_trace,
     verifier_evidence,
 )
+from experiments.runtime_hypothesis_feedback import reward_guidance  # noqa: E402
 from experiments.runtime_hypothesis_feedback.reward_agent import (  # noqa: E402
     design_runtime_probes,
     diagnose_submission,
@@ -165,8 +166,13 @@ def _reward_spec(arvo_id: str) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or not isinstance(value.get("reward_map"), dict):
-        raise ValueError(f"invalid Reward Map: {path}")
+    if not isinstance(value, dict) or not isinstance(value.get("stages"), dict):
+        raise ValueError(f"invalid reward guidance: {path}")
+    if value.get("schema_version") != reward_guidance.SCHEMA_VERSION:
+        raise ValueError(
+            f"reward guidance schema is {value.get('schema_version')!r}, "
+            f"expected {reward_guidance.SCHEMA_VERSION!r}: {path}"
+        )
     provenance = value.get("provenance") or {}
     if provenance.get("uses_hidden_gt") is not False:
         raise ValueError("Reward Map provenance does not exclude hidden GT")
@@ -1105,12 +1111,7 @@ def _normalized_stage_state(
         "invalid_anchor": "contradicted",
         "unavailable": "not_declared",
     }.get(str(reward.get("root")), "unresolved")
-    propagation_mode = str(
-        (((reward_spec or {}).get("reward_map") or {}).get("propagation") or {}).get(
-            "mode"
-        )
-        or "distinct"
-    )
+    propagation_mode = reward_guidance.propagation_mode(reward_spec)
     if propagation_mode in {"collapsed_with_target", "not_declared"}:
         propagation = propagation_mode
     else:
@@ -1512,7 +1513,7 @@ def _cached_trace_mapping(
         "claims": skeleton.get("claims", {}),
         "root_hypothesis": skeleton.get("root_hypothesis", {}),
         "unknowns": skeleton.get("unknowns", []),
-        "reward_map": skeleton.get("reward_map", {}),
+        "stages": skeleton.get("stages", {}),
     }
     cache_key = hashlib.sha256(
         json.dumps(
@@ -1538,7 +1539,7 @@ def _cached_trace_mapping(
     mapping = validate_probe_plan(
         design_runtime_probes(
             issue_text=Path(issue_path).read_text(encoding="utf-8"),
-            reward_spec={"reward_map": public_skeleton.get("reward_map") or {}},
+            reward_spec={"stages": public_skeleton.get("stages") or {}},
             trace=trace,
             api_key=_observer_api_key(),
             model=LIGHTWEIGHT_REWARD_MODEL,
@@ -1651,7 +1652,7 @@ async def submit_vul(
                     # The mapper sees the public task map as semantic context;
                     # the candidate trace remains only an untrusted probe hint.
                     skeleton = dict(skeleton)
-                    skeleton["reward_map"] = reward_spec["reward_map"]
+                    skeleton["stages"] = reward_spec["stages"]
                 mapping, mapping_cache_hit = _cached_trace_mapping(
                     task_id, skeleton, validated_trace
                 )
@@ -1746,7 +1747,7 @@ async def submit_vul(
         online_feedback["stage_state"] = delta["stage_state"]
         online_feedback["candidate_delta"] = delta
         if reward_spec is not None:
-            online_feedback["reward_map_schema"] = reward_spec.get("schema_version")
+            online_feedback["reward_guidance_schema"] = reward_spec.get("schema_version")
         lightweight_guidance = None
         lightweight_error = None
         if (

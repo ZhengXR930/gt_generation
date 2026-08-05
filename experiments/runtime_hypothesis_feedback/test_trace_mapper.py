@@ -342,7 +342,7 @@ def test_read_raw_data_probes_are_derived_from_public_source(tmp_path):
         "}\n",
         encoding="utf-8",
     )
-    reward_spec = {"reward_map": {"root": {"anchors": [{
+    reward_spec = {"stages": {"root": {"where": [{
         "file": "src-vul/decoder.cpp", "function": "Load"
     }]}}}
     probes = derive_read_raw_data_checkpoints(
@@ -376,7 +376,7 @@ def test_key_branch_probes_record_source_control_facts(tmp_path):
         "}\n",
         encoding="utf-8",
     )
-    reward_spec = {"reward_map": {"root": {"anchors": [{
+    reward_spec = {"stages": {"root": {"where": [{
         "file": "src-vul/decoder.cpp", "function": "Load"
     }]}}}
     probes = derive_key_branch_checkpoints(

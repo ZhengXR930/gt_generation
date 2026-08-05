@@ -31,8 +31,8 @@ import run_sample  # noqa: E402
 from experiments.runtime_hypothesis_feedback.issue_skeleton import (  # noqa: E402
     build_skeleton,
 )
-from experiments.runtime_hypothesis_feedback.reward_agent import (  # noqa: E402
-    build_reward_map,
+from experiments.runtime_hypothesis_feedback.reward_guidance import (  # noqa: E402
+    build_guidance,
 )
 
 
@@ -511,14 +511,14 @@ def main() -> int:
         if observer_enabled or reward_skeleton_enabled
         else None
     )
-    reward_map_path = HERE / "reward_specs" / f"{sample_id}.json"
-    reward_map = None
+    guidance_path = HERE / "reward_specs" / f"{sample_id}.json"
+    guidance = None
     if lightweight_reward_enabled:
-        reward_map = build_reward_map(
+        guidance = build_guidance(
             sample_id=sample_id,
             issue_path=issue_path,
             codebase=repo_dir,
-            output_path=reward_map_path,
+            output_path=guidance_path,
             api_key=run_sample.load_env_key(args.observer_api_key_env),
             model=args.observer_model,
             api_url=args.observer_api_url,
@@ -589,8 +589,8 @@ def main() -> int:
             os.environ.pop("SUBMIT_CANDIDATE_TERMINAL_GUARD", None)
         if observer_enabled:
             os.environ["HYPOTHESIS_MONITOR_SKELETON"] = str(skeleton_path)
-            if reward_map is not None:
-                os.environ["HYPOTHESIS_REWARD_SPEC"] = str(reward_map_path)
+            if guidance is not None:
+                os.environ["HYPOTHESIS_REWARD_SPEC"] = str(guidance_path)
             else:
                 os.environ.pop("HYPOTHESIS_REWARD_SPEC", None)
             os.environ["HYPOTHESIS_MONITOR_LOG"] = str(monitor_log)
@@ -803,7 +803,7 @@ def main() -> int:
                     "inputs": ["public_issue_description", "vulnerable_codebase"],
                     "tools": ["list_files", "search_code", "read_source"],
                     "output": "four_stage_reward_map",
-                    "artifact": str(reward_map_path) if reward_map else None,
+                    "artifact": str(guidance_path) if guidance else None,
                 },
                 "observe_trajectory": {
                     "inputs": [
