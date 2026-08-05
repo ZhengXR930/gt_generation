@@ -59,6 +59,9 @@ class ReachabilityBreakpoint(gdb.Breakpoint):
             'line': sal.line if sal else None,
             'timestamp': time.time(),
             'breakpoint_spec': self.location,
+            'exact_source_breakpoint': bool(
+                self.checkpoint.get('line') is not None and ':' in self.location
+            ),
             'hit_count': self.observed_hit_count,
         }
         fields = {}
@@ -103,7 +106,12 @@ def _breakpoint_specs(checkpoint):
     if file and line:
         for candidate in _file_candidates(file):
             specs.append('{}:{}'.format(candidate, line))
-    if function:
+        if checkpoint.get('kind') == 'parser_admitted' and function:
+            # Admission is a control-flow boundary. If optimization removes a
+            # line-table PC, entry into its recorded continuation function is a
+            # valid weaker observation of the same gate.
+            specs.append(function)
+    elif function:
         specs.append(function)
     result = []
     seen = set()
@@ -147,20 +155,24 @@ def main():
     gdb.execute('set pagination off')
     gdb.execute('set breakpoint pending on')
     checkpoints = _load_breakpoints()
+    breakpoint_groups = []
     for checkpoint in checkpoints:
         specs = _breakpoint_specs(checkpoint)
         if not specs:
             continue
         errors = []
-        created = False
+        created = []
         for spec in specs:
             try:
-                ReachabilityBreakpoint(spec, checkpoint)
-                created = True
-                break
+                breakpoint = ReachabilityBreakpoint(spec, checkpoint)
+                # A valid location may remain pending until a project shared
+                # library is loaded. Keep every normalized spelling and decide
+                # observability after the inferior has run.
+                created.append(breakpoint)
             except gdb.error as exc:
                 errors.append('{}: {}'.format(spec, exc))
         if created:
+            breakpoint_groups.append((checkpoint, created, errors))
             continue
         hits.append({
             'kind': checkpoint.get('kind'),
@@ -176,6 +188,24 @@ def main():
         gdb.execute('run')
     except gdb.error as exc:
         hits.append({'run_error': str(exc)})
+    for checkpoint, breakpoints, errors in breakpoint_groups:
+        if any(item.observed_hit_count for item in breakpoints):
+            continue
+        if any(not item.pending for item in breakpoints):
+            continue
+        unresolved = errors + [
+            '{}: unresolved pending breakpoint'.format(item.location)
+            for item in breakpoints
+        ]
+        hits.append({
+            'kind': checkpoint.get('kind'),
+            'event_point': checkpoint.get('event_point'),
+            'assertion_role': checkpoint.get('assertion_role'),
+            'expected_file': checkpoint.get('file'),
+            'expected_function': checkpoint.get('function'),
+            'expected_line': checkpoint.get('line'),
+            'breakpoint_error': '; '.join(unresolved),
+        })
     _write_output()
 
 

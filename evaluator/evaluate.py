@@ -137,12 +137,15 @@ def evaluate_sample(model: str, sample_dir: Path) -> dict[str, Any]:
         candidate = {
             "attempt_id": attempt_id,
             "sequence_in_run": item.get("sequence_in_run"),
+            "execution_status": item.get("execution_status"),
+            "execution_error": item.get("error"),
             "location_hit_source": hit_source,
             "target_vulnerability_triggered": item.get(
                 "target_vulnerability_triggered"
             ),
         }
         if location_report is not None:
+            candidate["execution_status"] = "executed"
             if location_report.get("target_vulnerability_triggered") is None:
                 location_report["target_vulnerability_triggered"] = item.get(
                     "target_vulnerability_triggered"
@@ -152,6 +155,9 @@ def evaluate_sample(model: str, sample_dir: Path) -> dict[str, Any]:
                 "target_vulnerability_triggered"
             )
         else:
+            candidate["execution_status"] = (
+                candidate.get("execution_status") or "infrastructure_unavailable"
+            )
             candidate["location_reachability"] = {
                 "evaluation_protocol": "location-reachability-v3",
                 "R1_input_admitted": None,
@@ -236,6 +242,9 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     evaluated_locations = [
         item for item in locations if item.get("reachability_checked") is True
     ]
+    recorded_unavailable_locations = [
+        item for item in locations if item.get("reachability_checked") is not True
+    ]
     submitted = sum(
         int((row.get("runtime") or {}).get("submitted_unique_pocs") or 0)
         for row in rows
@@ -289,9 +298,16 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "submitted_unique_pocs": submitted,
         "reachability_candidate_records": len(candidates),
         "reachability_executed_candidates": len(evaluated_locations),
-        "reachability_unavailable_candidates": max(
-            submitted - len(evaluated_locations), 0
+        # Do not conflate a candidate that has never been scheduled with an
+        # execution whose runtime or observation infrastructure was unavailable.
+        "reachability_not_scheduled_candidates": max(
+            submitted - len(candidates), 0
         ),
+        "reachability_infrastructure_unavailable_candidates": len(
+            recorded_unavailable_locations
+        ),
+        # Backward-compatible alias, now restricted to recorded executions.
+        "reachability_unavailable_candidates": len(recorded_unavailable_locations),
         "reachability_execution_coverage": (
             len(evaluated_locations) / submitted if submitted else None
         ),

@@ -12,13 +12,40 @@ from pathlib import Path
 from rerun_model_batches import LOG_ROOT, load_config, run_one
 
 
+def select_samples(config: dict) -> list[str]:
+    samples = config.get("samples") or []
+    selector = config.get("sample_selector")
+    if not selector:
+        return list(dict.fromkeys(samples))
+    if selector != "strict_non_arvo_runtime_recoverable":
+        raise ValueError(f"unknown sample_selector: {selector}")
+    from run_local_sample import GT_ROOT, load_runtime_spec
+
+    package_files = (
+        "ground_truth.json", "verified_invariants.json", "verified_assertions.json",
+        "field_bindings.json", "event_locations.json",
+    )
+    selected = []
+    for result_dir in sorted(GT_ROOT.joinpath("gt_results").iterdir()):
+        if not result_dir.is_dir() or result_dir.name.startswith("arvo_"):
+            continue
+        if not all((result_dir / name).is_file() for name in package_files):
+            continue
+        try:
+            load_runtime_spec(result_dir)
+        except RuntimeError:
+            continue
+        selected.append(result_dir.name)
+    return selected
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("config", help="Config filename beside this script")
     args = parser.parse_args()
 
     config = load_config(Path(args.config).name)
-    samples = list(dict.fromkeys(config["samples"]))
+    samples = select_samples(config)
     parallel = int(config.get("parallel", 1))
     summary_path = LOG_ROOT / f"{Path(args.config).stem}.jsonl"
     counts = {"complete": 0, "failed": 0, "skipped": 0, "deferred": 0}

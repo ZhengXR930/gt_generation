@@ -17,12 +17,19 @@ write this small `<result_dir>/reproduction_report.json` object:
   "sample_id": "...",
   "vulnerable_reproduced": true,
   "matches_issue": true,
+  "setup_command": "exact idempotent dependency/build command from a fresh staged checkout",
   "command": "...",
   "returncode": 1,
   "detector": "address",
   "crash_summary": "..."
 }
 ```
+
+For non-ARVO samples, `setup_command` is mandatory and must include every dependency
+installation, configuration, and compilation step needed to recreate the executable
+after `_work` is compacted. `command` must contain only the final target invocation and
+must consume `/gt/poc`. Do not replace either field with prose. For ARVO, set
+`setup_command` to an empty string because the vulnerable image is the durable runtime.
 
 Set either boolean false when the evidence does not establish it. A sanitizer finding
 must match the issue's bug class or reported stack; a nonzero process status alone is

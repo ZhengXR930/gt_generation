@@ -171,6 +171,19 @@ def _hit_matches_expected_location(hit: dict[str, Any]) -> bool:
     """Reject a function-fallback hit masquerading as an exact line hit."""
     expected_line = _to_int(hit.get('expected_line'))
     observed_line = _to_int(hit.get('line'))
+    # GDB may resolve an exact file:line breakpoint to the callee entry or a
+    # neighboring statement under optimization/inlining.  The breakpoint was
+    # still placed from the exact GT source specification; function fallbacks
+    # are never marked this way.
+    if expected_line is not None and hit.get('exact_source_breakpoint') is True:
+        return True
+    if (
+        expected_line is not None
+        and hit.get('kind') == 'parser_admitted'
+        and str(hit.get('expected_function') or '')
+        == str(hit.get('function') or '')
+    ):
+        return True
     if expected_line is not None and observed_line != expected_line:
         return False
     expected_file = str(hit.get('expected_file') or '').replace('\\', '/')

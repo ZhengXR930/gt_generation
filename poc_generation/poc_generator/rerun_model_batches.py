@@ -19,6 +19,7 @@ RESULTS_ROOT = HERE.parent / "poc_results"
 LOG_ROOT = RESULTS_ROOT / "_batch_logs"
 LOCK_ROOT = RESULTS_ROOT / "_sample_locks"
 RUN_SAMPLE = HERE / "run_sample.py"
+RUN_LOCAL_SAMPLE = HERE / "run_local_sample.py"
 
 
 def load_config(name: str) -> dict:
@@ -86,6 +87,40 @@ def result_is_complete(result_dir: Path) -> bool:
     return True
 
 
+def local_result_is_complete(result_dir: Path) -> bool:
+    manifest_path = result_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if manifest.get("evaluation_protocol") != "poc_trace_per_submission_v2_local":
+        return False
+    if manifest.get("max_iter") != 100:
+        return False
+    if manifest.get("status") not in {
+        "success", "iteration_cap", "agent_finished",
+    }:
+        return False
+    if not (result_dir / "fine_trace.json").is_file():
+        return False
+    if not (result_dir / "checkpoint").is_dir():
+        return False
+    for attempt in manifest.get("submission_attempts") or []:
+        attempt_id = str(attempt.get("attempt_id") or "")
+        attempt_dir = result_dir / "submissions" / attempt_id
+        if not attempt_id or not attempt_dir.is_dir():
+            return False
+        required = {
+            "poc.bin", "candidate_trace.json", "candidate_trace.response.txt",
+            "result.json", "runtime_output.txt",
+        }
+        if not all((attempt_dir / name).is_file() for name in required):
+            return False
+    return True
+
+
 def run_one(config: dict, sample_id: str) -> dict:
     namespace = config["results_namespace"]
     LOCK_ROOT.mkdir(parents=True, exist_ok=True)
@@ -96,36 +131,34 @@ def run_one(config: dict, sample_id: str) -> dict:
         except BlockingIOError:
             return {"model": namespace, "sample": sample_id, "status": "deferred"}
         result_dir = RESULTS_ROOT / namespace / sample_id
-        if result_is_complete(result_dir):
+        is_arvo = sample_id.startswith("arvo_")
+        complete = result_is_complete(result_dir) if is_arvo else local_result_is_complete(result_dir)
+        if complete:
             return {"model": namespace, "sample": sample_id, "status": "skipped"}
 
         log_dir = LOG_ROOT / namespace
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{sample_id}.log"
-        command = [
-            sys.executable,
-            str(RUN_SAMPLE),
-            "--arvo-id",
-            sample_id.removeprefix("arvo_"),
-            "--max-iter",
-            str(config["max_iter"]),
-            "--server",
-            config["server"],
-            "--difficulty",
-            config["difficulty"],
-            "--model",
-            config["model"],
-            "--openhands-repo",
-            config["openhands_repo"],
-            "--base-url",
-            config.get("base_url", ""),
-            "--api-key-env",
-            config["api_key_env"],
-            "--results-dir",
-            str(RESULTS_ROOT / namespace),
-            "--max-attempts",
-            str(config.get("max_attempts", 1)),
-        ]
+        if is_arvo:
+            command = [
+                sys.executable, str(RUN_SAMPLE), "--arvo-id",
+                sample_id.removeprefix("arvo_"), "--max-iter",
+                str(config["max_iter"]), "--server", config["server"],
+                "--difficulty", config["difficulty"], "--model", config["model"],
+                "--openhands-repo", config["openhands_repo"], "--base-url",
+                config.get("base_url", ""), "--api-key-env", config["api_key_env"],
+                "--results-dir", str(RESULTS_ROOT / namespace), "--max-attempts",
+                str(config.get("max_attempts", 1)),
+            ]
+        else:
+            command = [
+                sys.executable, str(RUN_LOCAL_SAMPLE), "--sample-id", sample_id,
+                "--max-iter", str(config["max_iter"]), "--timeout",
+                str(config.get("timeout", 7200)), "--model", config["model"],
+                "--openhands-repo", config["openhands_repo"], "--base-url",
+                config.get("base_url", ""), "--api-key-env", config["api_key_env"],
+                "--results-dir", str(RESULTS_ROOT / namespace),
+            ]
         started = time.monotonic()
         with log_path.open("w", encoding="utf-8") as log:
             returncode = subprocess.run(

@@ -3,7 +3,9 @@
 
 Replaces the gdb/ptrace engine for evaluating how far a subject PoC reaches. The
 ARVO/OSS-Fuzz target binary is built with SanitizerCoverage, so running it once
-with `-print_coverage=1 -runs=0` prints every reached line as
+with `-print_coverage=1` can print reached source information.  Fixed-input
+execution must not use ``-runs=0``: that historical invocation can terminate
+before consuming the submitted input.
 
     COVERED: in <function> <file>:<line>
 
@@ -40,9 +42,11 @@ def _run_coverage_in_image(image: str, poc_path: Path, timeout: int) -> str:
     """One container run: detect the fuzz target from /bin/arvo, execute the PoC
     once with libFuzzer coverage printing, return the raw COVERED lines."""
     script = (
-        'T=$(grep -oE "/out/[A-Za-z0-9_]+" /bin/arvo | head -1); '
+        'T=$(grep -aoE "/out/[A-Za-z0-9_.-]+" /bin/arvo | head -1); '
         '[ -z "$T" ] && { echo NO_TARGET; exit 3; }; '
-        '"$T" -print_coverage=1 -runs=0 /tmp/poc 2>&1 | grep "^COVERED: in "'
+        'mkdir -p /tmp/reachability-corpus; '
+        'cp /tmp/poc /tmp/reachability-corpus/input; '
+        '"$T" -print_coverage=1 -runs=1 /tmp/reachability-corpus 2>&1'
     )
     proc = subprocess.run(
         [

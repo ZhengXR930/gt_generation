@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from reachability.arvo_gdb import prepare_arvo_target, run_arvo_gdb
 from reachability.core import evaluate_r1_r5
 from reachability.engine import extract_reachability_checkpoints
+from reachability.local_gdb import run_local_gdb
+from reachability.runtime_spec import (
+    RuntimeSpecError,
+    apply_checkpoint_lines_to_gt,
+    compile_runtime_spec,
+    remap_checkpoints_to_workspace,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 POC_RESULTS = REPO_ROOT / "poc_generation" / "poc_results"
@@ -155,20 +163,35 @@ def evaluate_model_sample(
             "sample_id": sample_id,
             "skipped": "no submitted PoC",
         }
+    gt_dir = GT_RESULTS / sample_id
     image = _arvo_image(sample_id, manifest)
-    if image is None:
+    try:
+        runtime_spec = compile_runtime_spec(gt_dir)
+    except RuntimeSpecError as exc:
         return {
             "model": model,
             "sample_id": sample_id,
-            "skipped": "non-ARVO target preparation is not implemented",
+            "runtime_status": "runtime_spec_unavailable",
+            "error": str(exc),
         }
 
     gt = json.loads(gt_path.read_text())
     checkpoints = extract_reachability_checkpoints(gt)
+    scoring_gt = gt
+    if runtime_spec.backend == "local_workspace":
+        checkpoints = remap_checkpoints_to_workspace(checkpoints, gt_dir)
+        scoring_gt = apply_checkpoint_lines_to_gt(gt, checkpoints)
     reachability_root = sample_dir / "reachability"
     rows: list[dict[str, Any]] = []
     try:
-        with prepare_arvo_target(image) as prepared:
+        target_context = (
+            prepare_arvo_target(
+                image, repo_root=REPO_ROOT, debugger_image=debugger_image
+            )
+            if image is not None
+            else nullcontext(None)
+        )
+        with target_context as prepared:
             for candidate in candidates:
                 metadata = _candidate_metadata(candidate)
                 attempt_id = str(metadata.get("attempt_id") or "")
@@ -184,25 +207,41 @@ def evaluate_model_sample(
                     rows.append({**metadata, "error": "PoC file is missing"})
                     continue
                 try:
-                    gdb_result, hits, checked = run_arvo_gdb(
-                        prepared=prepared,
-                        poc_path=poc_path,
-                        checkpoints=checkpoints,
-                        output_dir=output_dir,
-                        repo_root=REPO_ROOT,
-                        timeout=timeout,
-                        debugger_image=debugger_image,
-                        max_hits_per_event=max_hits_per_event,
-                    )
-                    sanitizer_trace = (
+                    if prepared is not None:
+                        gdb_result, hits, checked = run_arvo_gdb(
+                            prepared=prepared,
+                            poc_path=poc_path,
+                            checkpoints=checkpoints,
+                            output_dir=output_dir,
+                            repo_root=REPO_ROOT,
+                            timeout=timeout,
+                            debugger_image=debugger_image,
+                            max_hits_per_event=max_hits_per_event,
+                        )
+                    else:
+                        gdb_result, hits, checked = run_local_gdb(
+                            spec=runtime_spec,
+                            gt_dir=gt_dir,
+                            poc_path=poc_path,
+                            checkpoints=checkpoints,
+                            output_dir=output_dir,
+                            repo_root=REPO_ROOT,
+                            timeout=timeout,
+                            max_hits_per_event=max_hits_per_event,
+                        )
+                    saved_runtime_trace = (
                         runtime_path.read_text(
                             encoding="utf-8", errors="replace"
                         )
                         if runtime_path.is_file()
                         else None
                     )
+                    current_runtime_trace = "\n".join(
+                        value for value in (gdb_result.stdout, gdb_result.stderr) if value
+                    )
+                    sanitizer_trace = current_runtime_trace or saved_runtime_trace
                     report = evaluate_r1_r5(
-                        gt=gt,
+                        gt=scoring_gt,
                         hits=hits if checked else None,
                         sanitizer_trace=sanitizer_trace,
                         checkpoints=checkpoints,
@@ -225,6 +264,9 @@ def evaluate_model_sample(
                     )
                     row = {
                         **metadata,
+                        "execution_status": (
+                            "executed" if checked else "infrastructure_failed"
+                        ),
                         **{
                             field: report.get(field)
                             for field in _REACHABILITY_FIELDS
@@ -250,6 +292,7 @@ def evaluate_model_sample(
                     rows.append(
                         {
                             **metadata,
+                            "execution_status": "infrastructure_failed",
                             "error": f"{type(exc).__name__}: {exc}",
                         }
                     )
@@ -264,6 +307,7 @@ def evaluate_model_sample(
         "evaluation_protocol": "location_reachability_per_unique_poc_v3",
         "model": model,
         "sample_id": sample_id,
+        "runtime_spec": runtime_spec.to_dict(),
         "checkpoint_source": {
             "R1": "ground_truth.reachability_checkpoints.parser_admitted",
             "R2": "ground_truth.source",

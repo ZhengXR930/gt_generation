@@ -27,6 +27,10 @@ KEEP_FILES = {
     "reachability_report.json",
     "generation_timing.json",
     "generation_provenance.json",
+    # Small evaluator-private rebuild contract.  The workspace and binaries are
+    # still removed; this recipe is required to reconstruct them at evaluation.
+    "reproduction_report.json",
+    "runtime_spec.json",
 }
 
 

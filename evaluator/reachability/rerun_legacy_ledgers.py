@@ -88,7 +88,11 @@ def rerun_group(
     checkpoints = extract_reachability_checkpoints(gt)
     completed = 0
     errors = []
-    with prepare_arvo_target(_image(sample_id, manifest)) as prepared:
+    with prepare_arvo_target(
+        _image(sample_id, manifest),
+        repo_root=REPO_ROOT,
+        debugger_image=debugger_image,
+    ) as prepared:
         for output_dir in outputs:
             attempt_id = output_dir.name
             candidate = candidates.get(attempt_id)

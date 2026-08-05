@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -22,6 +23,7 @@ _TARGET_RE = re.compile(rb"/out/([^\s'\"]+)")
 class PreparedTarget:
     root: Path
     executable: Path
+    container_id: str = ""
 
 
 def _run(
@@ -37,8 +39,26 @@ def _run(
 
 
 @contextmanager
-def prepare_arvo_target(image: str) -> Iterator[PreparedTarget]:
-    """Extract `/out` once so every candidate for the sample uses one binary."""
+def prepare_arvo_target(
+    image: str,
+    *,
+    repo_root: Path | None = None,
+    debugger_image: str = "gt-memory-env:latest",
+) -> Iterator[PreparedTarget]:
+    """Prepare a target without separating it from its runtime rootfs.
+
+    When ``repo_root`` is supplied, GDB is provisioned in a disposable
+    container made from the vulnerable image.  This preserves the target's ELF
+    interpreter and shared libraries.  Extraction remains as a compatibility
+    fallback for older callers.
+    """
+    if repo_root is not None:
+        with _prepare_native_target(
+            image, repo_root=repo_root, debugger_image=debugger_image
+        ) as prepared:
+            yield prepared
+        return
+
     root = Path(tempfile.mkdtemp(prefix="reachability_arvo_"))
     container_id = ""
     try:
@@ -76,6 +96,101 @@ def prepare_arvo_target(image: str) -> Iterator[PreparedTarget]:
         shutil.rmtree(root, ignore_errors=True)
 
 
+@contextmanager
+def _prepare_native_target(
+    image: str, *, repo_root: Path, debugger_image: str
+) -> Iterator[PreparedTarget]:
+    """Run the debugger inside the exact vulnerable-image runtime."""
+    container_id = ""
+    debugger_bundle = _ensure_debugger_bundle(debugger_image)
+    try:
+        inspected = _run(["docker", "image", "inspect", image])
+        if inspected.returncode != 0:
+            pulled = _run(["docker", "pull", image], timeout=1800)
+            if pulled.returncode != 0:
+                raise RuntimeError(
+                    f"could not pull vulnerable image {image}: "
+                    f"{pulled.stderr.strip() or pulled.stdout.strip()}"
+                )
+        created = _run([
+            "docker", "create", "--platform", "linux/amd64",
+            "--cap-add", "SYS_PTRACE",
+            "--security-opt", "seccomp=unconfined",
+            "-v", f"{repo_root}:{repo_root}",
+            "-v", f"{debugger_bundle}:/opt/reachability-gdb:ro",
+            "--entrypoint", "/bin/sh", image,
+            "-c", "while :; do sleep 3600; done",
+        ])
+        if created.returncode != 0:
+            raise RuntimeError(
+                f"docker create failed for {image}: {created.stderr.strip()}"
+            )
+        container_id = created.stdout.strip()
+        started = _run(["docker", "start", container_id])
+        if started.returncode != 0:
+            raise RuntimeError(
+                f"docker start failed for {image}: {started.stderr.strip()}"
+            )
+        target = _run([
+            "docker", "exec", container_id, "/bin/sh", "-lc",
+            "grep -aoE '/out/[A-Za-z0-9_.-]+' /bin/arvo | head -1",
+        ])
+        executable = target.stdout.strip()
+        if target.returncode != 0 or not executable.startswith("/out/"):
+            raise RuntimeError(f"could not identify fuzz target in {image}:/bin/arvo")
+
+        yield PreparedTarget(
+            root=Path("/"),
+            executable=Path(executable),
+            container_id=container_id,
+        )
+    finally:
+        if container_id:
+            _run(["docker", "rm", "-f", container_id])
+
+
+def _ensure_debugger_bundle(debugger_image: str) -> Path:
+    """Materialize a reusable GDB runtime without modifying target images."""
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", "/tmp"))
+    bundle = cache_root / "gt-reachability" / "gdb-bundle"
+    bundle.mkdir(parents=True, exist_ok=True)
+    lock_path = bundle.parent / "gdb-bundle.lock"
+    with lock_path.open("w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        complete = bundle / ".complete"
+        python_module = (
+            bundle / "usr" / "share" / "gdb" / "python" / "gdb" / "__init__.py"
+        )
+        if complete.is_file() and python_module.is_file():
+            return bundle
+        script = r"""
+set -eu
+deps=$(ldd /usr/bin/gdb | awk '/=> \// {print $3} /^\// {print $1}')
+cp --parents -L /usr/bin/gdb /lib64/ld-linux-x86-64.so.2 $deps /bundle
+mkdir -p /bundle/usr/share
+cp -a /usr/share/gdb /bundle/usr/share/
+if [ -d /usr/lib/python3.12 ]; then
+  mkdir -p /bundle/usr/lib
+  cp -a /usr/lib/python3.12 /bundle/usr/lib/
+fi
+if [ -e /lib/x86_64-linux-gnu/libthread_db.so.1 ]; then
+  cp --parents -L /lib/x86_64-linux-gnu/libthread_db.so.1 /bundle
+fi
+touch /bundle/.complete
+"""
+        built = _run([
+            "docker", "run", "--rm",
+            "-v", f"{bundle}:/bundle",
+            "--entrypoint", "/bin/sh", debugger_image, "-lc", script,
+        ], timeout=180)
+        if built.returncode != 0 or not complete.is_file():
+            raise RuntimeError(
+                "could not construct reusable GDB bundle: "
+                f"{built.stderr.strip() or built.stdout.strip()}"
+            )
+        return bundle
+
+
 def run_arvo_gdb(
     *,
     prepared: PreparedTarget,
@@ -95,42 +210,42 @@ def run_arvo_gdb(
     hits_path.unlink(missing_ok=True)
 
     gdb_script = repo_root / "evaluator" / "reachability" / "gdb_reachability.py"
-    command = [
-        "docker",
-        "run",
-        "--rm",
-        "--platform",
-        "linux/amd64",
-        "--user",
-        f"{os.getuid()}:{os.getgid()}",
-        "-e",
-        "HOME=/tmp",
-        "-e",
-        "ASAN_OPTIONS=detect_leaks=0",
-        "-e",
-        f"LD_LIBRARY_PATH={prepared.executable.parent}",
-        "-e",
-        f"REACHABILITY_BREAKPOINTS={breakpoints_path}",
-        "-e",
-        f"REACHABILITY_OUTPUT={hits_path}",
-        "-e",
-        f"REACHABILITY_MAX_HITS_PER_BREAKPOINT={max_hits_per_event}",
-        "-v",
-        f"{repo_root}:{repo_root}",
-        "-v",
-        f"{prepared.root}:{prepared.root}:ro",
-        "-w",
-        str(repo_root),
-        debugger_image,
-        "gdb",
-        "--batch",
-        "-q",
-        "-x",
-        str(gdb_script),
-        "--args",
-        str(prepared.executable),
-        str(poc_path.resolve()),
-    ]
+    if prepared.container_id:
+        bundled_gdb = [
+            "/opt/reachability-gdb/lib64/ld-linux-x86-64.so.2",
+            "--library-path",
+            "/opt/reachability-gdb/lib/x86_64-linux-gnu:"
+            "/opt/reachability-gdb/usr/lib/x86_64-linux-gnu",
+            "/opt/reachability-gdb/usr/bin/gdb",
+        ]
+        command = [
+            "docker", "exec", "-e", "HOME=/tmp",
+            "-e", "PYTHONHOME=/opt/reachability-gdb/usr",
+            "-e", "ASAN_OPTIONS=detect_leaks=0",
+            "-e", f"REACHABILITY_BREAKPOINTS={breakpoints_path}",
+            "-e", f"REACHABILITY_OUTPUT={hits_path}",
+            "-e", f"REACHABILITY_MAX_HITS_PER_BREAKPOINT={max_hits_per_event}",
+            "-w", str(repo_root), prepared.container_id,
+            *bundled_gdb,
+            "--data-directory=/opt/reachability-gdb/usr/share/gdb",
+            "--batch", "-q", "-x", str(gdb_script), "--args",
+            str(prepared.executable), str(poc_path.resolve()),
+        ]
+    else:
+        command = [
+            "docker", "run", "--rm", "--platform", "linux/amd64",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "-e", "HOME=/tmp", "-e", "ASAN_OPTIONS=detect_leaks=0",
+            "-e", f"LD_LIBRARY_PATH={prepared.executable.parent}",
+            "-e", f"REACHABILITY_BREAKPOINTS={breakpoints_path}",
+            "-e", f"REACHABILITY_OUTPUT={hits_path}",
+            "-e", f"REACHABILITY_MAX_HITS_PER_BREAKPOINT={max_hits_per_event}",
+            "-v", f"{repo_root}:{repo_root}",
+            "-v", f"{prepared.root}:{prepared.root}:ro",
+            "-w", str(repo_root), debugger_image,
+            "gdb", "--batch", "-q", "-x", str(gdb_script), "--args",
+            str(prepared.executable), str(poc_path.resolve()),
+        ]
     proc = _run(command, timeout=timeout)
     result = CommandResult(
         command=command,
