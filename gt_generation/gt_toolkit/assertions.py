@@ -569,6 +569,8 @@ def validate_assertions(
         }
         vulnerable_status = matrix["vulnerable"].get(original, {}).get("status")
         fixed_status = matrix["fixed"].get(original, {}).get("status")
+        fixed_original_case = fixed_cases.get(original) or {}
+        fixed_crashed = str(fixed_original_case.get("result") or "") == "crash"
         if assertion["kind"] in {"observed", "transition"}:
             verified = vulnerable_status == "satisfied"
         elif assertion.get("protects"):
@@ -611,6 +613,23 @@ def validate_assertions(
                     "fixed original is guarded; add a perturbation that executes the "
                     "protected event while the required predicate is true"
                 )
+        if (
+            assertion.get("protects")
+            and fixed_status == "violated"
+            and not fixed_crashed
+        ):
+            # The protected operation cannot have run with its safety obligation
+            # violated and left the process clean. The probe for
+            # assertion["protects"] is therefore firing somewhere the operation
+            # does not, most often at the top of the enclosing block and ahead
+            # of the guard the fix introduces.
+            item["probe_placement_error"] = (
+                f"probe for protected event {assertion['protects']!r} fired on the "
+                "fixed run while the required predicate was violated, yet that run "
+                "exited cleanly. Move the probe to immediately before the protected "
+                "operation, after every guard that can skip it; a probe emitted at "
+                "block entry observes reaching the block, not performing the operation"
+            )
         results.append(item)
     if not differential_applicable:
         # e.g. an MSAN use-of-uninitialized-value bug: the safety property is
@@ -620,6 +639,10 @@ def validate_assertions(
         differential_status = "not_applicable"
     elif any(item["verified"] and item["kind"] == "required" for item in results):
         differential_status = "confirmed"
+    elif any(item.get("probe_placement_error") for item in results):
+        # Distinct from vulnerable_side_only: nothing is known about the fixed
+        # side yet because the instrumentation did not observe what it claimed.
+        differential_status = "probe_misplaced"
     else:
         differential_status = "vulnerable_side_only"
     return {
