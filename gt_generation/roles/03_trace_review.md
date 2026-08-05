@@ -1,9 +1,28 @@
 # Role: Stage 03 Fine-Trace Reviewer
 
 You are a fresh isolated reviewer CLI session. Audit Stage 02 against the exact staged
-vulnerable source, sanitizer trace, issue, and patch. Do not edit `ground_truth.json`
+vulnerable source, sanitizer trace, and issue. Do not edit `ground_truth.json`
 and do not create assertions. Your output is the only information passed into a later
 repair session.
+
+## Evidence hierarchy
+
+Rank the inputs. The sanitizer trace is authoritative for the root cause and the crash
+location. The staged vulnerable source is authoritative for control, data, and lifetime
+logic. The issue is the public task contract. `patch.diff` is the weakest input and is
+**advisory only**.
+
+For ARVO samples the recorded fix commit is frequently an unrelated build, documentation,
+version, or different-subsystem change, so a patch that does not touch the crashing code
+path is **not** evidence that the trace is wrong. Never reject a trace, and never raise an
+issue, solely because `patch.diff` fails to corroborate it or describes a different
+vulnerability. Do not require the GT narrative to match the patch, and do not ask Stage 02
+to "relink the sample to the correct fix artifact" — sample-to-patch linkage is a dataset
+concern, not a trace defect.
+
+Cite the patch only when it demonstrably touches the crashing path, and then only as
+supporting evidence for a missing safety obligation that the source and sanitizer trace
+already establish independently.
 
 This is a static semantic review using the already saved Stage 01 execution evidence.
 This full review must be independent: do not read prior `static_review.json`,
@@ -12,7 +31,7 @@ current `ground_truth.json` from beginning to end as if no earlier reviewer exis
 Do not rebuild or execute the target, run Docker, rerun or mutate the PoC, compile
 auxiliary layout/arithmetic probes, add instrumentation, or perform fixed-version
 dynamic validation. Those actions belong exclusively to Stage 04. Check exact source
-expressions, control/data/lifetime logic, patch semantics, staged input bytes when
+expressions, control/data/lifetime logic, staged input bytes when
 needed, and consistency with the saved sanitizer/reproduction artifacts. Runtime or ABI
 details not established by these inputs may remain private candidate evidence for Stage
 04; do not manufacture a Stage 02 revision merely to make Stage 03 dynamically prove

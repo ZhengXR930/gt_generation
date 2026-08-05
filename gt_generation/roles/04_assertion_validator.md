@@ -287,7 +287,7 @@ Stage 01's vulnerable compile is the only default full build. Stage 04's
 `compile-target` and `compile-fixed` reuse that configured tree and rebuild only the
 active fuzz target. If that Make target is unavailable, the toolkit synchronously falls
 back to `/bin/arvo compile`; do not write polling loops or invoke a second compile
-command. Use `--fallback-image` only after the toolkit's fixed compile fallback fails.
+command.
 PoC-only perturbations reuse the current binary and never rebuild. This stage never
 selects or phrases evaluation questions. After the GT/assertion gates pass, clean only
 this sample; the later probe generator consumes the persisted JSON and needs no container:
