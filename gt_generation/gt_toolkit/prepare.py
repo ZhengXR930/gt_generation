@@ -43,7 +43,9 @@ _CRASH_MARKER_RE = re.compile(
 
 
 def _sh(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+    )
 
 
 def _pull(img: str, retries: int = 3) -> bool:
@@ -377,12 +379,35 @@ def _prepare_arvo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     _init_state(f"arvo_{aid}", d)
     target = _detect_arvo_target(vul)
     fix_available = bool(_sh(["docker", "images", "-q", fix]).stdout.strip())
+    patch_applies = _patch_applies(d / "patch.diff", src)
     return {"track": "arvo", "arvo_id": aid, "vul_image": vul, "fix_image": fix,
             "fix_image_pulled": False, "fix_image_available": fix_available,
-            "fix_strategy": "patch_incremental", "target": target,
+            "patch_applies": patch_applies,
+            "fix_strategy": "patch_incremental" if patch_applies else "fix_image_required",
+            "target": target,
             "workspace_container": f"gt-arvo_{aid}-workspace",
             "source": src.exists(), "poc": (d / "poc").exists(),
             "patch": (d / "patch.diff").exists(), "prepared": bool(src.exists())}
+
+
+def _patch_applies(patch: Path, src_root: Path) -> bool:
+    """Static check: can the staged fix commit actually apply to this source?
+
+    ARVO records a fix commit that is frequently an unrelated build/docs/version
+    change or targets a different subsystem. A patch that cannot apply means the
+    incremental fixed rebuild would silently produce a binary identical to the
+    vulnerable one, so Stage 04 must use the prebuilt -fix image instead.
+    """
+    if not patch.is_file() or not src_root.is_dir():
+        return False
+    roots = [src_root] + [c for c in sorted(src_root.iterdir()) if c.is_dir()]
+    for root in roots[:8]:
+        for strip in ("-p1", "-p2"):
+            probe = _sh(["git", "-C", str(root), "apply", "--check", strip,
+                         str(patch.resolve())])
+            if probe.returncode == 0:
+                return True
+    return False
 
 
 def ensure_arvo_resume_source(sample: dict[str, Any], result_dir: str | Path) -> dict[str, Any]:
@@ -507,7 +532,16 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
         '  echo "usage: $0 <build-or-reproduction command>" >&2\n'
         '  exit 2\n'
         'fi\n'
+        # Repo-track builds clone submodules and fetch dependencies from
+        # GitHub/GitLab. On a network-restricted host the container reaches
+        # nothing unless the caller's proxy is forwarded, so mirror whichever
+        # proxy variables are set instead of hardcoding an endpoint.
+        'PROXY_ENV=()\n'
+        'for _v in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do\n'
+        '  if [[ -n "${!_v:-}" ]]; then PROXY_ENV+=(-e "${_v}=${!_v}"); fi\n'
+        'done\n'
         'exec docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp '
+        '"${PROXY_ENV[@]}" '
         '-v "${ASSET_DIR}:/gt" -w /gt/_work/src "${IMAGE}" '
         'bash -lc "$*"\n'
     )

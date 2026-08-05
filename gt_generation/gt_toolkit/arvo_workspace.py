@@ -20,7 +20,9 @@ from typing import Any
 
 
 def _run(cmd: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+    )
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -527,11 +529,18 @@ def run_case(
     matched = expect == "any" or (expect == "crash" and crashed) or (
         expect == "clean" and proc.returncode == 0 and not crashed
     )
+    # A fixed build that compiles cleanly but still reproduces the crash is not a
+    # fixed-side witness: the staged patch did not remove the defect (commonly an
+    # unrelated ARVO fix commit). Differential verification must swap to the
+    # prebuilt -fix image instead of accepting this binary.
+    fixed_side_invalid = version == "fixed" and crashed
     _update_state(
         result_dir,
         context,
         phase=f"{version}_ran",
         **{
+            **({"fallback_required": True,
+                "fixed_strategy": "fix_image_required"} if fixed_side_invalid else {}),
             f"{version}_run_returncode": proc.returncode,
             f"{version}_expectation": expect,
             f"{version}_expectation_matched": matched,

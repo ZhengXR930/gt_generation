@@ -451,6 +451,7 @@ def run_stage(
         cwd=repo_root,
         shell=True,
         text=True,
+        errors="replace",
         capture_output=True,
         timeout=int(stage.get("timeout") or config.get("default_timeout") or 1800),
         env=stage_env(code_root, stage),
@@ -609,7 +610,10 @@ def check_validate_gt(
     cmd = [sys.executable, "-m", "gt_toolkit", "validate", str(gt_path)]
     if stage.get("validate_strict"):
         cmd.append("--strict")
-    proc = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, env=stage_env(code_root, stage))
+    proc = subprocess.run(
+        cmd, cwd=repo_root, capture_output=True, text=True, errors="replace",
+        env=stage_env(code_root, stage),
+    )
     return proc.returncode == 0
 
 
