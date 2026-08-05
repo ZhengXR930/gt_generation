@@ -31,7 +31,7 @@ def _load_selection(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def _cleanup_arvo(sample_id: str) -> None:
-    arvo_id = sample_id.removeprefix("arvo_")
+    arvo_id = sample_id[5:] if sample_id.startswith("arvo_") else sample_id
     subprocess.run(
         ["docker", "rm", "-f", f"gt-arvo_{arvo_id}-workspace"],
         stdout=subprocess.DEVNULL,
