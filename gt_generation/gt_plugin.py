@@ -111,6 +111,10 @@ def load_config(path: Path) -> dict[str, Any]:
         "parallel_dockers": parallel,
         "samples": samples,
         "selection_path": selection_path,
+        # Re-run only the stages that have not passed. A sample that died late
+        # keeps its accepted clone, reproduction and fine trace.
+        "resume": bool(raw.get("resume", False)),
+        "start_at": str(raw.get("start_at") or "").strip(),
     }
 
 
@@ -309,6 +313,11 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
         "--sample", str(input_path),
         "--result-dir", str(result_dir),
     ]
+    # Resume re-runs only the stages that have not passed yet.
+    if cfg.get("resume"):
+        command.append("--resume")
+    if cfg.get("start_at"):
+        command += ["--start-at", str(cfg["start_at"])]
     with log_path.open("w", encoding="utf-8") as stream:
         completed = subprocess.run(command, cwd=REPO_ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT)
 

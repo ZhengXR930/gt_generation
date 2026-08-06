@@ -297,12 +297,43 @@ def ensure_vulnerable_workspace(result_dir: Path) -> int:
     return compile_vulnerable(result_dir)
 
 
+def _restore_workspace_for_new_attempt(result_dir: Path) -> bool:
+    """Rebuild the workspace when a previous run's cleanup removed it.
+
+    Returns whether a restore happened; a live container is left untouched.
+
+    Recreating always produces the vulnerable baseline, which is where Stage 04
+    begins. That also resets the phase, so a caller that lost its container
+    mid-differential and asks to apply the fixed patch is turned away by the
+    patch contract rather than having fixed instrumentation applied to
+    vulnerable source.
+    """
+    context = _context(result_dir)
+    inspected = _run([
+        "docker", "inspect", "-f", "{{.State.Running}}", context["container"],
+    ])
+    if inspected.returncode == 0 and inspected.stdout.strip() == "true":
+        return False
+    if ensure_vulnerable_workspace(result_dir) != 0:
+        raise RuntimeError(
+            "the ARVO workspace was removed and could not be rebuilt; "
+            "re-run the sample from 01_reproducer"
+        )
+    return True
+
+
 def apply_instrumentation(
     result_dir: Path, patch: Path, *, runtime_disambiguation: bool = False
 ) -> int:
     marker = _require_execution_authorization(result_dir, runtime_disambiguation)
+    # A re-run of Stage 04 meets a workspace the previous run's cleanup removed.
+    # Restore it before the patch contract is checked: recreating resets the
+    # phase to a vulnerable one, which is the side the stage opens with.
+    restored = _restore_workspace_for_new_attempt(result_dir)
     patch = _require_persisted_instrumentation_patch(result_dir, patch)
     context = _context(result_dir)
+    if restored:
+        _update_state(result_dir, context, workspace_restored_for_attempt=True)
     root = _source_root(result_dir)
     container = context["container"]
     remote = "/tmp/gt_instrumentation.patch"

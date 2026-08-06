@@ -305,6 +305,33 @@ levels resolved. `audit-package` rejects a package whose reachability was never
 executed, so a Stage 04 that skips this leaves the sample incomplete no matter
 how good the assertions are.
 
+## Re-runs
+
+You may be started on a result directory where a previous attempt at this stage
+already wrote `assertion_results.json`, `verified_assertions.json`, the
+instrumentation patches and the traces. Those files are the record of an attempt
+that failed. They are not evidence about this one, and an `evidence_limitation`
+recorded in them is not a finding you can adopt -- it is the previous attempt's
+account of where it stopped. Re-derive every artifact you are required to
+produce; the runner only counts outputs written during this run.
+
+Two things that a previous attempt may have concluded were unavailable are not:
+
+- **The ARVO workspace rebuilds itself.** The container and images are removed
+  after every run to keep disk bounded, so on a re-run there is no container and
+  `docker ps` shows nothing. `apply-instrumentation` re-pulls the vulnerable
+  image, recreates the container and runs the full vulnerable build before
+  applying your patch. Start from the vulnerable side as usual; do not report a
+  missing workspace as a blocker.
+- **The `-fix` image is published for every ARVO sample.** If `switch-fixed`
+  cannot apply `patch.diff`, or the patched build still crashes, run
+  `compile-fixed --fallback-image`. A `differential_status` of
+  `vulnerable_side_only` means that path was not taken, not that the fixed side
+  is unobtainable.
+
+If after actually executing both sides the differential still cannot be
+established, say so with the commands you ran and their output.
+
 ## ARVO execution lifecycle
 
 For an ARVO sample, reuse the configured workspace container and full vulnerable build
