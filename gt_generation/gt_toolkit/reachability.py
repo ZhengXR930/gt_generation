@@ -77,6 +77,14 @@ def derive_debug_command(result_dir: Path) -> str | None:
     argv = ["{poc}" if part in poc_names else part for part in parts]
     if "{poc}" not in argv:
         argv.append("{poc}")
+    if argv and not argv[0].startswith("/"):
+        # Stage 01 records the command relative to the build directory, but the
+        # debugger is spawned as a grandchild process and gdb resolved it
+        # against a different working directory ("./fuzz/xml: No such file or
+        # directory", every breakpoint left pending). Anchor it instead of
+        # depending on where the process happens to start.
+        program = argv[0][2:] if argv[0].startswith("./") else argv[0]
+        argv[0] = "/gt/_work/src/" + program
     return " ".join(argv)
 
 
