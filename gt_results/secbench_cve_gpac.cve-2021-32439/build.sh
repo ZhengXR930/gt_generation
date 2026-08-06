@@ -7,4 +7,4 @@ if [[ $# -eq 0 ]]; then
   echo "usage: $0 <build-or-reproduction command>" >&2
   exit 2
 fi
-exec docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "${ASSET_DIR}:/gt" -w /gt/_work/src "${IMAGE}" bash -lc "$*"
+exec docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "${ASSET_DIR}:/gt" -v /data00/home/zhengxinran/Documents/trae_projects/test/gt_generation:/repo:ro -w /gt/_work/src "${IMAGE}" bash -lc "$*"
