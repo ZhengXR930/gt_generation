@@ -508,6 +508,7 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
         or Path(__file__).resolve().parents[2] / "docker" / "gt-memory-env"
     ).resolve()
     env_ok = _ensure_memory_env(env_image, env_context)
+    repo_root = Path(__file__).resolve().parents[2]
     src = d / "_work" / "src"
     shutil.rmtree(src, ignore_errors=True)
     if _sh(["git", "clone", str(repo), str(src)], timeout=1800).returncode != 0:
@@ -542,7 +543,12 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
         'done\n'
         'exec docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp '
         '"${PROXY_ENV[@]}" '
-        '-v "${ASSET_DIR}:/gt" -w /gt/_work/src "${IMAGE}" '
+        '-v "${ASSET_DIR}:/gt" '
+        # The toolkit runs inside the image for reachability: the target binary
+        # links against the image's glibc and sanitizer runtime, and gdb lives
+        # there too, so driving it from the host is the wrong side of the wall.
+        f'-v {shlex.quote(str(repo_root))}:/repo:ro '
+        '-w /gt/_work/src "${IMAGE}" '
         'bash -lc "$*"\n'
     )
     (d / "build.sh").chmod(0o755)

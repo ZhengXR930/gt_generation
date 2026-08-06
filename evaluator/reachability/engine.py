@@ -416,18 +416,6 @@ def write_breakpoint_spec(checkpoints: list[dict[str, Any]], output_path: Path) 
     )
 
 
-def _rewrite_prefix(value: str, path_map: tuple[str, str] | None) -> str:
-    """Map a host path into the wrapper's filesystem view."""
-    if not path_map:
-        return value
-    host, guest = path_map
-    host = str(host).rstrip('/')
-    guest = str(guest).rstrip('/')
-    if host and value.startswith(host):
-        return guest + value[len(host):]
-    return value
-
-
 def run_gdb_reachability(
     *,
     command: str,
@@ -435,16 +423,7 @@ def run_gdb_reachability(
     hits_path: Path,
     gdb_script: Path,
     timeout: int = 120,
-    wrapper: str | None = None,
-    path_map: tuple[str, str] | None = None,
 ) -> CommandResult:
-    """Run the target under gdb, optionally through a wrapper.
-
-    `wrapper` receives the whole gdb invocation as a single shell word, matching
-    the generated build.sh contract. It exists because repo-track binaries link
-    against the image's glibc and sanitizer runtime and cannot be executed on
-    the host at all; ARVO keeps the direct path.
-    """
     argv = shlex.split(command)
     if not argv:
         raise ValueError('Empty debug command')
@@ -452,28 +431,15 @@ def run_gdb_reachability(
     env = dict(os.environ)
     env['REACHABILITY_BREAKPOINTS'] = str(breakpoints_path)
     env['REACHABILITY_OUTPUT'] = str(hits_path)
-    gdb_argv = [
+    full_command = [
         'gdb',
         '--batch',
         '-q',
         '-x',
-        _rewrite_prefix(str(gdb_script), path_map),
+        str(gdb_script),
         '--args',
-        *[_rewrite_prefix(part, path_map) for part in argv],
+        *argv,
     ]
-    if wrapper:
-        # The wrapper starts a fresh container, so the two variables the gdb
-        # script reads have to travel inside the command rather than the env.
-        inner = ' '.join([
-            'REACHABILITY_BREAKPOINTS=' + shlex.quote(
-                _rewrite_prefix(str(breakpoints_path), path_map)),
-            'REACHABILITY_OUTPUT=' + shlex.quote(
-                _rewrite_prefix(str(hits_path), path_map)),
-            shlex.join(gdb_argv),
-        ])
-        full_command = [*shlex.split(wrapper), inner]
-    else:
-        full_command = gdb_argv
     proc = subprocess.run(
         full_command,
         text=True,
