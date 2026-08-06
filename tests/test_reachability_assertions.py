@@ -47,7 +47,7 @@ def test_assertion_trace_resolves_event_breakpoints_from_gt_codebase(tmp_path):
     assert checkpoints[1]["assertion_role"] == ["protected", "sink"]
 
 
-def test_assertion_event_hits_establish_root_reachability_and_order(tmp_path):
+def test_assertion_event_hits_report_order_without_promoting_stages(tmp_path):
     source = tmp_path / "bug.c"
     source.write_text(
         "int bug(int n) {\n"
@@ -100,15 +100,19 @@ def test_assertion_event_hits_establish_root_reachability_and_order(tmp_path):
         checkpoints=extract_reachability_checkpoints(gt) + assertion_points,
     )
 
-    assert report["R1_parser_admitted"] is True
-    assert report["R2_source_reached"] is True
-    assert report["R3_root_cause_function_reached"] is True
-    assert report["R4_root_cause_line_reached"] is True
+    # The assertion channel reports what the instrumentation observed...
     assert report["assertion_sequence_matches"] is True
     assert report["assertion_event_reachability"] == {"decision": True, "read": True}
+    # ...but under location-reachability-v3 it never promotes a location stage:
+    # only gdb hits on the GT anchors do, and none were supplied here.
+    assert report["R1_parser_admitted"] is False
+    assert report["R2_source_reached"] is False
+    assert report["R3_root_cause_function_reached"] is False
+    assert report["R4_root_cause_line_reached"] is False
+    assert report["reachability_depth"] == "R0"
 
 
-def test_selected_sink_invariant_marks_runtime_event_as_sink_reachability(tmp_path):
+def test_selected_sink_invariant_is_reported_but_does_not_mark_sink_reached(tmp_path):
     source = tmp_path / "src" / "bug.c"
     source.parent.mkdir()
     source.write_text(
@@ -165,11 +169,12 @@ def test_selected_sink_invariant_marks_runtime_event_as_sink_reachability(tmp_pa
         }],
         checkpoints=extract_reachability_checkpoints(gt) + points,
     )
-    assert report["R3_sink_function_reached"] is True
-    assert report["R4_sink_line_reached"] is True
+    assert report["assertion_event_reachability"] == {"stale_use": True}
+    assert report["R3_sink_function_reached"] is False
+    assert report["R4_sink_line_reached"] is False
 
 
-def test_required_protected_event_marks_sink_reachability(tmp_path):
+def test_required_protected_event_is_reported_but_does_not_mark_sink_reached(tmp_path):
     source = tmp_path / "src" / "bug.c"
     source.parent.mkdir()
     source.write_text(
@@ -217,8 +222,14 @@ def test_required_protected_event_marks_sink_reachability(tmp_path):
         }],
         checkpoints=extract_reachability_checkpoints(gt) + points,
     )
-    assert report["R3_sink_function_reached"] is True
-    assert report["R4_sink_line_reached"] is True
+    # Only the protected event was supplied, so the expected decision ->
+    # unsafe_write order is not satisfied and the sink stays unreached.
+    assert report["assertion_event_reachability"] == {
+        "decision": False, "unsafe_write": True,
+    }
+    assert report["assertion_sequence_matches"] is False
+    assert report["R3_sink_function_reached"] is False
+    assert report["R4_sink_line_reached"] is False
 
 
 def test_cli_uses_frozen_trace_hits_and_writes_package_local_artifacts(
@@ -286,11 +297,15 @@ def test_cli_uses_frozen_trace_hits_and_writes_package_local_artifacts(
         (out_dir / "reachability_report.json").read_text()
     )
     assert report["reachability_checked"] is True
-    assert report["R1_parser_admitted"] is True
-    assert report["R2_source_reached"] is True
-    assert report["R3_root_cause_function_reached"] is True
-    assert report["R4_root_cause_line_reached"] is True
     assert report["assertion_sequence_matches"] is True
+    # The CLI freezes the assertion trace into hits, but those hits are
+    # assertion events: under v3 they report the sequence and leave the
+    # location stages unreached, because no debugger ran on the GT anchors.
+    assert report["R1_parser_admitted"] is False
+    assert report["R2_source_reached"] is False
+    assert report["R3_root_cause_function_reached"] is False
+    assert report["R4_root_cause_line_reached"] is False
+    assert report["reachability_depth"] == "R0"
     assert report["artifacts"] == {
         "breakpoints": "reachability/reachability_breakpoints.json",
         "hits": "reachability/reachability_hits.json",
