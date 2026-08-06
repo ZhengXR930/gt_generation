@@ -221,7 +221,8 @@ def score(guidance: dict[str, Any], gt: dict[str, Any], result_dir: Path,
     return stages
 
 
-def select(limit: int, tracks: tuple[str, ...]) -> list[dict[str, Any]]:
+def select(limit: int, tracks: tuple[str, ...],
+           origins: tuple[str, ...] = ()) -> list[dict[str, Any]]:
     """Stratify by who wrote the description, which is what sets its floor."""
     records = {r["sample_id"]: r for r in json.loads(SELECTION.read_text())}
     manifest = json.loads(MANIFEST.read_text()) if MANIFEST.is_file() else {}
@@ -257,7 +258,21 @@ def select(limit: int, tracks: tuple[str, ...]) -> list[dict[str, Any]]:
 
     # The two large provenances carry the result; the smaller ones are shown to
     # keep their own floors visible rather than folded into an average.
-    order = ("cybergym", "commit_derived", "reporter", "crash_block_removed")
+    order = origins or ("cybergym", "commit_derived", "reporter",
+                        "crash_block_removed")
+    if origins:
+        # Validating one provenance at a time: give it the whole budget.
+        buckets = {name: [c for c in chosen if c["stratum"] == name]
+                   for name in order}
+        out: list[dict[str, Any]] = []
+        per = max(1, limit // len(order))
+        for name in order:
+            bucket = buckets[name]
+            if len(bucket) > per:
+                step = len(bucket) / per
+                bucket = [bucket[int(i * step)] for i in range(per)]
+            out.extend(bucket)
+        return out[:limit]
     buckets = {name: [c for c in chosen if c["stratum"] == name] for name in order}
     quota = {"cybergym": limit * 2 // 5, "commit_derived": limit * 2 // 5,
              "reporter": limit // 10}
@@ -286,12 +301,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="gpt-5.4-2026-03-05")
     parser.add_argument("--samples", type=int, default=3,
                         help="independent draft+audit passes per subject")
+    parser.add_argument("--origins", default="",
+                        help="restrict to these manifest provenances")
     parser.add_argument("--plan-only", action="store_true",
                         help="print the stratified selection and exit")
     args = parser.parse_args(argv)
 
     tracks = tuple(t.strip() for t in args.tracks.split(",") if t.strip())
-    subjects = select(args.limit, tracks)
+    origins = tuple(o.strip() for o in (args.origins or "").split(",") if o.strip())
+    subjects = select(args.limit, tracks, origins)
     counts = Counter(s["stratum"] for s in subjects)
     print(f"selected {len(subjects)} subjects: {dict(counts)}")
     for subject in subjects:

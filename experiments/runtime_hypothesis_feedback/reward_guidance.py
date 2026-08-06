@@ -598,6 +598,24 @@ def build_guidance(
             "requested_samples": samples,
             "usable_samples": len(drafts),
             "failures": failures,
+            # What each draft proposed, so a stage dropped as ambiguous can be
+            # told apart from one the drafts placed identically but pointed at
+            # differently.
+            "draft_anchors": [
+                {
+                    stage: [
+                        {
+                            "file": str(w.get("file") or ""),
+                            "function": str(w.get("function") or ""),
+                            "point": str(w.get("point") or ""),
+                        }
+                        for w in (draft.get(stage) or {}).get("where") or []
+                        if isinstance(w, dict)
+                    ]
+                    for stage in STAGES
+                }
+                for draft in drafts
+            ],
         },
         "source_audit": {
             "root_basename": codebase.resolve().name,
