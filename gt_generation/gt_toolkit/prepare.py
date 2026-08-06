@@ -492,6 +492,50 @@ def _ensure_memory_env(tag: str | None = None, context: str | Path | None = None
     return _sh(["docker", "build", "-t", tag, str(context)], timeout=3000).returncode == 0
 
 
+def _poc_source_dir(sample: dict[str, Any], sid: str) -> Path | None:
+    root = Path(__file__).resolve().parents[2] / "dataset"
+    candidates = []
+    poc_path = str(sample.get("poc_path") or "")
+    if poc_path:
+        candidate = (root / poc_path).resolve()
+        for parent in [candidate] + list(candidate.parents):
+            if parent.name == sid and parent.parent.name == "pocs":
+                candidates.append(parent)
+                break
+    candidates.append(root / "pocs" / sid)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dict[str, Any]:
+    """Copy the benchmark's own reproduction material next to the PoC.
+
+    SEC-bench records the fuzzing engine, fuzz target, job type and sanitizer in
+    bug_report.md. Without it Stage 01 has to guess the entry point from the
+    crash trace, and a libFuzzer testcase fed to a command line tool reproduces
+    nothing.
+    """
+    staged: dict[str, Any] = {"bug_report": False, "harness_downloads": 0}
+    pocdir = _poc_source_dir(sample, sid)
+    if pocdir is None or not pocdir.is_dir():
+        return staged
+
+    report = pocdir / "bug_report.md"
+    if report.is_file():
+        shutil.copy(report, d / "bug_report.md")
+        staged["bug_report"] = True
+
+    downloads = pocdir / "downloads"
+    if downloads.is_dir():
+        target = d / "harness_downloads"
+        shutil.rmtree(target, ignore_errors=True)
+        shutil.copytree(downloads, target)
+        staged["harness_downloads"] = sum(1 for _ in target.rglob("*") if _.is_file())
+    return staged
+
+
 def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     """SEC-bench / OSS-Fuzz / repo-based: no pre-built image. Build the shared
     gt-memory-env, clone the repo at the vulnerable commit, stage poc + patch. The
@@ -524,6 +568,7 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     if not (d / "patch.diff").exists():
         _stage_patch(sample, d, sid)
     staged_poc = _stage_repo_poc(sample, d, sid)
+    repro_config = _stage_reproduction_config(sample, d, sid)
     (d / "build.sh").write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n\n"
@@ -557,6 +602,8 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
               "env_context": str(env_context), "env_ok": env_ok,
               "repo": repo, "vulnerable_commit": vcommit, "source": src.exists(),
               "poc": (d / "poc").exists(), "poc_source": staged_poc,
+              "bug_report": repro_config["bug_report"],
+              "harness_downloads": repro_config["harness_downloads"],
               "patch": (d / "patch.diff").exists(),
               "prepared": bool(src.exists())}
     for key in (

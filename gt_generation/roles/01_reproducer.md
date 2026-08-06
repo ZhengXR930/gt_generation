@@ -8,6 +8,31 @@ Do not construct the fine trace, select invariants, or author assertions in this
 `<result_dir>`. Read the supplied sample metadata and staged files. Do not search the
 web, clone another checkout, or delegate to another agent.
 
+## The entry point is recorded, not inferred
+
+When `<result_dir>/bug_report.md` exists, it is the benchmark's own reproduction
+configuration and it is authoritative. Read it before deciding anything. It names
+the fuzzing engine, the fuzz target, the job type and the sanitizer, for example:
+
+```
+Fuzzing Engine: libFuzzer
+Fuzz Target:    xml
+Job Type:       libfuzzer_ubsan_libxml2
+Sanitizer:      undefined (UBSAN)
+```
+
+Build and run that target. A staged testcase belongs to the fuzz harness named
+there, not to the project's command line tools: feeding a libFuzzer testcase to
+`xmllint` or `testSAX` parses different bytes in a different order and reproduces
+nothing, which is indistinguishable from a sample that simply does not reproduce.
+Match the sanitizer too -- a UBSan bad-cast does not surface under ASan.
+
+`<result_dir>/harness_downloads/` holds the testcase exactly as the benchmark
+downloaded it, for when the staged `poc` has been normalised.
+
+Only when no bug_report.md is staged should you infer an entry point, and then say
+so in `crash_summary` so the limitation is visible rather than silent.
+
 Run the original PoC against the exact vulnerable build. Preserve the complete
 sanitizer output in `<result_dir>/sanitizer_trace.txt`. Update `sample_state.json` and
 write this small `<result_dir>/reproduction_report.json` object:
