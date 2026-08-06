@@ -204,6 +204,68 @@ def _hit_matches_expected_location(hit: dict[str, Any]) -> bool:
     return True
 
 
+# Canonical crash classes, longest patterns first so "heap-buffer-overflow"
+# is not swallowed by "buffer-overflow".
+_CRASH_CLASSES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("use-after-free", ("use-after-free", "use after free", "heap-use-after-free")),
+    ("double-free", ("double-free", "double free")),
+    ("bad-free", ("bad-free", "bad free", "invalid free", "attempting free")),
+    ("heap-buffer-overflow", ("heap-buffer-overflow", "heap buffer overflow")),
+    ("stack-buffer-overflow", ("stack-buffer-overflow", "stack buffer overflow")),
+    ("global-buffer-overflow", ("global-buffer-overflow", "global buffer overflow")),
+    ("stack-overflow", ("stack-overflow", "stack exhaustion")),
+    ("uninitialized-value", (
+        "use-of-uninitialized-value", "uninitialised", "uninitialized",
+    )),
+    ("memory-leak", ("memory leak", "detected memory leaks")),
+    ("bad-cast", ("bad-cast", "bad cast", "downcast")),
+    ("null-dereference", (
+        "null-dereference", "null pointer", "null-pointer", "segv on unknown address 0x000000000000",
+    )),
+    ("integer-overflow", (
+        "integer-overflow", "signed integer overflow", "unsigned integer overflow",
+    )),
+    ("shift", ("shift exponent", "left shift of negative")),
+    ("misaligned", ("misaligned address", "load of misaligned")),
+    ("segv", ("segv", "segmentation fault")),
+    # Deliberately last: UBSan prints this as the umbrella label for findings the
+    # entries above name precisely.
+    ("undefined-behavior", ("undefined-behavior", "undefined behaviour", "runtime error")),
+)
+
+
+def _crash_class(text: Any) -> str | None:
+    """Reduce a crash description to a canonical class, or None if it has none."""
+    value = str(text or "").lower()
+    if not value.strip():
+        return None
+    for name, patterns in _CRASH_CLASSES:
+        if any(pattern in value for pattern in patterns):
+            return name
+    return None
+
+
+def _detectors_agree(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
+    """Whether both sides name the same sanitizer."""
+    def tokens(source: dict[str, Any]) -> set[str]:
+        found = set()
+        for key in ("detector", "sanitizer"):
+            value = str(source.get(key) or "").lower()
+            for name, aliases in (
+                ("address", ("address", "asan")),
+                ("undefined", ("undefined", "ubsan")),
+                ("memory", ("memorysanitizer", "msan")),
+                ("thread", ("thread", "tsan")),
+                ("leak", ("leak", "lsan")),
+            ):
+                if any(alias in value for alias in aliases):
+                    found.add(name)
+        return found
+
+    expected_tokens, observed_tokens = tokens(expected), tokens(observed)
+    return bool(expected_tokens and observed_tokens and expected_tokens & observed_tokens)
+
+
 def _sanitizer_matches_gt(gt: dict[str, Any], observed: dict[str, Any]) -> bool:
     if not observed:
         return False
@@ -226,13 +288,23 @@ def _sanitizer_matches_gt(gt: dict[str, Any], observed: dict[str, Any]) -> bool:
     ]
     expected_type = str(expected.get('crash_type') or '').lower()
     observed_type = str(observed.get('crash_type') or '').lower()
-    type_match = bool(
-        expected_type and observed_type and (
-            expected_type == observed_type
-            or expected_type in observed_type
-            or observed_type in expected_type
-        )
-    )
+    expected_class = _crash_class(expected_type)
+    observed_class = _crash_class(observed_type) or _crash_class(observed.get('sanitizer'))
+    if expected_class and observed_class:
+        # Both sides carry a class: a different finding at the same line is
+        # still a different finding.
+        type_match = expected_class == observed_class
+    else:
+        # GT's crash_type is free prose and may name no class at all. Keep the
+        # old substring test where it can decide, otherwise fall back to the
+        # sanitizer actually agreeing rather than failing on wording.
+        type_match = bool(
+            expected_type and observed_type and (
+                expected_type == observed_type
+                or expected_type in observed_type
+                or observed_type in expected_type
+            )
+        ) or _detectors_agree(expected, observed)
     location_match = any(
         _location_matches(expected_location, observed_location)
         for expected_location in expected_locations

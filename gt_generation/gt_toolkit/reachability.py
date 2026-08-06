@@ -50,6 +50,68 @@ def _engine_env(root: Path) -> dict[str, str]:
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
+
+
+def _pad_separators(command: str) -> str:
+    """Make shell separators their own words.
+
+    shlex keeps punctuation attached, so "pipefail;" arrives as one token and the
+    rest of the line looks like arguments to `set`.
+    """
+    return re.sub(r"(\|\||&&|[;|&])", r" \1 ", command)
+
+
+# Shell words that introduce a new command rather than being one.
+_SEPARATORS = {";", "&&", "||", "|", "&"}
+# Builtins Stage 01 tends to prefix; none of them is the program under test.
+_PREAMBLE = {"set", "cd", "export", "ulimit", "source", ".", "exec", "time", "env"}
+
+
+def _program_invocation(parts: list[str]) -> list[str]:
+    """Reduce a shell line to the single command that names a real program.
+
+    Splits on separators, skips segments that are only shell preamble, and stops
+    at the first pipeline stage or redirection so the debugger receives an argv
+    rather than a script.
+    """
+    segments: list[list[str]] = [[]]
+    for part in parts:
+        if part in _SEPARATORS:
+            segments.append([])
+            continue
+        segments[-1].append(part)
+
+    for segment in segments:
+        words = list(segment)
+        while words and (_ENV_ASSIGNMENT.match(words[0]) or words[0] in _PREAMBLE):
+            head = words.pop(0)
+            if head in {"time", "exec", "env"}:
+                # These take the real command as their remaining words.
+                continue
+            if head in _PREAMBLE:
+                # `set -o pipefail`, `cd /x`: the rest belongs to the builtin.
+                words = []
+                break
+        if not words:
+            continue
+        # A redirection ends the argv; gdb has no shell to interpret it.
+        cleaned: list[str] = []
+        skip_next = False
+        for word in words:
+            if skip_next:
+                skip_next = False
+                continue
+            if word in {">", ">>", "<", "2>", "&>"}:
+                skip_next = True
+                continue
+            if word == "2>&1" or word.startswith(("2>", ">", "<")):
+                continue
+            cleaned.append(word)
+        if cleaned:
+            return cleaned
+    return []
+
+
 def derive_debug_command(result_dir: Path) -> str | None:
     """Recover the bare program and arguments Stage 01 used to reproduce.
 
@@ -61,16 +123,15 @@ def derive_debug_command(result_dir: Path) -> str | None:
         return None
     try:
         command = str(json.loads(report.read_text(encoding="utf-8")).get("command") or "")
-        parts = shlex.split(command)
+        parts = shlex.split(_pad_separators(command))
     except (json.JSONDecodeError, OSError, ValueError):
         return None
     if parts and parts[0].endswith("build.sh") and len(parts) >= 2:
         try:
-            parts = shlex.split(parts[1])
+            parts = shlex.split(_pad_separators(parts[1]))
         except ValueError:
             return None
-    while parts and _ENV_ASSIGNMENT.match(parts[0]):
-        parts.pop(0)
+    parts = _program_invocation(parts)
     if not parts:
         return None
     poc_names = {"/gt/poc", "poc", "./poc", str(result_dir / "poc")}
@@ -86,6 +147,60 @@ def derive_debug_command(result_dir: Path) -> str | None:
         program = argv[0][2:] if argv[0].startswith("./") else argv[0]
         argv[0] = "/gt/_work/src/" + program
     return " ".join(argv)
+
+
+def _restore_uninstrumented_source(result_dir: Path, timeout: int = 1800) -> dict[str, Any]:
+    """Undo Stage 04's instrumentation so line numbers match the GT again.
+
+    Returns what happened so the caller can record it; a checkout that is not a
+    git tree, or one with no modifications, is left alone.
+    """
+    src = result_dir / "_work" / "src"
+    status = {"reverted": False, "rebuilt": False}
+    if not (src / ".git").exists():
+        return status
+
+    dirty = subprocess.run(
+        ["git", "-C", str(src), "status", "--porcelain"],
+        capture_output=True, text=True, errors="replace",
+    )
+    if dirty.returncode != 0 or not dirty.stdout.strip():
+        return status
+
+    revert = subprocess.run(
+        ["git", "-C", str(src), "checkout", "--", "."],
+        capture_output=True, text=True, errors="replace",
+    )
+    if revert.returncode != 0:
+        status["error"] = revert.stderr[-300:]
+        return status
+    status["reverted"] = True
+
+    # Rebuild with the command Stage 01 established, so the binary the debugger
+    # attaches to is the one the GT line numbers belong to.
+    report = result_dir / "reproduction_report.json"
+    if not report.is_file():
+        return status
+    try:
+        setup = str(json.loads(report.read_text(encoding="utf-8")).get("setup_command") or "")
+    except (json.JSONDecodeError, OSError):
+        return status
+    if not setup.strip():
+        return status
+
+    build_sh = result_dir / "build.sh"
+    inner = setup
+    parts = shlex.split(setup) if setup else []
+    if parts and parts[0].endswith("build.sh") and len(parts) >= 2:
+        inner = parts[1]
+    proc = subprocess.run(
+        [str(build_sh), inner], capture_output=True, text=True,
+        errors="replace", timeout=timeout,
+    )
+    status["rebuilt"] = proc.returncode == 0
+    if proc.returncode != 0:
+        status["error"] = proc.stderr[-300:]
+    return status
 
 
 def run_for_result_dir(result_dir: Path, timeout: int = 900) -> int:
@@ -107,6 +222,8 @@ def run_for_result_dir(result_dir: Path, timeout: int = 900) -> int:
     if not debug_command:
         print(json.dumps({"reachability": "skipped", "reason": "no reproduction command"}))
         return 0
+
+    restored = _restore_uninstrumented_source(result_dir)
 
     inner = " ".join([
         "PYTHONPATH=/repo/gt_generation:/repo",
@@ -131,7 +248,11 @@ def run_for_result_dir(result_dir: Path, timeout: int = 900) -> int:
         (result_dir / "reachability_report.json").write_text(
             produced.read_text(encoding="utf-8"), encoding="utf-8"
         )
-        print(json.dumps({"reachability": "ran", "returncode": proc.returncode}))
+        print(json.dumps({
+            "reachability": "ran",
+            "returncode": proc.returncode,
+            "source_restored": restored,
+        }))
         return 0
     print(json.dumps({
         "reachability": "failed",

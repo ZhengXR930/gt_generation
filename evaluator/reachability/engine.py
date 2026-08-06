@@ -477,13 +477,30 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
     # Do not accept arbitrary application diagnostics such as
     # ``ERROR: dwarf_srclines: ...`` as sanitizer headers.  They can precede
     # the real ASan report by hundreds of lines.
+    sanitizer_name = ''
     first = re.search(
-        r'ERROR:\s+(?:AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer)'
+        r'ERROR:\s+(AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer)'
         r':\s+([A-Za-z0-9_-]+)',
         trace_text,
     )
     if first:
-        crash_type = first.group(1)
+        sanitizer_name, crash_type = first.group(1), first.group(2)
+    else:
+        # UBSan findings are non-fatal and carry no ERROR: header; the SUMMARY
+        # line is the only place the class is stated.
+        summary = re.search(
+            r'SUMMARY:\s+(AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer|'
+            r'LeakSanitizer|ThreadSanitizer)'
+            r':\s+([A-Za-z0-9_-]+)',
+            trace_text,
+        )
+        if summary:
+            sanitizer_name, crash_type = summary.group(1), summary.group(2)
+            if crash_type == 'undefined-behavior':
+                # The umbrella label; the runtime error line names the check.
+                detail = re.search(r'runtime error:\s+([^\n]+)', trace_text)
+                if detail:
+                    crash_type = detail.group(1).strip()
     access = re.search(r'\b(READ|WRITE|FREE) of size\b|\b(READ|WRITE) memory access\b', trace_text)
     if access:
         access_type = next(group for group in access.groups() if group)
@@ -546,8 +563,19 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
         return {}
 
     crash_location = first_project_frame(sections['crash_stack'])
+    if not crash_location:
+        # UBSan states the source position on the runtime error line itself.
+        runtime_error = re.search(
+            r'([^\s:]+\.[A-Za-z0-9_+]+):(\d+)(?::(\d+))?:\s+runtime error:', trace_text
+        )
+        if runtime_error:
+            crash_location = {
+                'file': runtime_error.group(1),
+                'line': int(runtime_error.group(2)),
+            }
     return {
         'crash_type': crash_type,
+        'sanitizer': sanitizer_name,
         'access_type': access_type,
         'crash_location': crash_location,
         'free_context': first_project_frame(sections['free_stack']),
