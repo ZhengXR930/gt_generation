@@ -1,0 +1,50 @@
+{
+  "project": "suricata",
+  "oss_fuzz_project": "suricata",
+  "source": "https://github.com/google/oss-fuzz/tree/master/projects/suricata",
+  "backlog_samples": 1,
+  "language": "rust",
+  "main_repo": "https://github.com/OISF/suricata.git",
+  "homepage": "https://suricata.io",
+  "sanitizers": [
+    "address",
+    "memory",
+    "undefined"
+  ],
+  "fuzzing_engines": [
+    "afl",
+    "honggfuzz",
+    "libfuzzer"
+  ],
+  "fuzz_target_binaries": [
+    "fuzz.rules",
+    "fuzz_applayerparserparse",
+    "fuzz_confyamlloadstring",
+    "fuzz_decodepcapfile",
+    "fuzz_predefpcap_aware",
+    "fuzz_siginit",
+    "fuzz_sigpcap",
+    "fuzz_sigpcap_aware"
+  ],
+  "harness_sources": [
+    "quadfuzz.c"
+  ],
+  "build_sh": "#!/bin/bash -eu\n# Copyright 2019 Google Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n################################################################################\n\n# build dependencies statically\nif [ \"$SANITIZER\" = \"memory\" ]\nthen\n    (\n    cd zlib\n    ./configure --static\n    make -j$(nproc) clean\n    make -j$(nproc) all\n    make -j$(nproc) install\n    )\nfi\n\n(\ntar -xvzf pcre2-10.39.tar.gz\ncd pcre2-10.39\n./configure --disable-shared\nmake -j$(nproc) clean\nmake -j$(nproc) all\nmake -j$(nproc) install\n)\n\ntar -xvzf lz4-1.9.2.tar.gz\ncd lz4-1.9.2\nmake liblz4.a\ncp lib/liblz4.a /usr/local/lib/\ncp lib/lz4*.h /usr/local/include/\ncd ..\n\ntar -xvzf jansson-2.14.tar.gz\ncd jansson-2.14\n./configure --disable-shared\nmake -j$(nproc)\nmake install\ncd ..\n\ntar -xvzf libpcap-1.9.1.tar.gz\ncd libpcap-1.9.1\n./configure --disable-shared\nmake -j$(nproc)\nmake install\ncd ..\n\ncd fuzzpcap\nmkdir build\ncd build\ncmake ..\nmake install\ncd ../..\n\ncd libyaml\n./bootstrap\n./configure --disable-shared\nmake -j$(nproc)\nmake install\ncd ..\n\nexport CARGO_BUILD_TARGET=\"x86_64-unknown-linux-gnu\"\n# cf https://github.com/google/sanitizers/issues/1389\nexport MSAN_OPTIONS=strict_memcmp=false\n\n#run configure with right options\nif [ \"$SANITIZER\" = \"address\" ]\nthen\n    export RUSTFLAGS=\"$RUSTFLAGS -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 -Cllvm-args=-sanitizer-coverage-trace-compares -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table -Clink-dead-code -Cllvm-args=-sanitizer-coverage-stack-depth -Ccodegen-units=1\"\n    export RUSTFLAGS=\"$RUSTFLAGS -Cdebug-assertions=yes\"\nfi\n\nfuzz_branches=(\"\")\nif [[ \"$SANITIZER\" != \"memory\" ]] && [[ ! -v CIFUZZ ]]\nthen\n    fuzz_branches+=(\"7\")\nfi\n\nif [[ `shuf -i 0-9 -n 1` -eq 0 ]]\nthen\n    # adds quadratic complexity custom mutator one random build out of 10\n    clang -fPIE -I. -c $SRC/quadfuzz/quadfuzz.c -o $SRC/quadfuzz/quadfuzz.o\n    export LIB_FUZZING_ENGINE=\"-fsanitize=fuzzer $SRC/quadfuzz/quadfuzz.o\"\n    echo \"Using quadfuzz\"\nfi\n\nfor branch in \"${fuzz_branches[@]}\"; do\n#we did not put libhtp there before so that cifuzz does not remove it\ncp -r libhtp suricata$branch/\n# build project\n(\ncd suricata$branch\nsh autogen.sh\n\n./src/tests/fuzz/oss-fuzz-configure.sh\nmake -j$(nproc)\n\n./src/suricata --list-app-layer-protos | tail -n +2 | while read i; do cp src/fuzz_applayerparserparse $OUT/fuzz_applayerparserparse\"$branch\"_$i; done\n\n(\ncd src\nls fuzz_* | while read i; do cp $i $OUT/$i$branch; done\n)\n# dictionaries\n./src/suricata --list-keywords | grep \"\\- \" | sed 's/- //' | awk '{print \"\\\"\"$0\"\\\"\"}' > $OUT/fuzz_siginit$branch.dict\n\necho \\\"SMB\\\" > $OUT/fuzz_applayerparserparse\"$branch\"_smb.dict\n\necho \"\\\"FPC0\\\"\" > $OUT/fuzz_sigpcap_aware$branch.dict\necho \"\\\"FPC0\\\"\" > $OUT/fuzz_predefpcap_aware$branch.dict\n\ngit grep tag rust | grep '\"' | cut -d '\"' -f2 | sort | uniq | awk 'length($0) > 2' | awk '{print \"\\\"\"$0\"\\\"\"}' | grep -v '\\\\' > generic.dict\ncat generic.dict >> $OUT/fuzz_siginit$branch.dict\ncat generic.dict >> $OUT/fuzz_applayerparserparse$branch.dict\ncat generic.dict >> $OUT/fuzz_sigpcap$branch.dict\ncat generic.dict >> $OUT/fuzz_sigpcap_aware$branch.dict\n\n# build corpuses\n# default configuration file\nzip -r $OUT/fuzz_confyamlloadstring\"$branch\"_seed_corpus.zip suricata.yaml\n# rebuilds rules corpus with only one rule by file\nunzip ../emerging.rules.zip\ncd rules\ncat *.rules > $OUT/fuzz.rules\ni=0\nmkdir corpus\n# quiet output for commands\nset +x\ncat *.rules | while read l; do echo $l > corpus/$i.rule; i=$((i+1)); done\nset -x\nzip -q -r $OUT/fuzz_siginit\"$branch\"_seed_corpus.zip corpus\ncd ../../suricata-verify\n\n# corpus with single files\nfind . -name \"*.pcap\" | xargs zip -r $OUT/fuzz_decodepcapfile\"$branch\"_seed_corpus.zip\nfind . -name \"*.yaml\" | xargs zip -r $OUT/fuzz_confyamlloadstring\"$branch\"_seed_corpus.zip\nfind . -name \"*.rules\" | xargs zip -r $OUT/fuzz_siginit\"$branch\"_seed_corpus.zip\n)\ndone\n\n# corpus using both rule and pcap as in suricata-verify\ncd $SRC/suricata-verify/tests\ni=0\nmkdir corpus\nset +x\nfind . -name \"*.pcap\" -exec dirname \"{}\" \\; | while read t; do\ncat $t/*.rules > corpus/$i || true; echo -ne '\\0' >> corpus/$i; cat $t/*.pcap >> corpus/$i || true; i=$((i+1));\ndone\nset -x\nzip -q -r $OUT/fuzz_sigpcap_seed_corpus.zip corpus\nrm -Rf corpus\nmkdir corpus\nset +x\nfind . -name \"*.pcap\" -exec dirname \"{}\" \\; | while read t; do\ngrep -v \"#\" $t/*.rules | head -1 | cut -d \"(\" -f2 | cut -d \")\" -f1 > corpus/$i || true; echo -ne '\\0' >> corpus/$i; fpc_bin $t/*.pcap >> corpus/$i || rm corpus/$i; i=$((i+1));\necho -ne '\\0' >> corpus/$i; python3 $SRC/fuzzpcap/tcptofpc.py $t/*.pcap >> corpus/$i || rm corpus/$i; i=$((i+1));\ndone\nset -x\nzip -q -r $OUT/fuzz_sigpcap_aware_seed_corpus.zip corpus\nrm -Rf corpus\nmkdir corpus\nset +x\nfind . -name \"*.pcap\" -exec dirname \"{}\" \\; | while read t; do\nfpc_bin $t/*.pcap >> corpus/$i || rm corpus/$i; i=$((i+1));\npython3 $SRC/fuzzpcap/tcptofpc.py $t/*.pcap >> corpus/$i || rm corpus/$i; i=$((i+1));\ndone\nset -x\nzip -q -r $OUT/fuzz_predefpcap_aware_seed_corpus.zip corpus\n",
+  "project_yaml": "homepage: \"https://suricata.io\"\nlanguage: rust\nprimary_contact: \"vjulien@openinfosecfoundation.org\"\nauto_ccs:\n- \"jish@openinfosecfoundation.org\"\n- \"p.antoine@catenacyber.fr\"\nsanitizers:\n  - address\n  - memory\n  - undefined\nfuzzing_engines:\n  - afl\n  - honggfuzz\n  - libfuzzer\nmain_repo: 'https://github.com/OISF/suricata.git'\n",
+  "dockerfile": "# Copyright 2019 Google Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n################################################################################\n\nFROM gcr.io/oss-fuzz-base/base-builder-rust\nRUN apt-get update && apt-get install -y build-essential autoconf automake libtool make pkg-config  python flex bison zlib1g-dev libpcre3-dev cmake tshark\n\n# TODO libmagic, liblzma and other optional libraries\nADD https://github.com/PhilipHazel/pcre2/releases/download/pcre2-10.39/pcre2-10.39.tar.gz pcre2-10.39.tar.gz\nADD https://www.tcpdump.org/release/libpcap-1.9.1.tar.gz libpcap-1.9.1.tar.gz\nADD https://github.com/akheron/jansson/releases/download/v2.14/jansson-2.14.tar.gz jansson-2.14.tar.gz\nRUN git clone --depth=1 https://github.com/yaml/libyaml\nADD https://github.com/lz4/lz4/archive/v1.9.2.tar.gz lz4-1.9.2.tar.gz\nRUN git clone --depth 1 https://github.com/catenacyber/quadfuzz.git\nRUN git clone --depth 1 -b develop https://github.com/madler/zlib.git\nRUN git clone --depth=1 https://github.com/catenacyber/fuzzpcap\n\nADD https://rules.emergingthreats.net/open/suricata/emerging.rules.zip emerging.rules.zip\n\nRUN cargo install --force cbindgen\n\nRUN git clone --depth 1 https://github.com/OISF/suricata.git suricata\nRUN git clone --depth 1 --branch main-7.0.x https://github.com/OISF/suricata.git suricata7\nRUN git clone --depth 1 https://github.com/OISF/libhtp.git libhtp\nRUN git clone --depth 1 https://github.com/OISF/suricata-verify suricata-verify\nWORKDIR $SRC\nCOPY build.sh $SRC/\n",
+  "apt_packages": [
+    "autoconf",
+    "automake",
+    "bison",
+    "build-essential",
+    "cmake",
+    "flex",
+    "libpcre3-dev",
+    "libtool",
+    "make",
+    "pkg-config",
+    "python",
+    "tshark",
+    "zlib1g-dev"
+  ]
+}

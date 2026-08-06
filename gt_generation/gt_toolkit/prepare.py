@@ -509,6 +509,240 @@ def _poc_source_dir(sample: dict[str, Any], sid: str) -> Path | None:
     return None
 
 
+# A crash type implies which sanitizer produced it, and therefore which build
+# flags reproduce it. Projects are usually fuzzed under several, so the crash
+# record is what narrows it down. Ordered: first match wins.
+_CRASH_TYPE_SANITIZER = (
+    ("use-of-uninitialized-value", "MemorySanitizer", "-fsanitize=memory"),
+    ("uninitialized", "MemorySanitizer", "-fsanitize=memory"),
+    ("direct-leak", "LeakSanitizer", "-fsanitize=address"),
+    ("indirect-leak", "LeakSanitizer", "-fsanitize=address"),
+    ("memory leak", "LeakSanitizer", "-fsanitize=address"),
+    ("data race", "ThreadSanitizer", "-fsanitize=thread"),
+    ("undefined", "UndefinedBehaviorSanitizer", "-fsanitize=undefined"),
+    ("integer-overflow", "UndefinedBehaviorSanitizer", "-fsanitize=undefined"),
+    ("shift", "UndefinedBehaviorSanitizer", "-fsanitize=undefined"),
+    ("divide-by-zero", "UndefinedBehaviorSanitizer", "-fsanitize=undefined"),
+    ("misaligned", "UndefinedBehaviorSanitizer", "-fsanitize=undefined"),
+    ("index out of bounds", "UndefinedBehaviorSanitizer", "-fsanitize=undefined"),
+    ("overflow", "AddressSanitizer", "-fsanitize=address"),
+    ("use-after-free", "AddressSanitizer", "-fsanitize=address"),
+    ("use-after-poison", "AddressSanitizer", "-fsanitize=address"),
+    ("double-free", "AddressSanitizer", "-fsanitize=address"),
+    ("bad-free", "AddressSanitizer", "-fsanitize=address"),
+    ("alloc-dealloc-mismatch", "AddressSanitizer", "-fsanitize=address"),
+    ("negative-size-param", "AddressSanitizer", "-fsanitize=address"),
+    ("segv", "AddressSanitizer", "-fsanitize=address"),
+    ("null-dereference", "AddressSanitizer", "-fsanitize=address"),
+)
+
+
+def _crash_record(sid: str) -> str:
+    """The benchmark's recorded crash type/state for this sample, if any."""
+    root = Path(__file__).resolve().parents[2] / "dataset" / "crash_traces"
+    for candidate in sorted(root.glob(f"*/{sid}.txt")):
+        try:
+            return candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    return ""
+
+
+def _checkout_harnesses(src: Path, limit: int = 40) -> list[str]:
+    """Files in the checkout that define a libFuzzer entry point.
+
+    build.sh often builds its targets through a loop or a helper function, so
+    the binary name is not textually present; the harness source always is.
+    """
+    if not src.is_dir():
+        return []
+    found = _sh(
+        ["git", "-C", str(src), "grep", "-l", "-I", "--", "LLVMFuzzerTestOneInput"],
+        timeout=180,
+    )
+    if found.returncode == 0 and found.stdout.strip():
+        return sorted(found.stdout.split())[:limit]
+    # Untracked or non-git trees: fall back to walking the source extensions.
+    hits = []
+    for ext in ("*.c", "*.cc", "*.cpp", "*.cxx"):
+        for f in src.rglob(ext):
+            try:
+                if "LLVMFuzzerTestOneInput" in f.read_text(encoding="utf-8", errors="replace"):
+                    hits.append(str(f.relative_to(src)))
+            except OSError:
+                continue
+            if len(hits) >= limit:
+                return sorted(hits)
+    return sorted(hits)
+
+
+def _synthesize_ossfuzz_bug_report(sample: dict[str, Any], d: Path, sid: str) -> bool:
+    """Write the bug_report.md an OSS-Fuzz-derived sample never shipped.
+
+    Returns False and writes nothing when the sample carries no OSS-Fuzz
+    identity and no crash record, so samples from other benchmarks are
+    unaffected.
+    """
+    crash = _crash_record(sid)
+    project = str(sample.get("project") or "").strip()
+    target = str(sample.get("oss_fuzz_target") or "").strip()
+    engine = str(sample.get("oss_fuzz_engine") or "").strip()
+    job = str(sample.get("oss_fuzz_job") or "").strip()
+    declared_sanitizer = str(sample.get("oss_fuzz_sanitizer") or "").strip()
+    testcase = str(sample.get("testcase_filename") or "").strip()
+
+    cfg_path = (
+        Path(__file__).resolve().parents[2]
+        / "dataset" / "ossfuzz_project_config" / f"{project}.json"
+    )
+    cfg: dict[str, Any] = {}
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
+    if not crash and not target and not cfg:
+        return False
+
+    crash_type = ""
+    match = re.search(r"^Crash type:\s*(.+)$", crash, re.M)
+    if match:
+        crash_type = match.group(1).strip()
+    issue_url = ""
+    match = re.search(r"https?://\S*oss-fuzz\S*", crash)
+    if match:
+        issue_url = match.group(0).rstrip(".,)")
+
+    # The sample's own sanitizer field wins; fall back to inferring it from the
+    # crash type, which is what the detector implies.
+    sanitizer_note = ""
+    if declared_sanitizer:
+        flag = ""
+        low = declared_sanitizer.lower()
+        for key, build_flag in (("address", "-fsanitize=address"),
+                                ("memory", "-fsanitize=memory"),
+                                ("undefined", "-fsanitize=undefined"),
+                                ("thread", "-fsanitize=thread")):
+            if key in low:
+                flag = build_flag
+                break
+        sanitizer_note = f"{declared_sanitizer}" + (f" -- build with {flag}" if flag else "")
+    else:
+        low = crash_type.lower()
+        for needle, name, build_flag in _CRASH_TYPE_SANITIZER:
+            if needle in low:
+                sanitizer_note = (
+                    f"not stated for this sample; the crash type ({crash_type}) is "
+                    f"reported by {name} -- build with {build_flag}"
+                )
+                break
+
+    lines = [
+        "================= Bug Report (1/1) ==================",
+        "## Source: OSS-Fuzz",
+        "## Assembled from: this sample's OSS-Fuzz record, its crash record, the",
+        "## project's configuration in google/oss-fuzz, and the harness sources",
+        "## present in this checkout. Not a verbatim upstream report; the fields",
+        "## under \'Reproduction target\' and \'Crash record\' are the sample\'s own",
+        "## and are authoritative.",
+    ]
+    if issue_url:
+        lines.append(f"## URL: {issue_url}")
+    if project:
+        name = cfg.get("oss_fuzz_project") or project
+        suffix = "" if name == project else f"  (oss-fuzz project: {name})"
+        lines.append(f"## Project: {project}{suffix}")
+    lines.append("")
+
+    lines.append("## Reproduction target")
+    if target or engine or job or declared_sanitizer:
+        if engine:
+            lines.append(f"Fuzzing Engine: {engine}")
+        if target:
+            lines.append(f"Fuzz Target: {target}")
+        if job:
+            lines.append(f"Job Type: {job}")
+        if sanitizer_note:
+            lines.append(f"Sanitizer: {sanitizer_note}")
+        if testcase:
+            lines.append(f"ClusterFuzz testcase: {testcase}")
+        lines.append("")
+        lines.append(
+            f"Build {target or 'the fuzz target'} and run it as "
+            f"`{target or '<fuzz_target>'} <poc>`. The PoC is a libFuzzer "
+            "testcase; feeding it to a command line tool reproduces nothing."
+        )
+    else:
+        lines.append(
+            "This sample does not record a fuzz target. Choose one using the "
+            "crash state below and the project configuration further down, and "
+            "state which you chose."
+        )
+        if sanitizer_note:
+            lines.append(f"Sanitizer: {sanitizer_note}")
+    lines.append("")
+
+    lines.append("## Crash record")
+    lines.append(crash.strip() if crash.strip() else "(none recorded)")
+    lines.append("")
+
+    # Locate the named target's source; its absence is the useful signal.
+    harnesses = _checkout_harnesses(d / "_work" / "src")
+    lines.append("## Harness sources in this checkout")
+    if harnesses:
+        matched = [h for h in harnesses if target and Path(h).stem == target]
+        if matched:
+            lines.append(f"{target} is defined here:")
+            lines += [f"  - {x}" for x in matched]
+            others = [h for h in harnesses if h not in matched]
+            if others:
+                lines.append("")
+                lines.append("Other targets in this repository:")
+                lines += [f"  - {x}" for x in others]
+        else:
+            if target:
+                lines.append(
+                    f"No file in this checkout defines {target}. Its harness most "
+                    "likely lives in the google/oss-fuzz project directory "
+                    "(see the build.sh below), not in this repository."
+                )
+                lines.append("")
+            lines.append("Files here that define LLVMFuzzerTestOneInput:")
+            lines += [f"  - {x}" for x in harnesses]
+    else:
+        lines.append(
+            "None found. The harnesses are supplied by the google/oss-fuzz "
+            "project directory; the build.sh below shows how they are compiled."
+        )
+    lines.append("")
+
+    declared = cfg.get("sanitizers") or []
+    binaries = cfg.get("fuzz_target_binaries") or []
+    if declared or binaries:
+        lines.append("## Project configuration (google/oss-fuzz)")
+        if declared:
+            lines.append(f"Sanitizers this project is fuzzed under: {', '.join(declared)}")
+        if binaries:
+            lines.append("Targets build.sh installs into $OUT: " + ", ".join(binaries))
+        if cfg.get("language"):
+            lines.append(f"Language: {cfg['language']}")
+        lines.append("")
+    if cfg.get("build_sh"):
+        lines.append("## How OSS-Fuzz builds this project (projects/"
+                     f"{cfg.get('oss_fuzz_project', project)}/build.sh)")
+        lines.append("")
+        lines.append("```bash")
+        lines.append(cfg["build_sh"].rstrip())
+        lines.append("```")
+        lines.append("")
+    if cfg.get("source"):
+        lines.append(f"## Project configuration: {cfg['source']}")
+        lines.append("")
+
+    (d / "bug_report.md").write_text("\n".join(lines), encoding="utf-8")
+    return True
+
+
 def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dict[str, Any]:
     """Copy the benchmark's own reproduction material next to the PoC.
 
@@ -520,6 +754,9 @@ def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dic
     staged: dict[str, Any] = {"bug_report": False, "harness_downloads": 0}
     pocdir = _poc_source_dir(sample, sid)
     if pocdir is None or not pocdir.is_dir():
+        if _synthesize_ossfuzz_bug_report(sample, d, sid):
+            staged["bug_report"] = True
+            staged["bug_report_assembled"] = True
         return staged
 
     report = pocdir / "bug_report.md"
@@ -533,6 +770,10 @@ def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dic
         shutil.rmtree(target, ignore_errors=True)
         shutil.copytree(downloads, target)
         staged["harness_downloads"] = sum(1 for _ in target.rglob("*") if _.is_file())
+
+    if not staged["bug_report"] and _synthesize_ossfuzz_bug_report(sample, d, sid):
+        staged["bug_report"] = True
+        staged["bug_report_assembled"] = True
     return staged
 
 

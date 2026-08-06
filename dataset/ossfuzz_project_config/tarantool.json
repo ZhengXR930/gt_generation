@@ -1,0 +1,45 @@
+{
+  "project": "tarantool",
+  "oss_fuzz_project": "tarantool",
+  "source": "https://github.com/google/oss-fuzz/tree/master/projects/tarantool",
+  "backlog_samples": 4,
+  "language": "c",
+  "main_repo": "https://github.com/tarantool/tarantool",
+  "homepage": "https://www.tarantool.io/en/",
+  "sanitizers": [
+    "address",
+    "undefined"
+  ],
+  "architectures": [
+    "x86_64"
+  ],
+  "fuzz_target_binaries": [
+    "compile_lua_fuzzer"
+  ],
+  "harness_sources": [],
+  "build_sh": "#!/bin/bash -eu\n# Copyright 2021 Google LLC\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n################################################################################\n\n# Clean up potentially persistent build directory.\n[[ -e $SRC/tarantool/build ]] && rm -rf $SRC/tarantool/build\n\n# For fuzz-introspector, exclude all functions in the tests directory,\n# libprotobuf-mutator and protobuf source code.\n# See https://github.com/ossf/fuzz-introspector/blob/main/doc/Config.md#code-exclusion-from-the-report\nexport FUZZ_INTROSPECTOR_CONFIG=$SRC/fuzz_introspector_exclusion.config\ncat > $FUZZ_INTROSPECTOR_CONFIG <<EOF\nFILES_TO_AVOID\ntarantool/build/test\ntarantool/build/icu-prefix\nEOF\n\ncd $SRC/tarantool\n\ncase $SANITIZER in\n  address) SANITIZERS_ARGS=\"-DENABLE_ASAN=ON\" ;;\n  undefined) SANITIZERS_ARGS=\"-DENABLE_UB_SANITIZER=ON\" ;;\n  *) SANITIZERS_ARGS=\"\" ;;\nesac\n\nexport LSAN_OPTIONS=\"verbosity=1:log_threads=1\"\n\n# Workaround for a LeakSanitizer crashes,\n# see https://github.com/google/oss-fuzz/issues/11798.\nif [ \"$ARCHITECTURE\" = \"aarch64\" ]; then\n    export ASAN_OPTIONS=detect_leaks=0\nfi\n\n: ${LD:=\"${CXX}\"}\n: ${LDFLAGS:=\"${CXXFLAGS}\"}  # to make sure we link with sanitizer runtime\n\nFUZZER_ARGS=\"\"\nif [[ \"$FUZZING_ENGINE\" == libfuzzer ]]; then\n  FUZZER_ARGS=\"-DENABLE_LIBFUZZER_STATIC_LINKAGE=ON\"\nfi\n\ncmake_args=(\n    # Specific to Tarantool\n    # Tarantool executable binary is needed for running Lua tests,\n    # it should not have any dependencies.\n    -DBUILD_STATIC=ON\n    -DENABLE_BACKTRACE=ON\n    -DENABLE_FUZZER=ON\n    -DOSS_FUZZ=ON\n    -DLUA_USE_APICHECK=ON\n    -DLUA_USE_ASSERT=ON\n    -DLUAJIT_USE_SYSMALLOC=ON\n    -DLUAJIT_ENABLE_GC64=ON\n    $SANITIZERS_ARGS\n    $FUZZER_ARGS\n\n    -DCMAKE_BUILD_TYPE=Debug\n\n    # C compiler\n    -DCMAKE_C_COMPILER=\"${CC}\"\n    -DCMAKE_C_FLAGS=\"${CFLAGS} -Wno-error=unused-command-line-argument -fno-sanitize=unsigned-integer-overflow\"\n\n    # C++ compiler\n    -DCMAKE_CXX_COMPILER=\"${CXX}\"\n    -DCMAKE_CXX_FLAGS=\"${CXXFLAGS} -Wno-error=unused-command-line-argument -fno-sanitize=unsigned-integer-overflow\"\n\n    # Linker\n    -DCMAKE_LINKER=\"${LD}\"\n    -DCMAKE_EXE_LINKER_FLAGS=\"${LDFLAGS}\"\n    -DCMAKE_MODULE_LINKER_FLAGS=\"${LDFLAGS}\"\n    -DCMAKE_SHARED_LINKER_FLAGS=\"${LDFLAGS}\"\n\n    # Dependencies\n    -DENABLE_BUNDLED_ICU=ON\n    -DENABLE_BUNDLED_LIBUNWIND=ON\n    -DENABLE_BUNDLED_ZSTD=OFF\n)\n\n# To deal with a host filesystem from inside of container.\ngit config --global --add safe.directory '*'\n\n# Build the project and fuzzers.\n[[ -e build ]] && rm -rf build\ncmake \"${cmake_args[@]}\" -S . -B build\ncmake --build build --target fuzzers --parallel --verbose\n\n# Archive and copy to $OUT seed corpus if the build succeeded.\n# Postfix `_fuzzer` is used in Tarantool, postfix `_test` is\n# used in additional tests [1].\n#\n# 1. https://github.com/ligurio/lunapark\ncp test/static/*.dict test/static/*.options $OUT/\nfor f in $(find build/test/fuzz/ \\( -name '*_fuzzer' -o -name '*_test' \\) -type f);\ndo\n  name=$(basename $f);\n  module=$(echo $name | sed 's/_fuzzer//' | sed 's/_test//' )\n  corpus_dir=\"test/static/corpus/$module\"\n  echo \"Copying for $module\";\n  cp $f $OUT/\n  if [ -e \"$corpus_dir\" ]; then\n    zip --quiet -j $OUT/\"$name\"_seed_corpus.zip $corpus_dir/*\n  fi\ndone\n\n# Finish execution if libFuzzer is not used, because luzer\n# is libFuzzer-based.\n# Code coverage is not supported,\n# see https://github.com/google/oss-fuzz/issues/14859.\nif [[ \"$FUZZING_ENGINE\" != libfuzzer ]] ||\n   [[ \"$SANITIZER\" == \"coverage\" ]]; then\n  exit\nfi\n\n# Tarantool binary is required for running luzer-based tests.\n# Beware, tarantool binary is linked with libFuzzer statically\n# when CMake options ENABLE_LIBFUZZER_STATIC_LINKAGE and\n# ENABLE_FUZZER are passed, the linkage can fail\n# when other fuzzing engine is used due to symbols conflict,\n# see FUZZING_ENGINE environment variable.\ncmake --build build --target tarantool --parallel --verbose\n\nLUA_RUNTIME_NAME=tarantool\nTARANTOOL_PATH=build/src/$LUA_RUNTIME_NAME\nLUA_MODULES_DIR=lua_modules\n\napt install -y luarocks\n\nLUA_LIBRARIES=$(realpath build/third_party/luajit/src/libluajit.a)\nLUA_INCLUDE_DIR=$(realpath third_party/luajit/src)\nluarocks install --lua-version 5.1 --server=https://luarocks.org/dev --tree=$LUA_MODULES_DIR luzer LUA_LIBRARIES=\"$LUA_LIBRARIES\" LUA_INCLUDE_DIR=\"$LUA_INCLUDE_DIR\" OSS_FUZZ=ON ENABLE_LUAJIT=ON LUAJIT_FRIENDLY_MODE=ON\n\n# These Lua modules exists only when target `lua-tests` is used,\n# see cmake/BuildLuaTests.cmake.\nlua_lib_path=\"build/test/fuzz/lua-tests/src/tests/lapi/lib*.lua\"\nif [ -f $lua_lib_path ]; then\n    cp $lua_lib_path $OUT\nfi\nLUZER_TEST_DIR=\"build/luzer_tests\"\n# Copying luzer-based tests to a $LUZER_TEST_DIR.\ncmake --build build --parallel --verbose --target copy_tests\n# Generating test wrappers for luzer-based tests.\nfor test_path in $(find $LUZER_TEST_DIR -name \"*.lua\" -type f);\ndo\n  test_file=$(basename $test_path);\n  test_name_we=\"${test_file%.*}\";\n  module_name=$(echo $test_name_we | sed 's/_test//' )\n  \"$SRC/compile_lua_fuzzer\" \"$LUA_RUNTIME_NAME\" $test_file\n  cp \"$test_path\" \"$OUT/\"\n  corpus_dir=\"test/static/corpus/$module_name\"\n  if [ -e \"$corpus_dir\" ]; then\n    zip --quiet -j $OUT/\"$test_name_we\"_seed_corpus.zip $corpus_dir/*\n    echo \"Build corpus '$OUT/\"$test_name_we\"_seed_corpus.zip' for the test '$test_name_we'\"\n  fi\ndone\n\ncp $TARANTOOL_PATH \"$OUT/$LUA_RUNTIME_NAME\"\ncp -R $LUA_MODULES_DIR \"$OUT/\"\n\n# Don't consider compile_lua_fuzzer as a test.\nrm -f \"$OUT/compile_lua_fuzzer\" \"$SRC/compile_lua_fuzzer\"\n",
+  "project_yaml": "base_os_version: ubuntu-24-04\nhomepage: \"https://www.tarantool.io/en/\"\nlanguage: c\nbuilds_per_day: 4\nprimary_contact: \"estetus@gmail.com\"\nauto_ccs:\n  - \"estetus@gmail.com\"\n  - \"totktonada.ru@gmail.com\"\n  - \"sergeykaplun1998@gmail.com\"\n  - \"imeevma@gmail.com\"\n  - \"boris.stepanenko@gmail.com\"\nsanitizers:\n  - address\n  - undefined\narchitectures:\n  - x86_64\nmain_repo: \"https://github.com/tarantool/tarantool\"\n",
+  "dockerfile": "# Copyright 2021 Google LLC\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n################################################################################\n\nFROM gcr.io/oss-fuzz-base/base-builder:ubuntu-24-04\nRUN apt-get update && apt-get install -y \\\n\tbuild-essential cmake make coreutils sed lld \\\n\tautoconf automake libtool zlib1g-dev \\\n\tlibreadline-dev libncurses5-dev libssl-dev \\\n\tlibunwind-dev luajit wget ninja-build \\\n\tlibzstd-dev libyaml-dev libcurl4-openssl-dev\n\nRUN git clone --jobs $(nproc) --recursive https://github.com/tarantool/tarantool\nWORKDIR $SRC/tarantool\n\n# Download a seed corpus.\nRUN rm -rf test/static\nRUN git clone https://github.com/ligurio/tarantool-corpus test/static\n\nCOPY build.sh $SRC/\nCOPY compile_lua_fuzzer $SRC/\n",
+  "apt_packages": [
+    "autoconf",
+    "automake",
+    "build-essential",
+    "cmake",
+    "coreutils",
+    "libcurl4-openssl-dev",
+    "libncurses5-dev",
+    "libreadline-dev",
+    "libssl-dev",
+    "libtool",
+    "libunwind-dev",
+    "libyaml-dev",
+    "libzstd-dev",
+    "lld",
+    "luajit",
+    "make",
+    "ninja-build",
+    "sed",
+    "wget",
+    "zlib1g-dev"
+  ]
+}
