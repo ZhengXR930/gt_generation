@@ -1,0 +1,292 @@
+"""Small, JSON-serializable domain model owned by the controller."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any
+
+
+STAGES = ("admission", "source", "root", "propagation", "target")
+
+
+class StageStatus(str, Enum):
+    CONFIRMED = "confirmed"
+    REFUTED = "refuted"
+    UNRESOLVED = "unresolved"
+    NOT_REACHED = "not_reached"
+    NOT_DECLARED = "not_declared"
+    OBSERVED_BUT_BLOCKED = "observed_but_blocked"
+
+
+@dataclass(frozen=True)
+class SourceAnchor:
+    file: str
+    function: str
+    fact: str
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "SourceAnchor":
+        if set(value) != {"file", "function", "fact"}:
+            raise ValueError("source anchor must contain file, function, and fact")
+        fields = {key: str(value[key]).strip() for key in value}
+        if not all(fields.values()):
+            raise ValueError("source anchor fields cannot be empty")
+        return cls(**fields)
+
+
+@dataclass(frozen=True)
+class RewardSpec:
+    claims: dict[str, str | None]
+    evidence: dict[str, tuple[SourceAnchor, ...]]
+
+    def __post_init__(self) -> None:
+        if tuple(self.claims) != STAGES or set(self.evidence) != set(STAGES):
+            raise ValueError(f"reward spec stages must be {STAGES}")
+        for stage in STAGES:
+            claim = self.claims[stage]
+            if claim is not None and not str(claim).strip():
+                raise ValueError(f"{stage} claim cannot be blank")
+            anchors = self.evidence[stage]
+            if len(anchors) > 2:
+                raise ValueError(f"{stage} has more than two source anchors")
+            if bool(claim) != bool(anchors):
+                raise ValueError(f"{stage} claim and evidence must co-occur")
+
+    @property
+    def constructable(self) -> bool:
+        return any(self.claims.values())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "claims": dict(self.claims),
+            "evidence": {
+                stage: [asdict(anchor) for anchor in self.evidence[stage]]
+                for stage in STAGES
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "RewardSpec":
+        if set(value) != {"claims", "evidence"}:
+            raise ValueError("reward spec must contain claims and evidence")
+        claims = value["claims"]
+        evidence = value["evidence"]
+        if not isinstance(claims, dict) or not isinstance(evidence, dict):
+            raise ValueError("claims and evidence must be objects")
+        normalized_claims: dict[str, str | None] = {}
+        normalized_evidence: dict[str, tuple[SourceAnchor, ...]] = {}
+        for stage in STAGES:
+            claim = claims.get(stage)
+            normalized_claims[stage] = None if claim is None else str(claim).strip()
+            items = evidence.get(stage)
+            if not isinstance(items, list):
+                raise ValueError(f"{stage} evidence must be a list")
+            normalized_evidence[stage] = tuple(SourceAnchor.from_dict(x) for x in items)
+        return cls(normalized_claims, normalized_evidence)
+
+
+@dataclass(frozen=True)
+class TaskContext:
+    task_id: str
+    issue_description: str
+    codebase_root: str
+    source_manifest_sha256: str
+    reward_spec: RewardSpec
+    spec_model: str
+    created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["reward_spec"] = self.reward_spec.to_dict()
+        return value
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "TaskContext":
+        copied = dict(value)
+        copied["reward_spec"] = RewardSpec.from_dict(copied["reward_spec"])
+        return cls(**copied)
+
+
+@dataclass(frozen=True)
+class TrajectoryEvent:
+    sequence: int
+    timestamp: str
+    source: str
+    kind: str
+    payload: dict[str, Any]
+
+
+@dataclass
+class ObservationState:
+    events: list[TrajectoryEvent] = field(default_factory=list)
+    last_observer_sequence: int = 0
+    last_submission_sequence: int = 0
+    submission_requested: bool = False
+    awaiting_verification: bool = False
+    terminal_reason: str | None = None
+
+    def append(self, *, timestamp: str, source: str, kind: str,
+               payload: dict[str, Any]) -> TrajectoryEvent:
+        event = TrajectoryEvent(
+            sequence=len(self.events) + 1,
+            timestamp=timestamp,
+            source=source,
+            kind=kind,
+            payload=payload,
+        )
+        self.events.append(event)
+        return event
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "events": [asdict(event) for event in self.events],
+            "last_observer_sequence": self.last_observer_sequence,
+            "last_submission_sequence": self.last_submission_sequence,
+            "submission_requested": self.submission_requested,
+            "awaiting_verification": self.awaiting_verification,
+            "terminal_reason": self.terminal_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ObservationState":
+        copied = dict(value)
+        copied["events"] = [TrajectoryEvent(**item) for item in copied.get("events", [])]
+        return cls(**copied)
+
+
+@dataclass(frozen=True)
+class Probe:
+    stage: str
+    anchor_kind: str
+    file: str
+    function: str
+    statement: str | None
+    captures: tuple[str, ...] = ()
+    condition: str | None = None
+    purpose: str = ""
+
+    def __post_init__(self) -> None:
+        if self.stage not in STAGES:
+            raise ValueError(f"invalid probe stage: {self.stage}")
+        if self.anchor_kind not in {"issue", "trace"}:
+            raise ValueError("probe anchor_kind must be issue or trace")
+        if not self.file.strip() or not self.function.strip():
+            raise ValueError("probe file and function are required")
+
+
+@dataclass(frozen=True)
+class ProbePlan:
+    probes: tuple[Probe, ...]
+    trace_claims: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "probes": [asdict(probe) for probe in self.probes],
+            "trace_claims": list(self.trace_claims),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ProbePlan":
+        probes = []
+        for item in value.get("probes", []):
+            copied = dict(item)
+            copied["captures"] = tuple(copied.get("captures", []))
+            probes.append(Probe(**copied))
+        claims = value.get("trace_claims", [])
+        if not isinstance(claims, list):
+            raise ValueError("trace_claims must be a list")
+        return cls(tuple(probes), tuple(str(x) for x in claims))
+
+
+@dataclass(frozen=True)
+class RuntimeFact:
+    fact_id: str
+    stage: str
+    kind: str
+    statement: str
+    data: dict[str, Any] = field(default_factory=dict)
+    trusted: bool = True
+
+    def __post_init__(self) -> None:
+        if self.stage not in STAGES and self.stage != "trigger":
+            raise ValueError(f"invalid runtime fact stage: {self.stage}")
+        if not self.fact_id or not self.statement:
+            raise ValueError("runtime fact id and statement are required")
+
+
+@dataclass(frozen=True)
+class RawRuntimeReport:
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    trigger_observed: bool
+    stage_observations: dict[str, StageStatus]
+    facts: tuple[RuntimeFact, ...]
+    instrumentation_available: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class StageAssessment:
+    stages: dict[str, StageStatus]
+    longest_confirmed_prefix: tuple[str, ...]
+    first_unresolved: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stages": {stage: self.stages[stage].value for stage in STAGES},
+            "longest_confirmed_prefix": list(self.longest_confirmed_prefix),
+            "first_unresolved": self.first_unresolved,
+        }
+
+
+@dataclass(frozen=True)
+class Feedback:
+    summary: str
+    contradiction: str | None
+    delta: str
+    evidence_ids: tuple[str, ...]
+    assessment: StageAssessment
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary,
+            "contradiction": self.contradiction,
+            "delta": self.delta,
+            "evidence_ids": list(self.evidence_ids),
+            "assessment": self.assessment.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class EvidenceRecord:
+    candidate_id: str
+    candidate_sha256: str
+    attempt_number: int
+    duplicate_of: str | None
+    probe_plan: ProbePlan
+    runtime: RawRuntimeReport
+    assessment: StageAssessment
+    feedback: Feedback
+    created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "candidate_sha256": self.candidate_sha256,
+            "attempt_number": self.attempt_number,
+            "duplicate_of": self.duplicate_of,
+            "probe_plan": self.probe_plan.to_dict(),
+            "runtime": {
+                **asdict(self.runtime),
+                "stage_observations": {
+                    key: value.value
+                    for key, value in self.runtime.stage_observations.items()
+                },
+                "facts": [asdict(fact) for fact in self.runtime.facts],
+            },
+            "assessment": self.assessment.to_dict(),
+            "feedback": self.feedback.to_dict(),
+            "created_at": self.created_at,
+        }

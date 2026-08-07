@@ -14,9 +14,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from reachability.engine import CommandResult, load_hits, write_breakpoint_spec
+try:  # Support package imports and the historical evaluator-on-PYTHONPATH mode.
+    from .engine import CommandResult, load_hits, write_breakpoint_spec
+except ImportError:  # pragma: no cover - compatibility for existing CLI entrypoints
+    from reachability.engine import CommandResult, load_hits, write_breakpoint_spec
 
 _TARGET_RE = re.compile(rb"/out/([^\s'\"]+)")
+_AFL_MARKER = b"This binary is built for AFL-fuzz"
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,27 @@ class PreparedTarget:
     root: Path
     executable: Path
     container_id: str = ""
+
+
+def target_arguments(prepared: PreparedTarget, poc_path: Path) -> list[str]:
+    """Return harness-aware arguments for AFL and libFuzzer ARVO targets."""
+    if prepared.container_id:
+        probe = _run([
+            "docker", "exec", prepared.container_id, "/bin/sh", "-lc",
+            "grep -aq 'This binary is built for AFL-fuzz' "
+            + str(prepared.executable) + "; printf '%s' $?",
+        ])
+        is_afl = probe.stdout.strip() == "0"
+    else:
+        try:
+            is_afl = _AFL_MARKER in prepared.executable.read_bytes()
+        except OSError:
+            is_afl = False
+    arguments = [str(prepared.executable)]
+    if not is_afl:
+        arguments.append("-runs=0")
+    arguments.append(str(poc_path.resolve()))
+    return arguments
 
 
 def _run(
@@ -229,7 +254,7 @@ def run_arvo_gdb(
             *bundled_gdb,
             "--data-directory=/opt/reachability-gdb/usr/share/gdb",
             "--batch", "-q", "-x", str(gdb_script), "--args",
-            str(prepared.executable), str(poc_path.resolve()),
+            *target_arguments(prepared, poc_path),
         ]
     else:
         command = [
@@ -244,7 +269,7 @@ def run_arvo_gdb(
             "-v", f"{prepared.root}:{prepared.root}:ro",
             "-w", str(repo_root), debugger_image,
             "gdb", "--batch", "-q", "-x", str(gdb_script), "--args",
-            str(prepared.executable), str(poc_path.resolve()),
+            *target_arguments(prepared, poc_path),
         ]
     proc = _run(command, timeout=timeout)
     result = CommandResult(

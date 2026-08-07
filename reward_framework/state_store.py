@@ -1,0 +1,170 @@
+"""Crash-safe task, trajectory, candidate, and evidence persistence."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .models import EvidenceRecord, ObservationState, TaskContext
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@dataclass(frozen=True)
+class RegisteredCandidate:
+    candidate_id: str
+    sha256: str
+    attempt_number: int
+    duplicate_of: str | None
+    candidate_dir: Path
+    attempt_dir: Path
+
+
+class StateStore:
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.candidates_dir = self.root / "candidates"
+        self.evidence_dir = self.root / "evidence"
+
+    @property
+    def task_path(self) -> Path:
+        return self.root / "task_context.json"
+
+    @property
+    def observation_path(self) -> Path:
+        return self.root / "observation_state.json"
+
+    def save_task(self, task: TaskContext) -> None:
+        if self.task_path.exists():
+            existing = TaskContext.from_dict(json.loads(self.task_path.read_text()))
+            if existing.task_id != task.task_id:
+                raise ValueError("state directory already belongs to another task")
+        atomic_json(self.task_path, task.to_dict())
+
+    def load_task(self) -> TaskContext:
+        return TaskContext.from_dict(json.loads(self.task_path.read_text()))
+
+    def save_observation(self, state: ObservationState) -> None:
+        atomic_json(self.observation_path, state.to_dict())
+
+    def load_observation(self) -> ObservationState:
+        if not self.observation_path.exists():
+            return ObservationState()
+        return ObservationState.from_dict(json.loads(self.observation_path.read_text()))
+
+    def append_event(self, *, source: str, kind: str,
+                     payload: dict[str, Any]) -> ObservationState:
+        state = self.load_observation()
+        state.append(timestamp=utc_now(), source=source, kind=kind, payload=payload)
+        self.save_observation(state)
+        return state
+
+    def _index(self) -> dict[str, Any]:
+        path = self.candidates_dir / "index.json"
+        if not path.exists():
+            return {"total_submissions": 0, "unique_candidates": 0,
+                    "by_sha256": {}, "attempts": []}
+        return json.loads(path.read_text())
+
+    def register_candidate(self, *, poc_path: Path, trace_path: Path,
+                           checkpoint_path: Path | None = None) -> RegisteredCandidate:
+        poc = poc_path.resolve()
+        trace = trace_path.resolve()
+        if not poc.is_file() or not trace.is_file():
+            raise FileNotFoundError("candidate PoC and trace must both exist")
+        content = poc.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        index = self._index()
+        attempt_number = int(index["total_submissions"]) + 1
+        duplicate_of = index["by_sha256"].get(digest)
+        if duplicate_of:
+            candidate_id = str(duplicate_of)
+            candidate_dir = self.candidates_dir / candidate_id
+        else:
+            unique_number = int(index["unique_candidates"]) + 1
+            candidate_id = f"candidate_{unique_number:04d}_{digest[:12]}"
+            candidate_dir = self.candidates_dir / candidate_id
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            (candidate_dir / "poc").write_bytes(content)
+            index["by_sha256"][digest] = candidate_id
+            index["unique_candidates"] = unique_number
+
+        attempt_dir = candidate_dir / "attempts" / f"attempt_{attempt_number:04d}"
+        attempt_dir.mkdir(parents=True, exist_ok=False)
+        shutil.copy2(trace, attempt_dir / "trace.json")
+        shutil.copy2(trace, candidate_dir / "latest_trace.json")
+        checkpoint_reference = None
+        if checkpoint_path is not None:
+            checkpoint_reference = str(checkpoint_path.resolve())
+        metadata = {
+            "attempt_number": attempt_number,
+            "candidate_id": candidate_id,
+            "sha256": digest,
+            "duplicate_of": duplicate_of,
+            "source_poc": str(poc),
+            "source_trace": str(trace),
+            "checkpoint": checkpoint_reference,
+            "created_at": utc_now(),
+        }
+        atomic_json(attempt_dir / "submission.json", metadata)
+        index["total_submissions"] = attempt_number
+        index["attempts"].append(metadata)
+        atomic_json(self.candidates_dir / "index.json", index)
+        return RegisteredCandidate(
+            candidate_id, digest, attempt_number, duplicate_of,
+            candidate_dir, attempt_dir,
+        )
+
+    def save_evidence(self, record: EvidenceRecord) -> Path:
+        path = self.evidence_dir / f"attempt_{record.attempt_number:04d}.json"
+        atomic_json(path, record.to_dict())
+        atomic_json(
+            self.candidates_dir / record.candidate_id / "latest_evidence.json",
+            record.to_dict(),
+        )
+        return path
+
+    def previous_distinct_evidence(self, candidate_sha256: str) -> dict[str, Any] | None:
+        if not self.evidence_dir.exists():
+            return None
+        for path in sorted(self.evidence_dir.glob("attempt_*.json"), reverse=True):
+            value = json.loads(path.read_text())
+            if value.get("candidate_sha256") != candidate_sha256:
+                return value
+        return None
+
+    def candidate_stats(self) -> dict[str, Any]:
+        index = self._index()
+        total = int(index["total_submissions"])
+        unique = int(index["unique_candidates"])
+        return {
+            "total_submissions": total,
+            "unique_candidates": unique,
+            "duplicate_submissions": total - unique,
+            "unique_ratio": (unique / total) if total else 0.0,
+        }
