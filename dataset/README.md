@@ -51,11 +51,11 @@ Candidate pools and the one-off selection script are intentionally omitted now t
 Ground-truth JSON files use shared trace semantics across all samples, so individual `ground_truth.json` files do not repeat this policy.
 
 Each finalized sample package under `gt_results/<sample_id>/` also contains
-`issue_description.json`.  It is the natural-language task description exposed
-to the coding agent, together with its provenance metadata.  The aggregate
-`dataset/issue_manifest.json` is retained only as a corpus index; the sample
-package itself is self-contained and does not depend on a parallel directory of
-per-sample text files.
+`issue_description.json`. It contains only the sample ID and the natural-language
+task description exposed to the coding agent. Description length is neither
+stored nor used as an admission criterion. The aggregate
+`dataset/issue_manifest.json` is retained only as an ID-to-description corpus
+index; the sample package itself is self-contained.
 
 - `coarse_trace` is a function-level control-flow summary. It should align with the key project frames in the observed sanitizer crash stack, while omitting incidental library/runtime frames when they do not help explain the vulnerability.
 - `fine_trace` is a statement-level vulnerability and data-flow trace, not a literal call stack. It should recover the attacker-controlled source, propagation or state transitions, root cause, and sink. It may omit stack frames that do not transform attacker-controlled state.
