@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def _repo_root() -> Path:
@@ -203,6 +204,157 @@ def _restore_uninstrumented_source(result_dir: Path, timeout: int = 1800) -> dic
     return status
 
 
+def _arvo_target_from_traces(result_dir: Path) -> str:
+    """The binary libFuzzer reported running, taken from a saved trace."""
+    for name in ("sanitizer_trace.txt", "default_crash_trace.txt",
+                 "vulnerable_assertion_trace.txt"):
+        path = result_dir / name
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # libFuzzer announces the binary it is about to run; that line is exact.
+        found = re.search(r"/out/([A-Za-z0-9_.-]+):\s+Running", text)
+        if not found:
+            # Otherwise a stack frame names it, with a +0x offset to strip.
+            found = re.search(r"/out/([A-Za-z0-9_.-]+)(?:\+0x[0-9a-f]+)?\b", text)
+        if found:
+            return found.group(1)
+    return ""
+
+
+def _arvo_context(result_dir: Path) -> dict[str, str] | None:
+    """Image, target and project for an ARVO package, or None if not ARVO.
+
+    prepare_report.json is not relied on: a completed package has been compacted
+    and no longer carries it.
+    """
+    report = result_dir / "prepare_report.json"
+    data: dict[str, Any] = {}
+    if report.is_file():
+        try:
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    if data and str(data.get("track") or "") not in ("arvo", ""):
+        return None
+
+    sample_id = str(data.get("sample_id") or result_dir.name)
+    info = result_dir / "sample_info.json"
+    project = str(data.get("project") or "")
+    if info.is_file():
+        try:
+            loaded = json.loads(info.read_text(encoding="utf-8"))
+            sample_id = str(loaded.get("sample_id") or sample_id)
+            project = project or str(loaded.get("project") or "")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    arvo_id = str(data.get("arvo_id") or "")
+    if not arvo_id:
+        if not sample_id.startswith("arvo_"):
+            return None
+        arvo_id = sample_id[len("arvo_"):]
+    if not arvo_id:
+        return None
+
+    return {
+        "arvo_id": arvo_id,
+        "image": str(data.get("vul_image") or f"n132/arvo:{arvo_id}-vul"),
+        "target": str(data.get("target") or "") or _arvo_target_from_traces(result_dir),
+        "project": project,
+    }
+
+
+def run_for_arvo(result_dir: Path, timeout: int = 2400) -> int:
+    """Run the debugger inside the sample's own ARVO image.
+
+    The image has the built target and the source but no gdb; installing it from
+    the image's own archive is what makes the measurement possible at all.
+    """
+    context = _arvo_context(result_dir)
+    if context is None:
+        return 1
+    target = context["target"]
+    if target:
+        binary = f"/out/{target}"
+    else:
+        # Nothing recorded it; if the image built exactly one target, that is it.
+        binary = ("$(set -- /out/*; for f; do [ -x \"$f\" ] && [ -f \"$f\" ] && "
+                  "echo \"$f\"; done | head -1)")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    optional = {
+        "--assertion-spec": "candidate_assertions.json",
+        "--assertion-trace": "vulnerable_assertion_trace.txt",
+        "--verified-invariants": "verified_invariants.json",
+        "--sanitizer-trace": "sanitizer_trace.txt",
+    }
+    arguments = [
+        "--gt", "/gt/ground_truth.json",
+        "--codebase", '"$SRC_ROOT"',
+        "--debug-command", f'"{binary} /gt/poc"',
+        "--poc", "/gt/poc",
+        "--out-dir", "/gt/reachability",
+    ]
+    for flag, name in optional.items():
+        if (result_dir / name).is_file():
+            arguments += [flag, f"/gt/{name}"]
+
+    # Prefer the checkout named after the project; fall back to the first one.
+    inner = (
+        "set -e\n"
+        "if ! command -v gdb >/dev/null 2>&1; then\n"
+        "  apt-get update -qq >/dev/null 2>&1 || true\n"
+        "  apt-get install -y -qq gdb >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "command -v gdb >/dev/null 2>&1 || { echo 'no gdb in image' >&2; exit 3; }\n"
+        f"SRC_ROOT=/src/{shlex.quote(context['project'])}\n"
+        'if [ ! -d "$SRC_ROOT" ]; then\n'
+        "  SRC_ROOT=$(for d in /src/*/; do [ -d \"$d/.git\" ] && { echo \"${d%/}\"; break; }; done)\n"
+        "fi\n"
+        'if [ -z "$SRC_ROOT" ] || [ ! -d "$SRC_ROOT" ]; then SRC_ROOT=/src; fi\n'
+        "export PYTHONPATH=/repo/gt_generation:/repo\n"
+        "python3 -m gt_toolkit reachability " + " ".join(arguments) + "\n"
+        f"chown -R {os.getuid()}:{os.getgid()} /gt/reachability 2>/dev/null || true\n"
+    )
+
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--entrypoint", "bash",
+            *_proxy_environment(),
+            "-v", f"{repo_root}:/repo:ro",
+            "-v", f"{result_dir}:/gt",
+            context["image"], "-lc", inner,
+        ],
+        capture_output=True, text=True, errors="replace", timeout=timeout,
+    )
+    produced = result_dir / "reachability" / "reachability_report.json"
+    if produced.is_file():
+        (result_dir / "reachability_report.json").write_text(
+            produced.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        print(json.dumps({"reachability": "ran", "track": "arvo",
+                          "returncode": proc.returncode}))
+        return 0
+    print(json.dumps({
+        "reachability": "failed", "track": "arvo",
+        "returncode": proc.returncode,
+        "stderr": proc.stderr[-600:],
+    }))
+    return 1
+
+
+def _proxy_environment() -> list[str]:
+    """Forward whichever proxy variables are set; apt inside needs them."""
+    forwarded: list[str] = []
+    for name in ("http_proxy", "https_proxy", "no_proxy",
+                 "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+        value = os.environ.get(name)
+        if value:
+            forwarded += ["-e", f"{name}={value}"]
+    return forwarded
+
+
 def run_for_result_dir(result_dir: Path, timeout: int = 900) -> int:
     """Run reachability for one package, on whichever side of the wall it lives.
 
@@ -216,8 +368,8 @@ def run_for_result_dir(result_dir: Path, timeout: int = 900) -> int:
         print(json.dumps({"reachability": "skipped", "reason": "no build.sh"}))
         return 0
     if "gt-memory-env" not in build_sh.read_text(encoding="utf-8", errors="replace"):
-        print(json.dumps({"reachability": "skipped", "reason": "arvo track"}))
-        return 0
+        # ARVO: no build.sh wrapper, so run the debugger in the sample's image.
+        return run_for_arvo(result_dir)
     debug_command = derive_debug_command(result_dir)
     if not debug_command:
         print(json.dumps({"reachability": "skipped", "reason": "no reproduction command"}))

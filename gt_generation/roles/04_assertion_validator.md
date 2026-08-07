@@ -304,7 +304,23 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit reachability \
 `--debug-wrapper` passes the whole gdb invocation to `build.sh` as one shell
 word; `--debug-path-map` rewrites host paths under the result directory to their
 `/gt` equivalents, including the gdb driver script the tool stages beside the
-outputs. Omit both for ARVO, which runs the debugger directly.
+outputs.
+
+**ARVO samples do not use that form at all.** The target lives inside the
+sample's image and links its glibc and sanitizer runtime, so a debugger started
+on the host cannot attach to it. Run the deterministic entry point instead:
+
+```bash
+PYTHONPATH=gt_generation python3 -m gt_toolkit reachability \
+  --for-result-dir <result_dir>
+```
+
+It reads the image, the fuzz target and the project source root out of the
+package, starts the debugger inside that image, and writes
+`reachability_report.json` to the package root. Do not assemble the arguments by
+hand for ARVO, and do not report reachability as unavailable without running
+this: a report with no hits and null R levels fails `audit-package` at Stage 05
+even when every assertion is sound.
 
 `reachability_report.json` must end with `reachability_checked` true and the R
 levels resolved. `audit-package` rejects a package whose reachability was never

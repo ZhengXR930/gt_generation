@@ -82,6 +82,19 @@ the scored source is that function's own consuming statement and the sink is the
 operation reached through that call. Set `static_valid` false and name the correct
 project statement in the feedback.
 
+Whether a location is harness code is decided by the toolkit, not by reading the path.
+Before you require any anchor to move, run
+
+```bash
+PYTHONPATH=gt_generation python3 -m gt_toolkit validate <result_dir>/ground_truth.json --json
+```
+
+and read its errors. An anchor that passes this check is not in the harness, however the
+file is named, and you may not reject it on that ground. Never name a replacement anchor
+that this check would reject: `apps/fuzzers/`, `test/fuzzing/`, `ossfuzz/` and the rest
+are harness paths even when the function inside them looks like ordinary project code,
+and demanding one leaves the sample unable to satisfy both you and the gate.
+
 Check source anchors, each vulnerability-relevant data/state transition, and the global
 causal chain. Completeness means lossless vulnerability-logic completeness, not coverage
 of every executed call, branch, return, loop iteration, or parser phase, and not a coarse
