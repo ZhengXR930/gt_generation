@@ -199,3 +199,35 @@ def test_trace_semantic_labels_are_rejected(tmp_path: Path) -> None:
     assert result["ok"] is False
     assert "coarse_trace[0] must not contain role or kind" in result["errors"]
     assert "fine_trace[0] must not contain role or kind" in result["errors"]
+
+
+def test_scored_anchors_reject_fuzzer_harness_functions(tmp_path: Path) -> None:
+    gt = _base_gt()
+    gt["sink"].update({
+        "file": "tests/fuzzer/target_fuzzer.cc",
+        "function": "LLVMFuzzerTestOneInput",
+        "line": 44,
+    })
+
+    result = _run_validate(gt, tmp_path)
+
+    assert result["ok"] is False
+    assert any("sink is anchored in unscored fuzzing harness" in item for item in result["errors"])
+
+
+def test_scored_anchor_trace_step_cannot_point_to_harness_step(tmp_path: Path) -> None:
+    gt = _base_gt()
+    gt["root_cause"]["trace_step"] = 2
+    gt["fine_trace"][1].update({
+        "file": "fuzz/fuzz_target.c",
+        "function": "helper_inside_harness",
+        "line": 22,
+    })
+
+    result = _run_validate(gt, tmp_path)
+
+    assert result["ok"] is False
+    assert any(
+        "root_cause.trace_step points to unscored fuzzing harness" in item
+        for item in result["errors"]
+    )

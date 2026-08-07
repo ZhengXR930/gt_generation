@@ -30,7 +30,13 @@ created by Stage 00. Never delete, rename, or rewrite them during validation or 
    relevant value transformation, predicate, memory/lifetime effect, or carried value
    to the sink unexplained. Do not select ordinary reachability plumbing, restatements
    of an already selected transition, incidental PoC state, generic API facts, or node
-   observations covered by the endpoints of a selected edge. There is no numeric quota:
+   observations covered by the endpoints of a selected edge. Do not select fuzzing
+   harness code as a verified invariant node, root criterion, or edge endpoint:
+   `LLVMFuzzerTestOneInput`, other harness callbacks, and helper functions in harness
+   files/directories (`fuzz/`, `fuzzer/`, `fuzzing/`, `ossfuzz/`, `*_fuzzer.*`) are
+   unscored test boundaries. If Stage 02's top-level source/root/sink or a trace step is
+   anchored there, stop and report the GT quality error instead of freezing assertions
+   over the harness. There is no numeric quota:
    the selected subgraph is as small as the particular vulnerability permits. Minimal
    means semantically irreducible, not the fewest JSON objects: retain every propagation
    hop where the carried value, alias/owner, or memory/lifetime state changes, and never

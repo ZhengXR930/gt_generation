@@ -46,15 +46,21 @@ only a function-level waypoint with `step`, `file`, `function`, and `summary`.
 
 `source` is the first *project-code* statement that consumes attacker-controlled input
 and creates vulnerability-relevant data or state: a parser/load/read/materialization
-point. For libFuzzer/OSS-Fuzz samples `LLVMFuzzerTestOneInput` is an unscored test
-boundary and must never be `source`; the same holds for any other fuzzer entry point.
+point. `root_cause` is the project statement that creates or fails to prevent the
+vulnerable state, and `sink` is the project unsafe operation that consumes it. None of
+these scored anchors may live in fuzzing harness code. For libFuzzer/OSS-Fuzz samples
+`LLVMFuzzerTestOneInput` is an unscored test boundary and must never be `source`,
+`root_cause`, or `sink`; the same holds for any other fuzzer entry point and helper
+functions in harness-only files such as `fuzz/`, `fuzzer/`, `fuzzing/`, `ossfuzz/`,
+or files named `*_fuzzer.*`.
 Anchor `source` at the project statement that first reads `data,size` into a length,
 count, object, ownership/lifetime state, dispatch key, or equivalent state used by the
 vulnerable path. When the harness passes the buffer straight into the vulnerable
 function with no intervening project parser — common in shallow traces — the scored
 source is that function's own statement that consumes the buffer, not the harness call
 site. The harness may still appear as an ordinary fine-trace step; it just cannot be the
-scored anchor. `gt-toolkit validate` rejects a harness entry point as `source`.
+scored anchor. `gt-toolkit validate` rejects fuzzing harness code as a top-level scored
+anchor and rejects a top-level anchor whose `trace_step` points at a harness-only step.
 
 Do not merge two vulnerability-relevant transformations when the intermediate
 source-level value feeds a later predicate, arithmetic operation, memory operation, or

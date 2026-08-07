@@ -55,14 +55,34 @@ LEGACY_KEYS = {
 
 BOOTSTRAP_WORDING = ("first-pass", "selected as", "requires review")
 
-# libFuzzer entry points are the documented unscored test boundary, never the scored
-# source. Deliberately limited to fuzzer entries: a CLI-repro sample may legitimately
-# read its input in main(), and widening this set would retroactively invalidate such
-# ground truth on a rule the contract does not actually state.
+# Fuzzing harnesses are unscored test boundaries, never scored vulnerability
+# anchors. A CLI-repro sample may legitimately read its input in main(), so the
+# function-name denylist stays limited to known fuzzer callbacks; path checks are
+# used to catch helper functions that live inside harness-only source files.
 HARNESS_ENTRY_FUNCTIONS = {
+    "TestOneInput",
+    "FuzzTarget",
     "LLVMFuzzerTestOneInput",
     "LLVMFuzzerInitialize",
+    "LLVMFuzzerCustomMutator",
+    "LLVMFuzzerCustomCrossOver",
 }
+
+HARNESS_PATH_COMPONENTS = {
+    "fuzz",
+    "fuzzer",
+    "fuzzers",
+    "fuzzing",
+    "ossfuzz",
+    "oss-fuzz",
+    "harness",
+    "harnesses",
+}
+HARNESS_BASENAME_RE = re.compile(
+    r"(^|[_\-.])(fuzz|fuzzer|harness)([_\-.]|$)|"
+    r"(fuzz|fuzzer|harness)s?\.(c|cc|cpp|cxx|h|hpp)$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -116,24 +136,72 @@ def _check_location(data: dict, key: str, report: Report) -> None:
         report.warn("source missing value_from (untrusted-input provenance)")
 
 
-def _check_scored_source_boundary(data: dict, report: Report) -> None:
-    """`source` must be project code, not the libFuzzer entry point.
+def _normalize_function_name(value: Any) -> str:
+    text = str(value or "").strip().split("(", 1)[0].strip()
+    # Some historical GT values include reviewer annotations such as
+    # "LLVMFuzzerTestOneInput / size clamp"; compare the executable prefix.
+    return text.split("/", 1)[0].strip()
+
+
+def harness_location_reason(loc: Any) -> str | None:
+    """Return why a source location is a fuzzing harness boundary, if it is one."""
+    if not isinstance(loc, dict):
+        return None
+    function = _normalize_function_name(loc.get("function"))
+    if function in HARNESS_ENTRY_FUNCTIONS:
+        return f"function {function!r} is a fuzzing harness entry point"
+    rel = str(loc.get("file") or "").replace("\\", "/").strip().lower()
+    if not rel:
+        return None
+    parts = [part for part in rel.split("/") if part]
+    if any(part in HARNESS_PATH_COMPONENTS for part in parts[:-1]):
+        return f"file {loc.get('file')!r} is under a fuzzing harness directory"
+    name = parts[-1] if parts else rel
+    if HARNESS_BASENAME_RE.search(name):
+        return f"file {loc.get('file')!r} looks like a fuzzing harness source"
+    return None
+
+
+def is_harness_location(loc: Any) -> bool:
+    return harness_location_reason(loc) is not None
+
+
+def _check_scored_anchor_boundaries(data: dict, report: Report) -> None:
+    """Top-level scored anchors must be project vulnerability code, not harness code.
 
     LLVMFuzzerTestOneInput is the unscored test boundary: every libFuzzer sample
-    shares it, so scoring it gives the answer away for free. The scored source is
-    the project parser/helper statement that reads `data,size` into a length,
-    count, object, ownership state, or dispatch key on the vulnerable path.
-    Shallow traces are the most exposed, because the harness sits close to the sink.
+    shares it, so scoring it gives the answer away for free. The same applies to
+    root/sink anchors in harness wrappers: a correct GT must identify the project
+    source statement that creates the vulnerable state and the project unsafe
+    operation that consumes it.
     """
-    source = data.get("source")
-    if not isinstance(source, dict):
-        return
-    function = str(source.get("function") or "").strip()
-    if function in HARNESS_ENTRY_FUNCTIONS:
-        report.err(
-            f"source.function is the unscored harness boundary '{function}'; "
-            "use the project statement that first consumes the fuzzer buffer"
-        )
+    fine = data.get("fine_trace")
+    fine_by_step = (
+        {
+            step.get("step"): step
+            for step in fine
+            if isinstance(step, dict)
+        }
+        if isinstance(fine, list)
+        else {}
+    )
+    for key in ("source", "root_cause", "sink"):
+        anchor = data.get(key)
+        reason = harness_location_reason(anchor)
+        if reason:
+            report.err(
+                f"{key} is anchored in unscored fuzzing harness code: {reason}; "
+                "use the project source statement for this vulnerability anchor"
+            )
+        if not isinstance(anchor, dict):
+            continue
+        linked = fine_by_step.get(anchor.get("trace_step"))
+        linked_reason = harness_location_reason(linked)
+        if linked_reason:
+            report.err(
+                f"{key}.trace_step points to unscored fuzzing harness code: "
+                f"{linked_reason}; link it to the project-code fine_trace step"
+            )
 
 
 def _check_bootstrap_wording(data: dict, report: Report) -> None:
@@ -202,7 +270,7 @@ def validate_data(
 
     for key in ("source", "sink", "root_cause", "tainted_value_origin"):
         _check_location(data, key, report)
-    _check_scored_source_boundary(data, report)
+    _check_scored_anchor_boundaries(data, report)
 
     # tainted_value_origin should carry the concrete value fields.
     tvo = data.get("tainted_value_origin", {})

@@ -12,7 +12,7 @@ from .assertions import (
     validate_frozen_spec,
     validate_invariant_bindings,
 )
-from .validate import validate_data
+from .validate import harness_location_reason, validate_data
 
 
 REQUIRED_FILES = (
@@ -96,6 +96,48 @@ def _artifact_reference_errors(
             continue
         if not candidate.is_file():
             errors.append(f"reachability artifact {name} is missing: {raw_path}")
+    return errors
+
+
+def _verified_invariant_harness_errors(verified_invariants: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+
+    def check(where: str, loc: dict[str, Any]) -> None:
+        reason = harness_location_reason(loc)
+        if reason:
+            errors.append(
+                f"verified_invariants.json {where} is anchored in unscored "
+                f"fuzzing harness code: {reason}"
+            )
+
+    criterion = verified_invariants.get("root_cause_criterion")
+    if isinstance(criterion, dict):
+        check("root_cause_criterion", criterion)
+
+    for index, node in enumerate(verified_invariants.get("nodes", [])):
+        if isinstance(node, dict):
+            check(f"nodes[{index}]", node)
+
+    for index, edge in enumerate(verified_invariants.get("edges", [])):
+        if not isinstance(edge, dict):
+            continue
+        check(
+            f"edges[{index}].from",
+            {
+                "file": edge.get("from_file"),
+                "function": edge.get("from_function"),
+                "line": edge.get("from_line"),
+            },
+        )
+        check(
+            f"edges[{index}].to",
+            {
+                "file": edge.get("to_file"),
+                "function": edge.get("to_function"),
+                "line": edge.get("to_line"),
+            },
+        )
+
     return errors
 
 
@@ -189,6 +231,7 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         documents["verified_invariants.json"], reconstructed_spec
     )
     errors.extend(f"invariant binding: {message}" for message in binding["errors"])
+    errors.extend(_verified_invariant_harness_errors(documents["verified_invariants.json"]))
 
     perturbations = documents["perturbation_results.json"]
     if perturbations.get("all_needed_witnessed") is not True:

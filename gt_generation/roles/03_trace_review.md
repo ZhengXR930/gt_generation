@@ -70,14 +70,17 @@ location and semantics. Review all other steps by their source operation and typ
 dependencies, not by a generated label. Coarse steps are unlabeled function-level
 waypoints.
 
-Reject a `source` anchored at a fuzzer entry point. `LLVMFuzzerTestOneInput` and any
-other harness entry are an unscored test boundary, never the scored source: the scored
-source is the project statement that first consumes the fuzzer buffer into a length,
-count, object, ownership/lifetime state, or dispatch key on the vulnerable path. This
-misanchoring is most likely on shallow traces where the harness calls the vulnerable
-function directly; in that case the scored source is that function's own consuming
-statement. Set `static_valid` false and name the correct project statement in the
-feedback.
+Reject any top-level `source`, `root_cause`, or `sink` anchored in fuzzing harness
+code. `LLVMFuzzerTestOneInput` and any other harness entry are unscored test
+boundaries, never scored anchors. The same applies to helper functions in harness-only
+files or directories such as `fuzz/`, `fuzzer/`, `fuzzing/`, `ossfuzz/`, or
+`*_fuzzer.*`: they may appear as ordinary trace context only when unavoidable, but the
+scored source/root/sink must be the project statement that consumes the input, creates
+the vulnerable state, or performs the unsafe operation. This misanchoring is most likely
+on shallow traces where the harness calls the vulnerable function directly; in that case
+the scored source is that function's own consuming statement and the sink is the project
+operation reached through that call. Set `static_valid` false and name the correct
+project statement in the feedback.
 
 Check source anchors, each vulnerability-relevant data/state transition, and the global
 causal chain. Completeness means lossless vulnerability-logic completeness, not coverage

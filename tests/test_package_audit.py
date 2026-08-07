@@ -19,6 +19,33 @@ def test_package_audit_rejects_missing_and_escaping_evidence_paths(tmp_path):
     assert any("escapes result directory" in error for error in errors)
 
 
+def test_verified_invariant_harness_errors_reject_scored_edges():
+    errors = package_audit._verified_invariant_harness_errors(
+        {
+            "root_cause_criterion": {
+                "invariant_id": "root",
+                "file": "src/parser.c",
+                "function": "parse",
+                "line": 10,
+            },
+            "nodes": [],
+            "edges": [
+                {
+                    "invariant_id": "edge.harness",
+                    "from_file": "src/parser.c",
+                    "from_function": "parse",
+                    "from_line": 10,
+                    "to_file": "tests/fuzz/parser_fuzzer.c",
+                    "to_function": "LLVMFuzzerTestOneInput",
+                    "to_line": 40,
+                }
+            ],
+        }
+    )
+
+    assert any("edges[0].to is anchored in unscored fuzzing harness" in error for error in errors)
+
+
 def test_package_audit_accepts_standalone_public_crash_trace(tmp_path):
     (tmp_path / "default_crash_trace.txt").write_text("ASAN crash state")
 
