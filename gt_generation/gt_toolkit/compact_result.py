@@ -12,6 +12,9 @@ from .package_audit import audit_package
 
 
 KEEP_FILES = {
+    # Repairing a package later means driving its ARVO workspace again,
+    # and that needs the image, container and target this records.
+    "prepare_report.json",
     "sample_info.json",
     "build.sh",
     "poc",

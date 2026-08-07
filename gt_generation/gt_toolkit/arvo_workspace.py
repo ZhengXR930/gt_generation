@@ -42,10 +42,30 @@ def _safe_name(sample_id: str) -> str:
 
 
 def _context(result_dir: Path) -> dict[str, Any]:
-    report = _load(result_dir / "prepare_report.json")
-    if report.get("track") != "arvo":
+    """Image, container and target for an ARVO package.
+
+    prepare_report.json is authoritative but optional: compact_result used to
+    delete it once a package completed, so a repair re-run of an older package
+    finds it missing. Everything in it can be recovered from what survives, and
+    refusing to do so turns every workspace command into a ValueError -- which
+    is how arvo_375220555 lost a confirmed differential on a re-run.
+    """
+    report_path = result_dir / "prepare_report.json"
+    report = _load(report_path) if report_path.is_file() else {}
+    track = str(report.get("track") or "")
+    if report and track and track != "arvo":
         raise ValueError("arvo-workspace requires an ARVO prepare_report.json")
     aid = str(report.get("arvo_id") or "")
+    if not aid:
+        name = result_dir.resolve().name
+        info = result_dir / "sample_info.json"
+        if info.is_file():
+            name = str(_load(info).get("sample_id") or name)
+        if not name.startswith("arvo_"):
+            raise ValueError("arvo-workspace requires an ARVO package")
+        aid = name[len("arvo_"):]
+    if not aid:
+        raise ValueError("arvo-workspace cannot determine the ARVO id")
     sample_id = f"arvo_{aid}"
     return {
         "sample_id": sample_id,
@@ -53,8 +73,24 @@ def _context(result_dir: Path) -> dict[str, Any]:
         "container": str(report.get("workspace_container") or _safe_name(sample_id)),
         "vul_image": str(report.get("vul_image") or f"n132/arvo:{aid}-vul"),
         "fix_image": str(report.get("fix_image") or f"n132/arvo:{aid}-fix"),
-        "target": str(report.get("target") or ""),
+        "target": str(report.get("target") or "") or _target_from_traces(result_dir),
     }
+
+
+def _target_from_traces(result_dir: Path) -> str:
+    """The binary libFuzzer reported running, from a saved trace."""
+    for name in ("sanitizer_trace.txt", "default_crash_trace.txt",
+                 "vulnerable_assertion_trace.txt"):
+        path = result_dir / name
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        found = re.search(r"/out/([A-Za-z0-9_.-]+):\s+Running", text)
+        if not found:
+            found = re.search(r"/out/([A-Za-z0-9_.-]+)(?:\+0x[0-9a-f]+)?\b", text)
+        if found:
+            return found.group(1)
+    return ""
 
 
 def _state_path(result_dir: Path) -> Path:
