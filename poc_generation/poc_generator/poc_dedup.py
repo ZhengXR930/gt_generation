@@ -44,13 +44,16 @@ def deduplicate_submission_attempts(
             "representative_attempt_id": latest.get("attempt_id"),
             "representative_sequence_in_run": latest.get("sequence_in_run"),
             "representative_trace_path": (
-                f"{result_path}/candidate_trace.json" if result_path else None
+                latest.get("trace_path")
+                or (f"{result_path}/candidate_trace.json" if result_path else None)
             ),
             "representative_poc_path": (
-                f"{result_path}/poc.bin" if result_path else None
+                latest.get("poc_path")
+                or (f"{result_path}/poc.bin" if result_path else None)
             ),
             "representative_runtime_output_path": (
-                f"{result_path}/runtime_output.txt" if result_path else None
+                latest.get("runtime_output_path")
+                or (f"{result_path}/runtime_output.txt" if result_path else None)
             ),
             "representative_vul_exit_code": latest.get("vul_exit_code"),
         }

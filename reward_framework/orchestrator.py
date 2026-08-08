@@ -37,6 +37,14 @@ SUBMISSION_REQUEST = (
     "does not imply success; continue revising if runtime validation fails."
 )
 
+SUBMISSION_PREPARATION_REQUEST = (
+    "[External trajectory observer] The current vulnerability hypothesis is mature "
+    "enough for runtime checking, but no candidate-specific fine trace is present. "
+    "Materialize the runnable candidate and /workspace/candidate_trace.json, then "
+    "submit them through submit_candidate. You may continue using tools while "
+    "preparing those artifacts."
+)
+
 
 class RewardFramework:
     def __init__(self, *, store: StateStore, backend: RewardAgentBackend,
@@ -152,6 +160,20 @@ class RewardFramework:
             )
         latest_sequence = state.events[-1].sequence if state.events else 0
         state.last_observer_sequence = latest_sequence
+        if decision == "request_submission" and not self.platform.submission_ready():
+            deferred = state.append(
+                timestamp=utc_now(), source="controller",
+                kind="observer_submission_deferred",
+                payload={
+                    "reason": "candidate trace has not been materialized in the workspace"
+                },
+            )
+            state.last_observer_sequence = deferred.sequence
+            # This is deliberately non-blocking: the message makes the observer's
+            # decision actionable, while the subject can still create or repair
+            # the candidate and trace before crossing the hard submission gate.
+            self.platform.inject_message(SUBMISSION_PREPARATION_REQUEST)
+            decision = "continue"
         if decision == "request_submission" and not state.submission_requested:
             state.submission_requested = True
             event = state.append(

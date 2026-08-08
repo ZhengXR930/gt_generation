@@ -777,7 +777,15 @@ def main() -> int:
     ap.add_argument("--model", default="deepseek/deepseek-chat")
     ap.add_argument("--base-url", default="")
     ap.add_argument("--api-key-env", default="")
-    ap.add_argument("--openhands-repo", type=Path, default=Path("/tmp/openhands-poc-smoke"))
+    ap.add_argument(
+        "--openhands-repo",
+        type=Path,
+        default=GT_ROOT / "external" / "OpenHands",
+        help=(
+            "Complete OpenHands 0.33.0 checkout. Run "
+            "scripts/setup_openhands.sh after cloning this repository."
+        ),
+    )
     ap.add_argument("--results-dir", type=Path, default=DEFAULT_POC_RESULTS / "local-smoke")
     args = ap.parse_args()
 

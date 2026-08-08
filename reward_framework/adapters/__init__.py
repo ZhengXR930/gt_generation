@@ -4,10 +4,12 @@ from .base import CallbackAdapter, PlatformAdapter
 from .openhands import (
     OpenHandsAdapter,
     create_openhands_adapter,
+    install_closed_network_runtime_route,
     install_openhands_reward_framework,
 )
 
 __all__ = [
     "CallbackAdapter", "PlatformAdapter", "OpenHandsAdapter",
-    "create_openhands_adapter", "install_openhands_reward_framework",
+    "create_openhands_adapter", "install_closed_network_runtime_route",
+    "install_openhands_reward_framework",
 ]

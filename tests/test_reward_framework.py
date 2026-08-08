@@ -15,7 +15,10 @@ from reward_framework.models import (
 from reward_framework.orchestrator import RewardFramework
 from reward_framework.runtime import StaticInstrumentationBackend
 from reward_framework.runtime import default_trigger_oracle
-from reward_framework.adapters.openhands import OpenHandsRewardTransport
+from reward_framework.adapters.openhands import (
+    OpenHandsRewardTransport,
+    is_direct_submit_invocation,
+)
 from reward_framework.instrumentation.arvo import (
     ArvoGDBInstrumentationBackend,
     compile_checkpoints,
@@ -24,6 +27,8 @@ from reward_framework.models import Probe
 from reward_framework.stage_evaluator import evaluate_stages
 from reward_framework.submission_tool import resolve_workspace_path
 from reward_framework.source_view import eligible_source_files
+from reward_framework.feedback_agent import fallback_feedback
+from poc_generation.poc_generator.run_sample import persist_reward_framework_state
 
 
 class FakeBackend:
@@ -110,6 +115,30 @@ def test_unavailable_instrumentation_is_unresolved_not_failure():
     result = evaluate_stages(spec, report)
     assert result.stages["admission"] == StageStatus.UNRESOLVED
     assert result.stages["source"] == StageStatus.NOT_REACHED
+
+
+def test_trigger_feedback_distinguishes_success_from_incomplete_stage_attribution():
+    anchor = SourceAnchor("a.c", "f", "fact")
+    spec = RewardSpec(
+        {stage: stage for stage in ("admission", "source", "root", "propagation", "target")},
+        {stage: (anchor,) for stage in ("admission", "source", "root", "propagation", "target")},
+    )
+    report = RawRuntimeReport(
+        77, "MemorySanitizer", "", True,
+        {
+            "admission": StageStatus.CONFIRMED,
+            "source": StageStatus.CONFIRMED,
+            "root": StageStatus.CONFIRMED,
+            "target": StageStatus.CONFIRMED,
+        },
+        (), True,
+    )
+    assessment = evaluate_stages(spec, report)
+    feedback = fallback_feedback(report, assessment, "first")
+    assert assessment.first_unresolved == "propagation"
+    assert assessment.stages["target"] == StageStatus.OBSERVED_BUT_BLOCKED
+    assert "independent trigger is confirmed" in feedback.summary
+    assert "stage attribution" in feedback.summary
 
 
 def test_generic_exit_one_is_not_trigger_and_paths_cannot_escape(tmp_path):
@@ -289,6 +318,9 @@ def test_openhands_transport_calls_host_framework(tmp_path):
             self.calls.append(arguments)
             return {"triggered": False, "attempt_number": 1}
 
+        def status(self):
+            return {"terminal_reason": None}
+
     framework = Framework()
     previous = os.environ.get("OPENHANDS_EVAL_HOST_GATEWAY")
     os.environ["OPENHANDS_EVAL_HOST_GATEWAY"] = "127.0.0.1"
@@ -325,3 +357,101 @@ def test_source_view_keeps_public_fuzz_driver_but_excludes_tests(tmp_path):
     relative = {path.relative_to(tmp_path).as_posix() for path in eligible_source_files(tmp_path)}
     assert "fuzzers/driver.c" in relative
     assert "tests/known_case.c" not in relative
+
+
+def test_direct_submit_guard_allows_source_inspection():
+    assert is_direct_submit_invocation("bash /workspace/submit.sh poc trace")
+    assert is_direct_submit_invocation("cd /workspace && ./submit.sh poc trace")
+    assert not is_direct_submit_invocation("cat /workspace/submit.sh")
+    assert not is_direct_submit_invocation("grep submit.sh README.md")
+
+
+def test_reward_framework_state_is_persisted_as_manifest_attempts(tmp_path):
+    run_dir = tmp_path / "run"
+    state = run_dir / "reward_framework"
+    candidate = state / "candidates/candidate_0001_deadbeef/attempts/attempt_0001"
+    candidate.mkdir(parents=True)
+    (state / "task_context.json").write_text("{}", encoding="utf-8")
+    (state / "candidates/candidate_0001_deadbeef/poc").write_bytes(b"poc")
+    (candidate / "trace.json").write_text("[]", encoding="utf-8")
+    (candidate / "current_runtime.json").write_text(
+        json.dumps({"exit_code": 77, "trigger_observed": True}), encoding="utf-8"
+    )
+    (state / "candidates/index.json").write_text(json.dumps({
+        "total_submissions": 1,
+        "unique_candidates": 1,
+        "by_sha256": {"deadbeef": "candidate_0001_deadbeef"},
+        "attempts": [{
+            "attempt_number": 1,
+            "candidate_id": "candidate_0001_deadbeef",
+            "sha256": "deadbeef",
+            "duplicate_of": None,
+        }],
+    }), encoding="utf-8")
+    (state / "evidence").mkdir()
+    (state / "evidence/attempt_0001.json").write_text(json.dumps({
+        "runtime": {"exit_code": 77, "trigger_observed": True},
+        "assessment": {"first_unresolved": "propagation"},
+        "feedback": {"summary": "triggered"},
+    }), encoding="utf-8")
+    (state / "observation_state.json").write_text(
+        json.dumps({"terminal_reason": "trigger_success"}), encoding="utf-8"
+    )
+
+    sample = tmp_path / "sample"
+    result = persist_reward_framework_state(run_dir, sample)
+    assert result is not None
+    summary, attempts = result
+    assert summary["success"] is True
+    assert summary["terminal_reason"] == "trigger_success"
+    assert attempts[0]["trace_valid"] is True
+    assert attempts[0]["trigger_observed"] is True
+    assert attempts[0]["trace_path"].endswith("attempt_0001/trace.json")
+    assert (sample / attempts[0]["evidence_path"]).is_file()
+
+
+def test_transport_replays_terminal_success_without_duplicate_submission(tmp_path):
+    workspace = tmp_path / "workspace"
+    for attempt in ("a" * 32, "b" * 32):
+        submission = workspace / ".reward_submissions" / attempt
+        submission.mkdir(parents=True)
+        (submission / "poc").write_bytes(b"same-poc")
+        (submission / "trace.json").write_text("[]", encoding="utf-8")
+
+    class Framework:
+        def __init__(self):
+            self.calls = 0
+            self.terminal = None
+
+        def status(self):
+            return {"terminal_reason": self.terminal}
+
+        def submit_candidate(self, _arguments):
+            self.calls += 1
+            self.terminal = "trigger_success"
+            return {"triggered": True, "attempt_number": 1}
+
+    framework = Framework()
+    previous = os.environ.get("OPENHANDS_EVAL_HOST_GATEWAY")
+    os.environ["OPENHANDS_EVAL_HOST_GATEWAY"] = "127.0.0.1"
+    transport = OpenHandsRewardTransport(workspace_root=workspace, framework=framework)
+    transport.start()
+    try:
+        results = []
+        for attempt in ("a" * 32, "b" * 32):
+            request = urllib.request.Request(
+                transport.url + "/submit",
+                data=json.dumps({"token": transport.token, "attempt_id": attempt}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                results.append(json.load(response))
+        assert framework.calls == 1
+        assert results[1]["replayed_after_terminal"] is True
+        assert results[1]["attempt_number"] == 1
+    finally:
+        transport.close()
+        if previous is None:
+            os.environ.pop("OPENHANDS_EVAL_HOST_GATEWAY", None)
+        else:
+            os.environ["OPENHANDS_EVAL_HOST_GATEWAY"] = previous

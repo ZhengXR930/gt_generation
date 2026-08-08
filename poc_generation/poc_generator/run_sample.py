@@ -233,6 +233,97 @@ def persist_submission_attempts(
     return persisted
 
 
+def persist_reward_framework_state(
+    run_dir: Path, sample_dir: Path
+) -> tuple[dict, list[dict]] | None:
+    """Persist and normalize the native Reward Framework submission ledger.
+
+    Native ``submit_candidate`` calls intentionally bypass the legacy CyberGym
+    HTTP submission database.  Treat the framework's crash-safe state directory
+    as the authoritative ledger whenever it exists, and expose its attempts in
+    the same manifest-level view used by ordinary evaluation runs.
+    """
+    source = run_dir / "reward_framework"
+    if not (source / "task_context.json").is_file():
+        return None
+
+    destination = sample_dir / "reward_framework"
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination)
+    persisted_index = destination / "candidates" / "index.json"
+    index = (
+        json.loads(persisted_index.read_text(encoding="utf-8"))
+        if persisted_index.is_file()
+        else {"attempts": []}
+    )
+    normalized = []
+    for sequence, metadata in enumerate(index.get("attempts") or [], 1):
+        attempt_number = int(metadata["attempt_number"])
+        candidate_id = str(metadata["candidate_id"])
+        attempt_rel = Path("reward_framework/candidates") / candidate_id / "attempts" / f"attempt_{attempt_number:04d}"
+        evidence_rel = Path("reward_framework/evidence") / f"attempt_{attempt_number:04d}.json"
+        evidence_path = sample_dir / evidence_rel
+        evidence = (
+            json.loads(evidence_path.read_text(encoding="utf-8"))
+            if evidence_path.is_file() else {}
+        )
+        runtime = evidence.get("runtime") or {}
+        trace_rel = attempt_rel / "trace.json"
+        poc_rel = Path("reward_framework/candidates") / candidate_id / "poc"
+        runtime_rel = attempt_rel / "current_runtime.json"
+        trace_path = sample_dir / trace_rel
+        trace_valid = False
+        try:
+            trace_value = json.loads(trace_path.read_text(encoding="utf-8"))
+            trace_valid = isinstance(trace_value, (list, dict))
+        except (OSError, TypeError, json.JSONDecodeError):
+            pass
+        normalized.append({
+            "attempt_id": f"reward_attempt_{attempt_number:04d}",
+            "attempt_number": attempt_number,
+            "sequence_in_run": sequence,
+            "source": "reward_framework",
+            "candidate_id": candidate_id,
+            "duplicate_of": metadata.get("duplicate_of"),
+            "poc_hash": metadata.get("sha256"),
+            "trace_valid": trace_valid,
+            "vul_exit_code": runtime.get("exit_code"),
+            "crashed": runtime.get("trigger_observed") is True,
+            "trigger_observed": runtime.get("trigger_observed") is True,
+            "assessment": evidence.get("assessment"),
+            "feedback": evidence.get("feedback"),
+            "result_path": f"{attempt_rel.as_posix()}/",
+            "trace_path": trace_rel.as_posix(),
+            "poc_path": poc_rel.as_posix(),
+            "runtime_output_path": (
+                runtime_rel.as_posix()
+                if (sample_dir / runtime_rel).is_file() else evidence_rel.as_posix()
+            ),
+            "evidence_path": evidence_rel.as_posix() if evidence_path.is_file() else None,
+        })
+
+    observation_path = destination / "observation_state.json"
+    observation = (
+        json.loads(observation_path.read_text(encoding="utf-8"))
+        if observation_path.is_file() else {}
+    )
+    crashed = [attempt for attempt in normalized if attempt["trigger_observed"]]
+    result = {
+        "ok": True,
+        "source": "reward_framework",
+        "submissions": normalized,
+        "num_submissions": len(normalized),
+        "submission_attempts": normalized,
+        "num_submission_attempts": len(normalized),
+        "num_crashed": len(crashed),
+        "success": bool(crashed),
+        "terminal_reason": observation.get("terminal_reason"),
+        "state_path": "reward_framework/observation_state.json",
+    }
+    return result, normalized
+
+
 def clear_previous_result(sample_dir: Path) -> None:
     """Remove the previous result for this exact model/sample before rerunning.
 
@@ -240,7 +331,7 @@ def clear_previous_result(sample_dir: Path) -> None:
     per-run archive only duplicates large checkpoints. A rerun is an explicit
     replacement of the prior result.
     """
-    for name in ("checkpoint", "submissions", "runs"):
+    for name in ("checkpoint", "submissions", "runs", "reward_framework"):
         path = sample_dir / name
         if path.is_dir():
             shutil.rmtree(path)
@@ -357,16 +448,21 @@ def run_attempt(
         args_json = json.loads((run_dir / "args.json").read_text())
         cybergym_agent_id = args_json["task"]["agent_id"]
 
-        db_path = ROOT / "server" / "poc.db"
-        success_info = (
-            check_success(db_path, cybergym_agent_id) if db_path.exists() else {"ok": False, "error": "db not found"}
-        )
         sample_dir = results_dir / sample_id
-        persisted_attempts = persist_submission_attempts(
-            sample_dir,
-            cybergym_agent_id,
-            success_info.get("submission_attempts") or [],
-        )
+        reward_result = persist_reward_framework_state(run_dir, sample_dir)
+        if reward_result is not None:
+            success_info, persisted_attempts = reward_result
+        else:
+            db_path = ROOT / "server" / "poc.db"
+            success_info = (
+                check_success(db_path, cybergym_agent_id)
+                if db_path.exists() else {"ok": False, "error": "db not found"}
+            )
+            persisted_attempts = persist_submission_attempts(
+                sample_dir,
+                cybergym_agent_id,
+                success_info.get("submission_attempts") or [],
+            )
         poc_deduplication, deduplicated_pocs = (
             deduplicate_submission_attempts(persisted_attempts)
         )
@@ -376,7 +472,11 @@ def run_attempt(
         ]
         if valid_attempts:
             latest = valid_attempts[-1]
-            candidate_path = sample_dir / str(latest["result_path"]) / "candidate_trace.json"
+            candidate_path = (
+                sample_dir / str(latest["trace_path"])
+                if latest.get("trace_path")
+                else sample_dir / str(latest["result_path"]) / "candidate_trace.json"
+            )
             if candidate_path.is_file():
                 trace_output = sample_dir / "fine_trace.json"
                 shutil.copy2(candidate_path, trace_output)
@@ -384,7 +484,10 @@ def run_attempt(
                     candidate_path,
                     trace_output.with_name("fine_trace.response.txt"),
                 )
-                trace_source = "last_valid_poc_submission"
+                trace_source = (
+                    "reward_framework_last_valid_submission"
+                    if reward_result is not None else "last_valid_poc_submission"
+                )
 
         # A final fine trace is written ONLY when the episode reaches a clean
         # endpoint (iteration limit / agent finished). Its
@@ -512,6 +615,18 @@ def run_attempt(
                     "tool-using continuation is needed later."
                 ),
             },
+            "reward_framework": (
+                {
+                    "enabled": True,
+                    "dir": "reward_framework/",
+                    "state_path": "reward_framework/observation_state.json",
+                    "task_context_path": "reward_framework/task_context.json",
+                    "candidate_index_path": "reward_framework/candidates/index.json",
+                    "evidence_dir": "reward_framework/evidence/",
+                    "terminal_reason": success_info.get("terminal_reason"),
+                }
+                if reward_result is not None else {"enabled": False}
+            ),
         }
         manifest_path = sample_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest_entry, indent=2, default=str))

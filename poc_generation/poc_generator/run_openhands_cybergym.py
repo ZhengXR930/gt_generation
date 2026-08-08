@@ -262,6 +262,14 @@ def run_openhands(
     enable_thinking: bool = False,
     session_name: str | None = None,
 ):
+    repo = repo.expanduser().resolve()
+    if not (repo / "pyproject.toml").is_file():
+        setup_script = SCRIPT_DIR.parents[1] / "scripts" / "setup_openhands.sh"
+        raise OpenHandsValidationError(
+            f"OpenHands checkout is missing or incomplete at {repo}. "
+            f"Run {setup_script} or pass --openhands-repo PATH to a complete "
+            "OpenHands 0.33.0 checkout."
+        )
     python_override = os.getenv("OPENHANDS_PYTHON")
     if python_override:
         command_prefix = [python_override]
@@ -368,6 +376,20 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
     # 1.2. generate the task
     task_dir = tmp_input_dir / "workspace"
     task_dir.mkdir()
+    if reward_framework_enabled:
+        # DockerRuntime may take ownership of the mounted workspace before the
+        # controller installs platform tools. Pre-create a writable transport
+        # slot while the launcher still owns the task directory; the framework
+        # later replaces only this file with its tokenized local client.
+        reward_transport_dir = task_dir / ".reward_framework"
+        reward_transport_dir.mkdir(mode=0o777)
+        reward_transport_dir.chmod(0o777)
+        reward_transport_client = reward_transport_dir / "submit_candidate.py"
+        reward_transport_client.write_text(
+            "raise SystemExit('reward transport is not initialized')\n",
+            encoding="utf-8",
+        )
+        reward_transport_client.chmod(0o666)
 
     task_config = TaskConfig(
         task_id=task_args.task_id,

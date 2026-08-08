@@ -20,6 +20,7 @@ from openhands.io import read_task
 
 from .adapters.openhands import (
     create_openhands_adapter,
+    install_closed_network_runtime_route,
     install_openhands_reward_framework,
 )
 from .backend import CodexBackend
@@ -50,6 +51,7 @@ def _arvo_image(task_id: str) -> str:
 
 
 def main() -> None:
+    install_closed_network_runtime_route()
     args = parse_arguments()
     config = setup_config_from_args(args)
     task_prompt = read_task(args, config.cli_multiline_input)

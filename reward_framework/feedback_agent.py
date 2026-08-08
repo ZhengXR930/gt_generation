@@ -60,6 +60,11 @@ def fallback_feedback(report: RawRuntimeReport, assessment: StageAssessment,
         f"Confirmed causal prefix: {prefix}. First unresolved boundary: {boundary}. "
         f"Trigger observed: {str(report.trigger_observed).lower()}."
     )
+    if report.trigger_observed and assessment.first_unresolved:
+        summary += (
+            " The independent trigger is confirmed, while exact stage attribution "
+            "remains conservative where passive probe evidence is incomplete."
+        )
     refuted = [stage for stage, status in assessment.stages.items()
                if status.value == "refuted"]
     contradiction = (
@@ -97,6 +102,12 @@ class FeedbackAgent:
             prose = " ".join(x for x in (summary, contradiction or "", model_delta) if x)
             if not summary or _ADVICE.search(prose):
                 raise ValueError("feedback is empty or contains advice")
+            if report.trigger_observed and assessment.first_unresolved:
+                summary = (
+                    "The independent runtime oracle confirmed the vulnerability trigger. "
+                    "Exact causal-stage attribution remains conservative at the unresolved "
+                    f"{assessment.first_unresolved} boundary. " + summary
+                )
             return Feedback(summary, contradiction, model_delta or delta,
                             evidence_ids, assessment)
         except (RuntimeError, ValueError, KeyError, json.JSONDecodeError):

@@ -21,7 +21,8 @@ set -euo pipefail
 #   OPENHANDS_NATIVE_TOOL_CALLING optional true/false override for OpenHands tool calling mode
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-OPENHANDS_REPO="${ROOT_DIR}/external/OpenHands"
+OPENHANDS_REPO="${OPENHANDS_REPO:-${ROOT_DIR}/external/OpenHands}"
+OPENHANDS_SETUP="${ROOT_DIR}/scripts/setup_openhands.sh"
 ADAPTER="${ROOT_DIR}/external/cybergym/examples/agents/openhands/run.py"
 DEFAULT_CYBERGYM_DATA_DIR="${ROOT_DIR}/external/cybergym_data_subset/data"
 
@@ -35,6 +36,11 @@ TIMEOUT="${TIMEOUT:-1200}"
 KEEP_TMP="${KEEP_TMP:-0}"
 OPENHANDS_RUNTIME_READY_TIMEOUT="${OPENHANDS_RUNTIME_READY_TIMEOUT:-300}"
 PYTHON_BIN="${CYBERGYM_PYTHON:-$(command -v python3.12 || command -v python3)}"
+
+if [[ ! -f "${OPENHANDS_REPO}/pyproject.toml" ]]; then
+  echo "OpenHands 0.33.0 is not installed; bootstrapping it now." >&2
+  "${OPENHANDS_SETUP}"
+fi
 
 : "${TASK_ID:?Set TASK_ID, e.g. arvo:10400}"
 : "${CYBERGYM_DATA_DIR:?Set CYBERGYM_DATA_DIR to cybergym_data/data}"

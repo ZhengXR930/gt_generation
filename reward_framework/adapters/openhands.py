@@ -6,6 +6,7 @@ import copy
 import http.server
 import json
 import os
+import re
 import secrets
 import shlex
 import threading
@@ -24,6 +25,10 @@ class OpenHandsAdapter(CallbackAdapter):
         super().__init__(workspace_root=workspace_root, inject=inject,
                          checkpoint_callback=checkpoint_callback)
 
+    def submission_ready(self) -> bool:
+        """The protocol requires the exact candidate trace before submission."""
+        return (self.workspace_root / "candidate_trace.json").is_file()
+
     @staticmethod
     def normalize_event(event: Any) -> tuple[str, str, dict[str, Any]]:
         if isinstance(event, dict):
@@ -31,6 +36,33 @@ class OpenHandsAdapter(CallbackAdapter):
             kind = str(event.get("action") or event.get("observation") or "event")
             return source, kind, dict(event)
         return "unknown", type(event).__name__, {"text": str(event)}
+
+
+def install_closed_network_runtime_route() -> None:
+    """Reach the action server through an internal Docker bridge address."""
+    network = os.getenv("OPENHANDS_RUNTIME_DOCKER_NETWORK", "").strip()
+    if not network:
+        return
+    from openhands.runtime.impl.docker.docker_runtime import DockerRuntime
+
+    if getattr(DockerRuntime, "_reward_closed_network_route_installed", False):
+        return
+    original_init_container = DockerRuntime._init_container
+
+    def closed_network_init_container(runtime):
+        original_init_container(runtime)
+        runtime.container.reload()
+        networks = runtime.container.attrs["NetworkSettings"]["Networks"]
+        endpoint = networks.get(network) or {}
+        address = endpoint.get("IPAddress")
+        if not address:
+            raise RuntimeError(
+                f"runtime container did not join closed Docker network {network!r}"
+            )
+        runtime.api_url = f"http://{address}:{runtime._container_port}"
+
+    DockerRuntime._init_container = closed_network_init_container
+    DockerRuntime._reward_closed_network_route_installed = True
 
 
 def _workspace_path(value: Any, field: str) -> str:
@@ -85,6 +117,7 @@ class OpenHandsRewardTransport:
         self.framework = framework
         self.token = secrets.token_urlsafe(24)
         self._lock = threading.Lock()
+        self._terminal_result: dict[str, Any] | None = None
         bridge = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -118,10 +151,20 @@ class OpenHandsRewardTransport:
                         raise ValueError("invalid attempt id")
                     relative = Path(".reward_submissions") / attempt
                     with bridge._lock:
-                        result = bridge.framework.submit_candidate({
-                            "poc_path": str(relative / "poc"),
-                            "trace_path": str(relative / "trace.json"),
-                        })
+                        status = bridge.framework.status()
+                        if (
+                            status.get("terminal_reason") == "trigger_success"
+                            and bridge._terminal_result is not None
+                        ):
+                            result = dict(bridge._terminal_result)
+                            result["replayed_after_terminal"] = True
+                        else:
+                            result = bridge.framework.submit_candidate({
+                                "poc_path": str(relative / "poc"),
+                                "trace_path": str(relative / "trace.json"),
+                            })
+                            if result.get("triggered") is True:
+                                bridge._terminal_result = dict(result)
                     self._reply(200, result)
                 except Exception as exc:
                     self._reply(400, {"error": f"{type(exc).__name__}: {exc}"})
@@ -143,7 +186,6 @@ class OpenHandsRewardTransport:
         )
         path = directory / "submit_candidate.py"
         path.write_text(script, encoding="utf-8")
-        path.chmod(0o755)
 
     def close(self) -> None:
         self.server.shutdown()
@@ -160,6 +202,17 @@ def _submission_command(arguments: str | dict[str, Any]) -> str:
     return " ".join(shlex.quote(x) for x in (
         "python3", "/workspace/.reward_framework/submit_candidate.py", poc, trace
     ))
+
+
+_DIRECT_SUBMIT = re.compile(
+    r"(?:^|(?:&&|\|\||;|\n)\s*)(?:bash\s+)?"
+    r"(?:\./|/workspace/)?submit\.sh(?:\s|$)"
+)
+
+
+def is_direct_submit_invocation(command: str) -> bool:
+    """Distinguish executing submit.sh from merely reading or mentioning it."""
+    return bool(_DIRECT_SUBMIT.search(command.strip()))
 
 
 def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
@@ -226,7 +279,9 @@ def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
                 maximum=int(getattr(state, "max_iterations", 100) or 100),
             )
             return action if allowed else NullAction()
-        if isinstance(action, CmdRunAction) and "submit.sh" in str(action.command):
+        if isinstance(action, CmdRunAction) and is_direct_submit_invocation(
+            str(action.command)
+        ):
             action.command = (
                 "printf '%s\\n' 'Direct submit.sh invocation is disabled. "
                 "Use the first-class submit_candidate tool.' >&2; (exit 2)"
