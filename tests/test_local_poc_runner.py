@@ -33,7 +33,7 @@ def test_readme_exposes_issue_but_not_saved_crash_evidence():
 
 def test_runtime_spec_reads_only_normalized_private_trigger(tmp_path):
     (tmp_path / "ground_truth.json").write_text(json.dumps({
-        "poc": {"trigger": "./target -runs=1 /gt/poc"},
+        "poc": {"trigger": "./build.sh './target -runs=1 /gt/poc'"},
     }))
     (tmp_path / "reachability_report.json").write_text(json.dumps({
         "sanitizer_observed": "address",
@@ -65,9 +65,18 @@ def test_runtime_spec_rejects_free_text_instead_of_inferring_command(tmp_path):
         load_runtime_spec(tmp_path)
 
 
+def test_runtime_spec_rejects_unwrapped_container_command(tmp_path):
+    (tmp_path / "ground_truth.json").write_text(json.dumps({
+        "poc": {"trigger": "./target -runs=1 /gt/poc"},
+    }))
+
+    with pytest.raises(RuntimeError, match="expected ./build.sh"):
+        load_runtime_spec(tmp_path)
+
+
 def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
     (tmp_path / "ground_truth.json").write_text(json.dumps({
-        "poc": {"trigger": "./target /gt/poc"},
+        "poc": {"trigger": "./build.sh './target /gt/poc'"},
     }))
     (tmp_path / "sample_info.json").write_text(json.dumps({
         "repo": "https://example.test/project.git",
@@ -88,7 +97,7 @@ def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
 
 def test_runtime_readiness_rejects_missing_runtime_images(tmp_path, monkeypatch):
     (tmp_path / "ground_truth.json").write_text(json.dumps({
-        "poc": {"trigger": "./target /gt/poc"},
+        "poc": {"trigger": "./build.sh './target /gt/poc'"},
     }))
     (tmp_path / "sample_info.json").write_text(json.dumps({
         "repo": "https://example.test/project.git",

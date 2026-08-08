@@ -74,17 +74,22 @@ def load_runtime_spec(sample_dir: Path) -> tuple[str, dict]:
     trigger = str(
         (load_json(gt_path).get("poc") or {}).get("trigger") or ""
     ).strip()
+    try:
+        parts = shlex.split(trigger)
+    except ValueError:
+        parts = []
     if (
-        not trigger
-        or "/gt/poc" not in trigger
+        len(parts) != 2
+        or parts[0] != "./build.sh"
+        or "/gt/poc" not in parts[1]
         or "\n" in trigger
         or len(trigger) >= 1000
-        or re.match(r"(?i)^(run|running|stage\s+\d+)\b", trigger)
     ):
         raise RuntimeError(
-            f"{sample_dir.name} has a non-executable poc.trigger; run "
-            "scripts/normalize_gt_runtime_metadata.py"
+            f"{sample_dir.name} has a non-executable poc.trigger; expected "
+            "./build.sh '<command containing /gt/poc>'"
         )
+    inner_command = parts[1]
 
     detector = ""
     reachability_path = sample_dir / "reachability_report.json"
@@ -92,7 +97,7 @@ def load_runtime_spec(sample_dir: Path) -> tuple[str, dict]:
         detector = str(
             load_json(reachability_path).get("sanitizer_observed") or ""
         )
-    return trigger, {
+    return inner_command, {
         "detector": detector,
         "source": "normalized_private_gt_trigger",
     }
