@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from .package_audit import audit_package
+from .evidence import write_commitment
 
 
 KEEP_FILES = {
-    # Repairing a package later means driving its ARVO workspace again,
-    # and that needs the image, container and target this records.
+    # Repairing a package later needs the original ARVO image/target metadata.
     "prepare_report.json",
     "sample_info.json",
     "build.sh",
@@ -30,6 +30,7 @@ KEEP_FILES = {
     "reachability_report.json",
     "generation_timing.json",
     "generation_provenance.json",
+    "evidence_commitment.json",
     # Small evaluator-private rebuild contract.  The workspace and binaries are
     # still removed; this recipe is required to reconstruct them at evaluation.
     "reproduction_report.json",
@@ -69,6 +70,7 @@ def compact_result(result_dir: Path) -> dict[str, Any]:
         else:
             path.unlink(missing_ok=True)
 
+    write_commitment(result_dir)
     after = audit_package(result_dir)
     return {
         "result_dir": str(result_dir),

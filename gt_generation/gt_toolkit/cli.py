@@ -6,7 +6,9 @@ Subcommands:
   state          Manage the canonical sample_state.json.
   reachability   Run R1-R5 PoC reachability against a ground_truth.json.
   assertions     Verify frozen assertions and summarize perturbation witnesses.
+  assertion-preflight Reject invalid assertion plans before instrumentation.
   audit-package  Validate a completed GT result directory and all evidence references.
+  bind-evidence  Commit the final GT and evidence files by content hash.
   compact-result Remove generation-only files from a validated result directory.
   arvo-workspace Reuse one ARVO container across vulnerable/fixed validation.
   gdb-watch      Emit / run the GDB python recorder for watchpoint coverage.
@@ -27,7 +29,9 @@ from . import __version__
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     commands = [
-        "prepare", "validate", "state", "reachability", "assertions", "audit-package", "compact-result", "arvo-workspace",
+        "prepare", "validate", "state", "reachability", "assertions",
+        "assertion-preflight", "audit-package", "bind-evidence",
+        "compact-result", "arvo-workspace",
         "gdb-watch", "schema-path",
     ]
     parser = argparse.ArgumentParser(prog="gt-toolkit", description=__doc__)
@@ -61,9 +65,15 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "assertions":
         from . import assertions
         return assertions.main(rest)
+    if ns.command == "assertion-preflight":
+        from . import assertion_preflight
+        return assertion_preflight.main(rest)
     if ns.command == "audit-package":
         from . import package_audit
         return package_audit.main(rest)
+    if ns.command == "bind-evidence":
+        from . import evidence
+        return evidence.main(rest)
     if ns.command == "compact-result":
         from . import compact_result
         return compact_result.main(rest)

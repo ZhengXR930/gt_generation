@@ -99,6 +99,16 @@ def load_config(path: Path) -> dict[str, Any]:
     if not selection_path.is_absolute():
         selection_path = REPO_ROOT / selection_path
 
+    start_at = str(raw.get("start_at") or "").strip()
+    stop_after = str(raw.get("stop_after") or "").strip()
+    if start_at in {"02_fine_trace", "03_trace_review", "04_assertion_validator"}:
+        if stop_after and stop_after != "05_validate":
+            raise SystemExit(
+                "partial GT repairs must run through 05_validate; "
+                "use runner.py directly for non-publishing stage diagnostics"
+            )
+        stop_after = "05_validate"
+
     return {
         "cli": cli,
         "adapter": adapter,
@@ -114,7 +124,8 @@ def load_config(path: Path) -> dict[str, Any]:
         # Re-run only the stages that have not passed. A sample that died late
         # keeps its accepted clone, reproduction and fine trace.
         "resume": bool(raw.get("resume", False)),
-        "start_at": str(raw.get("start_at") or "").strip(),
+        "start_at": start_at,
+        "stop_after": stop_after,
     }
 
 
@@ -217,6 +228,21 @@ def current_stage(result_dir: Path) -> str:
     return str(state.get("current_stage") or "starting")
 
 
+def completed_samples_to_skip(
+    samples: list[str], cfg: dict[str, Any]
+) -> list[str]:
+    """Ordinary batches skip complete GT; explicit partial reruns repair it."""
+    if cfg.get("start_at"):
+        return []
+    import gt_status
+
+    return [
+        sample_id
+        for sample_id in samples
+        if gt_status.classify(sample_id)[0] == "complete"
+    ]
+
+
 def _command_output(command: list[str]) -> str:
     try:
         completed = subprocess.run(
@@ -242,6 +268,7 @@ def write_provenance(result_dir: Path, cfg: dict[str, Any], track: str) -> None:
         "docker_track": track,
         "repo_docker_image": cfg["repo_docker_image"],
         "repo_docker_context": str(cfg["repo_docker_context"]),
+        "evidence_commitment_required": True,
     }
     if cfg.get("codex_provider"):
         provider = dict(cfg["codex_provider"])
@@ -271,7 +298,19 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
     log_path = logs_dir / f"{sample_id}.log"
     track = docker_track(sample)
     result_dir.mkdir(parents=True, exist_ok=True)
-    write_provenance(result_dir, cfg, track)
+    provenance_dir = result_dir
+    if cfg.get("start_at") and all(
+        (result_dir / name).is_file()
+        for name in (
+            "ground_truth.json",
+            "verified_assertions.json",
+            "verified_invariants.json",
+            "assertion_results.json",
+        )
+    ):
+        provenance_dir = inputs_dir / f"{sample_id}.provenance"
+        provenance_dir.mkdir(parents=True, exist_ok=True)
+    write_provenance(provenance_dir, cfg, track)
 
     started = time.monotonic()
     with running_lock:
@@ -289,6 +328,9 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
         "GT_CODEX_STRICT_CONFIG": "1" if cfg["strict_config"] else "0",
         "GT_REPO_DOCKER_IMAGE": cfg["repo_docker_image"],
         "GT_REPO_DOCKER_CONTEXT": str(cfg["repo_docker_context"]),
+        "GT_GENERATION_PROVENANCE_SOURCE": str(
+            provenance_dir / "generation_provenance.json"
+        ),
     }
     if cfg.get("codex_provider"):
         provider = cfg["codex_provider"]
@@ -318,6 +360,8 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
         command.append("--resume")
     if cfg.get("start_at"):
         command += ["--start-at", str(cfg["start_at"])]
+    if cfg.get("stop_after"):
+        command += ["--stop-after", str(cfg["stop_after"])]
     with log_path.open("w", encoding="utf-8") as stream:
         completed = subprocess.run(command, cwd=REPO_ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT)
 
@@ -374,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         gt_status.scan(gt_status._load_sample_ids(cfg["selection_path"])),
         len(selection), cfg["selection_path"],
     )
-    already_done = [s for s in cfg["samples"] if gt_status.classify(s)[0] == "complete"]
+    already_done = completed_samples_to_skip(cfg["samples"], cfg)
     if already_done:
         print(f"skipping {len(already_done)} already-complete sample(s): {sorted(already_done)}", flush=True)
     cfg["samples"] = [s for s in cfg["samples"] if s not in already_done]

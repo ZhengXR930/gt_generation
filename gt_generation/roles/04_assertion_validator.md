@@ -65,6 +65,24 @@ created by Stage 00. Never delete, rename, or rewrite them during validation or 
      --freeze-only \
      --freeze-marker <result_dir>/.assertion_spec_frozen.json
    ```
+   Then write the proposed invariant graph to `candidate_invariants.json`, plus
+   `field_bindings.json` and
+   `event_locations.json` and run the deterministic preflight before applying either
+   instrumentation patch:
+
+   ```bash
+   PYTHONPATH=gt_generation python3 -m gt_toolkit assertion-preflight \
+     --spec <result_dir>/candidate_assertions.json \
+     --candidate-invariants <result_dir>/candidate_invariants.json \
+     --field-bindings <result_dir>/field_bindings.json \
+     --event-locations <result_dir>/event_locations.json \
+     --out <result_dir>/assertion_preflight.json
+   ```
+
+   Do not compile or execute assertions until preflight succeeds. Repair every harness
+   anchor, unknown invariant, uncovered edge, or missing field/event binding it reports.
+   The workflow requires both runtime traces to be newer than the successful preflight,
+   so a late report cannot legitimize an already executed invalid plan.
 4. Run vulnerable original first. Observed assertions must hold; required obligations
    must be violated when the protected event occurs.
 5. Run fixed original. Distinguish `genuine`, `guarded`, and `not_exercised`. Add adjacent
@@ -75,8 +93,8 @@ created by Stage 00. Never delete, rename, or rewrite them during validation or 
    descriptively named `CASE` blocks.
    Stop after the closest source-grounded case supplies a genuine witness. Do not sweep
    symmetric values, a wider numeric range, or additional classes afterward.
-6. Keep only actually verified nodes, edges, and root criterion in
-   `verified_invariants.json`, then run the binding gate.
+6. From `candidate_invariants.json`, keep only actually verified nodes, edges, and root
+   criterion in `verified_invariants.json`, then run the binding gate.
 
 ## Source-derived assertion rule
 

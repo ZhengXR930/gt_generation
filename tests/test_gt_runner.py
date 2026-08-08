@@ -1,5 +1,8 @@
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from gt_generation import runner
 
@@ -59,6 +62,11 @@ def test_workflow_uses_four_isolated_agent_stages_and_review_feedback():
         stage for stage in workflow["stages"] if stage["name"] == "05_validate"
     )
     assert "gt_toolkit audit-package" in final_stage["command_template"]
+    assert "gt_toolkit validate {gt_path} --strict --json" in final_stage["command_template"]
+    assert "gt_toolkit bind-evidence" in final_stage["command_template"]
+    assert next(
+        stage for stage in workflow["stages"] if stage["name"] == "02_fine_trace"
+    )["validate_strict"] is True
 
 
 def test_claude_adapter_uses_one_model_no_stage_escalation():
@@ -91,6 +99,21 @@ def test_codex_adapter_uses_model_reasoning_and_strict_config():
     assert 'GT_AGENT_REASONING_EFFORT' in adapter
     assert 'model_reasoning_effort=' in adapter
     assert '--strict-config' in adapter
+
+
+def test_codex_adapter_waits_for_codex_so_bridge_cleanup_runs():
+    adapter = (
+        Path(__file__).parents[1]
+        / "gt_generation"
+        / "adapters"
+        / "codex"
+        / "gt_agent_codex.sh"
+    ).read_text()
+
+    assert "trap cleanup_bridge EXIT" in adapter
+    assert 'exec codex "${CODEX_ARGS[@]}"' not in adapter
+    assert 'codex "${CODEX_ARGS[@]}"' in adapter
+    assert 'exit "$CODEX_STATUS"' in adapter
 
 
 def test_changed_json_paths_include_added_list_items():
@@ -133,6 +156,15 @@ def test_runtime_feedback_requires_existing_flag_and_observe(tmp_path):
     assert runner.feedback_requests_runtime_disambiguation(tmp_path) is True
 
 
+def test_malformed_runtime_feedback_falls_back_to_static_repair(tmp_path):
+    (tmp_path / "trace_feedback.json").write_text(
+        '{"needs_runtime_disambiguation": true, "issues": [}',
+        encoding="utf-8",
+    )
+
+    assert runner.feedback_requests_runtime_disambiguation(tmp_path) is False
+
+
 def test_runtime_stage_requires_fresh_completed_workspace_cycle(tmp_path):
     variables = {"result_dir": str(tmp_path)}
     stage = {"name": "02_runtime_disambiguation"}
@@ -160,6 +192,172 @@ def test_runtime_stage_requires_fresh_completed_workspace_cycle(tmp_path):
     assert runner.check_runtime_disambiguation_success(
         {"name": "02_fine_trace"}, variables, 0
     ) is True
+
+
+def test_assertion_preflight_must_precede_runtime_traces(tmp_path):
+    stage = {"name": "04_assertion_validator"}
+    variables = {"result_dir": str(tmp_path)}
+    runner.write_json(
+        tmp_path / "candidate_assertions.json",
+        {"content_hash": "sha256:plan"},
+    )
+    for name in (
+        "field_bindings.json",
+        "event_locations.json",
+    ):
+        runner.write_json(tmp_path / name, {})
+    candidate_graph = {
+        "root_cause_criterion": {
+            "invariant_id": "root",
+            "file": "src/a.c",
+            "function": "parse",
+            "line": 10,
+        },
+        "nodes": [],
+        "edges": [],
+    }
+    runner.write_json(tmp_path / "candidate_invariants.json", candidate_graph)
+    runner.write_json(tmp_path / "verified_invariants.json", candidate_graph)
+    from gt_generation.gt_toolkit.evidence import file_sha256
+
+    runner.write_json(
+        tmp_path / "assertion_preflight.json",
+        {
+            "ok": True,
+            "assertion_content_hash": "sha256:plan",
+            "input_hashes": {
+                name: file_sha256(tmp_path / name)
+                for name in (
+                    "candidate_assertions.json",
+                    "candidate_invariants.json",
+                    "field_bindings.json",
+                    "event_locations.json",
+                )
+            },
+        },
+    )
+    for name in ("vulnerable_assertion_trace.txt", "fixed_assertion_trace.txt"):
+        (tmp_path / name).write_text("trace")
+
+    assert runner.check_assertion_preflight_success(stage, variables) is True
+    newer = (tmp_path / "assertion_preflight.json").stat().st_mtime + 10
+    os.utime(tmp_path / "assertion_preflight.json", (newer, newer))
+    assert runner.check_assertion_preflight_success(stage, variables) is False
+
+
+def test_repair_staging_failure_leaves_published_package_unchanged(tmp_path):
+    published = tmp_path / "sample"
+    published.mkdir()
+    (published / "ground_truth.json").write_text("published")
+    staging = runner.repair_staging_dir(published)
+
+    runner.prepare_repair_staging(published, staging)
+    (staging / "ground_truth.json").write_text("failed repair")
+
+    assert (published / "ground_truth.json").read_text() == "published"
+    assert (staging / "ground_truth.json").read_text() == "failed repair"
+
+
+def test_successful_repair_staging_atomically_replaces_package(tmp_path):
+    published = tmp_path / "sample"
+    published.mkdir()
+    (published / "ground_truth.json").write_text("published")
+    staging = runner.repair_staging_dir(published)
+    runner.prepare_repair_staging(published, staging)
+    (staging / "ground_truth.json").write_text("validated repair")
+
+    runner.publish_repair_staging(staging, published)
+
+    assert (published / "ground_truth.json").read_text() == "validated repair"
+    assert not staging.exists()
+    assert not published.with_name("sample.repair-backup").exists()
+
+
+def test_repair_publish_gate_requires_commitment(tmp_path):
+    assert runner.repair_package_ready_to_publish(tmp_path) is False
+
+
+def test_stage_bounds_reject_unknown_and_reversed_ranges():
+    stages = [{"name": "02"}, {"name": "03"}, {"name": "05"}]
+
+    with pytest.raises(SystemExit, match="unknown stage"):
+        runner.validate_stage_bounds(stages, "missing", "", "")
+    with pytest.raises(SystemExit, match="must not follow"):
+        runner.validate_stage_bounds(stages, "05", "02", "")
+
+
+def test_verified_graph_cannot_add_or_move_candidate_invariants():
+    candidate = {
+        "root_cause_criterion": {
+            "invariant_id": "root",
+            "file": "src/a.c",
+            "function": "parse",
+            "line": 10,
+            "relation": "length <= capacity",
+        },
+        "nodes": [
+            {
+                "invariant_id": "sink",
+                "file": "src/a.c",
+                "function": "parse",
+                "line": 20,
+            }
+        ],
+        "edges": [],
+    }
+    verified = {
+        **candidate,
+        "nodes": [],
+    }
+
+    assert runner.verified_graph_is_candidate_subset(candidate, verified) is True
+    verified["nodes"] = [
+        {
+            "invariant_id": "sink",
+            "file": "tests/fuzz/a_fuzzer.c",
+            "function": "LLVMFuzzerTestOneInput",
+            "line": 20,
+        }
+    ]
+    assert runner.verified_graph_is_candidate_subset(candidate, verified) is False
+    verified["nodes"] = []
+    verified["root_cause_criterion"] = {
+        **candidate["root_cause_criterion"],
+        "relation": "length > capacity",
+        "verified_by": "assertion.root",
+    }
+    assert runner.verified_graph_is_candidate_subset(candidate, verified) is False
+    verified["root_cause_criterion"] = {
+        **candidate["root_cause_criterion"],
+        "verified_by": "assertion.root",
+    }
+    assert runner.verified_graph_is_candidate_subset(candidate, verified) is True
+
+
+def test_failed_atomic_publish_restores_original_package(tmp_path, monkeypatch):
+    published = tmp_path / "sample"
+    published.mkdir()
+    (published / "ground_truth.json").write_text("published")
+    staging = runner.repair_staging_dir(published)
+    staging.mkdir()
+    (staging / "ground_truth.json").write_text("repair")
+    real_replace = os.replace
+    calls = 0
+
+    def fail_second_replace(source, destination):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(runner.os, "replace", fail_second_replace)
+    with pytest.raises(OSError, match="simulated publish failure"):
+        runner.publish_repair_staging(staging, published)
+
+    assert (published / "ground_truth.json").read_text() == "published"
+    assert (staging / "ground_truth.json").read_text() == "repair"
+    assert not published.with_name("sample.repair-backup").exists()
 
 
 def test_failed_review_reopens_fresh_producer_and_reviewer_sessions(tmp_path, monkeypatch):

@@ -175,7 +175,9 @@ def test_summary_separates_no_poc_unexecuted_and_runtime_unavailable():
     summary = _summarize(rows)
     assert summary["submitted_unique_pocs"] == 2
     assert summary["reachability_executed_candidates"] == 1
-    assert summary["reachability_unavailable_candidates"] == 1
+    assert summary["reachability_not_scheduled_candidates"] == 1
+    assert summary["reachability_infrastructure_unavailable_candidates"] == 0
+    assert summary["reachability_unavailable_candidates"] == 0
     assert summary["reachability_depth_distribution"]["R2"] == 1
     assert summary["R3_evaluable_candidates"] == 1
     assert summary["R3_reach_rate"] == 0
