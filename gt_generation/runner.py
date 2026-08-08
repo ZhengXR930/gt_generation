@@ -891,7 +891,9 @@ def prepare_repair_staging(source: Path, staging: Path) -> None:
     if copied.returncode != 0:
         shutil.copytree(source, staging, symlinks=True)
     for name in (".gt_generation.lock", "gt_generation_state.json"):
-        (staging / name).unlink(missing_ok=True)
+        path = staging / name
+        if path.is_file() or path.is_symlink():
+            path.unlink()
 
 
 def write_repair_context(source: Path, staging: Path) -> dict[str, Any]:

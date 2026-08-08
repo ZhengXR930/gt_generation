@@ -258,6 +258,20 @@ def test_repair_staging_failure_leaves_published_package_unchanged(tmp_path):
     assert (staging / "ground_truth.json").read_text() == "failed repair"
 
 
+def test_generator_avoids_python38_path_apis():
+    code_root = Path(__file__).parents[1] / "gt_generation"
+    for relative in (
+        "runner.py",
+        "gt_toolkit/compact_result.py",
+        "gt_toolkit/prepare.py",
+    ):
+        source = (code_root / relative).read_text(encoding="utf-8")
+        assert "missing_ok=" not in source
+        assert ".removeprefix(" not in source
+        assert ".removesuffix(" not in source
+        assert ".is_relative_to(" not in source
+
+
 def test_successful_repair_staging_atomically_replaces_package(tmp_path):
     published = tmp_path / "sample"
     published.mkdir()

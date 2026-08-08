@@ -126,7 +126,8 @@ def _stage_default_crash_trace(
 ) -> dict[str, Any]:
     """Preserve the exact crash context originally visible to the evaluated agent."""
     destination = result_dir / "default_crash_trace.txt"
-    destination.unlink(missing_ok=True)
+    if destination.is_file() or destination.is_symlink():
+        destination.unlink()
     inline = str(sample.get("default_crash_trace") or "")
     source = ""
     if inline.strip():
@@ -874,7 +875,8 @@ def _stage_repo_poc(sample: dict[str, Any], d: Path, sid: str) -> str:
     only then fall back to legacy flat files while filtering obvious metadata.
     """
     destination = d / "poc"
-    destination.unlink(missing_ok=True)
+    if destination.is_file() or destination.is_symlink():
+        destination.unlink()
     repo_root = Path(__file__).resolve().parents[2]
     raw_candidates = (
         sample.get("poc_artifact_path"),

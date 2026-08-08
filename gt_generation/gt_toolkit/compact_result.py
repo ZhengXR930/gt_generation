@@ -68,7 +68,8 @@ def compact_result(result_dir: Path) -> dict[str, Any]:
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path)
         else:
-            path.unlink(missing_ok=True)
+            if path.is_file() or path.is_symlink():
+                path.unlink()
 
     write_commitment(result_dir)
     after = audit_package(result_dir)
