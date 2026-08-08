@@ -55,6 +55,7 @@ from run_sample import (  # noqa: E402
     default_api_key_env,
     load_env_key,
     native_tool_calling_for_model,
+    runtime_server_url,
     trajectory_has_finish_action,
 )
 from poc_dedup import deduplicate_submission_attempts  # noqa: E402
@@ -65,95 +66,35 @@ def load_json(path: Path) -> dict:
 
 
 def load_runtime_spec(sample_dir: Path) -> tuple[str, dict]:
-    """Recover the private fixed harness without exposing GT to the agent."""
-    repro_path = sample_dir / "reproduction_report.json"
-    if repro_path.is_file():
-        repro = load_json(repro_path)
-        command = minimize_submission_command(
-            extract_inner_repro_command(repro, sample_dir)
-        )
-        if "/gt/poc" in command:
-            return command, repro
-
+    """Load the packaged private oracle without inferring commands at runtime."""
     gt_path = sample_dir / "ground_truth.json"
-    if gt_path.is_file():
-        trigger = str((load_json(gt_path).get("poc") or {}).get("trigger") or "")
-        trigger = trigger.replace("{poc}", "/gt/poc").strip()
-        if "/gt/poc" in trigger and "\n" not in trigger and len(trigger) < 1000:
-            return trigger, {"detector": "", "source": "private_gt_trigger"}
-
-    reachability_path = sample_dir / "reachability_report.json"
-    if not reachability_path.is_file():
-        raise RuntimeError(f"{sample_dir.name} has no executable runtime oracle")
-    reachability = load_json(reachability_path)
-    raw = (reachability.get("debug_command") or {}).get("command") or []
-    if not isinstance(raw, list) or "--args" not in raw:
-        inferred = infer_command_from_sanitizer_trace(sample_dir)
-        if not inferred:
-            inferred = infer_command_from_public_bug_report(sample_dir)
-        if inferred:
-            return inferred, {
-                "detector": str(reachability.get("sanitizer_observed") or ""),
-                "source": "sanitizer_invocation",
-            }
-        raise RuntimeError(f"{sample_dir.name} has no recoverable debug command")
-    args = [str(item) for item in raw[raw.index("--args") + 1 :]]
-    if not args:
-        raise RuntimeError(f"{sample_dir.name} debug command has no target")
-    if args[0].endswith("build.sh") and len(args) >= 2:
-        command = args[1] if len(args) == 2 else shlex.join(args[1:])
-    else:
-        command = shlex.join(args)
-    absolute_prefix = str(sample_dir.resolve())
-    command = command.replace(absolute_prefix, "/gt")
-    command = command.replace(f"gt_results/{sample_dir.name}", "/gt")
-    command = command.replace(str(sample_dir / "poc"), "/gt/poc")
-    info = load_json(sample_dir / "sample_info.json")
-    expected_name = str(info.get("poc_expected_testcase_name") or "")
-    if expected_name:
-        command = re.sub(
-            rf"(?<!\S)\S*{re.escape(expected_name)}\S*", "/gt/poc", command
+    if not gt_path.is_file():
+        raise RuntimeError(f"{sample_dir.name} has no packaged ground truth")
+    trigger = str(
+        (load_json(gt_path).get("poc") or {}).get("trigger") or ""
+    ).strip()
+    if (
+        not trigger
+        or "/gt/poc" not in trigger
+        or "\n" in trigger
+        or len(trigger) >= 1000
+        or re.match(r"(?i)^(run|running|stage\s+\d+)\b", trigger)
+    ):
+        raise RuntimeError(
+            f"{sample_dir.name} has a non-executable poc.trigger; run "
+            "scripts/normalize_gt_runtime_metadata.py"
         )
-    command = minimize_submission_command(command)
-    if "/gt/poc" not in command:
-        inferred = infer_command_from_public_bug_report(sample_dir)
-        if inferred:
-            command = inferred
-        else:
-            raise RuntimeError(f"{sample_dir.name} recovered command does not consume /gt/poc")
-    detector = str(reachability.get("sanitizer_observed") or "")
-    return command, {"detector": detector, "source": "reachability_debug_command"}
 
-
-def infer_command_from_sanitizer_trace(sample_dir: Path) -> str | None:
-    trace_path = sample_dir / "sanitizer_trace.txt"
-    if not trace_path.is_file():
-        return None
-    trace = trace_path.read_text(encoding="utf-8", errors="replace")
-    match = re.search(r"(?m)^(?P<target>\S+): Running 1 inputs? 1 time", trace)
-    if not match:
-        return None
-    target = match.group("target")
-    absolute_prefix = str(sample_dir.resolve())
-    target = target.replace(absolute_prefix, "/gt")
-    if target.startswith("./"):
-        target = "/gt/_work/src/" + target[2:]
-    return f"{shlex.quote(target)} -runs=1 /gt/poc"
-
-
-def infer_command_from_public_bug_report(sample_dir: Path) -> str | None:
-    report_path = GT_ROOT / "dataset" / "pocs" / sample_dir.name / "bug_report.md"
-    if not report_path.is_file():
-        return None
-    report = report_path.read_text(encoding="utf-8", errors="replace")
-    match = re.search(r"(?mi)^Fuzz Target:\s*(?P<target>[A-Za-z0-9_.-]+)\s*$", report)
-    if not match:
-        return None
-    target = shlex.quote(match.group("target"))
-    return (
-        f'target="$(find /gt/_work -type f -name {target} -perm -111 | head -1)"; '
-        'test -n "$target" && "$target" -runs=1 /gt/poc'
-    )
+    detector = ""
+    reachability_path = sample_dir / "reachability_report.json"
+    if reachability_path.is_file():
+        detector = str(
+            load_json(reachability_path).get("sanitizer_observed") or ""
+        )
+    return trigger, {
+        "detector": detector,
+        "source": "normalized_private_gt_trigger",
+    }
 
 
 def clear_previous_result(sample_dir: Path) -> None:
@@ -163,6 +104,46 @@ def clear_previous_result(sample_dir: Path) -> None:
             shutil.rmtree(path)
     for name in ("manifest.json", "fine_trace.json", "fine_trace.response.txt"):
         (sample_dir / name).unlink(missing_ok=True)
+
+
+def check_runtime_readiness(sample_dir: Path) -> dict:
+    """Fail before an agent run when the private local runtime cannot be restored."""
+    load_runtime_spec(sample_dir)
+    sample_info_path = sample_dir / "sample_info.json"
+    if not sample_info_path.is_file():
+        raise RuntimeError(f"{sample_dir.name} has no sample_info.json")
+    sample_info = load_json(sample_info_path)
+    cached_source = (sample_dir / "_work" / "src").is_dir()
+    repo = str(sample_info.get("repo") or sample_info.get("repo_url") or "").strip()
+    commit = str(sample_info.get("vulnerable_commit") or "").strip()
+    if not cached_source and (not repo or not commit):
+        raise RuntimeError(
+            f"{sample_dir.name} has neither cached source nor repo@vulnerable_commit"
+        )
+
+    required_images = ("gt-memory-env:latest", "alpine:3.23")
+    image_check = subprocess.run(
+        ["docker", "image", "inspect", *required_images],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    if image_check.returncode:
+        raise RuntimeError(
+            "local PoC runtime images are missing; run scripts/setup_openhands.sh "
+            "and build docker/gt-memory-env"
+        )
+    return {
+        "ready": True,
+        "source_strategy": "cached_worktree" if cached_source else "clone_commit",
+        "repo": repo,
+        "vulnerable_commit": commit,
+        "required_images": list(required_images),
+    }
 
 
 def extract_inner_repro_command(report: dict, sample_dir: Path) -> str:
@@ -544,8 +525,9 @@ class LocalExecutionBridge:
 
     @property
     def url(self) -> str:
-        gateway = os.getenv("OPENHANDS_EVAL_HOST_GATEWAY", "172.17.0.1")
-        return f"http://{gateway}:{self.server.server_port}"
+        return runtime_server_url(
+            f"http://host.docker.internal:{self.server.server_port}"
+        )
 
     def start(self) -> None:
         self.thread.start()
@@ -591,7 +573,14 @@ class LocalExecutionBridge:
                     )
                 return {"exit_code": completed.returncode, "output": output}
             except subprocess.TimeoutExpired as exc:
-                output = (exc.stdout or "") + (exc.stderr or "")
+                def decode_timeout_output(value) -> str:
+                    if isinstance(value, bytes):
+                        return value.decode("utf-8", errors="replace")
+                    return str(value or "")
+
+                output = decode_timeout_output(
+                    exc.stdout
+                ) + decode_timeout_output(exc.stderr)
                 return {"exit_code": 124, "output": output + "\nexecution timed out\n"}
 
     def _transport_admin(self, command: str) -> None:
@@ -620,7 +609,7 @@ class LocalExecutionBridge:
         command = self.inner_command.replace(
             "/gt/poc", f"/gt/.submissions/{attempt_id}/poc.bin"
         )
-        result = self.run_command(command, 60)
+        result = self.run_command(command, 180)
         output = str(result.get("output") or "")
         triggered = runtime_triggered(output, int(result["exit_code"]), self.detector)
         runtime_path = submission / "runtime_output.txt"
@@ -717,6 +706,7 @@ def write_config(
     log_dir: Path,
     model: str,
     base_url: str,
+    api_version: str | None,
     native_tool_calling: bool | None,
 ) -> None:
     template = ROOT / "template" / "config.toml"
@@ -727,6 +717,8 @@ def write_config(
     config["core"]["save_trajectory_path"] = str(log_dir / "trajectory")
     config["llm"]["model"] = model_map(model, openai_compatible=bool(base_url))
     config["llm"]["base_url"] = base_url
+    if api_version:
+        config["llm"]["api_version"] = api_version
     config["llm"]["temperature"] = 0.0
     config["llm"]["top_p"] = 1.0
     if native_tool_calling is not None:
@@ -746,8 +738,14 @@ def persist_results(sample_dir: Path, workspace: Path, run_dir: Path, config_pat
 
     checkpoint = sample_dir / "checkpoint"
     checkpoint.mkdir(parents=True, exist_ok=True)
+    pre_finalization = checkpoint / "pre_finalization"
+    frozen_checkpoint = (
+        pre_finalization
+        if (pre_finalization / "metadata.json").is_file()
+        else None
+    )
     for name in ("file", "cache"):
-        src = run_dir / name
+        src = (frozen_checkpoint or run_dir) / name
         dst = checkpoint / name
         if dst.exists():
             shutil.rmtree(dst)
@@ -756,7 +754,12 @@ def persist_results(sample_dir: Path, workspace: Path, run_dir: Path, config_pat
         else:
             dst.mkdir()
     for src, name in (
-        (run_dir / "trajectory", "trajectory"),
+        (
+            (frozen_checkpoint / "trajectory")
+            if frozen_checkpoint is not None
+            else (run_dir / "trajectory"),
+            "trajectory",
+        ),
         (run_dir / "args.json", "args.json"),
         (config_path, "config.toml"),
         (prompt_path, "prompt.txt"),
@@ -766,6 +769,12 @@ def persist_results(sample_dir: Path, workspace: Path, run_dir: Path, config_pat
                 copy_json_redacted(src, checkpoint / name)
             else:
                 shutil.copy2(src, checkpoint / name)
+    if frozen_checkpoint is not None:
+        shutil.copy2(
+            frozen_checkpoint / "metadata.json",
+            checkpoint / "metadata.json",
+        )
+        shutil.rmtree(frozen_checkpoint)
     (sample_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
 
 
@@ -776,6 +785,7 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--model", default="deepseek/deepseek-chat")
     ap.add_argument("--base-url", default="")
+    ap.add_argument("--api-version", default="")
     ap.add_argument("--api-key-env", default="")
     ap.add_argument(
         "--openhands-repo",
@@ -792,6 +802,8 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     results_dir = args.results_dir.expanduser().resolve()
     sample_result_dir = results_dir / args.sample_id
+    gt_sample_dir = GT_ROOT / "gt_results" / args.sample_id
+    runtime_readiness = check_runtime_readiness(gt_sample_dir)
     clear_previous_result(sample_result_dir)
     sample_result_dir.mkdir(parents=True, exist_ok=True)
 
@@ -822,6 +834,7 @@ def main() -> int:
             log_dir=run_dir,
             model=args.model,
             base_url=args.base_url,
+            api_version=args.api_version or None,
             native_tool_calling=native_tool_calling_for_model(args.model),
         )
 
@@ -831,6 +844,12 @@ def main() -> int:
         os.environ["OPENHANDS_HARNESS_MODE"] = "evaluation"
         os.environ["OPENHANDS_CAPTURE_FINE_TRACE"] = "1"
         os.environ["OPENHANDS_FINE_TRACE_OUTPUT"] = str(sample_result_dir / "fine_trace.json")
+        os.environ["OPENHANDS_PRE_FINALIZATION_CHECKPOINT"] = str(
+            sample_result_dir / "checkpoint" / "pre_finalization"
+        )
+        os.environ.setdefault(
+            "OPENHANDS_MAIN_MODULE", "poc_generation.openhands_fine_trace_main"
+        )
 
         bridge = LocalExecutionBridge(workspace, inner_command, repro)
         bridge.start()
@@ -851,7 +870,6 @@ def main() -> int:
         finally:
             bridge.close()
 
-        gt_sample_dir = GT_ROOT / "gt_results" / args.sample_id
         submissions = validate_submissions_on_host(gt_sample_dir, workspace, inner_command)
         submission_dirs = sorted((workspace / ".submissions").glob("*")) if (workspace / ".submissions").is_dir() else []
         trace_produced = (sample_result_dir / "fine_trace.json").is_file() or (workspace / ".latest_candidate_trace.json").is_file()
@@ -879,12 +897,19 @@ def main() -> int:
         poc_deduplication, deduplicated_pocs = deduplicate_submission_attempts(
             submissions
         )
+        frozen_checkpoint = (
+            sample_result_dir
+            / "checkpoint"
+            / "pre_finalization"
+            / "metadata.json"
+        ).is_file()
         manifest = {
             "evaluation_protocol": "poc_trace_per_submission_v2_local",
             "sample_id": args.sample_id,
             "model": args.model,
             "api_key_env": api_key_env,
             "max_iter": args.max_iter,
+            "runtime_readiness": runtime_readiness,
             "status": status,
             "agent_action_count": agent_action_count,
             "terminal_finish_observed": terminal_finish_observed,
@@ -897,7 +922,14 @@ def main() -> int:
                 "produced": trace_produced,
                 "source": "last_valid_poc_submission" if submission_dirs else "task_finalization",
             },
-            "checkpoint": {"dir": "checkpoint/"},
+            "checkpoint": {
+                "dir": "checkpoint/",
+                "phase": (
+                    "pre_fine_trace_finalization"
+                    if frozen_checkpoint
+                    else "terminal"
+                ),
+            },
         }
         persist_results(sample_result_dir, workspace, run_dir, config_path, prompt_path, manifest)
         print(json.dumps(manifest, indent=2))

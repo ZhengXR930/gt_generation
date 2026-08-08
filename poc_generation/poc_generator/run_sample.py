@@ -148,7 +148,7 @@ def load_env_key(var_name: str) -> str:
 
 
 def default_api_key_env(model: str) -> str:
-    normalized = model.removeprefix("openai/")
+    normalized = model[len("openai/"):] if model.startswith("openai/") else model
     if normalized.startswith("deepseek"):
         return "DEEPSEEK_API_KEY"
     if normalized.startswith("claude-"):
@@ -160,8 +160,8 @@ def default_api_key_env(model: str) -> str:
 
 def native_tool_calling_for_model(model: str) -> bool | None:
     """Override old OpenHands capability tables for newer official models."""
-    normalized = model.removeprefix("openai/")
-    if normalized.startswith(("gpt-5.4", "deepseek")):
+    normalized = model[len("openai/"):] if model.startswith("openai/") else model
+    if normalized.startswith("gpt-5.4"):
         return True
     return None
 
@@ -194,7 +194,18 @@ def runtime_server_url(server: str) -> str:
     """Use the Docker bridge gateway on Linux, where host.docker.internal
     is not guaranteed to be registered inside the OpenHands runtime."""
     if sys.platform.startswith("linux"):
-        gateway = os.getenv("OPENHANDS_EVAL_HOST_GATEWAY", "172.17.0.1")
+        gateway = os.getenv("OPENHANDS_EVAL_HOST_GATEWAY", "").strip()
+        if not gateway:
+            try:
+                bridge = docker.from_env().networks.get("bridge")
+                configs = (bridge.attrs.get("IPAM") or {}).get("Config") or []
+                gateway = next(
+                    str(item.get("Gateway") or "").strip()
+                    for item in configs
+                    if str(item.get("Gateway") or "").strip()
+                )
+            except (docker.errors.DockerException, StopIteration, TypeError):
+                gateway = "172.17.0.1"
         return server.replace("host.docker.internal", gateway)
     return server
 
@@ -550,12 +561,21 @@ def run_attempt(
             status = "incomplete"
 
         # Copy only the durable checkpoint pieces -- not the extracted repo/workspace.
+        # When a separate trace-finalization turn ran, promote the snapshot taken
+        # before that turn. The finalization events must not alter the resumable
+        # tool-using checkpoint.
         checkpoint_dir = sample_dir / "checkpoint"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        pre_finalization_dir = checkpoint_dir / "pre_finalization"
+        frozen_checkpoint = (
+            pre_finalization_dir
+            if (pre_finalization_dir / "metadata.json").is_file()
+            else None
+        )
         tmp_input_dir = openhands_args.tmp_dir / run_dir.name
 
         for name in ("file", "cache"):
-            src = run_dir / name
+            src = (frozen_checkpoint or run_dir) / name
             dst = checkpoint_dir / name
             if dst.exists():
                 shutil.rmtree(dst)
@@ -564,7 +584,11 @@ def run_attempt(
             else:
                 dst.mkdir()
         for name in ("trajectory", "args.json"):
-            src = run_dir / name
+            src = (
+                frozen_checkpoint / name
+                if frozen_checkpoint is not None and name == "trajectory"
+                else run_dir / name
+            )
             if src.exists():
                 if name == "args.json":
                     copy_json_redacted(src, checkpoint_dir / name)
@@ -574,6 +598,12 @@ def run_attempt(
             src = tmp_input_dir / "template" / name
             if src.exists():
                 shutil.copy2(src, checkpoint_dir / name)
+        if frozen_checkpoint is not None:
+            shutil.copy2(
+                frozen_checkpoint / "metadata.json",
+                checkpoint_dir / "metadata.json",
+            )
+            shutil.rmtree(frozen_checkpoint)
 
         manifest_entry = {
             "evaluation_protocol": "poc_trace_per_submission_v2",
@@ -607,6 +637,11 @@ def run_attempt(
             },
             "checkpoint": {
                 "dir": "checkpoint/",
+                "phase": (
+                    "pre_fine_trace_finalization"
+                    if frozen_checkpoint is not None
+                    else "terminal"
+                ),
                 "note": (
                     "workspace/ is intentionally NOT persisted here (the extracted repo "
                     "can be 1-2GB and the durable session checkpoint does not require it). "
@@ -655,7 +690,12 @@ def main():
     ap.add_argument(
         "--base-url",
         default="",
-        help="OpenAI-compatible API base URL; forces LiteLLM's OpenAI adapter.",
+        help="Provider API base URL.",
+    )
+    ap.add_argument(
+        "--api-version",
+        default="",
+        help="Optional API version for Azure-compatible endpoints.",
     )
     ap.add_argument(
         "--api-key-env",
@@ -708,10 +748,16 @@ def main():
     os.environ["OPENHANDS_HARNESS_MODE"] = "evaluation"
     os.environ["OPENHANDS_CAPTURE_FINE_TRACE"] = "1"
     os.environ["OPENHANDS_FINE_TRACE_OUTPUT"] = str(trace_output)
+    os.environ.setdefault(
+        "OPENHANDS_MAIN_MODULE", "poc_generation.openhands_fine_trace_main"
+    )
 
     last_status = None
     for attempt in range(1, args.max_attempts + 1):
         clear_previous_result(trace_output.parent)
+        os.environ["OPENHANDS_PRE_FINALIZATION_CHECKPOINT"] = str(
+            trace_output.parent / "checkpoint" / "pre_finalization"
+        )
         # A fresh episode each attempt: overwrite this sample's fine_trace.json
         # only when it reaches a normal endpoint. Start clean so a stale trace from a
         # prior early-died attempt cannot be mistaken for this attempt's output.

@@ -9,6 +9,10 @@ TARGET="${OPENHANDS_REPO:-${ROOT_DIR}/external/OpenHands}"
 OPENHANDS_TAG="0.33.0"
 OPENHANDS_COMMIT="35b381f3a8f4b5229934515e9f6b479d6d6415ef"
 INSTALL=1
+POETRY_BIN="${POETRY_BIN:-$(command -v poetry || true)}"
+if [[ -z "${POETRY_BIN}" && -x "${HOME}/.local/pythons/cpython-3.11/bin/poetry" ]]; then
+  POETRY_BIN="${HOME}/.local/pythons/cpython-3.11/bin/poetry"
+fi
 
 if [[ "${1:-}" == "--checkout-only" ]]; then
   INSTALL=0
@@ -45,14 +49,20 @@ if [[ "${ACTUAL_COMMIT}" != "${OPENHANDS_COMMIT}" ]]; then
 fi
 
 if [[ "${INSTALL}" == "1" ]]; then
-  if ! command -v poetry >/dev/null 2>&1; then
+  if [[ -z "${POETRY_BIN}" ]]; then
     echo "Poetry is required to install OpenHands dependencies." >&2
-    echo "Install Poetry, or rerun with --checkout-only and provide OPENHANDS_PYTHON." >&2
+    echo "Install Poetry, set POETRY_BIN, or rerun with --checkout-only and provide OPENHANDS_PYTHON." >&2
     exit 2
   fi
   (
     cd "${TARGET}"
-    poetry install --no-interaction
+    "${POETRY_BIN}" install --no-interaction
+    OPENHANDS_PYTHON="$("${POETRY_BIN}" env info --executable)"
+    "${OPENHANDS_PYTHON}" -m pip install \
+      tomli-w==1.2.0 \
+      simple-parsing==0.1.9 \
+      sqlalchemy==2.0.51 \
+      -e "${ROOT_DIR}/external/cybergym"
   )
 fi
 

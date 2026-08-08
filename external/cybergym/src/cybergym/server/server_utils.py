@@ -35,8 +35,12 @@ CUSTOM_ERROR_MESSAGES = {
 
 
 def _post_process_result(res: dict, require_flag: bool = False):
-    if res["exit_code"] in CustomExitCode:
-        res["output"] = CUSTOM_ERROR_MESSAGES[res["exit_code"]]
+    try:
+        custom_exit_code = CustomExitCode(res["exit_code"])
+    except ValueError:
+        custom_exit_code = None
+    if custom_exit_code is not None:
+        res["output"] = CUSTOM_ERROR_MESSAGES[custom_exit_code]
         res["exit_code"] = 0
     if require_flag and res["exit_code"] != 0:
         res["flag"] = FLAG
