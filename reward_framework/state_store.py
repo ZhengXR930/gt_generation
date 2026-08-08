@@ -12,7 +12,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import EvidenceRecord, ObservationState, TaskContext
+from .models import (
+    EvidenceRecord,
+    EvidenceState,
+    HarnessPolicy,
+    HarnessState,
+    ObservationState,
+    TaskContext,
+)
 
 
 def utc_now() -> str:
@@ -57,7 +64,20 @@ class StateStore:
 
     @property
     def observation_path(self) -> Path:
+        """Legacy mirror retained for existing checkpoints and analysis code."""
         return self.root / "observation_state.json"
+
+    @property
+    def trajectory_path(self) -> Path:
+        return self.root / "trajectory_state.json"
+
+    @property
+    def evidence_state_path(self) -> Path:
+        return self.root / "evidence_state.json"
+
+    @property
+    def harness_state_path(self) -> Path:
+        return self.root / "harness_state.json"
 
     def save_task(self, task: TaskContext) -> None:
         if self.task_path.exists():
@@ -70,12 +90,105 @@ class StateStore:
         return TaskContext.from_dict(json.loads(self.task_path.read_text()))
 
     def save_observation(self, state: ObservationState) -> None:
+        atomic_json(self.trajectory_path, state.to_dict())
+        # Version-one consumers expect this exact path. Keep it as a mirror,
+        # not as a second independently mutable state.
         atomic_json(self.observation_path, state.to_dict())
 
     def load_observation(self) -> ObservationState:
-        if not self.observation_path.exists():
+        path = (
+            self.trajectory_path
+            if self.trajectory_path.exists()
+            else self.observation_path
+        )
+        if not path.exists():
             return ObservationState()
-        return ObservationState.from_dict(json.loads(self.observation_path.read_text()))
+        return ObservationState.from_dict(json.loads(path.read_text()))
+
+    def save_evidence_state(self, state: EvidenceState) -> None:
+        atomic_json(self.evidence_state_path, state.to_dict())
+
+    def load_evidence_state(self) -> EvidenceState:
+        if not self.evidence_state_path.exists():
+            rebuilt = EvidenceState()
+            if self.evidence_dir.exists():
+                for path in sorted(self.evidence_dir.glob("attempt_*.json")):
+                    value = json.loads(path.read_text())
+                    runtime = value.get("runtime") or {}
+                    assessment = value.get("assessment") or {}
+                    feedback = value.get("feedback") or {}
+                    errors: list[str] = []
+                    if value.get("duplicate_of"):
+                        errors.append("duplicate_candidate")
+                    if runtime.get("instrumentation_available") is False:
+                        errors.append("instrumentation_unavailable")
+                    if runtime.get("error"):
+                        errors.append("runtime_or_probe_error")
+                    boundary = assessment.get("first_unresolved")
+                    if boundary:
+                        errors.append(f"causal_boundary:{boundary}")
+                    if feedback.get("contradiction"):
+                        errors.append("candidate_claim_refuted")
+                    for error in errors:
+                        rebuilt.recurring_errors[error] = (
+                            rebuilt.recurring_errors.get(error, 0) + 1
+                        )
+                    summary = {
+                        "attempt_number": value.get("attempt_number"),
+                        "candidate_id": value.get("candidate_id"),
+                        "candidate_sha256": value.get("candidate_sha256"),
+                        "duplicate_of": value.get("duplicate_of"),
+                        "trigger_observed": runtime.get("trigger_observed") is True,
+                        "instrumentation_available": runtime.get(
+                            "instrumentation_available"
+                        ),
+                        "runtime_facts": list(runtime.get("facts") or []),
+                        "assessment": assessment,
+                        "feedback": feedback,
+                        "errors": errors,
+                        "created_at": value.get("created_at"),
+                    }
+                    rebuilt.attempts.append(summary)
+                    rebuilt.latest_attempt_number = int(
+                        value.get("attempt_number") or 0
+                    )
+                    rebuilt.latest_candidate_id = value.get("candidate_id")
+                    rebuilt.last_confirmed_prefix = tuple(
+                        assessment.get("longest_confirmed_prefix") or []
+                    )
+            if rebuilt.attempts:
+                self.save_evidence_state(rebuilt)
+            return rebuilt
+        return EvidenceState.from_dict(json.loads(self.evidence_state_path.read_text()))
+
+    def initialize_harness(
+        self, *, platform: str, baseline_profile: str, max_iterations: int = 100
+    ) -> HarnessState:
+        if self.harness_state_path.exists():
+            return self.load_harness_state()
+        state = HarnessState(
+            baseline_profile=baseline_profile,
+            current_policy=HarnessPolicy(
+                platform=platform, max_iterations=max_iterations
+            ),
+        )
+        self.save_harness_state(state)
+        return state
+
+    def save_harness_state(self, state: HarnessState) -> None:
+        atomic_json(self.harness_state_path, state.to_dict())
+
+    def load_harness_state(self) -> HarnessState:
+        return HarnessState.from_dict(json.loads(self.harness_state_path.read_text()))
+
+    def global_state(self) -> dict[str, Any]:
+        """One complete optimizer view without lossy boolean summaries."""
+        return {
+            "task": self.load_task().to_dict(),
+            "trajectory": self.load_observation().to_dict(),
+            "evidence": self.load_evidence_state().to_dict(),
+            "harness": self.load_harness_state().to_dict(),
+        }
 
     def append_event(self, *, source: str, kind: str,
                      payload: dict[str, Any]) -> ObservationState:
@@ -147,6 +260,9 @@ class StateStore:
             self.candidates_dir / record.candidate_id / "latest_evidence.json",
             record.to_dict(),
         )
+        aggregate = self.load_evidence_state()
+        aggregate.append_record(record)
+        self.save_evidence_state(aggregate)
         return path
 
     def previous_distinct_evidence(self, candidate_sha256: str) -> dict[str, Any] | None:

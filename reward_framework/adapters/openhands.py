@@ -19,6 +19,8 @@ from ..submission_tool import SUBMIT_CANDIDATE_TOOL, TOOL_NAME
 
 
 class OpenHandsAdapter(CallbackAdapter):
+    platform_name = "openhands"
+
     def __init__(self, *, workspace_root: Path,
                  inject: Callable[[str], None],
                  checkpoint_callback: Callable[[str], Path | None]):
@@ -256,6 +258,10 @@ def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
 
     def controlled_step(state):
         nonlocal seen_events
+        framework.record_iteration(
+            iteration=int(getattr(state, "iteration", 0) or 0),
+            maximum=int(getattr(state, "max_iterations", 100) or 100),
+        )
         history = list(state.history)
         for event in history[seen_events:]:
             value = event_to_dict(event)

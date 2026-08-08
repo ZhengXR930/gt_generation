@@ -27,6 +27,8 @@ ENVS = [
     "OPENHANDS_HARNESS_MODE",
     "OPENHANDS_CAPTURE_FINE_TRACE",
     "OPENHANDS_FINE_TRACE_OUTPUT",
+    "OPENHANDS_PRE_FINALIZATION_CHECKPOINT",
+    "OPENHANDS_CACHE_DIR",
     "OPENHANDS_TASK_WORKSPACE",
     "OPENHANDS_MAIN_MODULE",
 ]
@@ -34,10 +36,13 @@ API_KEY_ENVS = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "LLM_
 OPENAI_PREFIXES = ["gpt-", "o3", "o4"]
 ANTHROPIC_PREFIXES = ["claude-"]
 DEEPSEEK_PREFIXES = ["deepseek", "deepseek/"]
+HARNESS_PROFILES = {"baseline", "reward"}
+PINNED_OPENHANDS_COMMIT = "35b381f3a8f4b5229934515e9f6b479d6d6415ef"
 
 
 SCRIPT_DIR = Path(__file__).parent.absolute()
 PROJECT_ROOT = SCRIPT_DIR.parents[4]
+REPOSITORY_ROOT = SCRIPT_DIR.parents[1]
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -59,6 +64,48 @@ class OpenHandsValidationError(OpenHandsError):
     """Exception raised when OpenHands validation fails"""
 
     pass
+
+
+def configure_harness_profile(
+    profile: str, *, max_iterations: int, update_harness: bool = True
+) -> None:
+    """Select one isolated harness without modifying the OpenHands checkout."""
+    if profile not in HARNESS_PROFILES:
+        raise ValueError(f"unknown OpenHands harness profile: {profile}")
+    controlled = (
+        "OPENHANDS_REWARD_FRAMEWORK",
+        "REWARD_FRAMEWORK_CROSS_SAMPLE_TRAINING",
+        "REWARD_FRAMEWORK_BASELINE_PROFILE",
+        "REWARD_FRAMEWORK_MAX_ITERATIONS",
+        "OPENHANDS_MAIN_MODULE",
+        "OPENHANDS_NATIVE_SUBMIT_TOOL",
+        "OPENHANDS_REQUIRE_PRISTINE",
+    )
+    for name in controlled:
+        os.environ.pop(name, None)
+    os.environ["OPENHANDS_HARNESS_PROFILE"] = profile
+    os.environ["OPENHANDS_REQUIRE_PRISTINE"] = "0" if profile == "reward" else "1"
+    if profile != "reward":
+        for name in (
+            "REWARD_FRAMEWORK_TRAINING_ROOT",
+            "REWARD_FRAMEWORK_PRISTINE_OPENHANDS",
+            "REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION",
+            "REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT",
+        ):
+            os.environ.pop(name, None)
+    if profile == "baseline":
+        # The production evaluator always uses the untouched upstream module.
+        os.environ["OPENHANDS_MAIN_MODULE"] = "openhands.core.main"
+        return
+    os.environ["OPENHANDS_REWARD_FRAMEWORK"] = "1"
+    os.environ["OPENHANDS_MAIN_MODULE"] = "reward_framework.openhands_entrypoint"
+    os.environ["OPENHANDS_NATIVE_SUBMIT_TOOL"] = "1"
+    os.environ["REWARD_FRAMEWORK_BASELINE_PROFILE"] = (
+        "openhands_0.33.0_pristine"
+    )
+    os.environ["REWARD_FRAMEWORK_MAX_ITERATIONS"] = str(max_iterations)
+    if update_harness:
+        os.environ["REWARD_FRAMEWORK_CROSS_SAMPLE_TRAINING"] = "1"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -270,6 +317,27 @@ def run_openhands(
             f"Run {setup_script} or pass --openhands-repo PATH to a complete "
             "OpenHands 0.33.0 checkout."
         )
+    if os.getenv("OPENHANDS_REQUIRE_PRISTINE", "0") == "1":
+        try:
+            revision = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                text=True, capture_output=True, check=True,
+            ).stdout.strip()
+            dirty = subprocess.run(
+                ["git", "-C", str(repo), "status", "--porcelain"],
+                text=True, capture_output=True, check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise OpenHandsValidationError(
+                "OpenHands must be the pinned pristine checkout created by "
+                "scripts/setup_openhands.sh"
+            ) from exc
+        if revision != PINNED_OPENHANDS_COMMIT or dirty:
+            raise OpenHandsValidationError(
+                "Refusing to run a modified OpenHands checkout: expected pristine "
+                f"{PINNED_OPENHANDS_COMMIT}, got {revision}"
+                + (" with local changes" if dirty else "")
+            )
     python_override = os.getenv("OPENHANDS_PYTHON")
     if python_override:
         command_prefix = [python_override]
@@ -304,10 +372,18 @@ def run_openhands(
     for env_var in ENVS:
         if os.getenv(env_var) is not None:
             env[env_var] = os.getenv(env_var)
+    pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(REPOSITORY_ROOT), pythonpath) if part
+    )
 
     env["LLM_API_KEY"] = llm_api_key or get_api_key(model)
     env["LOG_TO_FILE"] = "1"
     env["LOG_DIR"] = str(log_dir)
+    rendered_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    env["OPENHANDS_CACHE_DIR"] = str(
+        (rendered_config.get("core") or {}).get("cache_dir") or ""
+    )
     if debug:
         env["DEBUG"] = "1"
     env["LOG_ALL_EVENTS"] = "1"
@@ -347,7 +423,10 @@ def session_name_for_task(task_id: str) -> str:
 
 
 def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
-    reward_framework_enabled = os.getenv("OPENHANDS_REWARD_FRAMEWORK", "0") == "1"
+    profile = os.getenv("OPENHANDS_HARNESS_PROFILE", "baseline")
+    if profile not in HARNESS_PROFILES:
+        raise ValueError(f"unknown OpenHands harness profile: {profile}")
+    reward_framework_enabled = profile == "reward"
     if reward_framework_enabled:
         # This must be visible while the generated README and prompt are being
         # prepared, not only after the OpenHands controller starts.

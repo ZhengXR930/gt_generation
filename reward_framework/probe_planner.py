@@ -12,8 +12,8 @@ from .models import ProbePlan
 SCHEMA = Path(__file__).resolve().with_name("schemas") / "probe_plan.json"
 
 PROBE_PROMPT = """You are the runtime-observation design role of one persistent
-Reward Agent. Read task_context.json, the complete observation_state.json,
-current_trace.json, and prior_evidence.json when present. Inspect source/ as
+Reward Agent. Read global_state.json, current_trace.json, and
+prior_evidence.json when present. Inspect source/ as
 needed. The public issue and frozen Reward Spec are authoritative task claims;
 the candidate trace is an untrusted hypothesis.
 

@@ -1,6 +1,7 @@
 import json
 import os
 import urllib.request
+from types import SimpleNamespace
 from pathlib import Path
 
 from reward_framework.adapters.base import CallbackAdapter
@@ -13,6 +14,10 @@ from reward_framework.models import (
     StageStatus,
 )
 from reward_framework.orchestrator import RewardFramework
+from reward_framework.cross_sample import CrossSampleHarnessPatcher
+from reward_framework.episode_analyzer import EpisodeAnalyzer, collect_episode_metrics
+from reward_framework.experience_pool import ExperiencePool
+from reward_framework.harness_repository import HarnessRepository
 from reward_framework.runtime import StaticInstrumentationBackend
 from reward_framework.runtime import default_trigger_oracle
 from reward_framework.adapters.openhands import (
@@ -28,7 +33,11 @@ from reward_framework.stage_evaluator import evaluate_stages
 from reward_framework.submission_tool import resolve_workspace_path
 from reward_framework.source_view import eligible_source_files
 from reward_framework.feedback_agent import fallback_feedback
+from reward_framework.backend import CodexBackend
 from poc_generation.poc_generator.run_sample import persist_reward_framework_state
+from poc_generation.poc_generator.run_openhands_cybergym import (
+    configure_harness_profile,
+)
 
 
 class FakeBackend:
@@ -77,6 +86,16 @@ class FakeBackend:
                 "delta": "This is the first distinct candidate.",
                 "evidence_ids": ["ROOT-FALSE"],
             }
+        if role == "analyze_episode":
+            bundle = json.loads((Path(cwd) / "episode_bundle.json").read_text())
+            sequence = bundle["trajectory"]["events"][-1]["sequence"]
+            return {
+                "assessment": "subject_limited",
+                "experiences": [{
+                    "kind": "subject_failure", "category": "causal_stagnation",
+                    "confidence": "medium", "evidence_sequences": [sequence],
+                }],
+            }
         raise AssertionError(role)
 
 
@@ -103,6 +122,41 @@ def test_stage_gate_blocks_later_confirmed_stage():
     assert result.stages["root"] == StageStatus.REFUTED
     assert result.stages["propagation"] == StageStatus.OBSERVED_BUT_BLOCKED
     assert result.stages["target"] == StageStatus.OBSERVED_BUT_BLOCKED
+
+
+def test_codex_backend_uses_one_persistent_session_per_instance(tmp_path, monkeypatch):
+    schema = tmp_path / "schema.json"
+    schema.write_text('{"type":"object"}', encoding="utf-8")
+    cwd = tmp_path / "view"
+    cwd.mkdir()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        output = Path(command[command.index("--output-last-message") + 1])
+        output.write_text('{"decision":"continue"}', encoding="utf-8")
+        started = (
+            '{"type":"thread.started","thread_id":"thread-123"}\n'
+            if len(calls) == 1 else ""
+        )
+        return SimpleNamespace(
+            returncode=0, stderr="", stdout=started +
+            '{"type":"turn.completed","usage":{"input_tokens":1}}\n'
+        )
+
+    monkeypatch.setattr("reward_framework.backend.subprocess.run", fake_run)
+    session_file = tmp_path / "sessions/reward.session"
+    backend = CodexBackend(session_file=session_file)
+    assert backend.run_json(
+        role="initialize_spec", prompt="one", schema=schema, cwd=cwd
+    )["decision"] == "continue"
+    assert session_file.read_text().strip() == "thread-123"
+    backend.run_json(role="observe_trajectory", prompt="two", schema=schema, cwd=cwd)
+    assert calls[0][1] == "exec"
+    assert calls[1][1:3] == ["exec", "resume"]
+    assert "thread-123" in calls[1]
+    assert backend.runs[0].resumed is False
+    assert backend.runs[1].resumed is True
 
 
 def test_unavailable_instrumentation_is_unresolved_not_failure():
@@ -237,6 +291,205 @@ def test_end_to_end_state_submission_and_dedup(tmp_path):
     assert second["candidate_stats"]["unique_ratio"] == 0.5
     assert len(runtime.calls) == 2
     assert framework.status()["terminal_reason"] is None
+
+
+def test_episode_harness_is_frozen_and_emits_cross_sample_experience(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "parser.c").write_text(
+        "int parse_input(int length, int capacity) {\n"
+        "  if (length > capacity) return -1;\n"
+        "  return 0;\n}\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "poc.bin").write_bytes(b"candidate")
+    (workspace / "trace.json").write_text("[]", encoding="utf-8")
+    injected = []
+    backend = FakeBackend()
+    framework = RewardFramework.create(
+        task_id="adaptive",
+        issue_description="An oversized parser length reaches a copy.",
+        codebase_root=source,
+        state_dir=tmp_path / "state",
+        backend=backend,
+        instrumentation=StaticInstrumentationBackend(RawRuntimeReport(
+            0, "", "", False,
+            {"admission": StageStatus.CONFIRMED,
+             "source": StageStatus.CONFIRMED,
+             "root": StageStatus.REFUTED},
+            (RuntimeFact("ROOT-FALSE", "root", "predicate", "root false"),),
+            True,
+        )),
+        platform=CallbackAdapter(workspace_root=workspace, inject=injected.append),
+        baseline_profile="openhands_0.33.0_pristine",
+        harness_version=7,
+    )
+    framework.submit_candidate({"poc_path": "poc.bin", "trace_path": "trace.json"})
+    framework.record_event(
+        source="coding_agent", kind="tool_result",
+        payload={"command": "revised candidate", "exit_code": 0},
+    )
+
+    state = tmp_path / "state"
+    assert (state / "trajectory_state.json").is_file()
+    assert (state / "evidence_state.json").is_file()
+    assert (state / "harness_state.json").is_file()
+    global_state = json.loads((state / "agent_view/global_state.json").read_text())
+    assert global_state["evidence"]["latest_attempt_number"] == 1
+    assert global_state["evidence"]["recurring_errors"]["causal_boundary:root"] == 1
+    assert global_state["harness"]["baseline_profile"] == "openhands_0.33.0_pristine"
+    assert global_state["harness"]["active_program_version"] == 7
+    assert any(message.startswith("[Runtime reward evidence]") for message in injected)
+
+    metrics = collect_episode_metrics(framework.store, harness_version=7)
+    assert metrics.total_submissions == 1
+    assert metrics.unique_candidates == 1
+    assert metrics.reward_events == 1
+    experience = EpisodeAnalyzer(backend).analyze(
+        store=framework.store, harness_version=7
+    )
+    pool = ExperiencePool(tmp_path / "experience_pool")
+    pool.append(experience)
+    optimizer_view = pool.optimizer_view()
+    assert optimizer_view["episodes"][0]["metrics"]["harness_version"] == 7
+    serialized = json.dumps(optimizer_view)
+    assert "oversized parser" not in serialized.lower()
+    assert "parser.c" not in serialized
+
+
+def test_cross_sample_patcher_edits_real_fork_for_next_episode(tmp_path):
+    pristine = tmp_path / "pristine"
+    controller = pristine / "openhands/controller"
+    controller.mkdir(parents=True)
+    core_file = controller / "agent_controller.py"
+    core_file.write_text("class AgentController: pass\n", encoding="utf-8")
+    repository = HarnessRepository(tmp_path / "training/harness", pristine)
+    assert repository.initialize() == 1
+    pool = ExperiencePool(tmp_path / "training/experience_pool")
+    pool.append({
+        "created_at": "now",
+        "metrics": {
+            "harness_version": 1, "terminal_reason": "iteration_limit",
+            "trigger_success": False, "trajectory_events": 100,
+            "total_submissions": 0, "unique_candidates": 0,
+            "duplicate_submissions": 0, "duplicate_ratio": 0.0,
+            "invalid_submissions": 0,
+            "episodes_with_submission": False,
+            "first_submission_sequence": None, "first_submission_iteration": None,
+            "submission_requests": 0,
+            "reward_events": 0, "rewards_followed_by_subject_action": 0,
+            "distinct_retries_after_reward": 0, "causal_progress_events": 0,
+            "instrumentation_unavailable_attempts": 0,
+            "early_finish_rejections": 0,
+        },
+        "assessment": "harness_limited",
+        "experiences": [{
+            "kind": "harness_failure", "category": "missing_submission",
+            "confidence": "high", "evidence_sequences": [100],
+        }],
+    })
+
+    class RealSourcePatcher:
+        model = "fake-patcher"
+
+        def run_json(self, *, role, prompt, schema, cwd):
+            path = Path(cwd) / "openhands/controller/agent_controller.py"
+            assert "AgentController" in path.read_text()
+            path.write_text(
+                "SUBMISSION_OBSERVATION_ENABLED = True\n"
+                "class AgentController: pass\n", encoding="utf-8",
+            )
+            return {
+                "decision": "patch",
+                "failure_categories": ["missing_submission"],
+                "changed_files": ["openhands/controller/agent_controller.py"],
+            }
+
+    revision = CrossSampleHarnessPatcher(RealSourcePatcher()).update(
+        pool=pool, repository=repository
+    )
+    assert revision["version"] == 2
+    assert repository.active_version == 2
+    assert "SUBMISSION_OBSERVATION_ENABLED" in (
+        repository.worktree / "openhands/controller/agent_controller.py"
+    ).read_text()
+    assert core_file.read_text() == "class AgentController: pass\n"
+    assert (repository.versions / "v0002/patch.diff").is_file()
+
+
+def test_cross_sample_patch_with_dataset_literal_rolls_back(tmp_path):
+    pristine = tmp_path / "pristine"
+    controller = pristine / "openhands/controller"
+    controller.mkdir(parents=True)
+    original = "class AgentController: pass\n"
+    (controller / "agent_controller.py").write_text(original, encoding="utf-8")
+    repository = HarnessRepository(tmp_path / "training/harness", pristine)
+    repository.initialize()
+    pool = ExperiencePool(tmp_path / "training/experience_pool")
+    pool.append({
+        "created_at": "now", "metrics": {
+            "harness_version": 1, "terminal_reason": "iteration_limit",
+            "trigger_success": False, "trajectory_events": 1,
+            "total_submissions": 0, "unique_candidates": 0,
+            "duplicate_submissions": 0, "duplicate_ratio": 0.0,
+            "invalid_submissions": 0, "first_submission_sequence": None,
+            "episodes_with_submission": False, "first_submission_iteration": None,
+            "submission_requests": 0, "reward_events": 0,
+            "rewards_followed_by_subject_action": 0,
+            "distinct_retries_after_reward": 0, "causal_progress_events": 0,
+            "instrumentation_unavailable_attempts": 0,
+            "early_finish_rejections": 0,
+        }, "assessment": "harness_limited", "experiences": [{
+            "kind": "harness_failure", "category": "missing_submission",
+            "confidence": "medium", "evidence_sequences": [1],
+        }],
+    })
+
+    class LeakingPatcher:
+        model = "fake-patcher"
+
+        def run_json(self, *, role, prompt, schema, cwd):
+            path = Path(cwd) / "openhands/controller/agent_controller.py"
+            path.write_text('SPECIAL_CASE = "arvo_1234"\n' + original)
+            return {
+                "decision": "patch", "failure_categories": ["missing_submission"],
+                "changed_files": ["openhands/controller/agent_controller.py"],
+            }
+
+    try:
+        CrossSampleHarnessPatcher(LeakingPatcher()).update(
+            pool=pool, repository=repository
+        )
+    except ValueError as exc:
+        assert "sample-specific literal" in str(exc)
+    else:
+        raise AssertionError("dataset-specific harness patch was accepted")
+    assert repository.active_version == 1
+    assert (
+        repository.worktree / "openhands/controller/agent_controller.py"
+    ).read_text() == original
+
+
+def test_explicit_harness_profiles_isolate_pristine_evaluation(monkeypatch):
+    monkeypatch.setenv("OPENHANDS_REWARD_FRAMEWORK", "1")
+    monkeypatch.setenv("REWARD_FRAMEWORK_CROSS_SAMPLE_TRAINING", "1")
+    configure_harness_profile("baseline", max_iterations=100)
+    assert os.environ["OPENHANDS_MAIN_MODULE"] == "openhands.core.main"
+    assert "OPENHANDS_REWARD_FRAMEWORK" not in os.environ
+    assert "REWARD_FRAMEWORK_CROSS_SAMPLE_TRAINING" not in os.environ
+
+    configure_harness_profile("reward", max_iterations=100)
+    assert os.environ["OPENHANDS_MAIN_MODULE"] == "reward_framework.openhands_entrypoint"
+    assert os.environ["REWARD_FRAMEWORK_CROSS_SAMPLE_TRAINING"] == "1"
+
+    monkeypatch.setenv("REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT", "/frozen/fork")
+    configure_harness_profile("reward", max_iterations=100, update_harness=False)
+    assert os.environ["OPENHANDS_MAIN_MODULE"] == "reward_framework.openhands_entrypoint"
+    assert os.environ["OPENHANDS_REQUIRE_PRISTINE"] == "0"
+    assert "REWARD_FRAMEWORK_CROSS_SAMPLE_TRAINING" not in os.environ
+    assert os.environ["REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT"] == "/frozen/fork"
 
 
 def test_iteration_limit_is_only_non_trigger_terminal(tmp_path):

@@ -9,6 +9,7 @@ poc_generation/<sample_id>/checkpoint/, and writes poc_generation/<sample_id>/ma
 The subject's GT-shaped final fine trace is captured as part of the same task.
 """
 import argparse
+import atexit
 import fcntl
 import json
 import logging
@@ -25,12 +26,20 @@ ROOT = Path(__file__).resolve().parent            # poc_generation/poc_generator
 GT_ROOT = ROOT.parents[1]                          # repo root (external/, config.txt, poc_results/)
 DEFAULT_POC_RESULTS = ROOT.parent / "poc_results"  # overridden per model by --results-dir
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(GT_ROOT))
 sys.path.insert(0, str(GT_ROOT / "external" / "cybergym" / "src"))
 
-from run_openhands_cybergym import run_with_configs, OpenhandsArgs, LLMArgs, TaskArgs  # noqa: E402
+from run_openhands_cybergym import (  # noqa: E402
+    configure_harness_profile,
+    run_with_configs,
+    OpenhandsArgs,
+    LLMArgs,
+    TaskArgs,
+)
 from cybergym.task.types import TaskDifficulty  # noqa: E402
 from check_success import check as check_success  # noqa: E402
 from poc_dedup import deduplicate_submission_attempts  # noqa: E402
+from reward_framework.harness_repository import HarnessRepository  # noqa: E402
 
 
 def cleanup_scratch(scratch: Path) -> None:
@@ -414,6 +423,24 @@ def run_attempt(
 
     Only 'success'/'iteration_cap' reach a normal endpoint with a valid final
     fine trace; 'incomplete' means the episode should be re-run (see main)."""
+    requested_profile = getattr(args, "harness_profile", None)
+    if requested_profile is not None:
+        harness_profile = requested_profile
+        configure_harness_profile(
+            harness_profile,
+            max_iterations=args.max_iter,
+            update_harness=not getattr(args, "freeze_harness_updates", False),
+        )
+        if harness_profile == "reward":
+            version = os.getenv("REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION", "1")
+            os.environ["REWARD_FRAMEWORK_BASELINE_PROFILE"] = (
+                f"openhands_evolved_v{version}"
+            )
+    else:
+        # Historical experiment drivers install their own isolated entrypoints
+        # before calling run_attempt directly. Preserve those callers; the
+        # production CLI always supplies an explicit baseline profile.
+        harness_profile = os.getenv("OPENHANDS_HARNESS_PROFILE", "legacy_external")
     scratch = Path(tempfile.mkdtemp(prefix=f"run_{sample_id}_"))
     scratch_log_dir = scratch / "results"
     scratch_tmp_dir = scratch / "tmp"
@@ -433,7 +460,9 @@ def run_attempt(
             native_tool_calling=native_tool_calling_for_model(args.model),
         ),
         max_iter=args.max_iter,
-        repo=Path(args.openhands_repo).expanduser().resolve(),
+        repo=Path(
+            os.getenv("REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT", args.openhands_repo)
+        ).expanduser().resolve(),
         remove_tmp=False,  # need config.toml still present to copy it out below
         timeout=args.timeout,
     )
@@ -613,6 +642,7 @@ def run_attempt(
             "session_name": args_json["session_name"],
             "cybergym_agent_id": cybergym_agent_id,
             "model": args.model,
+            "harness_profile": harness_profile,
             "base_url": args.base_url,
             "api_version": getattr(args, "api_version", ""),
             "api_key_env": args.api_key_env or default_api_key_env(args.model),
@@ -655,9 +685,22 @@ def run_attempt(
                     "enabled": True,
                     "dir": "reward_framework/",
                     "state_path": "reward_framework/observation_state.json",
+                    "trajectory_state_path": "reward_framework/trajectory_state.json",
+                    "evidence_state_path": "reward_framework/evidence_state.json",
+                    "harness_state_path": "reward_framework/harness_state.json",
                     "task_context_path": "reward_framework/task_context.json",
                     "candidate_index_path": "reward_framework/candidates/index.json",
                     "evidence_dir": "reward_framework/evidence/",
+                    "episode_experience_path": (
+                        "reward_framework/episode_experience.json"
+                        if (sample_dir / "reward_framework/episode_experience.json").is_file()
+                        else None
+                    ),
+                    "cross_sample_update_path": (
+                        "reward_framework/cross_sample_update.json"
+                        if (sample_dir / "reward_framework/cross_sample_update.json").is_file()
+                        else None
+                    ),
                     "terminal_reason": success_info.get("terminal_reason"),
                 }
                 if reward_result is not None else {"enabled": False}
@@ -682,10 +725,36 @@ def main():
     ap.add_argument("--timeout", type=int, default=10800)
     ap.add_argument("--model", default="deepseek/deepseek-chat")
     ap.add_argument(
+        "--harness-profile",
+        choices=("baseline", "reward"),
+        default="baseline",
+        help=(
+            "baseline uses pristine OpenHands; reward enables the complete "
+            "Reward Framework and cross-sample harness optimization."
+        ),
+    )
+    ap.add_argument(
         "--openhands-repo",
         type=Path,
         default=GT_ROOT / "external" / "OpenHands",
         help="Complete OpenHands checkout containing pyproject.toml.",
+    )
+    ap.add_argument(
+        "--harness-training-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Shared GT-free Experience Pool and versioned OpenHands fork for "
+            "the reward profile; defaults beside results-dir."
+        ),
+    )
+    ap.add_argument(
+        "--freeze-harness-updates",
+        action="store_true",
+        help=(
+            "Use the current learned reward harness without updating its "
+            "Experience Pool or source; intended for validation/test."
+        ),
     )
     ap.add_argument(
         "--base-url",
@@ -719,9 +788,50 @@ def main():
     results_dir = args.results_dir.expanduser().resolve()
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    adaptive_python_root = None
+    harness_training_lock = None
+    if args.harness_profile == "reward":
+        training_root = (
+            args.harness_training_dir.expanduser().resolve()
+            if args.harness_training_dir is not None
+            else results_dir.parent / "harness_training"
+        )
+        training_root.mkdir(parents=True, exist_ok=True)
+        if not args.freeze_harness_updates:
+            harness_training_lock = (training_root / ".sample_update.lock").open("a+")
+            fcntl.flock(harness_training_lock.fileno(), fcntl.LOCK_EX)
+            atexit.register(harness_training_lock.close)
+        repository = HarnessRepository(
+            training_root / "harness", args.openhands_repo.expanduser().resolve()
+        )
+        version = repository.initialize()
+        # Freeze one source snapshot for every retry of this sample. The global
+        # worktree may advance after an episode, but never underneath a sample.
+        adaptive_python_root = training_root / "launches" / f"{args.arvo_id}_{os.getpid()}"
+        if adaptive_python_root.exists():
+            shutil.rmtree(adaptive_python_root)
+        adaptive_python_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            repository.worktree, adaptive_python_root,
+            ignore=shutil.ignore_patterns(".harness_optimizer", "__pycache__", "*.pyc"),
+        )
+        atexit.register(shutil.rmtree, adaptive_python_root, True)
+        if not args.freeze_harness_updates:
+            os.environ["REWARD_FRAMEWORK_TRAINING_ROOT"] = str(training_root)
+        os.environ["REWARD_FRAMEWORK_PRISTINE_OPENHANDS"] = str(
+            args.openhands_repo.expanduser().resolve()
+        )
+        os.environ["REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION"] = str(version)
+        os.environ["REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT"] = str(
+            adaptive_python_root
+        )
+
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-    python_paths = [str(GT_ROOT), str(GT_ROOT / "external" / "cybergym" / "src")]
+    python_paths = []
+    if adaptive_python_root is not None:
+        python_paths.append(str(adaptive_python_root))
+    python_paths.extend([str(GT_ROOT), str(GT_ROOT / "external" / "cybergym" / "src")])
     if os.environ.get("PYTHONPATH"):
         python_paths.append(os.environ["PYTHONPATH"])
     os.environ["PYTHONPATH"] = os.pathsep.join(python_paths)
