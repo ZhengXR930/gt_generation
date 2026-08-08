@@ -13,6 +13,8 @@ from .base import CallbackAdapter
 
 
 class CodexAdapter(CallbackAdapter):
+    platform_name = "codex"
+
     def __init__(self, *, workspace_root: Path,
                  inject: Callable[[str], None],
                  checkpoint_callback: Callable[[str], Path | None]):

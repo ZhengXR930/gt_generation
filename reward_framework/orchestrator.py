@@ -13,11 +13,11 @@ from .backend import RewardAgentBackend
 from .feedback_agent import FeedbackAgent
 from .models import (
     EvidenceRecord,
+    EvidenceState,
     ObservationState,
     ProbePlan,
     RawRuntimeReport,
     RuntimeFact,
-    StageStatus,
     TaskContext,
 )
 from .observer import TrajectoryObserver
@@ -28,7 +28,6 @@ from .spec_agent import SpecAgent
 from .stage_evaluator import evaluate_stages
 from .state_store import StateStore, atomic_json, utc_now
 from .submission_tool import parse_submission
-
 
 SUBMISSION_REQUEST = (
     "[External trajectory observer] The current workspace contains a runnable "
@@ -65,7 +64,10 @@ class RewardFramework:
                codebase_root: Path, state_dir: Path,
                backend: RewardAgentBackend,
                instrumentation: InstrumentationBackend,
-               platform: PlatformAdapter) -> "RewardFramework":
+               platform: PlatformAdapter,
+               baseline_profile: str = "adaptive_reward_v1",
+               harness_version: int = 1,
+               max_iterations: int = 100) -> "RewardFramework":
         store = StateStore(state_dir)
         framework = cls(
             store=store, backend=backend,
@@ -80,12 +82,22 @@ class RewardFramework:
             agent_root=framework.agent_root,
         )
         store.save_task(task)
+        store.initialize_harness(
+            platform=getattr(platform, "platform_name", "generic"),
+            baseline_profile=baseline_profile,
+            max_iterations=max_iterations,
+        )
+        harness = store.load_harness_state()
+        harness.active_program_version = harness_version
+        store.save_harness_state(harness)
+        store.save_evidence_state(EvidenceState())
         state = ObservationState()
         state.append(
             timestamp=utc_now(), source="controller", kind="task_initialized",
             payload={
                 "task_id": task_id,
                 "reward_spec_constructable": task.reward_spec.constructable,
+                "baseline_profile": baseline_profile,
                 "declared_stages": [
                     stage for stage, claim in task.reward_spec.claims.items() if claim
                 ],
@@ -98,7 +110,10 @@ class RewardFramework:
     @classmethod
     def resume(cls, *, state_dir: Path, backend: RewardAgentBackend,
                instrumentation: InstrumentationBackend,
-               platform: PlatformAdapter) -> "RewardFramework":
+               platform: PlatformAdapter,
+               baseline_profile: str = "adaptive_reward_v1",
+               harness_version: int = 1,
+               max_iterations: int = 100) -> "RewardFramework":
         """Resume a crash-safe episode without regenerating its frozen Spec."""
         store = StateStore(state_dir)
         if not store.task_path.is_file():
@@ -108,6 +123,14 @@ class RewardFramework:
             instrumentation=instrumentation, platform=platform,
         )
         store.load_task()  # validate the persisted schema before installing hooks
+        store.initialize_harness(
+            platform=getattr(platform, "platform_name", "generic"),
+            baseline_profile=baseline_profile,
+            max_iterations=max_iterations,
+        )
+        harness = store.load_harness_state()
+        harness.active_program_version = harness_version
+        store.save_harness_state(harness)
         framework._refresh_agent_view()
         return framework
 
@@ -123,7 +146,13 @@ class RewardFramework:
         atomic_json(self.agent_root / "task_context.json", self._public_task(task))
         refresh_agent_documents(self.agent_root, {
             "observation_state.json": self.store.observation_path,
+            "trajectory_state.json": self.store.trajectory_path,
+            "evidence_state.json": self.store.evidence_state_path,
+            "harness_state.json": self.store.harness_state_path,
         })
+        global_state = self.store.global_state()
+        global_state["task"] = self._public_task(task)
+        atomic_json(self.agent_root / "global_state.json", global_state)
         optional = {
             "current_trace.json": current_trace,
             "prior_evidence.json": prior_evidence,
@@ -141,6 +170,21 @@ class RewardFramework:
         state = self.store.append_event(source=source, kind=kind, payload=payload)
         self._refresh_agent_view()
         return state
+
+    def record_iteration(self, *, iteration: int, maximum: int) -> None:
+        state = self.store.load_observation()
+        latest = next(
+            (event for event in reversed(state.events)
+             if event.kind == "controller_iteration"),
+            None,
+        )
+        if latest is not None and int(latest.payload.get("iteration") or -1) == iteration:
+            return
+        state.append(
+            timestamp=utc_now(), source="controller", kind="controller_iteration",
+            payload={"iteration": iteration, "maximum": maximum},
+        )
+        self.store.save_observation(state)
 
     def observe_trajectory(self) -> str:
         task = self.store.load_task()
@@ -214,10 +258,20 @@ class RewardFramework:
         state = self.store.load_observation()
         if state.terminal_reason:
             raise RuntimeError(f"episode already terminated: {state.terminal_reason}")
-        poc_path, trace_path = parse_submission(
-            self.platform.workspace_root, arguments
-        )
-        self._validate_trace(trace_path)
+        try:
+            poc_path, trace_path = parse_submission(
+                self.platform.workspace_root, arguments
+            )
+            self._validate_trace(trace_path)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+            state.append(
+                timestamp=utc_now(), source="controller",
+                kind="candidate_submission_rejected",
+                payload={"error_type": type(exc).__name__},
+            )
+            self.store.save_observation(state)
+            self._refresh_agent_view()
+            raise
         checkpoint = self.platform.checkpoint(
             f"submission_{self.store.candidate_stats()['total_submissions'] + 1:04d}"
         )
@@ -332,9 +386,11 @@ class RewardFramework:
         event = state.append(
             timestamp=utc_now(), source="reward_agent", kind="verification_completed",
             payload={
+                "reward_event_id": f"reward_attempt_{registered.attempt_number:04d}",
                 "attempt_number": registered.attempt_number,
                 "candidate_id": registered.candidate_id,
                 "trigger_observed": report.trigger_observed,
+                "runtime_facts": [asdict(fact) for fact in report.facts],
                 "assessment": assessment.to_dict(),
                 "feedback": feedback.to_dict(),
                 "evidence_path": str(evidence_path),
@@ -350,6 +406,16 @@ class RewardFramework:
             prior_evidence=previous_path,
             current_runtime=runtime_path,
         )
+        if not report.trigger_observed:
+            self._refresh_agent_view(
+                current_trace=stored_trace,
+                prior_evidence=previous_path,
+                current_runtime=runtime_path,
+            )
+            factual = feedback.summary
+            if feedback.contradiction:
+                factual += " " + feedback.contradiction
+            self.platform.inject_message("[Runtime reward evidence] " + factual)
         response = {
             "candidate_id": registered.candidate_id,
             "attempt_number": registered.attempt_number,
@@ -407,4 +473,5 @@ class RewardFramework:
             "submission_requested": state.submission_requested,
             "trajectory_events": len(state.events),
             "candidate_stats": self.store.candidate_stats(),
+            "harness": self.store.load_harness_state().to_dict(),
         }

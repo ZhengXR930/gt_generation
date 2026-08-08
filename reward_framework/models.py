@@ -118,7 +118,7 @@ class TrajectoryEvent:
 
 
 @dataclass
-class ObservationState:
+class TrajectoryState:
     events: list[TrajectoryEvent] = field(default_factory=list)
     last_observer_sequence: int = 0
     last_submission_sequence: int = 0
@@ -149,9 +149,129 @@ class ObservationState:
         }
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "ObservationState":
+    def from_dict(cls, value: dict[str, Any]) -> "TrajectoryState":
         copied = dict(value)
         copied["events"] = [TrajectoryEvent(**item) for item in copied.get("events", [])]
+        return cls(**copied)
+
+
+# Backward-compatible public name used by the first Reward Framework version.
+# New code and persisted files call this the trajectory state because it is the
+# platform-neutral, complete action/observation history rather than a summary.
+ObservationState = TrajectoryState
+
+
+@dataclass
+class EvidenceState:
+    """Cross-candidate runtime memory used for diagnosis and error summaries."""
+
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    latest_attempt_number: int = 0
+    latest_candidate_id: str | None = None
+    last_confirmed_prefix: tuple[str, ...] = ()
+    recurring_errors: dict[str, int] = field(default_factory=dict)
+
+    def append_record(self, record: "EvidenceRecord") -> None:
+        boundary = record.assessment.first_unresolved
+        errors: list[str] = []
+        if record.duplicate_of:
+            errors.append("duplicate_candidate")
+        if not record.runtime.instrumentation_available:
+            errors.append("instrumentation_unavailable")
+        if record.runtime.error:
+            errors.append("runtime_or_probe_error")
+        if boundary:
+            errors.append(f"causal_boundary:{boundary}")
+        if record.feedback.contradiction:
+            errors.append("candidate_claim_refuted")
+        for error in errors:
+            self.recurring_errors[error] = self.recurring_errors.get(error, 0) + 1
+        self.attempts.append({
+            "attempt_number": record.attempt_number,
+            "candidate_id": record.candidate_id,
+            "candidate_sha256": record.candidate_sha256,
+            "duplicate_of": record.duplicate_of,
+            "trigger_observed": record.runtime.trigger_observed,
+            "instrumentation_available": record.runtime.instrumentation_available,
+            "runtime_facts": [asdict(fact) for fact in record.runtime.facts],
+            "assessment": record.assessment.to_dict(),
+            "feedback": record.feedback.to_dict(),
+            "errors": errors,
+            "created_at": record.created_at,
+        })
+        self.latest_attempt_number = record.attempt_number
+        self.latest_candidate_id = record.candidate_id
+        self.last_confirmed_prefix = record.assessment.longest_confirmed_prefix
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempts": self.attempts,
+            "latest_attempt_number": self.latest_attempt_number,
+            "latest_candidate_id": self.latest_candidate_id,
+            "last_confirmed_prefix": list(self.last_confirmed_prefix),
+            "recurring_errors": dict(self.recurring_errors),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "EvidenceState":
+        copied = dict(value)
+        copied["attempts"] = list(copied.get("attempts") or [])
+        copied["last_confirmed_prefix"] = tuple(
+            copied.get("last_confirmed_prefix") or []
+        )
+        copied["recurring_errors"] = dict(copied.get("recurring_errors") or {})
+        return cls(**copied)
+
+
+@dataclass(frozen=True)
+class HarnessPolicy:
+    """Episode-frozen launch constraints; never optimized inside a sample."""
+
+    version: int = 1
+    platform: str = "generic"
+    max_iterations: int = 100
+
+    def __post_init__(self) -> None:
+        if self.version < 1 or self.max_iterations < 1:
+            raise ValueError("harness policy version and max_iterations must be positive")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "HarnessPolicy":
+        return cls(**{
+            key: value[key] for key in ("version", "platform", "max_iterations")
+            if key in value
+        })
+
+
+@dataclass
+class HarnessState:
+    baseline_profile: str
+    current_policy: HarnessPolicy
+    # This is the immutable fork version loaded when the episode process began.
+    active_program_version: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "baseline_profile": self.baseline_profile,
+            "current_policy": self.current_policy.to_dict(),
+            "active_program_version": self.active_program_version,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "HarnessState":
+        copied = dict(value)
+        copied["current_policy"] = HarnessPolicy.from_dict(
+            copied["current_policy"]
+        )
+        for legacy in (
+            "revisions", "last_optimizer_sequence", "pending_reward_sequence",
+            "pending_reward_attempt", "last_patcher_reward_sequence",
+            "optimizer_errors",
+        ):
+            copied.pop(legacy, None)
         return cls(**copied)
 
 

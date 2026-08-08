@@ -1,4 +1,4 @@
-"""Model backend abstraction and a bounded Codex CLI implementation."""
+"""Model backend abstraction and bounded, persistent Codex CLI sessions."""
 
 from __future__ import annotations
 
@@ -21,12 +21,19 @@ class RewardAgentBackend(Protocol):
 @dataclass
 class CodexRun:
     role: str
+    session_id: str | None
+    resumed: bool
     commands: list[str]
     usage: dict[str, Any]
 
 
 class CodexBackend:
-    """Invoke an ephemeral, read-only Codex session for one Reward-Agent role."""
+    """One durable Codex CLI role.
+
+    A backend instance represents one agent identity.  All calls made through
+    it resume the same Codex thread; Reward Agent and Harness Patcher therefore
+    use two instances and never accidentally share conversational memory.
+    """
 
     _FORBIDDEN_COMMAND = re.compile(
         r"(^|[;&|]\s*)(cd\s+\.\.|find\s+\.\.|ls\s+\.\.|"
@@ -36,11 +43,32 @@ class CodexBackend:
     )
 
     def __init__(self, *, model: str = "gpt-5.5", executable: str = "codex",
-                 timeout: int = 1800):
+                 timeout: int = 1800, session_file: Path | None = None,
+                 sandbox: str = "read-only"):
+        if sandbox not in {"read-only", "workspace-write"}:
+            raise ValueError("CodexBackend only permits read-only or workspace-write")
         self.model = model
         self.executable = executable
         self.timeout = timeout
+        self.session_file = session_file.resolve() if session_file else None
+        self.sandbox = sandbox
+        self.session_id = self._load_session_id()
         self.runs: list[CodexRun] = []
+
+    def _load_session_id(self) -> str | None:
+        if self.session_file is None or not self.session_file.is_file():
+            return None
+        value = self.session_file.read_text(encoding="utf-8").strip()
+        return value or None
+
+    def _save_session_id(self, session_id: str) -> None:
+        self.session_id = session_id
+        if self.session_file is None:
+            return
+        self.session_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.session_file.with_suffix(".tmp")
+        temporary.write_text(session_id + "\n", encoding="utf-8")
+        temporary.replace(self.session_file)
 
     def run_json(self, *, role: str, prompt: str, schema: Path,
                  cwd: Path) -> dict[str, Any]:
@@ -49,24 +77,39 @@ class CodexBackend:
             raise FileNotFoundError("Codex cwd and output schema must exist")
         with tempfile.TemporaryDirectory(prefix=f"reward-agent-{role}-") as raw:
             result = Path(raw) / "result.json"
-            command = [
-                self.executable, "exec",
-                "--model", self.model,
-                "--sandbox", "read-only",
-                "--cd", str(cwd),
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--ignore-user-config",
-                "--ignore-rules",
-                "--output-schema", str(schema.resolve()),
-                "--output-last-message", str(result),
-                "--json", "-",
-            ]
+            resumed = self.session_id is not None
+            if resumed:
+                command = [
+                    self.executable, "exec", "resume",
+                    "--model", self.model,
+                    "--skip-git-repo-check",
+                    "--ignore-user-config", "--ignore-rules",
+                    "--output-schema", str(schema.resolve()),
+                    "--output-last-message", str(result),
+                    "--json", str(self.session_id), "-",
+                ]
+            else:
+                command = [
+                    self.executable, "exec",
+                    "--model", self.model,
+                    "--sandbox", self.sandbox,
+                    "--cd", str(cwd),
+                    "--skip-git-repo-check",
+                    "--ignore-user-config", "--ignore-rules",
+                    "--output-schema", str(schema.resolve()),
+                    "--output-last-message", str(result),
+                    "--json", "-",
+                ]
             completed = subprocess.run(
                 command,
                 input=prompt,
                 text=True,
                 capture_output=True,
+                # `codex exec resume` has no --cd option. Without an explicit
+                # process cwd, resumed Reward/Patcher turns silently inherit
+                # the controller's directory and can no longer see their
+                # materialized state view.
+                cwd=cwd,
                 timeout=self.timeout,
                 check=False,
             )
@@ -77,19 +120,32 @@ class CodexBackend:
                 )
             commands: list[str] = []
             usage: dict[str, Any] = {}
+            thread_id: str | None = None
             for line in completed.stdout.splitlines():
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if event.get("type") == "item.completed":
+                if event.get("type") in {"thread.started", "session.started"}:
+                    thread_id = str(
+                        event.get("thread_id") or event.get("session_id") or ""
+                    ).strip() or None
+                elif event.get("type") == "item.completed":
                     item = event.get("item") or {}
                     if item.get("type") == "command_execution":
                         commands.append(str(item.get("command") or ""))
                 elif event.get("type") == "turn.completed":
                     usage = dict(event.get("usage") or {})
             violations = [cmd for cmd in commands if self._FORBIDDEN_COMMAND.search(cmd)]
-            self.runs.append(CodexRun(role, commands, usage))
+            if not resumed:
+                if thread_id is None:
+                    raise RuntimeError(
+                        f"Codex role {role} did not report a persistent thread id"
+                    )
+                self._save_session_id(thread_id)
+            self.runs.append(CodexRun(
+                role, self.session_id, resumed, commands, usage
+            ))
             if violations:
                 raise RuntimeError(
                     f"Codex role {role} violated its information boundary: "

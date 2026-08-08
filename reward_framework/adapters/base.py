@@ -7,6 +7,7 @@ from typing import Callable, Protocol
 
 
 class PlatformAdapter(Protocol):
+    platform_name: str
     workspace_root: Path
 
     def inject_message(self, message: str) -> None: ...
@@ -15,6 +16,8 @@ class PlatformAdapter(Protocol):
 
 
 class CallbackAdapter:
+    platform_name = "generic"
+
     def __init__(self, *, workspace_root: Path,
                  inject: Callable[[str], None] | None = None,
                  checkpoint_callback: Callable[[str], Path | None] | None = None,

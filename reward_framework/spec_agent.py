@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,7 +9,6 @@ from pathlib import Path
 from .backend import RewardAgentBackend
 from .models import RewardSpec, TaskContext
 from .source_view import materialize_source_view
-
 
 SCHEMA = Path(__file__).resolve().with_name("schemas") / "spec.json"
 
@@ -40,6 +38,9 @@ direct Root-to-Target transition. Use null when issue plus source do not support
 a defensible stage. Every non-null stage requires one or two source citations;
 every null stage requires an empty evidence list. Citation paths must be
 relative to the current directory and functions must be source-verifiable.
+
+The vulnerable source view is the source/ directory. Inspect it, but write
+citation paths relative to source/ (do not include the source/ prefix).
 
 PUBLIC ISSUE (verbatim):
 {issue}
@@ -104,7 +105,9 @@ class SpecAgent:
                 role="initialize_spec" if attempt == 0 else "repair_spec",
                 prompt=base_prompt + correction,
                 schema=SCHEMA,
-                cwd=source_view,
+                # Every Reward-Agent role shares one durable Codex session, so
+                # its working root is stable for the entire episode.
+                cwd=agent_root,
             )
             try:
                 spec = RewardSpec.from_dict(raw)

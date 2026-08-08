@@ -1,119 +1,141 @@
-# Unified Reward Framework
+# GT-Free Reward Framework
 
-This package implements an external, GT-blind runtime-reward loop for
-vulnerability-reproduction agents.  It is independent of `gt_results/`, the
-frozen evaluator, and the historical reward experiments.
+This package separates task-local runtime reward from cross-sample OpenHands
+harness evolution. Ground truth is never materialized in an Agent view and is
+not an optimization signal.
 
-## Controller-owned flow
+## Two time scales
 
 ```text
-issue + vulnerable source
-        |
-        v
-Codex Spec Agent -> Admission -> Source -> Root -> Propagation -> Target
-        |
-coding trajectory <-> persistent observer (continue/request_submission)
-        |
-submit_candidate -> checkpoint + content deduplication
-        |
-Codex probe plan -> instrumentation adapter -> trusted runtime facts
-        |
-deterministic ordered stage gate -> Codex factual feedback
-        |
-trigger success or continue until the iteration limit
+one episode (frozen harness_vN)
+issue + vulnerable source -> Reward Spec
+Subject trajectory -> submit_candidate -> checkpoint
+PoC + trace -> runtime probes -> ordered stage assessment -> factual Reward
+trigger success or iteration limit
+                         |
+                         v
+episode-end deterministic metrics + Codex Experience Analyzer
+                         |
+                         v
+append-only cross-sample Experience Pool
+                         |
+                         v
+Codex Harness Patcher -> isolated OpenHands fork -> validate/rollback
+                         |
+                         v
+next process loads harness_vN+1
 ```
 
-The issue is a trusted task statement.  The candidate fine trace is an
-untrusted hypothesis.  Runtime evidence and the independent trigger oracle are
-authoritative.  Codex never owns stage status, score, deduplication, execution,
-or termination.
+The harness is immutable for every retry belonging to one sample. There is no
+in-episode source patch, process restart, or policy hot swap.
 
-## State
+## Information boundary
 
-Each task state directory contains:
+The task-local Reward Agent sees only:
 
-- `task_context.json`: immutable public issue, source manifest, and frozen Spec;
-- `observation_state.json`: the complete coding-agent trajectory and controller
-  transitions;
-- `candidates/`: one folder per unique PoC, a latest trace, and every submission
-  attempt/checkpoint reference;
-- `evidence/`: one immutable runtime/assessment/feedback record per attempt;
-- `agent_view/`: a source-only Reward-Agent view plus public state documents.
+- public issue description;
+- vulnerable codebase;
+- Subject trajectory and submitted fine trace;
+- candidate execution and passive runtime facts;
+- earlier evidence from the same episode.
 
-Duplicate PoCs reuse the unique candidate folder, retain the latest trace, and
-still receive a separate attempt record.  `candidate_stats()` reports total,
-unique, duplicate, and unique ratio.
+It does not see GT fine traces, invariant graphs, known PoCs, historical crash
+states, held-out results, patches, or sanitizer traces supplied by the dataset.
 
-## Codex roles
+The cross-sample Harness Patcher sees even less task content:
 
-`CodexBackend` defaults to `gpt-5.5` and invokes `codex exec` with an ephemeral
-session, read-only sandbox, ignored user configuration/rules, and a strict JSON
-schema.  One backend instance provides four persistent logical roles:
+- a complete isolated OpenHands source fork;
+- generalized episode metrics;
+- enumerated experience categories and local trajectory sequence references;
+- prior harness version and Patch history.
 
-1. one-time Spec initialization;
-2. full-trajectory submission observation;
-3. per-candidate passive probe planning;
-4. evidence-grounded factual feedback.
+It does not receive task ids, issue text, vulnerable source, PoCs, candidate
+traces, runtime prose, or GT. Source validation also rejects dataset-specific
+literals in a proposed OpenHands Patch.
 
-The backend audits commands and rejects sessions that access parent/absolute
-paths, GT/result paths, patches, sanitizer traces, network tools, environment
-variables, or git history.
+## Task-local state
 
-## Runtime adapter contract
+Each episode state directory contains:
 
-`InstrumentationBackend.verify()` receives the immutable PoC, exact submitted
-trace, source-validated probe plan, and attempt output directory.  It returns:
+- `task_context.json`: immutable issue, source manifest, and Reward Spec;
+- `trajectory_state.json`: complete platform-neutral trajectory;
+- `evidence_state.json`: attempts, runtime facts, causal progress, and errors;
+- `harness_state.json`: the frozen OpenHands fork version used by the episode;
+- `candidates/`: content-deduplicated PoCs and every submission/checkpoint;
+- `evidence/`: immutable runtime/assessment/feedback record per attempt;
+- `episode_experience.json`: GT-free end-of-episode experience card;
+- `cross_sample_update.json`: pool append and next harness version result.
 
-```python
-RawRuntimeReport(
-    exit_code=...,
-    stdout=...,
-    stderr=...,
-    trigger_observed=...,
-    stage_observations={"admission": StageStatus.CONFIRMED, ...},
-    facts=(RuntimeFact(...), ...),
-    instrumentation_available=True,
-)
-```
+## Reward Agent
 
-`CommandInstrumentationBackend` can wrap any platform runtime.  Its optional
-instrumentation command receives `{poc}`, `{trace}`, `{probe_plan}`,
-`{stage_report}`, and `{output_dir}` placeholders.  This is the bridge for the
-existing ARVO GDB runner and future SEC/OSS-specific local RuntimeSpecs; the
-core framework contains no dataset-specific breakpoint assumptions.
-The exact external JSON contract is frozen in `schemas/stage_report.json`;
-instrumentation may report only direct `confirmed`, `refuted`, `unresolved`, or
-`not_reached` observations.  `not_declared` and `observed_but_blocked` remain
-controller-owned derived states.
+One persistent read-only Codex CLI session is resumed across four task-local
+roles:
 
-`ArvoGDBInstrumentationBackend` is the production ARVO implementation. It
-repairs a stale trace line by locating the selected statement in the current
-public source, compiles source/function/line breakpoints, evaluates an optional
-side-effect-free `condition`, runs the real `/bin/arvo` harness independently,
-and converts only GDB hits/values into stage facts. Inputs are staged briefly
-under the mounted repository and compact evidence is copied into the attempt;
-the prepared binary is never archived.
+1. compile `Admission -> Source -> Root -> Propagation -> Target` from public
+   issue plus source;
+2. observe the full trajectory and request submission at semantic readiness;
+3. align untrusted trace claims with source-valid passive probes;
+4. turn trusted runtime evidence into factual, non-prescriptive feedback.
 
-## Integration
+Stage status remains deterministic and controller-owned. Absence of evidence is
+`unresolved`, not `refuted`; later observations behind a failed causal gate are
+`observed_but_blocked`.
 
-OpenHands and Codex adapters use callback-based message injection and checkpoint
-creation. The OpenHands production hook registers `SUBMIT_CANDIDATE_TOOL`,
-lowers its sandboxed call through a token-authenticated local transport to
-`RewardFramework.submit_candidate()`, records every visible trajectory event,
-and invokes `observe_trajectory()` at completed action or turn boundaries. A
-requested submission blocks stale non-submission actions, while ordinary
-investigation remains agent-controlled. No fixed tool-count trigger is used.
+## Experience Pool and multi-objective optimization
 
-Only trigger success and `reach_iteration_limit()` terminate an episode.  At
-the limit, the framework injects the required no-tool final fine-trace request.
+Every completed episode contributes exact metrics for:
 
-For the CyberGym/OpenHands launcher, enable the formal wiring with:
+- trigger success;
+- no-submission behavior and first-submission sequence;
+- total, unique, duplicate, and invalid submissions;
+- Reward events followed by Subject action;
+- distinct retries after Reward;
+- ordered causal progress;
+- instrumentation unavailability and premature finish attempts.
+
+The Experience Analyzer may classify only enumerated, evidence-bound categories
+such as `missing_submission`, `duplicate_candidate_loop`,
+`reward_context_loss`, `productive_retry`, or `causal_stagnation`. The pool
+stores successes as controls as well as failures. Raw submission count is never
+the sole objective.
+
+## Cross-sample Harness Patcher
+
+A separate persistent workspace-write Codex CLI session runs only after an
+episode ends. It may change real files under OpenHands controller, CodeAct,
+memory, core loop, and prompt source. The controller checks:
+
+- changed files exactly match the structured declaration;
+- the Patch stays inside the allowed OpenHands harness surface;
+- Python files parse and files are not deleted;
+- no dataset/result/GT literals appear;
+- controller-owned Experience Pool input remains unchanged.
+
+Rejected changes restore the complete pre-Patch worktree. Accepted changes are
+stored as a unified diff, changed-file snapshot, metadata, and a monotonically
+increasing harness version. The next sample receives a frozen copy through
+`PYTHONPATH`; pristine baseline evaluation still imports the untouched upstream
+checkout.
+
+## Experimental variants
 
 ```bash
-OPENHANDS_REWARD_FRAMEWORK=1 <existing run command>
+# untouched formal baseline
+python poc_generation/poc_generator/run_sample.py ... --harness-profile baseline
+
+# complete method: Reward plus GT-free cross-sample harness evolution
+python poc_generation/poc_generator/run_sample.py ... \
+  --harness-profile reward \
+  --harness-training-dir /path/to/shared_training_state
+
+# the same complete method in held-out validation/test mode
+python poc_generation/poc_generator/run_sample.py ... \
+  --harness-profile reward \
+  --freeze-harness-updates \
+  --harness-training-dir /path/to/frozen_training_state
 ```
 
-The launcher preserves the standard evaluation prompt and replaces only its
-submission transport. It sets the task/workspace/state variables and selects
-`reward_framework.openhands_entrypoint`; the Reward Agent model defaults to
-`gpt-5.5` and can be changed with `REWARD_FRAMEWORK_MODEL`.
+There are only two experimental variants: `baseline` and `reward`. Use
+sequential training samples for `reward`: the next sample is the unit that
+consumes an accepted harness update. `--freeze-harness-updates` is a lifecycle
+control for validation/test, not a third method variant.

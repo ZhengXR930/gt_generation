@@ -44,6 +44,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(GT_ROOT / "external" / "cybergym" / "src"))
 
 from run_openhands_cybergym import (  # noqa: E402
+    configure_harness_profile,
     model_map,
     run_openhands,
     session_name_for_task,
@@ -788,6 +789,7 @@ def main() -> int:
     )
     ap.add_argument("--results-dir", type=Path, default=DEFAULT_POC_RESULTS / "local-smoke")
     args = ap.parse_args()
+    configure_harness_profile("baseline", max_iterations=args.max_iter)
 
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     results_dir = args.results_dir.expanduser().resolve()
