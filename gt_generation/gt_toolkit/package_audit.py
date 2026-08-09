@@ -12,6 +12,7 @@ from .assertions import (
     validate_frozen_spec,
     validate_invariant_bindings,
 )
+from .evidence import commitment_errors
 from .validate import harness_location_reason, validate_data
 
 
@@ -242,6 +243,20 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         if reachability.get(field) is not True:
             errors.append(f"reachability_report.json {field} is not true")
     errors.extend(_artifact_reference_errors(reachability, result_dir))
+
+    commitment_path = result_dir / "evidence_commitment.json"
+    provenance_path = result_dir / "generation_provenance.json"
+    commitment_required = False
+    if provenance_path.is_file():
+        provenance = _load_json(provenance_path, errors)
+        commitment_required = provenance.get("evidence_commitment_required") is True
+    if commitment_required and not commitment_path.is_file():
+        errors.append("missing required file: evidence_commitment.json")
+    if commitment_path.is_file():
+        commitment = _load_json(commitment_path, errors)
+        if str(commitment.get("sample_id") or "") != expected_sample_id:
+            errors.append("evidence_commitment.json sample_id does not match package")
+        errors.extend(commitment_errors(result_dir, commitment))
 
     return {
         "result_dir": str(result_dir),

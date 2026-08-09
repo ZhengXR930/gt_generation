@@ -137,4 +137,8 @@ if [[ -n "${GT_AGENT_REASONING_EFFORT:-}" ]]; then
 fi
 CODEX_ARGS+=("$PROMPT")
 
-exec codex "${CODEX_ARGS[@]}"
+set +e
+codex "${CODEX_ARGS[@]}"
+CODEX_STATUS=$?
+set -e
+exit "$CODEX_STATUS"

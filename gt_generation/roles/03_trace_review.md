@@ -37,6 +37,12 @@ details not established by these inputs may remain private candidate evidence fo
 04; do not manufacture a Stage 02 revision merely to make Stage 03 dynamically prove
 them.
 
+If `<result_dir>/repair_context.json` exists, read its prior verified assertions and
+measurements before reviewing. They are saved runtime evidence from the previously
+audited package. You may reject them when they conflict with current source or artifacts,
+but you may not ignore them and replace a verified project-code fact with a fuzz-harness
+anchor. The repaired package must still rebuild Stage 04 evidence and pass Stage 05.
+
 If the current generation state shows that `02_runtime_disambiguation` ran for this
 version of `ground_truth.json`, also inspect that stage's existing role log and the
 workspace run log it references. Those are already-produced inputs to this review, not

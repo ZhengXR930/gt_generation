@@ -9,6 +9,14 @@ Read the sample metadata, exact staged vulnerable source, patch, sanitizer trace
 a separate reviewer session: repair every concrete issue it lists, then rebuild the
 whole chain for consistency rather than editing only the named sentence.
 
+If `<result_dir>/repair_context.json` exists, this is a repair of a previously
+validated package. Read its prior verified assertions and vulnerable/fixed measurements
+before editing. They are admissible saved runtime evidence, not speculation: preserve
+facts supported by those measurements unless current source or artifacts refute them.
+Do not downgrade a differentially verified project-code predicate to "candidate" merely
+because the sanitizer stack ends at a later harness boundary. Stage 04 will rebuild and
+re-bind the evidence for this revision; never copy old hashes directly.
+
 Stage 01's saved reproduction and crash trace are the runtime evidence available here.
 Do not rebuild the project, rerun the PoC, compile auxiliary probes, add instrumentation,
 or attempt vulnerable/fixed dynamic validation in Stage 02. Record source-level logic

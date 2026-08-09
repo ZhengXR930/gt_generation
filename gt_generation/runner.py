@@ -25,6 +25,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -35,6 +36,7 @@ from typing import Any
 CODE_ROOT = Path(__file__).resolve().parent          # gt_generation/ (roles, workflow, gt_toolkit)
 REPO_ROOT = CODE_ROOT.parent                          # repo root (gt_results, dataset, evaluator)
 DEFAULT_CONFIG = CODE_ROOT / "workflow.json"
+FINAL_STAGE = "05_validate"
 
 
 @dataclass
@@ -92,10 +94,39 @@ def main() -> None:
         or sample.get("id")
         or args.sample.stem
     )
-    result_dir = args.result_dir or Path(str(config.get("result_root", "gt_results"))) / sample_id
-    if not result_dir.is_absolute():
-        result_dir = repo_root / result_dir
-    result_dir.mkdir(parents=True, exist_ok=True)
+    published_result_dir = (
+        args.result_dir
+        or Path(str(config.get("result_root", "gt_results"))) / sample_id
+    )
+    if not published_result_dir.is_absolute():
+        published_result_dir = repo_root / published_result_dir
+    published_result_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = published_result_dir.parent / (
+        "." + published_result_dir.name + ".gt_generation.lock"
+    )
+    lock_handle = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(
+            f"Another GT runner is already active for {sample_id}: {lock_path}"
+        )
+    lock_handle.write(f"pid={os.getpid()}\nstarted_at={now()}\n")
+    lock_handle.flush()
+    stages = list(config.get("stages") or [])
+    if not stages:
+        raise SystemExit(f"No stages in config: {args.config}")
+    validate_stage_bounds(stages, args.start_at, args.stop_after, args.only)
+
+    transactional_repair = should_stage_repair(
+        published_result_dir, args.start_at, args.only, args.dry_run
+    )
+    result_dir = published_result_dir
+    if transactional_repair:
+        result_dir = repair_staging_dir(published_result_dir)
+        prepare_repair_staging(published_result_dir, result_dir)
+        write_repair_context(published_result_dir, result_dir)
+    install_generation_provenance(result_dir)
     # Per-run flags the stage roles read. runtime_disambiguation gates the bounded
     # Stage 02 instrumentation escalation; it is OFF by default so the common path stays
     # short. Rewritten every run so a config change takes effect immediately.
@@ -106,16 +137,6 @@ def main() -> None:
     })
     timing_path = result_dir / "generation_timing.json"
     prior_timing = load_json(timing_path) if timing_path.is_file() else {}
-    lock_path = result_dir / ".gt_generation.lock"
-    lock_handle = lock_path.open("w", encoding="utf-8")
-    try:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise SystemExit(
-            f"Another GT runner is already active for {sample_id}: {lock_path}"
-        )
-    lock_handle.write(f"pid={os.getpid()}\nstarted_at={now()}\n")
-    lock_handle.flush()
     logs_dir = generation_logs_path(result_dir, dry_run=args.dry_run)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -132,10 +153,6 @@ def main() -> None:
         "stages": [],
     }
     write_json(state_path, state)
-
-    stages = list(config.get("stages") or [])
-    if not stages:
-        raise SystemExit(f"No stages in config: {args.config}")
 
     should_run = make_stage_filter(stages, args.start_at, args.stop_after, args.only)
     active_stages = [
@@ -243,6 +260,35 @@ def main() -> None:
             final_state["status"] = "failed"
             final_state["compaction"] = compact_report
             failed = True
+    repair_publish_allowed = (
+        transactional_repair
+        and should_run(FINAL_STAGE)
+        and FINAL_STAGE not in prior_ok
+        and repair_package_ready_to_publish(result_dir)
+    )
+    if transactional_repair and not failed and not repair_publish_allowed:
+        failed = True
+        final_state["status"] = "failed"
+        final_state["failure"] = (
+            "repair package failed the runner-owned commitment/audit publish gate"
+        )
+        write_json(state_path, final_state)
+    if (
+        transactional_repair
+        and repair_publish_allowed
+        and not failed
+        and not args.dry_run
+    ):
+        publish_repair_staging(result_dir, published_result_dir)
+        final_state["published_result_dir"] = str(published_result_dir)
+        final_state["repair_staging_dir"] = str(result_dir)
+        final_state["published"] = True
+        write_json(published_result_dir / "gt_generation_state.json", final_state)
+    elif transactional_repair:
+        final_state["published_result_dir"] = str(published_result_dir)
+        final_state["repair_staging_dir"] = str(result_dir)
+        final_state["published"] = False
+        write_json(state_path, final_state)
     print(json.dumps(final_state, indent=2, ensure_ascii=False))
     if failed:
         raise SystemExit(1)
@@ -359,7 +405,12 @@ def feedback_requests_runtime_disambiguation(result_dir: Path) -> bool:
     feedback_path = result_dir / "trace_feedback.json"
     if not feedback_path.is_file():
         return False
-    feedback = load_json(feedback_path)
+    try:
+        feedback = load_json(feedback_path)
+    except (json.JSONDecodeError, ValueError):
+        # Reviewer output is model-authored. A malformed optional routing hint
+        # must not abort the ordinary static repair loop.
+        return False
     return bool(feedback.get("needs_runtime_disambiguation")) and bool(
         str(feedback.get("observe") or "").strip()
     )
@@ -463,6 +514,7 @@ def run_stage(
     success_check_ok = (
         check_success(stage, variables)
         and check_validate_gt(stage, variables, repo_root, code_root)
+        and check_assertion_preflight_success(stage, variables)
         and check_runtime_disambiguation_success(stage, variables, started_ts)
     )
     return StageResult(
@@ -658,6 +710,103 @@ def check_runtime_disambiguation_success(
     )
 
 
+def check_assertion_preflight_success(
+    stage: dict[str, Any], variables: dict[str, str]
+) -> bool:
+    """Stage 04 must approve the plan before either runtime trace is written."""
+    if str(stage.get("name") or "") != "04_assertion_validator":
+        return True
+    result_dir = Path(variables["result_dir"])
+    report_path = result_dir / "assertion_preflight.json"
+    try:
+        report = load_json(report_path)
+    except Exception:
+        return False
+    if report.get("ok") is not True:
+        return False
+    spec_path = result_dir / "candidate_assertions.json"
+    if not spec_path.is_file():
+        return False
+    try:
+        spec = load_json(spec_path)
+    except Exception:
+        return False
+    if report.get("assertion_content_hash") != spec.get("content_hash"):
+        return False
+    expected_inputs = (
+        "candidate_assertions.json",
+        "candidate_invariants.json",
+        "field_bindings.json",
+        "event_locations.json",
+    )
+    input_hashes = report.get("input_hashes")
+    if not isinstance(input_hashes, dict):
+        return False
+    for name in expected_inputs:
+        path = result_dir / name
+        if not path.is_file() or input_hashes.get(name) != (
+            "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        ):
+            return False
+    verified_path = result_dir / "verified_invariants.json"
+    if not verified_path.is_file():
+        return False
+    try:
+        candidate_graph = load_json(result_dir / "candidate_invariants.json")
+        verified_graph = load_json(verified_path)
+    except Exception:
+        return False
+    if not verified_graph_is_candidate_subset(candidate_graph, verified_graph):
+        return False
+    preflight_mtime = report_path.stat().st_mtime
+    traces = (
+        result_dir / "vulnerable_assertion_trace.txt",
+        result_dir / "fixed_assertion_trace.txt",
+    )
+    return all(path.is_file() and path.stat().st_mtime >= preflight_mtime for path in traces)
+
+
+def verified_graph_is_candidate_subset(
+    candidate: dict[str, Any], verified: dict[str, Any]
+) -> bool:
+    """Runtime may remove invariants or add evidence, but not rewrite the plan."""
+    def entries(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        criterion = document.get("root_cause_criterion")
+        if isinstance(criterion, dict) and criterion.get("invariant_id"):
+            result[str(criterion["invariant_id"])] = criterion
+        for node in document.get("nodes", []):
+            if isinstance(node, dict) and node.get("invariant_id"):
+                result[str(node["invariant_id"])] = node
+        for edge in document.get("edges", []):
+            if isinstance(edge, dict) and edge.get("invariant_id"):
+                result[str(edge["invariant_id"])] = edge
+        return result
+
+    def preserves_candidate_fields(
+        candidate_value: Any, verified_value: Any
+    ) -> bool:
+        if isinstance(candidate_value, dict):
+            return isinstance(verified_value, dict) and all(
+                key in verified_value
+                and preserves_candidate_fields(value, verified_value[key])
+                for key, value in candidate_value.items()
+            )
+        if isinstance(candidate_value, list):
+            return candidate_value == verified_value
+        return candidate_value == verified_value
+
+    candidate_entries = entries(candidate)
+    verified_entries = entries(verified)
+    return bool(verified_entries) and all(
+        invariant_id in candidate_entries
+        and preserves_candidate_fields(
+            candidate_entries[invariant_id], verified_entry
+        )
+        for invariant_id, verified_entry in verified_entries.items()
+    )
+
+
 def get_nested(data: dict[str, Any], field: str) -> Any:
     current: Any = data
     for part in field.split("."):
@@ -692,6 +841,137 @@ def runtime_disambiguation_enabled(
 ) -> bool:
     """Resolve the default-OFF workflow gate with a per-invocation opt-in."""
     return command_line_enabled or bool(config.get("runtime_disambiguation", False))
+
+
+def validate_stage_bounds(
+    stages: list[dict[str, Any]], start_at: str, stop_after: str, only: str
+) -> None:
+    names = [str(stage.get("name") or "") for stage in stages]
+    for label, value in (
+        ("--start-at", start_at),
+        ("--stop-after", stop_after),
+        ("--only", only),
+    ):
+        if value and value not in names:
+            raise SystemExit(f"{label} names unknown stage {value!r}")
+    if only and (start_at or stop_after):
+        raise SystemExit("--only cannot be combined with --start-at or --stop-after")
+    if start_at and stop_after and names.index(start_at) > names.index(stop_after):
+        raise SystemExit("--start-at must not follow --stop-after")
+
+
+def should_stage_repair(
+    result_dir: Path, start_at: str, only: str, dry_run: bool
+) -> bool:
+    """Existing evidence bundles are never edited in place by a partial workflow."""
+    if dry_run or not (start_at or only):
+        return False
+    durable = (
+        "ground_truth.json",
+        "verified_assertions.json",
+        "verified_invariants.json",
+        "assertion_results.json",
+    )
+    return all((result_dir / name).is_file() for name in durable)
+
+
+def repair_staging_dir(result_dir: Path) -> Path:
+    return result_dir.with_name(result_dir.name + ".repair-staging")
+
+
+def prepare_repair_staging(source: Path, staging: Path) -> None:
+    if staging.exists():
+        shutil.rmtree(staging)
+    copied = subprocess.run(
+        ["cp", "--reflink=auto", "-a", str(source), str(staging)],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if copied.returncode != 0:
+        shutil.copytree(source, staging, symlinks=True)
+    for name in (".gt_generation.lock", "gt_generation_state.json"):
+        path = staging / name
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+
+
+def write_repair_context(source: Path, staging: Path) -> dict[str, Any]:
+    """Expose prior verified measurements without treating them as new proof."""
+    context: dict[str, Any] = {
+        "schema_version": "gt-repair-context-v1",
+        "source_result_dir": str(source),
+        "generated_at": now(),
+        "prior_package_audit_ok": False,
+        "prior_evidence": {},
+    }
+    try:
+        try:
+            from gt_toolkit.package_audit import audit_package
+        except ModuleNotFoundError:
+            from gt_generation.gt_toolkit.package_audit import audit_package
+
+        audit = audit_package(source)
+        context["prior_package_audit_ok"] = bool(audit["ok"])
+        context["prior_package_audit_errors"] = audit["errors"]
+    except Exception as exc:
+        context["prior_package_audit_errors"] = [str(exc)]
+    for name in (
+        "verified_assertions.json",
+        "verified_invariants.json",
+        "assertion_results.json",
+        "field_bindings.json",
+        "event_locations.json",
+    ):
+        path = source / name
+        if path.is_file():
+            try:
+                context["prior_evidence"][name] = load_json(path)
+            except Exception:
+                context["prior_evidence"][name] = {"unreadable": True}
+    write_json(staging / "repair_context.json", context)
+    return context
+
+
+def install_generation_provenance(result_dir: Path) -> None:
+    source_text = os.environ.get("GT_GENERATION_PROVENANCE_SOURCE", "").strip()
+    if not source_text:
+        return
+    source = Path(source_text)
+    if source.is_file() and source.resolve() != (
+        result_dir / "generation_provenance.json"
+    ).resolve():
+        shutil.copy2(source, result_dir / "generation_provenance.json")
+
+
+def repair_package_ready_to_publish(result_dir: Path) -> bool:
+    """Never trust a configurable Stage-05 command as the sole publish gate."""
+    if not (result_dir / "evidence_commitment.json").is_file():
+        return False
+    try:
+        try:
+            from gt_toolkit.package_audit import audit_package
+        except ModuleNotFoundError:
+            from gt_generation.gt_toolkit.package_audit import audit_package
+
+        report = audit_package(result_dir)
+        return bool(report["ok"]) and not report["warnings"]
+    except Exception:
+        return False
+
+
+def publish_repair_staging(staging: Path, published: Path) -> None:
+    """Replace a completed package only after the staged package passes Stage 05."""
+    backup = published.with_name(published.name + ".repair-backup")
+    if backup.exists():
+        shutil.rmtree(backup)
+    os.replace(published, backup)
+    try:
+        os.replace(staging, published)
+    except BaseException:
+        os.replace(backup, published)
+        raise
+    shutil.rmtree(backup)
 
 
 def clear_stale_feedback_control_files(logs_dir: Path) -> list[Path]:

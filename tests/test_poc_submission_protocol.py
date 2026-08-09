@@ -3,6 +3,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from docker.errors import DockerException
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "external" / "cybergym" / "src"))
@@ -121,8 +123,13 @@ def test_prompt_binds_each_poc_to_candidate_trace():
     assert "R1" not in prompt
 
 
-def test_linux_runtime_server_uses_docker_bridge(monkeypatch):
+def test_linux_runtime_server_falls_back_to_default_docker_bridge(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("OPENHANDS_EVAL_HOST_GATEWAY", raising=False)
+    monkeypatch.setattr(
+        "poc_generation.poc_generator.run_sample.docker.from_env",
+        lambda: (_ for _ in ()).throw(DockerException("unavailable")),
+    )
     assert (
         runtime_server_url("http://host.docker.internal:8666")
         == "http://172.17.0.1:8666"
