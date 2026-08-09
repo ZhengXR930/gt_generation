@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -275,20 +276,50 @@ def _verify_source_fingerprint(result_dir: Path) -> None:
         )
 
 
-def _require_persisted_instrumentation_patch(result_dir: Path, patch: Path) -> Path:
-    state = _load(_state_path(result_dir))
-    phase = str(state.get("phase") or "")
-    version = "fixed" if phase.startswith("fixed") else "vulnerable"
+def _require_persisted_instrumentation_patch(result_dir: Path, patch: Path) -> tuple[Path, str]:
+    resolved = patch.resolve()
+    vulnerable = (result_dir / "vulnerable-instrumentation.patch").resolve()
+    fixed = (result_dir / "fixed-instrumentation.patch").resolve()
+    if resolved == vulnerable:
+        version = "vulnerable"
+    elif resolved == fixed:
+        version = "fixed"
+    else:
+        raise RuntimeError(
+            "instrumentation must use a persisted vulnerable or fixed result patch"
+        )
     expected = (result_dir / f"{version}-instrumentation.patch").resolve()
-    if patch.resolve() != expected or not expected.is_file():
+    if not expected.is_file():
         raise RuntimeError(
             f"{version} instrumentation must be persisted exactly at {expected}"
         )
-    return expected
+    return expected, version
 
 
 def _docker_exec(container: str, command: str, timeout: int = 3600) -> subprocess.CompletedProcess[str]:
     return _run(["docker", "exec", container, "/bin/bash", "-lc", command], timeout)
+
+
+def _remove_stale_plan_containers(container_prefix: str) -> list[str]:
+    listed = _run([
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        f"name=^{container_prefix}",
+        "--format",
+        "{{.Names}}",
+    ])
+    if listed.returncode != 0:
+        return []
+    names = [
+        name.strip()
+        for name in listed.stdout.splitlines()
+        if name.strip().startswith(container_prefix)
+    ]
+    for name in names:
+        _run(["docker", "rm", "-f", name])
+    return names
 
 
 def create(result_dir: Path) -> int:
@@ -358,6 +389,48 @@ def _restore_workspace_for_new_attempt(result_dir: Path) -> bool:
     return True
 
 
+def _reset_side_for_instrumentation_retry(
+    result_dir: Path, context: dict[str, Any], version: str
+) -> bool:
+    """Restore the requested side before reapplying a frozen patch.
+
+    A stage retry reuses the live container. The previous attempt may have left
+    its instrumentation in the source tree or advanced to the fixed side. In
+    either case a second `git apply --check` is guaranteed to fail unless the
+    tracked tree is restored first. Build outputs stay in place for incremental
+    reuse.
+    """
+    state_path = _state_path(result_dir)
+    state = _load(state_path) if state_path.is_file() else {}
+    phase = str(state.get("phase") or "")
+    prior_patch = str(state.get("instrumentation_patch") or "")
+    if not prior_patch and not phase.startswith("fixed"):
+        return False
+    if version == "fixed":
+        if not phase.startswith("fixed"):
+            raise RuntimeError(
+                "fixed instrumentation requires switch-fixed before application"
+            )
+        return False
+    root = _source_root(result_dir)
+    proc = _docker_exec(
+        context["container"], f"git -C {shlex.quote(root)} reset --hard HEAD"
+    )
+    _write_log(result_dir, "instrumentation_retry_reset.log", proc)
+    if proc.returncode != 0:
+        raise RuntimeError("could not restore vulnerable source for instrumentation retry")
+    _update_state(
+        result_dir,
+        context,
+        phase="vulnerable_source_reset",
+        instrumentation_patch="",
+        instrumentation_patch_sha256="",
+        instrumentation_source_sha256="",
+        workspace_reset_for_instrumentation_retry=True,
+    )
+    return True
+
+
 def apply_instrumentation(
     result_dir: Path, patch: Path, *, runtime_disambiguation: bool = False
 ) -> int:
@@ -366,10 +439,11 @@ def apply_instrumentation(
     # Restore it before the patch contract is checked: recreating resets the
     # phase to a vulnerable one, which is the side the stage opens with.
     restored = _restore_workspace_for_new_attempt(result_dir)
-    patch = _require_persisted_instrumentation_patch(result_dir, patch)
+    patch, version = _require_persisted_instrumentation_patch(result_dir, patch)
     context = _context(result_dir)
     if restored:
         _update_state(result_dir, context, workspace_restored_for_attempt=True)
+    _reset_side_for_instrumentation_retry(result_dir, context, version)
     root = _source_root(result_dir)
     container = context["container"]
     remote = "/tmp/gt_instrumentation.patch"
@@ -409,7 +483,180 @@ def compile_vulnerable(result_dir: Path) -> int:
     return proc.returncode
 
 
+def validate_instrumentation_plan(
+    result_dir: Path,
+    vulnerable_patch: Path,
+    fixed_patch: Path,
+    out: Path,
+) -> int:
+    """Compile both frozen instrumentation patches in disposable ARVO containers."""
+    marker = _require_frozen_spec(result_dir)
+    context = _context(result_dir)
+    checks: dict[str, Any] = {}
+    for version, patch, image in (
+        ("vulnerable", vulnerable_patch, context["vul_image"]),
+        ("fixed", fixed_patch, context["fix_image"]),
+    ):
+        expected, patch_version = _require_persisted_instrumentation_patch(
+            result_dir, patch
+        )
+        if patch_version != version:
+            raise RuntimeError(
+                f"{version} build check received {patch_version} instrumentation"
+            )
+        container = f"{context['container']}-plan-{version}-{os.getpid()}"
+        side_context = {**context, "container": container}
+        applied = subprocess.CompletedProcess([], 1, "", "not started")
+        compiled = subprocess.CompletedProcess([], 1, "", "not started")
+        try:
+            pulled = _run(["docker", "pull", image], timeout=2400)
+            if pulled.returncode != 0:
+                compiled = pulled
+                continue
+            created = _run(["docker", "create", "--name", container, image])
+            if created.returncode != 0:
+                compiled = created
+                continue
+            started = _run(["docker", "start", container])
+            if started.returncode != 0:
+                compiled = started
+                continue
+            root = _detect_source_root(result_dir, side_context)
+            if not root:
+                compiled = subprocess.CompletedProcess(
+                    [], 1, "", "cannot resolve project source root"
+                )
+                continue
+            remote = f"/tmp/gt_{version}_instrumentation.patch"
+            copied = _run(["docker", "cp", str(expected), f"{container}:{remote}"])
+            if copied.returncode != 0:
+                applied = copied
+                continue
+            applied = _docker_exec(
+                container,
+                f"git -C {shlex.quote(root)} apply --check {remote} && "
+                f"git -C {shlex.quote(root)} apply {remote}",
+            )
+            if applied.returncode == 0:
+                compiled = _docker_exec(container, "/bin/arvo compile", timeout=7200)
+        finally:
+            _run(["docker", "rm", "-f", container])
+            _write_log(result_dir, f"plan_{version}_apply.log", applied)
+            _write_log(result_dir, f"plan_{version}_compile.log", compiled)
+            checks[version] = {
+                "image": image,
+                "patch": expected.name,
+                "patch_sha256": "sha256:" + hashlib.sha256(
+                    expected.read_bytes()
+                ).hexdigest(),
+                "apply_returncode": applied.returncode,
+                "compile_returncode": compiled.returncode,
+            }
+    report = {
+        "schema_version": "instrumentation-build-preflight-v1",
+        "sample_id": context["sample_id"],
+        "assertion_content_hash": marker["content_hash"],
+        "ok": all(
+            check["apply_returncode"] == 0 and check["compile_returncode"] == 0
+            for check in checks.values()
+        ) and set(checks) == {"vulnerable", "fixed"},
+        "checks": checks,
+    }
+    _write(out, report)
+    return 0 if report["ok"] else 1
+
+
+def validate_instrumentation_side(
+    result_dir: Path,
+    version: str,
+    patch: Path,
+    out: Path,
+) -> int:
+    """Compile one frozen observation patch in its stock ARVO image."""
+    if version not in {"vulnerable", "fixed"}:
+        raise ValueError(f"unsupported instrumentation side: {version}")
+    marker = _require_frozen_spec(result_dir)
+    context = _context(result_dir)
+    expected, patch_version = _require_persisted_instrumentation_patch(
+        result_dir, patch
+    )
+    if patch_version != version:
+        raise RuntimeError(
+            f"{version} build check received {patch_version} instrumentation"
+        )
+    image = context["vul_image"] if version == "vulnerable" else context["fix_image"]
+    _remove_stale_plan_containers(
+        f"{context['container']}-plan-{version}-"
+    )
+    container = f"{context['container']}-plan-{version}-{os.getpid()}"
+    side_context = {**context, "container": container}
+    applied = subprocess.CompletedProcess([], 1, "", "not started")
+    compiled = subprocess.CompletedProcess([], 1, "", "not started")
+    try:
+        pulled = _run(["docker", "pull", image], timeout=2400)
+        if pulled.returncode != 0:
+            compiled = pulled
+        else:
+            created = _run(["docker", "create", "--name", container, image])
+            if created.returncode != 0:
+                compiled = created
+            else:
+                started = _run(["docker", "start", container])
+                if started.returncode != 0:
+                    compiled = started
+                else:
+                    root = _detect_source_root(result_dir, side_context)
+                    if not root:
+                        compiled = subprocess.CompletedProcess(
+                            [], 1, "", "cannot resolve project source root"
+                        )
+                    else:
+                        remote = f"/tmp/gt_{version}_instrumentation.patch"
+                        copied = _run([
+                            "docker", "cp", str(expected), f"{container}:{remote}"
+                        ])
+                        if copied.returncode != 0:
+                            applied = copied
+                        else:
+                            applied = _docker_exec(
+                                container,
+                                f"git -C {shlex.quote(root)} apply --check {remote} && "
+                                f"git -C {shlex.quote(root)} apply {remote}",
+                            )
+                            if applied.returncode == 0:
+                                compiled = _docker_exec(
+                                    container, "/bin/arvo compile", timeout=7200
+                                )
+    finally:
+        _run(["docker", "rm", "-f", container])
+        _write_log(result_dir, f"plan_{version}_apply.log", applied)
+        _write_log(result_dir, f"plan_{version}_compile.log", compiled)
+    check = {
+        "image": image,
+        "patch": expected.name,
+        "patch_sha256": "sha256:" + hashlib.sha256(
+            expected.read_bytes()
+        ).hexdigest(),
+        "apply_returncode": applied.returncode,
+        "compile_returncode": compiled.returncode,
+    }
+    report = {
+        "schema_version": "instrumentation-side-preflight-v1",
+        "sample_id": context["sample_id"],
+        "version": version,
+        "assertion_content_hash": marker["content_hash"],
+        "ok": (
+            check["apply_returncode"] == 0
+            and check["compile_returncode"] == 0
+        ),
+        "check": check,
+    }
+    _write(out, report)
+    return 0 if report["ok"] else 1
+
+
 def switch_fixed(result_dir: Path, patch: Path) -> int:
+    """Legacy helper for old runs; new ARVO validation uses switch_fixed_image."""
     _require_frozen_spec(result_dir)
     context = _context(result_dir)
     root = _source_root(result_dir)
@@ -433,6 +680,34 @@ def switch_fixed(result_dir: Path, patch: Path) -> int:
         instrumentation_source_sha256="",
     )
     return proc.returncode
+
+
+def switch_fixed_image(result_dir: Path) -> int:
+    """Replace the vulnerable workspace with ARVO's published fixed image."""
+    _require_frozen_spec(result_dir)
+    context = _context(result_dir)
+    pull = _run(["docker", "pull", context["fix_image"]], timeout=2400)
+    if pull.returncode != 0:
+        return pull.returncode
+    _run(["docker", "rm", "-f", context["container"]])
+    created = _run([
+        "docker", "create", "--name", context["container"], context["fix_image"]
+    ])
+    if created.returncode != 0:
+        return created.returncode
+    started = _run(["docker", "start", context["container"]])
+    _update_state(
+        result_dir,
+        context,
+        phase="fixed_image_source" if started.returncode == 0 else "fixed_image_failed",
+        container_running=started.returncode == 0,
+        fixed_strategy="fixed_image",
+        source_root="",
+        instrumentation_patch="",
+        instrumentation_patch_sha256="",
+        instrumentation_source_sha256="",
+    )
+    return started.returncode
 
 
 def reset_source(result_dir: Path) -> int:
@@ -531,9 +806,14 @@ def compile_target(
         f"{version}_compile_fallback_used": fallback_used,
         f"{version}_compile_returncode": proc.returncode,
     }
+    if proc.returncode == 0:
+        updates["instrumentation_source_sha256"] = _source_fingerprint(result_dir)
     if version == "fixed":
+        state_path = _state_path(result_dir)
+        state = _load(state_path) if state_path.is_file() else {}
+        fixed_strategy = str(state.get("fixed_strategy") or "fixed_image")
         updates.update(
-            fixed_strategy="patch_incremental",
+            fixed_strategy=fixed_strategy,
             fixed_compile_returncode=proc.returncode,
         )
     _update_state(result_dir, context, **updates)
@@ -576,6 +856,8 @@ def run_case(
     expect: str,
     *,
     runtime_disambiguation: bool = False,
+    case_name: str = "original",
+    append_trace: bool = False,
 ) -> int:
     context = _context(result_dir)
     state = _load(_state_path(result_dir))
@@ -596,6 +878,17 @@ def run_case(
     matched = expect == "any" or (expect == "crash" and crashed) or (
         expect == "clean" and proc.returncode == 0 and not crashed
     )
+    trace_path = result_dir / f"{version}_assertion_trace.txt"
+    trace_mode = "a" if append_trace else "w"
+    trace_result = "crash" if crashed else ("clean" if proc.returncode == 0 else "error")
+    with trace_path.open(trace_mode, encoding="utf-8") as trace:
+        trace.write(
+            f"CASE name={case_name} rc={proc.returncode} result={trace_result}\n"
+        )
+        trace.write(combined)
+        if combined and not combined.endswith("\n"):
+            trace.write("\n")
+        trace.write("ENDCASE\n")
     # A fixed build that compiles cleanly but still reproduces the crash is not a
     # fixed-side witness: the staged patch did not remove the defect (commonly an
     # unrelated ARVO fix commit). Differential verification must swap to the
@@ -662,8 +955,17 @@ def main(argv: list[str] | None = None) -> int:
     p_target.add_argument("--version", required=True, choices=["vulnerable", "fixed"])
     p_target.add_argument("--target", default="")
     p_target.add_argument("--runtime-disambiguation", action="store_true")
+    p_plan = sub.add_parser("validate-instrumentation-plan")
+    p_plan.add_argument("--vulnerable-patch", required=True, type=Path)
+    p_plan.add_argument("--fixed-patch", required=True, type=Path)
+    p_plan.add_argument("--out", required=True, type=Path)
+    p_side = sub.add_parser("validate-instrumentation-side")
+    p_side.add_argument("--version", required=True, choices=["vulnerable", "fixed"])
+    p_side.add_argument("--patch", required=True, type=Path)
+    p_side.add_argument("--out", required=True, type=Path)
     p_switch = sub.add_parser("switch-fixed")
     p_switch.add_argument("--patch", required=True, type=Path)
+    sub.add_parser("switch-fixed-image")
     sub.add_parser("reset-source")
     p_fixed = sub.add_parser("compile-fixed")
     p_fixed.add_argument("--target", default="")
@@ -673,6 +975,8 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--version", required=True, choices=["vulnerable", "fixed"])
     p_run.add_argument("--expect", default="any", choices=["crash", "clean", "any"])
     p_run.add_argument("--runtime-disambiguation", action="store_true")
+    p_run.add_argument("--case-name", default="original")
+    p_run.add_argument("--append-trace", action="store_true")
     p_cleanup = sub.add_parser("cleanup")
     p_cleanup.add_argument("--remove-images", action="store_true")
     sub.add_parser("status")
@@ -697,8 +1001,24 @@ def main(argv: list[str] | None = None) -> int:
             target=args.target,
             runtime_disambiguation=args.runtime_disambiguation,
         )
+    if args.action == "validate-instrumentation-plan":
+        return validate_instrumentation_plan(
+            args.result_dir,
+            args.vulnerable_patch,
+            args.fixed_patch,
+            args.out,
+        )
+    if args.action == "validate-instrumentation-side":
+        return validate_instrumentation_side(
+            args.result_dir,
+            args.version,
+            args.patch,
+            args.out,
+        )
     if args.action == "switch-fixed":
         return switch_fixed(args.result_dir, args.patch)
+    if args.action == "switch-fixed-image":
+        return switch_fixed_image(args.result_dir)
     if args.action == "reset-source":
         return reset_source(args.result_dir)
     if args.action == "compile-fixed":
@@ -714,6 +1034,8 @@ def main(argv: list[str] | None = None) -> int:
             args.version,
             args.expect,
             runtime_disambiguation=args.runtime_disambiguation,
+            case_name=args.case_name,
+            append_trace=args.append_trace,
         )
     if args.action == "cleanup":
         return cleanup(args.result_dir, args.remove_images)

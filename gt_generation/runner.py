@@ -37,6 +37,14 @@ CODE_ROOT = Path(__file__).resolve().parent          # gt_generation/ (roles, wo
 REPO_ROOT = CODE_ROOT.parent                          # repo root (gt_results, dataset, evaluator)
 DEFAULT_CONFIG = CODE_ROOT / "workflow.json"
 FINAL_STAGE = "05_validate"
+ASSERTION_PLAN_STAGE = "04_assertion_plan"
+VULNERABLE_INSTRUMENTATION_STAGE = "04_instrument_vulnerable"
+FIXED_INSTRUMENTATION_STAGE = "04_instrument_fixed"
+ASSERTION_EXECUTE_STAGE = "04_assertion_execute"
+LEGACY_ASSERTION_STAGE = "04_assertion_validator"
+STAGE_ALIASES = {
+    LEGACY_ASSERTION_STAGE: ASSERTION_PLAN_STAGE,
+}
 
 
 @dataclass
@@ -54,6 +62,7 @@ class StageResult:
     attempts: int = 1
     skipped: bool = False
     dry_run: bool = False
+    failure_kind: str = ""
 
     @property
     def ok(self) -> bool:
@@ -72,6 +81,14 @@ def main() -> None:
     parser.add_argument("--stop-after", default="", help="Stop after this stage name.")
     parser.add_argument("--only", default="", help="Run only one stage.")
     parser.add_argument("--resume", action="store_true", help="Skip stages already ok in the prior state file.")
+    parser.add_argument(
+        "--reuse-repair-staging",
+        action="store_true",
+        help=(
+            "Preserve an existing transactional repair staging directory. "
+            "Use only to continue accepted earlier stages after a failed attempt."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
     parser.add_argument("--keep-going", action="store_true", help="Continue after a failed stage.")
     parser.add_argument(
@@ -124,8 +141,15 @@ def main() -> None:
     result_dir = published_result_dir
     if transactional_repair:
         result_dir = repair_staging_dir(published_result_dir)
-        prepare_repair_staging(published_result_dir, result_dir)
-        write_repair_context(published_result_dir, result_dir)
+        prepare_transactional_repair(
+            published_result_dir,
+            result_dir,
+            reuse=args.reuse_repair_staging,
+        )
+    elif args.reuse_repair_staging:
+        raise SystemExit(
+            "--reuse-repair-staging requires a transactional partial repair"
+        )
     install_generation_provenance(result_dir)
     # Per-run flags the stage roles read. runtime_disambiguation gates the bounded
     # Stage 02 instrumentation escalation; it is OFF by default so the common path stays
@@ -201,6 +225,8 @@ def main() -> None:
             logs_dir=logs_dir,
             dry_run=args.dry_run,
         )
+        if not args.dry_run:
+            prepare_stage_entry(name, result_dir)
         result = run_stage_with_retries(**stage_kwargs)
         append_stage(state_path, result)
         if not result.ok and stage.get("feedback_to") and not args.dry_run:
@@ -302,9 +328,102 @@ def run_stage_with_retries(**kwargs: Any) -> StageResult:
     attempt = 1
     while not result.ok and attempt <= retries and not (result.dry_run or result.skipped):
         attempt += 1
+        prepare_stage_retry(
+            str(stage.get("name") or ""),
+            Path(kwargs["result_dir"]),
+        )
         result = run_stage(**kwargs)
         result.attempts = attempt
     return result
+
+
+def prepare_stage_retry(stage_name: str, result_dir: Path) -> list[Path]:
+    """Remove only outputs owned by the retried stage.
+
+    Stage 04 used to rerun one large agent while leaving a mixture of plan,
+    execution and reachability artifacts behind. The freshness gate then marked
+    a semantically valid run failed, or worse, let the agent reason from stale
+    runtime evidence. Split stages keep their commitments and retry only their
+    own outputs.
+    """
+    owned = {
+        ASSERTION_PLAN_STAGE: (
+            "candidate_assertions.json",
+            "candidate_invariants.json",
+            "field_bindings.json",
+            "event_locations.json",
+            ".assertion_spec_frozen.json",
+            "assertion_preflight.json",
+        ),
+        VULNERABLE_INSTRUMENTATION_STAGE: (
+            "vulnerable-instrumentation.patch",
+            "vulnerable_instrumentation_preflight.json",
+        ),
+        FIXED_INSTRUMENTATION_STAGE: (
+            "fixed-instrumentation.patch",
+            "fixed_instrumentation_preflight.json",
+        ),
+        ASSERTION_EXECUTE_STAGE: (
+            "vulnerable_assertion_trace.txt",
+            "fixed_assertion_trace.txt",
+            "assertion_results.json",
+            "perturbation_results.json",
+            "verified_assertions.json",
+            "verified_invariants.json",
+        ),
+        "04_reachability": (
+            "reachability_report.json",
+        ),
+    }
+    removed: list[Path] = []
+    for name in owned.get(stage_name, ()):
+        path = result_dir / name
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            removed.append(path)
+    if stage_name == "04_reachability":
+        reachability_dir = result_dir / "reachability"
+        if reachability_dir.is_dir():
+            shutil.rmtree(reachability_dir)
+            removed.append(reachability_dir)
+    return removed
+
+
+def prepare_stage_entry(stage_name: str, result_dir: Path) -> list[Path]:
+    """Hide prior evidence from a new split-stage attempt.
+
+    Transactional repairs begin as a copy of the published package. Stage 04A
+    must not see old runtime answers, and each deterministic stage must produce
+    evidence for the current frozen plan rather than inherit a prior report.
+    """
+    removed: list[Path] = []
+    if stage_name == ASSERTION_PLAN_STAGE:
+        for owned_stage in (
+            ASSERTION_PLAN_STAGE,
+            VULNERABLE_INSTRUMENTATION_STAGE,
+            FIXED_INSTRUMENTATION_STAGE,
+            ASSERTION_EXECUTE_STAGE,
+            "04_reachability",
+        ):
+            removed.extend(prepare_stage_retry(owned_stage, result_dir))
+    elif stage_name == VULNERABLE_INSTRUMENTATION_STAGE:
+        for owned_stage in (
+            VULNERABLE_INSTRUMENTATION_STAGE,
+            FIXED_INSTRUMENTATION_STAGE,
+            ASSERTION_EXECUTE_STAGE,
+            "04_reachability",
+        ):
+            removed.extend(prepare_stage_retry(owned_stage, result_dir))
+    elif stage_name == FIXED_INSTRUMENTATION_STAGE:
+        for owned_stage in (
+            FIXED_INSTRUMENTATION_STAGE,
+            ASSERTION_EXECUTE_STAGE,
+            "04_reachability",
+        ):
+            removed.extend(prepare_stage_retry(owned_stage, result_dir))
+    elif stage_name in {ASSERTION_EXECUTE_STAGE, "04_reachability"}:
+        removed.extend(prepare_stage_retry(stage_name, result_dir))
+    return removed
 
 
 def run_feedback_loop(
@@ -514,15 +633,54 @@ def run_stage(
     success_check_ok = (
         check_success(stage, variables)
         and check_validate_gt(stage, variables, repo_root, code_root)
-        and check_assertion_preflight_success(stage, variables)
+        and check_assertion_stage_success(stage, variables)
         and check_runtime_disambiguation_success(stage, variables, started_ts)
     )
     return StageResult(
         name=name, command=command, returncode=proc.returncode, started_at=started_at,
         ended_at=now(), stdout_path=str(stdout_path), stderr_path=str(stderr_path),
         required_outputs_ok=required_outputs_ok, success_check_ok=success_check_ok,
+        failure_kind=stage_failure_kind(
+            name, proc.returncode, required_outputs_ok, success_check_ok
+        ),
         duration_seconds=round(time.monotonic() - started_monotonic, 3),
     )
+
+
+def stage_failure_kind(
+    stage_name: str,
+    returncode: int | None,
+    required_outputs_ok: bool,
+    success_check_ok: bool,
+) -> str:
+    if returncode == 0 and required_outputs_ok and success_check_ok:
+        return ""
+    if stage_name == ASSERTION_PLAN_STAGE:
+        return (
+            "assertion_plan_incomplete"
+            if not required_outputs_ok
+            else "assertion_plan_invalid"
+        )
+    if stage_name in {
+        VULNERABLE_INSTRUMENTATION_STAGE,
+        FIXED_INSTRUMENTATION_STAGE,
+    }:
+        return (
+            "instrumentation_incomplete"
+            if not required_outputs_ok
+            else "instrumentation_invalid"
+        )
+    if stage_name == ASSERTION_EXECUTE_STAGE:
+        return (
+            "assertion_execution_incomplete"
+            if not required_outputs_ok
+            else "differential_unverified"
+        )
+    if stage_name == "04_reachability":
+        return "reachability_failed"
+    if stage_name == LEGACY_ASSERTION_STAGE:
+        return "legacy_assertion_stage_failed"
+    return "stage_command_failed" if returncode not in (None, 0) else "stage_gate_failed"
 
 
 def stage_env(code_root: Path, stage: dict[str, Any]) -> dict[str, str]:
@@ -710,11 +868,18 @@ def check_runtime_disambiguation_success(
     )
 
 
-def check_assertion_preflight_success(
+def check_assertion_stage_success(
     stage: dict[str, Any], variables: dict[str, str]
 ) -> bool:
-    """Stage 04 must approve the plan before either runtime trace is written."""
-    if str(stage.get("name") or "") != "04_assertion_validator":
+    """Validate the frozen plan, then require fresh traces only at execution."""
+    stage_name = str(stage.get("name") or "")
+    if stage_name not in {
+        ASSERTION_PLAN_STAGE,
+        VULNERABLE_INSTRUMENTATION_STAGE,
+        FIXED_INSTRUMENTATION_STAGE,
+        ASSERTION_EXECUTE_STAGE,
+        LEGACY_ASSERTION_STAGE,
+    }:
         return True
     result_dir = Path(variables["result_dir"])
     report_path = result_dir / "assertion_preflight.json"
@@ -733,6 +898,18 @@ def check_assertion_preflight_success(
         return False
     if report.get("assertion_content_hash") != spec.get("content_hash"):
         return False
+    marker_path = result_dir / ".assertion_spec_frozen.json"
+    try:
+        marker = load_json(marker_path)
+    except Exception:
+        return False
+    if (
+        marker.get("content_hash") != spec.get("content_hash")
+        or marker.get("file_sha256") != (
+            "sha256:" + hashlib.sha256(spec_path.read_bytes()).hexdigest()
+        )
+    ):
+        return False
     expected_inputs = (
         "candidate_assertions.json",
         "candidate_invariants.json",
@@ -746,6 +923,72 @@ def check_assertion_preflight_success(
         path = result_dir / name
         if not path.is_file() or input_hashes.get(name) != (
             "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        ):
+            return False
+    if stage_name == ASSERTION_PLAN_STAGE:
+        return True
+    sample_id = str(spec.get("sample_id") or "")
+    required_versions: tuple[str, ...] = ()
+    if stage_name == VULNERABLE_INSTRUMENTATION_STAGE:
+        required_versions = ("vulnerable",)
+    elif stage_name == FIXED_INSTRUMENTATION_STAGE:
+        required_versions = ("fixed",)
+    elif stage_name == ASSERTION_EXECUTE_STAGE:
+        required_versions = ("vulnerable", "fixed")
+    if sample_id.startswith("arvo_") and stage_name != LEGACY_ASSERTION_STAGE:
+        for version in required_versions:
+            patch_path = result_dir / f"{version}-instrumentation.patch"
+            build_report_path = (
+                result_dir / f"{version}_instrumentation_preflight.json"
+            )
+            if not patch_path.is_file():
+                return False
+            patch_hash = (
+                "sha256:" + hashlib.sha256(patch_path.read_bytes()).hexdigest()
+            )
+            try:
+                build_report = load_json(build_report_path)
+            except Exception:
+                return False
+            check = build_report.get("check")
+            if (
+                build_report.get("ok") is not True
+                or build_report.get("version") != version
+                or build_report.get("assertion_content_hash")
+                != spec.get("content_hash")
+                or not isinstance(check, dict)
+                or check.get("patch_sha256") != patch_hash
+                or check.get("apply_returncode") != 0
+                or check.get("compile_returncode") != 0
+            ):
+                return False
+    if stage_name in {
+        VULNERABLE_INSTRUMENTATION_STAGE,
+        FIXED_INSTRUMENTATION_STAGE,
+    }:
+        return True
+    if sample_id.startswith("arvo_") and stage_name == LEGACY_ASSERTION_STAGE:
+        build_report_path = result_dir / "instrumentation_build_preflight.json"
+        try:
+            build_report = load_json(build_report_path)
+        except Exception:
+            return False
+        patch_hashes = {
+            version: input_hashes.get(f"{version}-instrumentation.patch")
+            for version in ("vulnerable", "fixed")
+        }
+        checks = build_report.get("checks")
+        if (
+            build_report.get("ok") is not True
+            or build_report.get("assertion_content_hash") != spec.get("content_hash")
+            or not isinstance(checks, dict)
+            or any(
+                not isinstance(checks.get(version), dict)
+                or checks[version].get("patch_sha256") != patch_hashes[version]
+                or checks[version].get("apply_returncode") != 0
+                or checks[version].get("compile_returncode") != 0
+                for version in ("vulnerable", "fixed")
+            )
         ):
             return False
     verified_path = result_dir / "verified_invariants.json"
@@ -764,6 +1007,13 @@ def check_assertion_preflight_success(
         result_dir / "fixed_assertion_trace.txt",
     )
     return all(path.is_file() and path.stat().st_mtime >= preflight_mtime for path in traces)
+
+
+def check_assertion_preflight_success(
+    stage: dict[str, Any], variables: dict[str, str]
+) -> bool:
+    """Backward-compatible name used by integrations and older tests."""
+    return check_assertion_stage_success(stage, variables)
 
 
 def verified_graph_is_candidate_subset(
@@ -818,6 +1068,9 @@ def get_nested(data: dict[str, Any], field: str) -> Any:
 
 def make_stage_filter(stages: list[dict[str, Any]], start_at: str, stop_after: str, only: str):
     names = [str(stage.get("name") or "") for stage in stages]
+    start_at = resolve_stage_alias(start_at, names)
+    stop_after = resolve_stage_alias(stop_after, names)
+    only = resolve_stage_alias(only, names)
     if only:
         return lambda name: name == only
     start_index = names.index(start_at) if start_at in names else 0
@@ -847,6 +1100,9 @@ def validate_stage_bounds(
     stages: list[dict[str, Any]], start_at: str, stop_after: str, only: str
 ) -> None:
     names = [str(stage.get("name") or "") for stage in stages]
+    start_at = resolve_stage_alias(start_at, names)
+    stop_after = resolve_stage_alias(stop_after, names)
+    only = resolve_stage_alias(only, names)
     for label, value in (
         ("--start-at", start_at),
         ("--stop-after", stop_after),
@@ -858,6 +1114,13 @@ def validate_stage_bounds(
         raise SystemExit("--only cannot be combined with --start-at or --stop-after")
     if start_at and stop_after and names.index(start_at) > names.index(stop_after):
         raise SystemExit("--start-at must not follow --stop-after")
+
+
+def resolve_stage_alias(name: str, available: list[str]) -> str:
+    if not name or name in available:
+        return name
+    resolved = STAGE_ALIASES.get(name, name)
+    return resolved if resolved in available else name
 
 
 def should_stage_repair(
@@ -894,6 +1157,20 @@ def prepare_repair_staging(source: Path, staging: Path) -> None:
         path = staging / name
         if path.is_file() or path.is_symlink():
             path.unlink()
+
+
+def prepare_transactional_repair(
+    source: Path, staging: Path, *, reuse: bool = False
+) -> None:
+    """Create a fresh staging copy unless an explicit continuation reuses it."""
+    if reuse:
+        if not staging.is_dir():
+            raise SystemExit(
+                f"Cannot reuse missing repair staging directory: {staging}"
+            )
+        return
+    prepare_repair_staging(source, staging)
+    write_repair_context(source, staging)
 
 
 def write_repair_context(source: Path, staging: Path) -> dict[str, Any]:

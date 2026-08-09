@@ -21,7 +21,7 @@ def _result(name: str, ok: bool) -> runner.StageResult:
     )
 
 
-def test_workflow_uses_four_isolated_agent_stages_and_review_feedback():
+def test_workflow_splits_assertion_plan_execution_and_reachability():
     workflow = json.loads(
         (Path(__file__).parents[1] / "gt_generation" / "workflow.json").read_text()
     )
@@ -32,21 +32,50 @@ def test_workflow_uses_four_isolated_agent_stages_and_review_feedback():
         "01_reproducer",
         "02_fine_trace",
         "03_trace_review",
-        "04_assertion_validator",
+        "04_assertion_plan",
+        "04_instrument_vulnerable",
+        "04_instrument_fixed",
+        "04_assertion_execute",
     ]
-    assert len({stage["role"] for stage in agent_stages}) == 4
+    assert len({stage["role"] for stage in agent_stages}) == 7
     review = next(stage for stage in agent_stages if stage["name"] == "03_trace_review")
     assert review["feedback_to"] == "02_fine_trace"
     assert review["runtime_role"] == "roles/02_runtime_disambiguation.md"
     assert review["incremental_role"] == "roles/03_trace_review_incremental.md"
     assert review["feedback_rounds"] == 2
+    plan_stage = next(
+        stage for stage in agent_stages if stage["name"] == "04_assertion_plan"
+    )
+    assert plan_stage["success_check"] == {
+        "path": "{result_dir}/assertion_preflight.json",
+        "field": "ok",
+        "equals": True,
+    }
     assertion_stage = next(
-        stage for stage in agent_stages if stage["name"] == "04_assertion_validator"
+        stage for stage in agent_stages if stage["name"] == "04_assertion_execute"
     )
     assert assertion_stage["success_check"] == {
         "path": "{result_dir}/assertion_results.json",
         "field": "all_verified",
         "equals": True,
+    }
+    reachability_stage = next(
+        stage for stage in workflow["stages"] if stage["name"] == "04_reachability"
+    )
+    assert not reachability_stage.get("role")
+    assert "gt_toolkit reachability --for-result-dir" in (
+        reachability_stage["command_template"]
+    )
+    assert reachability_stage["success_check"] == {
+        "path": "{result_dir}/reachability_report.json",
+        "all": [
+            {"field": "reachability_checked", "equals": True},
+            {"field": "R1_parser_admitted", "equals": True},
+            {"field": "R2_source_reached", "equals": True},
+            {"field": "R3_root_cause_reached", "equals": True},
+            {"field": "R4_sink_reached", "equals": True},
+            {"field": "R5_sanitizer_triggered", "equals": True},
+        ],
     }
     prepare_stage = next(
         stage for stage in workflow["stages"] if stage["name"] == "00_prepare"
@@ -64,6 +93,7 @@ def test_workflow_uses_four_isolated_agent_stages_and_review_feedback():
     assert "gt_toolkit audit-package" in final_stage["command_template"]
     assert "gt_toolkit validate {gt_path} --strict --json" in final_stage["command_template"]
     assert "gt_toolkit bind-evidence" in final_stage["command_template"]
+    assert "gt_toolkit reachability" not in final_stage["command_template"]
     assert next(
         stage for stage in workflow["stages"] if stage["name"] == "02_fine_trace"
     )["validate_strict"] is True
@@ -195,7 +225,9 @@ def test_runtime_stage_requires_fresh_completed_workspace_cycle(tmp_path):
 
 
 def test_assertion_preflight_must_precede_runtime_traces(tmp_path):
-    stage = {"name": "04_assertion_validator"}
+    from gt_generation.gt_toolkit.evidence import file_sha256
+
+    stage = {"name": "04_assertion_execute"}
     variables = {"result_dir": str(tmp_path)}
     runner.write_json(
         tmp_path / "candidate_assertions.json",
@@ -206,6 +238,22 @@ def test_assertion_preflight_must_precede_runtime_traces(tmp_path):
         "event_locations.json",
     ):
         runner.write_json(tmp_path / name, {})
+    for version in ("vulnerable", "fixed"):
+        patch = tmp_path / f"{version}-instrumentation.patch"
+        patch.write_text("patch", encoding="utf-8")
+        runner.write_json(
+            tmp_path / f"{version}_instrumentation_preflight.json",
+            {
+                "ok": True,
+                "version": version,
+                "assertion_content_hash": "sha256:plan",
+                "check": {
+                    "patch_sha256": file_sha256(patch),
+                    "apply_returncode": 0,
+                    "compile_returncode": 0,
+                },
+            },
+        )
     candidate_graph = {
         "root_cause_criterion": {
             "invariant_id": "root",
@@ -218,8 +266,14 @@ def test_assertion_preflight_must_precede_runtime_traces(tmp_path):
     }
     runner.write_json(tmp_path / "candidate_invariants.json", candidate_graph)
     runner.write_json(tmp_path / "verified_invariants.json", candidate_graph)
-    from gt_generation.gt_toolkit.evidence import file_sha256
-
+    spec_path = tmp_path / "candidate_assertions.json"
+    runner.write_json(
+        tmp_path / ".assertion_spec_frozen.json",
+        {
+            "content_hash": "sha256:plan",
+            "file_sha256": file_sha256(spec_path),
+        },
+    )
     runner.write_json(
         tmp_path / "assertion_preflight.json",
         {
@@ -245,6 +299,190 @@ def test_assertion_preflight_must_precede_runtime_traces(tmp_path):
     assert runner.check_assertion_preflight_success(stage, variables) is False
 
 
+def test_assertion_plan_gate_does_not_require_runtime_outputs(tmp_path):
+    variables = {"result_dir": str(tmp_path)}
+    runner.write_json(
+        tmp_path / "candidate_assertions.json",
+        {"content_hash": "sha256:plan"},
+    )
+    for name in (
+        "candidate_invariants.json",
+        "field_bindings.json",
+        "event_locations.json",
+    ):
+        runner.write_json(tmp_path / name, {})
+    from gt_generation.gt_toolkit.evidence import file_sha256
+
+    runner.write_json(
+        tmp_path / ".assertion_spec_frozen.json",
+        {
+            "content_hash": "sha256:plan",
+            "file_sha256": file_sha256(tmp_path / "candidate_assertions.json"),
+        },
+    )
+    inputs = (
+        "candidate_assertions.json",
+        "candidate_invariants.json",
+        "field_bindings.json",
+        "event_locations.json",
+    )
+    runner.write_json(
+        tmp_path / "assertion_preflight.json",
+        {
+            "ok": True,
+            "assertion_content_hash": "sha256:plan",
+            "input_hashes": {
+                name: file_sha256(tmp_path / name)
+                for name in inputs
+            },
+        },
+    )
+
+    assert runner.check_assertion_stage_success(
+        {"name": "04_assertion_plan"}, variables
+    ) is True
+
+
+def test_arvo_instrumentation_stage_requires_only_its_side_build(tmp_path):
+    variables = {"result_dir": str(tmp_path)}
+    runner.write_json(
+        tmp_path / "candidate_assertions.json",
+        {"sample_id": "arvo_42", "content_hash": "sha256:plan"},
+    )
+    for name in (
+        "candidate_invariants.json",
+        "field_bindings.json",
+        "event_locations.json",
+    ):
+        runner.write_json(tmp_path / name, {})
+    from gt_generation.gt_toolkit.evidence import file_sha256
+
+    runner.write_json(
+        tmp_path / ".assertion_spec_frozen.json",
+        {
+            "content_hash": "sha256:plan",
+            "file_sha256": file_sha256(tmp_path / "candidate_assertions.json"),
+        },
+    )
+    inputs = (
+        "candidate_assertions.json",
+        "candidate_invariants.json",
+        "field_bindings.json",
+        "event_locations.json",
+    )
+    input_hashes = {
+        name: file_sha256(tmp_path / name)
+        for name in inputs
+    }
+    runner.write_json(
+        tmp_path / "assertion_preflight.json",
+        {
+            "ok": True,
+            "assertion_content_hash": "sha256:plan",
+            "input_hashes": input_hashes,
+        },
+    )
+    patch = tmp_path / "vulnerable-instrumentation.patch"
+    patch.write_text("patch", encoding="utf-8")
+    runner.write_json(
+        tmp_path / "vulnerable_instrumentation_preflight.json",
+        {
+            "ok": True,
+            "version": "vulnerable",
+            "assertion_content_hash": "sha256:plan",
+            "check": {
+                "patch_sha256": file_sha256(patch),
+                "apply_returncode": 0,
+                "compile_returncode": 0,
+            },
+        },
+    )
+    stage = {"name": "04_instrument_vulnerable"}
+    assert runner.check_assertion_stage_success(stage, variables) is True
+
+    report = runner.load_json(
+        tmp_path / "vulnerable_instrumentation_preflight.json"
+    )
+    report["check"]["compile_returncode"] = 2
+    runner.write_json(
+        tmp_path / "vulnerable_instrumentation_preflight.json", report
+    )
+    assert runner.check_assertion_stage_success(stage, variables) is False
+
+
+def test_split_stage_entry_and_retry_remove_only_owned_outputs(tmp_path):
+    plan_files = {
+        "candidate_assertions.json",
+        "candidate_invariants.json",
+        "field_bindings.json",
+        "event_locations.json",
+        ".assertion_spec_frozen.json",
+        "assertion_preflight.json",
+    }
+    vulnerable_files = {
+        "vulnerable-instrumentation.patch",
+        "vulnerable_instrumentation_preflight.json",
+    }
+    fixed_files = {
+        "fixed-instrumentation.patch",
+        "fixed_instrumentation_preflight.json",
+    }
+    execution_files = {
+        "vulnerable_assertion_trace.txt",
+        "fixed_assertion_trace.txt",
+        "assertion_results.json",
+        "perturbation_results.json",
+        "verified_assertions.json",
+        "verified_invariants.json",
+    }
+    for name in (
+        plan_files
+        | vulnerable_files
+        | fixed_files
+        | execution_files
+        | {"reachability_report.json"}
+    ):
+        (tmp_path / name).write_text("old", encoding="utf-8")
+
+    runner.prepare_stage_entry("04_instrument_fixed", tmp_path)
+    assert all((tmp_path / name).is_file() for name in plan_files | vulnerable_files)
+    assert all(not (tmp_path / name).exists() for name in fixed_files)
+    assert all(not (tmp_path / name).exists() for name in execution_files)
+
+    for name in fixed_files | execution_files:
+        (tmp_path / name).write_text("old", encoding="utf-8")
+    runner.prepare_stage_entry("04_assertion_execute", tmp_path)
+
+    assert all(
+        (tmp_path / name).is_file()
+        for name in plan_files | vulnerable_files | fixed_files
+    )
+    assert all(not (tmp_path / name).exists() for name in execution_files)
+    assert not (tmp_path / "reachability_report.json").exists()
+
+    runner.prepare_stage_entry("04_assertion_plan", tmp_path)
+    assert all(
+        not (tmp_path / name).exists()
+        for name in plan_files | vulnerable_files | fixed_files
+    )
+    assert not (tmp_path / "reachability_report.json").exists()
+
+
+def test_split_stage_failure_kinds_are_specific():
+    assert runner.stage_failure_kind(
+        "04_assertion_plan", 1, False, False
+    ) == "assertion_plan_incomplete"
+    assert runner.stage_failure_kind(
+        "04_instrument_fixed", 1, True, False
+    ) == "instrumentation_invalid"
+    assert runner.stage_failure_kind(
+        "04_assertion_execute", 1, True, False
+    ) == "differential_unverified"
+    assert runner.stage_failure_kind(
+        "04_reachability", 1, False, False
+    ) == "reachability_failed"
+
+
 def test_repair_staging_failure_leaves_published_package_unchanged(tmp_path):
     published = tmp_path / "sample"
     published.mkdir()
@@ -258,18 +496,63 @@ def test_repair_staging_failure_leaves_published_package_unchanged(tmp_path):
     assert (staging / "ground_truth.json").read_text() == "failed repair"
 
 
+def test_explicit_repair_staging_reuse_preserves_accepted_earlier_stages(tmp_path):
+    published = tmp_path / "sample"
+    published.mkdir()
+    (published / "ground_truth.json").write_text("published")
+    staging = runner.repair_staging_dir(published)
+    staging.mkdir()
+    (staging / "ground_truth.json").write_text("accepted repaired GT")
+    (staging / "static_review.json").write_text('{"static_valid": true}')
+
+    runner.prepare_transactional_repair(published, staging, reuse=True)
+
+    assert (staging / "ground_truth.json").read_text() == "accepted repaired GT"
+    assert (staging / "static_review.json").is_file()
+
+
+def test_explicit_repair_staging_reuse_requires_existing_directory(tmp_path):
+    published = tmp_path / "sample"
+    published.mkdir()
+
+    with pytest.raises(SystemExit, match="Cannot reuse missing repair staging"):
+        runner.prepare_transactional_repair(
+            published,
+            runner.repair_staging_dir(published),
+            reuse=True,
+        )
+
+
 def test_generator_avoids_python38_path_apis():
-    code_root = Path(__file__).parents[1] / "gt_generation"
+    repo_root = Path(__file__).parents[1]
     for relative in (
-        "runner.py",
-        "gt_toolkit/compact_result.py",
-        "gt_toolkit/prepare.py",
+        "gt_generation/runner.py",
+        "gt_generation/gt_toolkit/compact_result.py",
+        "gt_generation/gt_toolkit/prepare.py",
+        "gt_generation/gt_toolkit/reachability.py",
+        "evaluator/reachability/arvo_gdb.py",
     ):
-        source = (code_root / relative).read_text(encoding="utf-8")
+        source = (repo_root / relative).read_text(encoding="utf-8")
         assert "missing_ok=" not in source
         assert ".removeprefix(" not in source
         assert ".removesuffix(" not in source
         assert ".is_relative_to(" not in source
+
+
+def test_arvo_reachability_uses_host_orchestrator_not_image_python():
+    source = (
+        Path(__file__).parents[1]
+        / "gt_generation"
+        / "gt_toolkit"
+        / "reachability.py"
+    ).read_text(encoding="utf-8")
+    function = source.split("def run_for_arvo(", 1)[1].split(
+        "\ndef _proxy_environment", 1
+    )[0]
+
+    assert "prepare_arvo_target(" in function
+    assert "run_arvo_gdb(" in function
+    assert "python3 -m gt_toolkit" not in function
 
 
 def test_successful_repair_staging_atomically_replaces_package(tmp_path):

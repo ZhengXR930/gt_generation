@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,11 +25,31 @@ def _load(path: Path) -> dict[str, Any]:
     return value
 
 
+def _validate_patch_syntax(path: Path) -> list[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "apply", "--numstat", "--", str(path.resolve())],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+    except OSError as exc:
+        return [f"cannot validate instrumentation patch {path.name}: {exc}"]
+    if completed.returncode == 0 and completed.stdout.strip():
+        return []
+    detail = (completed.stderr or completed.stdout).strip()
+    if not detail:
+        detail = "patch contains no file changes"
+    return [f"invalid instrumentation patch {path.name}: {detail}"]
+
+
 def run_preflight(
     spec_path: Path,
     invariants_path: Path,
     field_bindings_path: Path,
     event_locations_path: Path,
+    vulnerable_instrumentation_path: Path | None = None,
+    fixed_instrumentation_path: Path | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     try:
@@ -49,15 +70,31 @@ def run_preflight(
     errors.extend(_verified_invariant_harness_errors(invariants))
     coverage = validate_binding_coverage(spec, field_bindings, event_locations)
     errors.extend(coverage["errors"])
+    input_paths = (
+        spec_path,
+        invariants_path,
+        field_bindings_path,
+        event_locations_path,
+    )
+    optional_paths = (
+        vulnerable_instrumentation_path,
+        fixed_instrumentation_path,
+    )
+    for path in optional_paths:
+        if path is not None and not path.is_file():
+            errors.append(f"missing instrumentation plan: {path.name}")
+        elif path is not None:
+            errors.extend(_validate_patch_syntax(path))
+    committed_paths = input_paths + tuple(
+        path for path in optional_paths if path is not None and path.is_file()
+    )
     return {
         "schema_version": "assertion-preflight-v1",
         "sample_id": spec.get("sample_id"),
         "assertion_content_hash": spec.get("content_hash"),
         "input_hashes": {
-            spec_path.name: file_sha256(spec_path),
-            invariants_path.name: file_sha256(invariants_path),
-            field_bindings_path.name: file_sha256(field_bindings_path),
-            event_locations_path.name: file_sha256(event_locations_path),
+            path.name: file_sha256(path)
+            for path in committed_paths
         },
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "ok": not errors,
@@ -73,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--candidate-invariants", type=Path, required=True)
     parser.add_argument("--field-bindings", type=Path, required=True)
     parser.add_argument("--event-locations", type=Path, required=True)
+    parser.add_argument("--vulnerable-instrumentation", type=Path)
+    parser.add_argument("--fixed-instrumentation", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     report = run_preflight(
@@ -80,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
         args.candidate_invariants,
         args.field_bindings,
         args.event_locations,
+        args.vulnerable_instrumentation,
+        args.fixed_instrumentation,
     )
     args.out.write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n",

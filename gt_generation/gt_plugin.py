@@ -101,7 +101,20 @@ def load_config(path: Path) -> dict[str, Any]:
 
     start_at = str(raw.get("start_at") or "").strip()
     stop_after = str(raw.get("stop_after") or "").strip()
-    if start_at in {"02_fine_trace", "03_trace_review", "04_assertion_validator"}:
+    if start_at == "04_assertion_validator":
+        start_at = "04_assertion_plan"
+    if stop_after == "04_assertion_validator":
+        stop_after = "04_assertion_plan"
+    repair_stages = {
+        "02_fine_trace",
+        "03_trace_review",
+        "04_assertion_plan",
+        "04_instrument_vulnerable",
+        "04_instrument_fixed",
+        "04_assertion_execute",
+        "04_reachability",
+    }
+    if start_at in repair_stages:
         if stop_after and stop_after != "05_validate":
             raise SystemExit(
                 "partial GT repairs must run through 05_validate; "
@@ -124,6 +137,7 @@ def load_config(path: Path) -> dict[str, Any]:
         # Re-run only the stages that have not passed. A sample that died late
         # keeps its accepted clone, reproduction and fine trace.
         "resume": bool(raw.get("resume", False)),
+        "reuse_repair_staging": bool(raw.get("reuse_repair_staging", False)),
         "start_at": start_at,
         "stop_after": stop_after,
     }
@@ -358,6 +372,8 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
     # Resume re-runs only the stages that have not passed yet.
     if cfg.get("resume"):
         command.append("--resume")
+    if cfg.get("reuse_repair_staging"):
+        command.append("--reuse-repair-staging")
     if cfg.get("start_at"):
         command += ["--start-at", str(cfg["start_at"])]
     if cfg.get("stop_after"):

@@ -81,6 +81,11 @@ def test_fixed_compile_is_target_level_incremental_not_full(tmp_path, monkeypatc
         lambda result_dir, runtime_disambiguation: {},
     )
     monkeypatch.setattr(arvo_workspace, "_verify_source_fingerprint", lambda result_dir: None)
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_source_fingerprint",
+        lambda result_dir: "sha256:compiled-source",
+    )
     monkeypatch.setattr(arvo_workspace, "_source_root", lambda result_dir: "/src/readstat")
 
     def fake_exec(container, command, timeout=3600):
@@ -115,6 +120,11 @@ def test_instrumented_vulnerable_compile_reuses_configured_target(tmp_path, monk
         lambda result_dir, runtime_disambiguation: {},
     )
     monkeypatch.setattr(arvo_workspace, "_verify_source_fingerprint", lambda result_dir: None)
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_source_fingerprint",
+        lambda result_dir: "sha256:compiled-source",
+    )
     monkeypatch.setattr(arvo_workspace, "_source_root", lambda result_dir: "/src/readstat")
     monkeypatch.setattr(
         arvo_workspace,
@@ -146,6 +156,11 @@ def test_target_compile_falls_back_without_agent_polling(tmp_path, monkeypatch):
         lambda result_dir, runtime_disambiguation: {},
     )
     monkeypatch.setattr(arvo_workspace, "_verify_source_fingerprint", lambda result_dir: None)
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_source_fingerprint",
+        lambda result_dir: "sha256:compiled-source",
+    )
     monkeypatch.setattr(arvo_workspace, "_source_root", lambda result_dir: "/src/readstat")
 
     def fake_exec(container, command, timeout=3600):
@@ -200,6 +215,38 @@ def test_switch_fixed_preserves_untracked_build_outputs(tmp_path, monkeypatch):
     assert "git -C /src/readstat reset --hard HEAD" in commands[0]
     assert "git -C /src/readstat apply" in commands[0]
     assert "git clean" not in commands[0]
+
+
+def test_switch_fixed_image_replaces_vulnerable_workspace(tmp_path, monkeypatch):
+    context = {
+        "container": "workspace",
+        "fix_image": "n132/arvo:42-fix",
+    }
+    calls = []
+    updates = []
+    monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
+    monkeypatch.setattr(arvo_workspace, "_require_frozen_spec", lambda result_dir: {})
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_run",
+        lambda cmd, timeout=3600: calls.append(cmd) or _proc(),
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_update_state",
+        lambda *args, **kwargs: updates.append(kwargs) or {},
+    )
+
+    assert arvo_workspace.switch_fixed_image(tmp_path) == 0
+    assert ["docker", "pull", "n132/arvo:42-fix"] in calls
+    assert ["docker", "rm", "-f", "workspace"] in calls
+    assert [
+        "docker", "create", "--name", "workspace", "n132/arvo:42-fix"
+    ] in calls
+    assert ["docker", "start", "workspace"] in calls
+    assert updates[-1]["fixed_strategy"] == "fixed_image"
+    assert updates[-1]["source_root"] == ""
+    assert updates[-1]["instrumentation_source_sha256"] == ""
 
 
 def test_workspace_rejects_execution_before_exact_spec_is_frozen(tmp_path):
@@ -305,10 +352,200 @@ def test_instrumentation_patch_must_use_fixed_persisted_result_path(tmp_path):
 
     assert arvo_workspace._require_persisted_instrumentation_patch(
         tmp_path, expected
-    ) == expected.resolve()
+    ) == (expected.resolve(), "vulnerable")
 
     temporary = tmp_path / "_work" / "instrumentation.patch"
     temporary.parent.mkdir()
     temporary.write_text(expected.read_text())
-    with pytest.raises(RuntimeError, match="persisted exactly"):
+    with pytest.raises(RuntimeError, match="persisted vulnerable or fixed"):
         arvo_workspace._require_persisted_instrumentation_patch(tmp_path, temporary)
+
+
+def test_vulnerable_instrumentation_retry_restores_tracked_source(tmp_path, monkeypatch):
+    context = {"container": "workspace"}
+    arvo_workspace._write(
+        tmp_path / "arvo_workspace.json",
+        {
+            "phase": "vulnerable_incremental_failed",
+            "instrumentation_patch": str(
+                tmp_path / "vulnerable-instrumentation.patch"
+            ),
+        },
+    )
+    commands = []
+    updates = []
+    monkeypatch.setattr(arvo_workspace, "_source_root", lambda result_dir: "/src/project")
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_docker_exec",
+        lambda container, command, timeout=3600: commands.append(command) or _proc(),
+    )
+    monkeypatch.setattr(arvo_workspace, "_write_log", lambda *args: None)
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_update_state",
+        lambda *args, **kwargs: updates.append(kwargs) or {},
+    )
+
+    assert arvo_workspace._reset_side_for_instrumentation_retry(
+        tmp_path, context, "vulnerable"
+    )
+    assert commands == ["git -C /src/project reset --hard HEAD"]
+    assert updates[-1]["workspace_reset_for_instrumentation_retry"] is True
+    assert updates[-1]["instrumentation_source_sha256"] == ""
+
+
+def test_first_instrumentation_application_does_not_reset_source(tmp_path):
+    arvo_workspace._write(
+        tmp_path / "arvo_workspace.json", {"phase": "vulnerable_compiled"}
+    )
+
+    assert not arvo_workspace._reset_side_for_instrumentation_retry(
+        tmp_path, {"container": "workspace"}, "vulnerable"
+    )
+
+
+def test_instrumentation_plan_compiles_both_sides_and_cleans_containers(
+    tmp_path, monkeypatch
+):
+    context = {
+        "sample_id": "arvo_42",
+        "container": "gt-arvo_42-workspace",
+        "vul_image": "n132/arvo:42-vul",
+        "fix_image": "n132/arvo:42-fix",
+    }
+    vulnerable = tmp_path / "vulnerable-instrumentation.patch"
+    fixed = tmp_path / "fixed-instrumentation.patch"
+    vulnerable.write_text("vulnerable patch", encoding="utf-8")
+    fixed.write_text("fixed patch", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_require_frozen_spec",
+        lambda result_dir: {"content_hash": "sha256:plan"},
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_require_persisted_instrumentation_patch",
+        lambda result_dir, patch: (
+            patch.resolve(),
+            "vulnerable" if patch == vulnerable else "fixed",
+        ),
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_detect_source_root",
+        lambda result_dir, side_context: "/src/project",
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_run",
+        lambda cmd, timeout=3600: calls.append(cmd) or _proc(),
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_docker_exec",
+        lambda container, command, timeout=3600: calls.append(
+            [container, command]
+        ) or _proc(),
+    )
+    monkeypatch.setattr(arvo_workspace, "_write_log", lambda *args: None)
+
+    out = tmp_path / "instrumentation_build_preflight.json"
+    assert arvo_workspace.validate_instrumentation_plan(
+        tmp_path, vulnerable, fixed, out
+    ) == 0
+    report = json.loads(out.read_text())
+    assert report["ok"] is True
+    assert report["checks"]["vulnerable"]["compile_returncode"] == 0
+    assert report["checks"]["fixed"]["compile_returncode"] == 0
+    assert sum(
+        call[:3] == ["docker", "rm", "-f"]
+        for call in calls
+        if isinstance(call, list)
+    ) == 2
+
+
+def test_instrumentation_side_compiles_only_selected_image_and_cleans_container(
+    tmp_path, monkeypatch
+):
+    context = {
+        "sample_id": "arvo_42",
+        "container": "gt-arvo_42-workspace",
+        "vul_image": "n132/arvo:42-vul",
+        "fix_image": "n132/arvo:42-fix",
+    }
+    fixed = tmp_path / "fixed-instrumentation.patch"
+    fixed.write_text("fixed patch", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_require_frozen_spec",
+        lambda result_dir: {"content_hash": "sha256:plan"},
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_require_persisted_instrumentation_patch",
+        lambda result_dir, patch: (patch.resolve(), "fixed"),
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_detect_source_root",
+        lambda result_dir, side_context: "/src/project",
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_run",
+        lambda cmd, timeout=3600: calls.append(cmd) or _proc(),
+    )
+    monkeypatch.setattr(
+        arvo_workspace,
+        "_docker_exec",
+        lambda container, command, timeout=3600: calls.append(
+            [container, command]
+        ) or _proc(),
+    )
+    monkeypatch.setattr(arvo_workspace, "_write_log", lambda *args: None)
+
+    out = tmp_path / "fixed_instrumentation_preflight.json"
+    assert arvo_workspace.validate_instrumentation_side(
+        tmp_path, "fixed", fixed, out
+    ) == 0
+    report = json.loads(out.read_text())
+    assert report["ok"] is True
+    assert report["version"] == "fixed"
+    assert report["check"]["image"] == "n132/arvo:42-fix"
+    assert ["docker", "pull", "n132/arvo:42-vul"] not in calls
+    assert sum(
+        call[:3] == ["docker", "rm", "-f"]
+        for call in calls
+        if isinstance(call, list)
+    ) == 1
+
+
+def test_stale_side_preflight_containers_are_removed(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, timeout=3600):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "ps", "-a"]:
+            return _proc(
+                stdout=(
+                    "gt-arvo_42-workspace-plan-fixed-100\n"
+                    "gt-arvo_42-workspace-plan-fixed-200\n"
+                )
+            )
+        return _proc()
+
+    monkeypatch.setattr(arvo_workspace, "_run", fake_run)
+
+    assert arvo_workspace._remove_stale_plan_containers(
+        "gt-arvo_42-workspace-plan-fixed-"
+    ) == [
+        "gt-arvo_42-workspace-plan-fixed-100",
+        "gt-arvo_42-workspace-plan-fixed-200",
+    ]
+    assert ["docker", "rm", "-f", "gt-arvo_42-workspace-plan-fixed-100"] in calls
+    assert ["docker", "rm", "-f", "gt-arvo_42-workspace-plan-fixed-200"] in calls

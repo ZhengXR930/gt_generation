@@ -179,10 +179,15 @@ sample records the effective CLI, model, custom Codex provider when used, adapte
 hash, authentication method, and non-ARVO Docker settings in
 `generation_provenance.json`.
 
-For ARVO, Stage 01 creates one sample workspace and performs the only default full
-vulnerable build. Stage 04 reuses it for instrumented target-level rebuilds, applies the
-official patch in place, and incrementally rebuilds the fixed target. The fixed image is
-pulled only as an explicit fallback; cleanup removes only that sample's workspace/images.
+For ARVO, Stage 01 creates one sample workspace and performs the default vulnerable
+build and reproduction. Stage 04 is split at its failure boundaries: assertion planning
+first freezes invariants from the accepted fine trace, sanitizer trace, and vulnerable
+source; separate vulnerable and fixed instrumentation stages then generate and compile
+one observation patch each against the corresponding published image; execution finally
+runs the frozen observations. A failed fixed-side patch retries only fixed
+instrumentation and cannot rewrite the invariant plan or vulnerable patch. The official
+`patch.diff` is not an invariant input or an execution oracle. Cleanup removes only that
+sample's workspace/images.
 
 Every result directory permanently retains the three reproducibility assets
 `sample_info.json`, `build.sh`, and `poc`. Runtime worktrees, containers,
