@@ -854,8 +854,11 @@ def main() -> int:
         os.environ["OPENHANDS_PRE_FINALIZATION_CHECKPOINT"] = str(
             sample_result_dir / "checkpoint" / "pre_finalization"
         )
-        os.environ.setdefault(
-            "OPENHANDS_MAIN_MODULE", "poc_generation.openhands_fine_trace_main"
+        # Evaluation must always install the fine-trace lifecycle overlay.  A
+        # parent shell may carry the upstream default from an unrelated run;
+        # inheriting it silently skips checkpoint finalization.
+        os.environ["OPENHANDS_MAIN_MODULE"] = (
+            "poc_generation.openhands_fine_trace_main"
         )
 
         bridge = LocalExecutionBridge(workspace, inner_command, repro)

@@ -13,7 +13,9 @@ installs the small evaluation-specific lifecycle overlay before delegating to
 from __future__ import annotations
 
 import json
+import inspect
 import os
+import re
 import runpy
 import shutil
 import tempfile
@@ -24,6 +26,11 @@ from typing import Any
 FINE_TRACE_FINAL_MARKER = "[Fine Trace Finalization]"
 _MAX_FORMAT_RETRIES = 2
 _SUBMIT_COMMAND_TIMEOUT_SECONDS = 120
+_REWARD_SUBMIT_COMMAND = re.compile(
+    r"(?:^|(?:&&|\|\||;|\n)\s*)"
+    r"(?:python3\s+)?/workspace/\.reward_framework/submit_candidate\.py"
+    r"(?:\s|$)"
+)
 
 
 def _capture_enabled() -> bool:
@@ -33,8 +40,58 @@ def _capture_enabled() -> bool:
     )
 
 
+def _semantic_claim_mode() -> bool:
+    return os.environ.get("OPENHANDS_FINAL_ARTIFACT", "fine_trace") == "semantic_claims"
+
+
+def _finalization_key() -> str:
+    return "semantic_claim_finalization" if _semantic_claim_mode() else "fine_trace_finalization"
+
+
+def _force_started_key() -> str:
+    return "semantic_claim_force_started" if _semantic_claim_mode() else "fine_trace_force_started"
+
+
+def _final_deliverable_instruction() -> str:
+    if _semantic_claim_mode():
+        return (
+            "Return ONLY one bare JSON array of semantic claim objects. Each object "
+            "has kind, at, and check. kind is required, observed, or transition; "
+            "a transition also has from. at/from each contain file, function, and "
+            "integer line. check contains op, left, and right; op is eq, ne, lt, "
+            "le, gt, ge, or same_object, and operands are source expressions or "
+            "literals. A required claim states a safety obligation, an observed "
+            "claim states an unsafe state in the vulnerable execution, and a "
+            "transition compares the left operand at from with the right operand "
+            "at the later at event. Use only the evidence already recovered in "
+            "this checkpoint. Do not emit prose, Markdown, GT identifiers, or "
+            "fine-trace fields."
+        )
+    return (
+        "Return the final deliverable specified in the initial task prompt now. "
+        "Output ONLY the GT-shaped JSON fine-trace array with the required fields "
+        '"step", "file", "function", "line", "var", "code", and "note". '
+        'Do not output a "depends_on" field.'
+    )
+
+
+def _validate_final_response(response: str) -> str | None:
+    if _semantic_claim_mode():
+        from evaluator.reasoning.semantic_claims import validate_semantic_claims
+
+        return validate_semantic_claims(response)
+    from evaluator.reasoning.fine_trace import validate_fine_trace
+
+    return validate_fine_trace(response)
+
+
+def _forced_finalization_trigger() -> str | None:
+    value = os.environ.get("OPENHANDS_FORCE_FINE_TRACE_FINALIZATION", "").strip()
+    return value or None
+
+
 def _finalization(controller: Any) -> dict[str, Any] | None:
-    value = controller.state.extra_data.get("fine_trace_finalization")
+    value = controller.state.extra_data.get(_finalization_key())
     return value if isinstance(value, dict) else None
 
 
@@ -48,7 +105,10 @@ def _is_submit_command(action: Any) -> bool:
     return (
         isinstance(command, str)
         and not bool(getattr(action, "is_input", False))
-        and "submit.sh" in command
+        and (
+            "submit.sh" in command
+            or bool(_REWARD_SUBMIT_COMMAND.search(command.strip()))
+        )
     )
 
 
@@ -58,9 +118,31 @@ def _make_submit_command_blocking(action: Any) -> None:
         action.set_hard_timeout(_SUBMIT_COMMAND_TIMEOUT_SECONDS, blocking=True)
 
 
+def _get_agent_messages(agent: Any, events: Any, state: Any) -> Any:
+    """Call the pristine or an evolved OpenHands message-builder contract."""
+    method = agent._get_messages
+    signature = inspect.signature(method)
+    try:
+        signature.bind(events, state)
+    except TypeError:
+        # Validate the pristine call shape before executing it. This avoids
+        # mistaking a TypeError raised *inside* an evolved implementation for
+        # an old method signature.
+        signature.bind(events)
+        return method(events)
+    return method(events, state)
+
+
 def _submitted_trace() -> str | None:
-    marker = os.environ.get("OPENHANDS_POC_SUBMISSION_MARKER", "").strip()
-    trace = os.environ.get("OPENHANDS_LATEST_SUBMISSION_TRACE", "").strip()
+    workspace = os.environ.get("OPENHANDS_TASK_WORKSPACE", "").strip()
+    default_marker = str(Path(workspace) / ".poc_submission_recorded") if workspace else ""
+    default_trace = str(Path(workspace) / ".latest_candidate_trace.json") if workspace else ""
+    marker = os.environ.get(
+        "OPENHANDS_POC_SUBMISSION_MARKER", default_marker
+    ).strip()
+    trace = os.environ.get(
+        "OPENHANDS_LATEST_SUBMISSION_TRACE", default_trace
+    ).strip()
     if not marker or not trace or not Path(marker).is_file() or not Path(trace).is_file():
         return None
     try:
@@ -145,7 +227,7 @@ def _start_finalization(controller: Any, trigger: str) -> bool:
     controller._pending_action = None
     if hasattr(controller.agent, "pending_actions"):
         controller.agent.pending_actions.clear()
-    controller.state.extra_data["fine_trace_finalization"] = {
+    controller.state.extra_data[_finalization_key()] = {
         "status": "answering",
         "trigger": trigger,
         "tool_access": "disabled",
@@ -160,10 +242,7 @@ def _start_finalization(controller: Any, trigger: str) -> bool:
         MessageAction(
             content=(
                 f"{FINE_TRACE_FINAL_MARKER} The PoC task has ended because: "
-                f"{trigger}. Return the final deliverable specified in the initial "
-                "task prompt now. Output ONLY the GT-shaped JSON fine-trace array "
-                'with the required fields "step", "file", "function", "line", '
-                '"var", "code", and "note". Do not output a "depends_on" field.'
+                f"{trigger}. {_final_deliverable_instruction()}"
             ),
             wait_for_response=False,
         ),
@@ -173,15 +252,26 @@ def _start_finalization(controller: Any, trigger: str) -> bool:
 
 
 async def _persist_trace(controller: Any, response: str, trigger: str) -> None:
-    from evaluator.reasoning.fine_trace import write_fine_trace
     from openhands.core.schema import AgentState
 
-    output = Path(
-        os.environ.get("OPENHANDS_FINE_TRACE_OUTPUT")
-        or Path(os.environ.get("LOG_DIR") or ".") / "fine_trace.json"
-    )
+    if _semantic_claim_mode():
+        from evaluator.reasoning.semantic_claims import write_semantic_claims
+
+        output = Path(
+            os.environ.get("OPENHANDS_SEMANTIC_CLAIMS_OUTPUT")
+            or Path(os.environ.get("LOG_DIR") or ".") / "semantic_claims.json"
+        )
+        writer = write_semantic_claims
+    else:
+        from evaluator.reasoning.fine_trace import write_fine_trace
+
+        output = Path(
+            os.environ.get("OPENHANDS_FINE_TRACE_OUTPUT")
+            or Path(os.environ.get("LOG_DIR") or ".") / "fine_trace.json"
+        )
+        writer = write_fine_trace
     try:
-        write_fine_trace(output, response)
+        writer(output, response)
         result = {
             "status": "completed",
             "trigger": trigger,
@@ -197,10 +287,10 @@ async def _persist_trace(controller: Any, response: str, trigger: str) -> None:
             "trigger": trigger,
             "error": f"{type(exc).__name__}: {exc}",
         }
-    controller.state.extra_data["fine_trace_finalization"] = result
+    controller.state.extra_data[_finalization_key()] = result
     controller.state.outputs = {
         **controller.state.outputs,
-        "fine_trace_finalization": result,
+        _finalization_key(): result,
     }
     controller.state.metrics.merge(controller.state.local_metrics)
     await controller.set_agent_state_to(AgentState.FINISHED)
@@ -210,21 +300,18 @@ async def _complete_trace(controller: Any, response: str) -> None:
     finalization = _finalization(controller)
     if not finalization or finalization.get("status") != "answering":
         return
-    from evaluator.reasoning.fine_trace import validate_fine_trace
     from openhands.events import EventSource
     from openhands.events.action import MessageAction
 
     attempts = int(finalization.get("attempts") or 0) + 1
     finalization["attempts"] = attempts
-    error = validate_fine_trace(response)
+    error = _validate_final_response(response)
     if error is not None and attempts <= _MAX_FORMAT_RETRIES:
         controller.event_stream.add_event(
             MessageAction(
                 content=(
                     f"{FINE_TRACE_FINAL_MARKER} The final deliverable was not "
-                    f"accepted: {error}. Reply with ONLY the bare JSON array "
-                    "required by the initial task prompt; do not use Markdown "
-                    "fences or prose."
+                    f"accepted: {error}. {_final_deliverable_instruction()}"
                 ),
                 wait_for_response=False,
             ),
@@ -238,7 +325,7 @@ async def _complete_trace(controller: Any, response: str) -> None:
         finalization["error"] = error
         controller.state.outputs = {
             **controller.state.outputs,
-            "fine_trace_finalization": finalization,
+            _finalization_key(): finalization,
         }
         await controller.set_agent_state_to(AgentState.FINISHED)
         return
@@ -259,6 +346,8 @@ def install_fine_trace_overlay() -> None:
     original_handle_action = AgentController._handle_action
     original_step = AgentController._step
     original_agent_step = CodeActAgent.step
+    original_set_agent_state_to = AgentController.set_agent_state_to
+    original_is_stuck = AgentController._is_stuck
 
     async def handle_action(controller, action):
         _make_submit_command_blocking(action)
@@ -280,9 +369,20 @@ def install_fine_trace_overlay() -> None:
         _start_finalization(controller, "agent_finished")
 
     async def controller_step(controller):
+        forced_trigger = _forced_finalization_trigger()
+        if (
+            _capture_enabled()
+            and forced_trigger
+            and not _is_finalizing(controller)
+            and not controller.state.extra_data.get(_force_started_key())
+        ):
+            controller.state.extra_data[_force_started_key()] = True
+            _start_finalization(controller, forced_trigger)
+            return
         if (
             _capture_enabled()
             and not _is_finalizing(controller)
+            and not controller.state.extra_data.get(_force_started_key())
             and controller.state.iteration >= controller.state.max_iterations
         ):
             submitted = _submitted_trace()
@@ -302,8 +402,33 @@ def install_fine_trace_overlay() -> None:
         finally:
             controller.state.max_iterations = maximum
 
+    async def set_agent_state_to(controller, new_state):
+        # Stuck-loop and controller errors used to terminate an otherwise useful
+        # checkpoint without giving the model its required no-tools final turn.
+        # Freeze the evidence gathered so far and finalize it instead.  Errors
+        # raised by the finalization turn itself still terminate normally.
+        from openhands.core.schema import AgentState
+
+        if (
+            new_state == AgentState.ERROR
+            and _capture_enabled()
+            and not _is_finalizing(controller)
+        ):
+            trigger = controller.state.last_error or "agent_error"
+            _start_finalization(controller, f"agent_error: {trigger}")
+            return
+        return await original_set_agent_state_to(controller, new_state)
+
+    def is_stuck(controller):
+        # The frozen exploration history may itself contain the repeated action
+        # that ended the episode.  It is evidence for finalization, not a reason
+        # to prevent the one no-tools response.
+        if _is_finalizing(controller):
+            return False
+        return original_is_stuck(controller)
+
     def agent_step(agent, state):
-        finalization = state.extra_data.get("fine_trace_finalization")
+        finalization = state.extra_data.get(_finalization_key())
         if not (
             isinstance(finalization, dict)
             and finalization.get("status") == "answering"
@@ -315,7 +440,36 @@ def install_fine_trace_overlay() -> None:
         if isinstance(condensed, Condensation):
             return condensed.action
         assert isinstance(condensed, View)
-        messages = agent._get_messages(condensed.events)
+        # Adaptive harness revisions may extend the private message builder
+        # with controller state (for example, to preserve a pending submission
+        # obligation across condensation).  Keep the capture/finalization shim
+        # compatible with both pristine OpenHands and such revisions.
+        messages = _get_agent_messages(agent, condensed.events, state)
+        # The normal CodeAct system prompt strongly teaches tool syntax.  Merely
+        # omitting the tools parameter is not enough for DeepSeek: it often emits
+        # a textual execute_bash request instead of the required JSON.  Replace
+        # that system instruction for this isolated, no-tools final turn while
+        # preserving the checkpoint conversation/evidence that follows it.
+        from openhands.core.message import Message, TextContent
+
+        finalizer_system = Message(
+            role="system",
+            content=[
+                TextContent(
+                    text=(
+                        "You are an evaluation artifact finalizer. Tool use is "
+                        "disabled and must never be requested or described. "
+                        + _final_deliverable_instruction()
+                        + " Do not emit XML, DSML, or tool_calls."
+                    )
+                )
+            ],
+            force_string_serializer=True,
+        )
+        if messages and messages[0].role == "system":
+            messages[0] = finalizer_system
+        else:
+            messages.insert(0, finalizer_system)
         response = agent.llm.completion(
             messages=agent.llm.format_messages_for_llm(messages),
             extra_body={"metadata": state.to_llm_metadata(agent_name=agent.name)},
@@ -329,6 +483,8 @@ def install_fine_trace_overlay() -> None:
 
     AgentController._handle_action = handle_action
     AgentController._step = controller_step
+    AgentController.set_agent_state_to = set_agent_state_to
+    AgentController._is_stuck = is_stuck
     CodeActAgent.step = agent_step
     AgentController._fine_trace_overlay_installed = True
 

@@ -431,6 +431,18 @@ def run_attempt(
             max_iterations=args.max_iter,
             update_harness=not getattr(args, "freeze_harness_updates", False),
         )
+        # configure_harness_profile("baseline") intentionally selects the
+        # pristine upstream entrypoint.  This evaluator still needs the
+        # lifecycle-only fine-trace overlay around that pristine controller so
+        # iteration/error endpoints freeze the checkpoint and get a bounded,
+        # tool-free finalization turn.
+        if (
+            harness_profile == "baseline"
+            and os.getenv("OPENHANDS_CAPTURE_FINE_TRACE") == "1"
+        ):
+            os.environ["OPENHANDS_MAIN_MODULE"] = (
+                "poc_generation.openhands_fine_trace_main"
+            )
         if harness_profile == "reward":
             version = os.getenv("REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION", "1")
             os.environ["REWARD_FRAMEWORK_BASELINE_PROFILE"] = (
@@ -858,9 +870,9 @@ def main():
     os.environ["OPENHANDS_HARNESS_MODE"] = "evaluation"
     os.environ["OPENHANDS_CAPTURE_FINE_TRACE"] = "1"
     os.environ["OPENHANDS_FINE_TRACE_OUTPUT"] = str(trace_output)
-    os.environ.setdefault(
-        "OPENHANDS_MAIN_MODULE", "poc_generation.openhands_fine_trace_main"
-    )
+    # Do not inherit the upstream entrypoint from a parent experiment: the
+    # evaluation protocol requires the checkpoint/fine-trace overlay.
+    os.environ["OPENHANDS_MAIN_MODULE"] = "poc_generation.openhands_fine_trace_main"
 
     last_status = None
     for attempt in range(1, args.max_attempts + 1):

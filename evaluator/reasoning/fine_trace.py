@@ -52,7 +52,9 @@ def unwrap_final_answer_transport(response: str) -> str:
         value, end = json.JSONDecoder().raw_decode(text)
     except (TypeError, json.JSONDecodeError):
         return text
-    if isinstance(value, list) and _DSML_FINISH_TRAILING_PARAMETERS.fullmatch(text[end:]):
+    if isinstance(value, (list, dict)) and _DSML_FINISH_TRAILING_PARAMETERS.fullmatch(
+        text[end:]
+    ):
         return text[:end].strip()
     return text
 
