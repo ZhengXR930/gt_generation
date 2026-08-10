@@ -115,6 +115,38 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def reward_subject_llm_recovery_config() -> dict[str, int | float]:
+    """Bound one Subject request while retaining OpenHands' in-place retry.
+
+    ``num_retries`` is Tenacity's total attempt count in OpenHands 0.33. The
+    defaults cap a stalled turn at roughly three 90-second requests plus two
+    short backoffs, instead of letting one request consume the whole episode.
+    """
+
+    def positive_int(name: str, default: int) -> int:
+        value = int(os.getenv(name, str(default)))
+        if value < 1:
+            raise ValueError(f"{name} must be at least 1")
+        return value
+
+    timeout = positive_int("REWARD_FRAMEWORK_SUBJECT_LLM_TIMEOUT", 90)
+    attempts = positive_int("REWARD_FRAMEWORK_SUBJECT_LLM_ATTEMPTS", 3)
+    min_wait = positive_int("REWARD_FRAMEWORK_SUBJECT_LLM_RETRY_MIN_WAIT", 2)
+    max_wait = positive_int("REWARD_FRAMEWORK_SUBJECT_LLM_RETRY_MAX_WAIT", 15)
+    if max_wait < min_wait:
+        raise ValueError(
+            "REWARD_FRAMEWORK_SUBJECT_LLM_RETRY_MAX_WAIT must be greater "
+            "than or equal to REWARD_FRAMEWORK_SUBJECT_LLM_RETRY_MIN_WAIT"
+        )
+    return {
+        "timeout": timeout,
+        "num_retries": attempts,
+        "retry_multiplier": 2.0,
+        "retry_min_wait": min_wait,
+        "retry_max_wait": max_wait,
+    }
+
+
 @dataclass
 class LLMArgs:
     model: str
@@ -574,6 +606,10 @@ Write a fine trace for the exact candidate, then call the first-class
     if openhands_args.llm.api_version:
         config["llm"]["api_version"] = openhands_args.llm.api_version
     config["llm"]["max_output_tokens"] = openhands_args.llm.max_output_tokens
+    if reward_framework_enabled:
+        # Baseline evaluation remains pristine. Recovery applies only to the
+        # optimized reward harness and retries the same uncommitted turn.
+        config["llm"].update(reward_subject_llm_recovery_config())
 
     native_tool_calling = openhands_args.llm.native_tool_calling
     if native_tool_calling is not None:

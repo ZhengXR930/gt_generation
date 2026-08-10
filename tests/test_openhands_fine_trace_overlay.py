@@ -93,6 +93,25 @@ def test_submit_command_input_is_not_rewritten():
     overlay._make_submit_command_blocking(Action())
 
 
+def test_message_builder_supports_pristine_and_evolved_harness_contracts():
+    class Pristine:
+        def _get_messages(self, events):
+            return ("pristine", events)
+
+    class Evolved:
+        def _get_messages(self, events, state):
+            return ("evolved", events, state)
+
+    events = ["event"]
+    state = object()
+    assert overlay._get_agent_messages(Pristine(), events, state) == (
+        "pristine", events
+    )
+    assert overlay._get_agent_messages(Evolved(), events, state) == (
+        "evolved", events, state
+    )
+
+
 def test_pre_finalization_checkpoint_captures_state_cache_and_trajectory(
     tmp_path, monkeypatch
 ):

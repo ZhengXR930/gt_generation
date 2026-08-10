@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -13,6 +14,7 @@ class PlatformAdapter(Protocol):
     def inject_message(self, message: str) -> None: ...
     def checkpoint(self, label: str) -> Path | None: ...
     def submission_ready(self) -> bool: ...
+    def submission_fingerprint(self) -> str | None: ...
 
 
 class CallbackAdapter:
@@ -35,3 +37,10 @@ class CallbackAdapter:
 
     def submission_ready(self) -> bool:
         return self._submission_ready()
+
+    def submission_fingerprint(self) -> str | None:
+        """Identify the currently materialized candidate without interpreting it."""
+        candidate = self.workspace_root / "poc.bin"
+        if not candidate.is_file():
+            return None
+        return hashlib.sha256(candidate.read_bytes()).hexdigest()

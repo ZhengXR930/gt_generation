@@ -7,6 +7,8 @@ its current model-specific result is already a complete v2, 100-iteration run.
 
 import fcntl
 import json
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +22,71 @@ LOG_ROOT = RESULTS_ROOT / "_batch_logs"
 LOCK_ROOT = RESULTS_ROOT / "_sample_locks"
 RUN_SAMPLE = HERE / "run_sample.py"
 RUN_LOCAL_SAMPLE = HERE / "run_local_sample.py"
+
+
+def cleanup_arvo_assets(sample_id: str) -> dict:
+    """Remove rebuildable per-sample source and Docker assets after a run."""
+    if not re.fullmatch(r"arvo_\d+", sample_id):
+        return {"status": "skipped", "reason": "not_arvo"}
+
+    arvo_id = sample_id.removeprefix("arvo_")
+    data_root = (
+        HERE.parents[1] / "external" / "cybergym_data_subset" / "data" / "arvo"
+    ).resolve()
+    sample_root = (data_root / arvo_id).resolve()
+    if sample_root.parent != data_root or sample_root.name != arvo_id:
+        return {"status": "refused", "reason": "unexpected_sample_path"}
+
+    image_name = f"n132/arvo:{arvo_id}-vul"
+    removed_containers = []
+    image_status = "absent"
+    try:
+        import docker
+
+        client = docker.from_env()
+        containers = client.containers.list(all=True, filters={"ancestor": image_name})
+        active = [
+            container.name
+            for container in containers
+            if container.status in {"created", "running", "restarting", "paused"}
+        ]
+        if active:
+            return {
+                "status": "skipped",
+                "reason": "active_target_container",
+                "containers": active,
+            }
+        for container in containers:
+            container.remove(force=False)
+            removed_containers.append(container.name)
+        try:
+            client.images.remove(image_name, force=False)
+            image_status = "removed"
+        except docker.errors.ImageNotFound:
+            pass
+    except Exception as exc:
+        image_status = f"retained: {type(exc).__name__}: {exc}"
+
+    repo_dir = sample_root / "repo-vul"
+    repo_status = "absent"
+    try:
+        if repo_dir.is_symlink():
+            repo_dir.unlink()
+            repo_status = "symlink_removed"
+        elif repo_dir.is_dir():
+            shutil.rmtree(repo_dir)
+            repo_status = "removed"
+        elif repo_dir.exists():
+            repo_status = "refused_non_directory"
+    except Exception as exc:
+        repo_status = f"retained: {type(exc).__name__}: {exc}"
+
+    return {
+        "status": "complete",
+        "repo": repo_status,
+        "image": image_status,
+        "removed_containers": removed_containers,
+    }
 
 
 def load_config(name: str) -> dict:
@@ -44,6 +111,7 @@ def result_is_complete(result_dir: Path) -> bool:
         "agent_finished",
         "iteration_cap_trace_recovered",
         "agent_finished_trace_recovered",
+        "checkpoint_trace_recovered",
     }:
         return False
     if not (result_dir / "fine_trace.json").is_file():
@@ -100,7 +168,7 @@ def local_result_is_complete(result_dir: Path) -> bool:
     if manifest.get("max_iter") != 100:
         return False
     if manifest.get("status") not in {
-        "success", "iteration_cap", "agent_finished",
+        "success", "iteration_cap", "agent_finished", "checkpoint_trace_recovered",
     }:
         return False
     if not (result_dir / "fine_trace.json").is_file():
@@ -134,7 +202,10 @@ def run_one(config: dict, sample_id: str) -> dict:
         is_arvo = sample_id.startswith("arvo_")
         complete = result_is_complete(result_dir) if is_arvo else local_result_is_complete(result_dir)
         if complete:
-            return {"model": namespace, "sample": sample_id, "status": "skipped"}
+            record = {"model": namespace, "sample": sample_id, "status": "skipped"}
+            if is_arvo and config.get("cleanup_arvo_assets"):
+                record["cleanup"] = cleanup_arvo_assets(sample_id)
+            return record
 
         log_dir = LOG_ROOT / namespace
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -159,6 +230,9 @@ def run_one(config: dict, sample_id: str) -> dict:
                 config.get("base_url", ""), "--api-key-env", config["api_key_env"],
                 "--results-dir", str(RESULTS_ROOT / namespace),
             ]
+        api_version = str(config.get("api_version") or "").strip()
+        if api_version:
+            command.extend(["--api-version", api_version])
         started = time.monotonic()
         with log_path.open("w", encoding="utf-8") as log:
             returncode = subprocess.run(
@@ -167,7 +241,7 @@ def run_one(config: dict, sample_id: str) -> dict:
                 stdout=log,
                 stderr=subprocess.STDOUT,
             ).returncode
-    return {
+    record = {
         "model": namespace,
         "sample": sample_id,
         "status": "complete" if returncode == 0 else "failed",
@@ -175,6 +249,9 @@ def run_one(config: dict, sample_id: str) -> dict:
         "seconds": round(time.monotonic() - started, 1),
         "log": str(log_path),
     }
+    if is_arvo and config.get("cleanup_arvo_assets"):
+        record["cleanup"] = cleanup_arvo_assets(sample_id)
+    return record
 
 
 def main() -> int:

@@ -4,18 +4,55 @@ from __future__ import annotations
 
 import copy
 import http.server
+import inspect
 import json
 import os
 import re
 import secrets
 import shlex
+import shutil
+import signal
+import socket
 import threading
+import traceback
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
+
+import docker
 
 from .base import CallbackAdapter
 from ..state_store import atomic_json
 from ..submission_tool import SUBMIT_CANDIDATE_TOOL, TOOL_NAME
+
+
+class _SubjectWallClockTimeout(TimeoutError):
+    """Interrupt a provider call that ignored its configured HTTP timeout."""
+
+
+def _call_with_wall_timeout(call: Callable[[], Any], seconds: float) -> Any:
+    """Bound a synchronous Subject request without leaking a worker thread.
+
+    LiteLLM normally enforces the timeout itself. Some OpenAI-compatible
+    providers can remain blocked below that layer, so reward-harness runs add a
+    process-local POSIX timer when the completion runs on the main thread. The
+    caller translates this private exception into OpenHands' retryable error.
+    """
+    if seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        return call()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def expired(_signum, _frame):
+        raise _SubjectWallClockTimeout(
+            f"Subject model request exceeded {seconds:g} seconds"
+        )
+
+    signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 class OpenHandsAdapter(CallbackAdapter):
@@ -28,8 +65,11 @@ class OpenHandsAdapter(CallbackAdapter):
                          checkpoint_callback=checkpoint_callback)
 
     def submission_ready(self) -> bool:
-        """The protocol requires the exact candidate trace before submission."""
-        return (self.workspace_root / "candidate_trace.json").is_file()
+        """Both exact candidate artifacts must exist before the submit cue."""
+        return all(
+            (self.workspace_root / name).is_file()
+            for name in ("poc.bin", "candidate_trace.json")
+        )
 
     @staticmethod
     def normalize_event(event: Any) -> tuple[str, str, dict[str, Any]]:
@@ -111,6 +151,32 @@ except urllib.error.HTTPError as exc:
 '''
 
 
+def _submission_bridge_host() -> str:
+    """Return the controller address reachable from the closed runtime.
+
+    ``OPENHANDS_EVAL_HOST_GATEWAY`` is reserved for the external CyberGym
+    service.  The Reward submission HTTP server lives in this controller
+    process, so an isolated runtime must use the controller's own address on
+    their shared internal Docker network instead of that network's gateway.
+    """
+    configured = os.getenv("REWARD_FRAMEWORK_CONTROLLER_HOST", "").strip()
+    if configured:
+        return configured
+    try:
+        client = docker.from_env()
+        current = client.containers.get(socket.gethostname())
+        attachments = current.attrs.get("NetworkSettings", {}).get("Networks", {})
+        for name, attachment in attachments.items():
+            network = client.networks.get(name)
+            if bool(network.attrs.get("Internal")):
+                address = str(attachment.get("IPAddress") or "").strip()
+                if address:
+                    return address
+    except (docker.errors.DockerException, AttributeError, KeyError, TypeError):
+        pass
+    return os.getenv("OPENHANDS_EVAL_HOST_GATEWAY", "172.17.0.1").strip()
+
+
 class OpenHandsRewardTransport:
     """Bridge a sandboxed native tool call to the host-side framework."""
 
@@ -165,19 +231,48 @@ class OpenHandsRewardTransport:
                                 "poc_path": str(relative / "poc"),
                                 "trace_path": str(relative / "trace.json"),
                             })
+                            bridge._record_valid_submission_trace(relative)
                             if result.get("triggered") is True:
                                 bridge._terminal_result = dict(result)
                     self._reply(200, result)
                 except Exception as exc:
+                    # Keep the Subject-facing response compact, but persist the
+                    # controller traceback.  Submission is a cross-process
+                    # boundary; without this record every infrastructure
+                    # failure is flattened into an unactionable HTTP 400.
+                    diagnostics = (
+                        bridge.framework.store.root / "transport_errors"
+                    )
+                    diagnostics.mkdir(parents=True, exist_ok=True)
+                    error_id = secrets.token_hex(8)
+                    (diagnostics / f"{error_id}.txt").write_text(
+                        traceback.format_exc(), encoding="utf-8"
+                    )
                     self._reply(400, {"error": f"{type(exc).__name__}: {exc}"})
 
         self.server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
+    def _record_valid_submission_trace(self, relative: Path) -> None:
+        """Publish the latest valid submitted trace to the lifecycle overlay.
+
+        The ordinary evaluation submitter already maintains these two files.
+        Reward submissions cross a separate HTTP boundary, so without the same
+        marker the fine-trace overlay mistakes a submitted episode for a
+        zero-submission episode and starts an unnecessary no-tools final turn.
+        """
+        source = self.workspace_root / relative / "trace.json"
+        latest = self.workspace_root / ".latest_candidate_trace.json"
+        staging = latest.with_name(latest.name + ".tmp")
+        shutil.copy2(source, staging)
+        staging.replace(latest)
+        (self.workspace_root / ".poc_submission_recorded").write_text(
+            "reward_framework\n", encoding="utf-8"
+        )
+
     @property
     def url(self) -> str:
-        gateway = os.getenv("OPENHANDS_EVAL_HOST_GATEWAY", "172.17.0.1")
-        return f"http://{gateway}:{self.server.server_port}"
+        return f"http://{_submission_bridge_host()}:{self.server.server_port}"
 
     def start(self) -> None:
         self.thread.start()
@@ -217,12 +312,32 @@ def is_direct_submit_invocation(command: str) -> bool:
     return bool(_DIRECT_SUBMIT.search(command.strip()))
 
 
+def is_fine_trace_finalization(state: Any) -> bool:
+    """Identify the isolated evaluation final turn without OpenHands types."""
+    finalization = getattr(state, "extra_data", {}).get("fine_trace_finalization")
+    return bool(
+        isinstance(finalization, dict)
+        and finalization.get("status") == "answering"
+    )
+
+
+def fine_trace_finalization_trigger(state: Any) -> str | None:
+    """Return the lifecycle trigger for the active tool-free final turn."""
+    finalization = getattr(state, "extra_data", {}).get("fine_trace_finalization")
+    if not isinstance(finalization, dict) or finalization.get("status") != "answering":
+        return None
+    trigger = str(finalization.get("trigger") or "").strip()
+    return trigger or None
+
+
 def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
                                        framework: Any) -> OpenHandsRewardTransport:
     """Install the real tool, trajectory observer, and terminal policy."""
     import openhands.agenthub.codeact_agent.function_calling as function_calling
     from openhands.events.action import AgentFinishAction, CmdRunAction, NullAction
     from openhands.events.serialization.event import event_to_dict
+    from openhands.core.exceptions import LLMNoResponseError
+    from openhands.llm.llm import LLM_RETRY_EXCEPTIONS
 
     if not any(tool["function"]["name"] == TOOL_NAME for tool in agent.tools):
         agent.tools.append(copy.deepcopy(SUBMIT_CANDIDATE_TOOL))
@@ -231,8 +346,11 @@ def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
     )
     transport.start()
     original_converter = function_calling.response_to_actions
+    converter_accepts_tools = "tools" in inspect.signature(
+        original_converter
+    ).parameters
 
-    def response_to_actions(response):
+    def response_to_actions(response, tools=None):
         translated = copy.deepcopy(response)
         indexes: list[int] = []
         calls = getattr(translated.choices[0].message, "tool_calls", None) or []
@@ -243,7 +361,10 @@ def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
             call.function.name = "execute_bash"
             call.function.arguments = json.dumps({"command": command, "is_input": "false"})
             indexes.append(index)
-        actions = original_converter(translated)
+        if converter_accepts_tools:
+            actions = original_converter(translated, tools=tools)
+        else:
+            actions = original_converter(translated)
         for index in indexes:
             original = response.choices[0].message.tool_calls[index]
             calls[index].function.name = TOOL_NAME
@@ -253,6 +374,53 @@ def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
         return actions
 
     function_calling.response_to_actions = response_to_actions
+
+    # OpenHands retries these exceptions internally. Observe the innermost
+    # completion boundary so a recovered provider failure is not mistaken for
+    # Subject inactivity.
+    original_completion = agent.llm._completion_unwrapped
+    consecutive_retryable_errors = 0
+
+    def observed_completion(*args, **kwargs):
+        nonlocal consecutive_retryable_errors
+        try:
+            # Add a small grace period around the configured provider timeout.
+            # This is a wall-clock safety net, not another retry loop; the
+            # existing OpenHands Tenacity wrapper owns retry semantics.
+            wall_timeout = float(agent.llm.config.timeout or 90) + 5.0
+            try:
+                response = _call_with_wall_timeout(
+                    lambda: original_completion(*args, **kwargs), wall_timeout
+                )
+            except _SubjectWallClockTimeout as exc:
+                raise LLMNoResponseError(str(exc)) from exc
+        except LLM_RETRY_EXCEPTIONS as exc:
+            consecutive_retryable_errors += 1
+            framework.record_event(
+                source="controller",
+                kind="subject_llm_retryable_error",
+                payload={
+                    "attempt": consecutive_retryable_errors,
+                    "configured_attempts": int(agent.llm.config.num_retries),
+                    "timeout_seconds": agent.llm.config.timeout,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                },
+            )
+            raise
+        if consecutive_retryable_errors:
+            framework.record_event(
+                source="controller",
+                kind="subject_llm_recovered",
+                payload={
+                    "failed_attempts": consecutive_retryable_errors,
+                    "successful_attempt": consecutive_retryable_errors + 1,
+                },
+            )
+            consecutive_retryable_errors = 0
+        return response
+
+    agent.llm._completion_unwrapped = observed_completion
     original_step = agent.step
     seen_events = 0
 
@@ -269,6 +437,18 @@ def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
             framework.record_event(source=source, kind=kind, payload=payload)
         saw_new_events = len(history) > seen_events
         seen_events = len(history)
+        finalization_trigger = fine_trace_finalization_trigger(state)
+        if finalization_trigger == "iteration_limit":
+            # The evaluation overlay starts a bounded, tool-free answer turn
+            # before OpenHands returns its final state. Record the actual
+            # terminal condition now; otherwise the overlay converts the
+            # ordinary limit into FINISHED and the post-run ERROR check can no
+            # longer distinguish it from a voluntary finish.
+            framework.reach_iteration_limit(
+                iteration=int(getattr(state, "max_iterations", 100) or 100),
+                maximum=int(getattr(state, "max_iterations", 100) or 100),
+                notify=False,
+            )
         status = framework.status()
         if status["terminal_reason"] == "trigger_success":
             return AgentFinishAction(
@@ -276,10 +456,20 @@ def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
                 task_completed="true",
             )
         decision = "continue"
-        if saw_new_events and not status["awaiting_verification"]:
+        if (
+            saw_new_events
+            and not status["awaiting_verification"]
+            and finalization_trigger is None
+        ):
             decision = framework.observe_trajectory()
         action = original_step(state)
         if isinstance(action, AgentFinishAction):
+            if is_fine_trace_finalization(state):
+                # The evaluation lifecycle has already frozen the tool-using
+                # checkpoint and is collecting its bounded, tool-free output.
+                # This is not a premature Subject finish and must reach the
+                # overlay's response validator unchanged.
+                return action
             allowed = framework.before_finish(
                 iteration=int(getattr(state, "iteration", 0) or 0),
                 maximum=int(getattr(state, "max_iterations", 100) or 100),
@@ -293,19 +483,12 @@ def install_openhands_reward_framework(*, agent: Any, event_stream: Any,
                 "Use the first-class submit_candidate tool.' >&2; (exit 2)"
             )
             return action
-        submission_required = (
-            decision == "request_submission"
-            or framework.status()["submission_requested"]
-        )
-        metadata = getattr(action, "tool_call_metadata", None)
-        is_submission = bool(
-            metadata and getattr(metadata, "function_name", None) == TOOL_NAME
-        )
-        if submission_required and not is_submission:
-            # The injected observer message becomes visible on the next turn;
-            # discard this stale proposal so it cannot race ahead of the
-            # requested first-class submission boundary.
-            return NullAction()
+        # A submission request is persistent state, not an action gate.  The
+        # Subject may need another edit or validation command after seeing the
+        # request before it can invoke submit_candidate safely.  Dropping such
+        # actions deadlocks models that do not submit on the immediately next
+        # turn.  before_finish() still prevents a pending candidate from being
+        # abandoned, while the first-class tool remains the Subject's choice.
         return action
 
     agent.step = controlled_step

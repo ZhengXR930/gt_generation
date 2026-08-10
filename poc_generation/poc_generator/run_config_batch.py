@@ -11,22 +11,42 @@ from pathlib import Path
 
 from rerun_model_batches import LOG_ROOT, load_config, run_one
 
+GT_ROOT = Path(__file__).resolve().parents[2]
+
 
 def select_samples(config: dict) -> list[str]:
     samples = config.get("samples") or []
     selector = config.get("sample_selector")
     if not selector:
         return list(dict.fromkeys(samples))
+    if selector in {"strict_gt_complete", "strict_gt_complete_non_arvo"}:
+        status_path = GT_ROOT / "GT_STATUS.md"
+        selected = []
+        in_complete = False
+        for line in status_path.read_text(encoding="utf-8").splitlines():
+            if line == "## Complete":
+                in_complete = True
+                continue
+            if in_complete and line.startswith("## "):
+                break
+            if in_complete and line.startswith("- "):
+                sample_id = line[2:].strip().split(maxsplit=1)[0].strip("`")
+                if sample_id:
+                    selected.append(sample_id)
+        selected = list(dict.fromkeys(selected))
+        if selector == "strict_gt_complete_non_arvo":
+            selected = [sample for sample in selected if not sample.startswith("arvo_")]
+        return selected
     if selector != "strict_non_arvo_runtime_recoverable":
         raise ValueError(f"unknown sample_selector: {selector}")
-    from run_local_sample import GT_ROOT, load_runtime_spec
+    from run_local_sample import GT_ROOT as LOCAL_GT_ROOT, load_runtime_spec
 
     package_files = (
         "ground_truth.json", "verified_invariants.json", "verified_assertions.json",
         "field_bindings.json", "event_locations.json",
     )
     selected = []
-    for result_dir in sorted(GT_ROOT.joinpath("gt_results").iterdir()):
+    for result_dir in sorted(LOCAL_GT_ROOT.joinpath("gt_results").iterdir()):
         if not result_dir.is_dir() or result_dir.name.startswith("arvo_"):
             continue
         if not all((result_dir / name).is_file() for name in package_files):

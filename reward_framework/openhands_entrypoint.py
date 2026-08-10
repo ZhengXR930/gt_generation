@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 from pathlib import Path
 
 import openhands.core.main as oh_main
 from openhands.core.config import parse_arguments, setup_config_from_args
+from openhands.core.schema import AgentState
 from openhands.core.setup import generate_sid
 from openhands.events.action import MessageAction
 from openhands.io import read_task
@@ -31,6 +33,7 @@ from .harness_repository import HarnessRepository
 from .instrumentation.arvo import ArvoGDBInstrumentationBackend
 from .orchestrator import RewardFramework
 from .state_store import atomic_json
+from poc_generation.openhands_fine_trace_main import install_fine_trace_overlay
 
 
 def _source_root(workspace: Path) -> Path:
@@ -55,7 +58,60 @@ def _arvo_image(task_id: str) -> str:
     return f"n132/arvo:{match.group(1)}-vul"
 
 
+def _is_iteration_limit_error(final_state) -> bool:
+    """Return whether OpenHands used ERROR to report normal budget exhaustion."""
+    if final_state is None or final_state.agent_state != AgentState.ERROR:
+        return False
+    message = str(final_state.last_error or "").lower()
+    return "reached maximum iteration" in message
+
+
+def _codex_executable() -> str:
+    configured = os.getenv("REWARD_FRAMEWORK_CODEX_EXECUTABLE", "").strip()
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"configured Codex executable is missing: {path}")
+        return str(path)
+    discovered = shutil.which("codex")
+    if discovered:
+        return discovered
+    user_install = Path.home() / ".local" / "bin" / "codex"
+    if user_install.is_file():
+        return str(user_install.resolve())
+    raise FileNotFoundError(
+        "Codex CLI is required by the Reward Agent; set "
+        "REWARD_FRAMEWORK_CODEX_EXECUTABLE"
+    )
+
+
+def _codex_auth_file(executable: str) -> Path:
+    configured = os.getenv("REWARD_FRAMEWORK_CODEX_AUTH_FILE", "").strip()
+    if configured:
+        candidate = Path(configured).expanduser().resolve()
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"configured Codex auth file is missing: {candidate}"
+            )
+        return candidate
+    resolved = Path(executable).expanduser().resolve()
+    for parent in (resolved, *resolved.parents):
+        if parent.name == ".codex":
+            candidate = parent / "auth.json"
+            if candidate.is_file():
+                return candidate
+    raise FileNotFoundError(
+        "could not locate auth.json beside the configured Codex executable; "
+        "set REWARD_FRAMEWORK_CODEX_AUTH_FILE"
+    )
+
+
 def main() -> None:
+    # The reward entrypoint replaces the ordinary evaluation entrypoint, so it
+    # must install the same lifecycle-only finalization overlay itself.  This
+    # preserves the pre-finalization checkpoint and yields the required
+    # tool-free fine trace when a zero-submission episode reaches its budget.
+    install_fine_trace_overlay()
     install_closed_network_runtime_route()
     args = parse_arguments()
     config = setup_config_from_args(args)
@@ -74,15 +130,31 @@ def main() -> None:
     source_root = _source_root(workspace)
     repo_root = Path(__file__).resolve().parents[1]
     sessions = state_dir / "codex_sessions"
+    codex_executable = _codex_executable()
+    codex_auth_file = _codex_auth_file(codex_executable)
+    codex_isolation_image = os.getenv(
+        "REWARD_FRAMEWORK_CODEX_ISOLATION_IMAGE", "gt-reward-controller:0.33"
+    ).strip()
     backend = CodexBackend(
         model=os.getenv("REWARD_FRAMEWORK_MODEL", "gpt-5.5"),
-        timeout=int(os.getenv("REWARD_FRAMEWORK_MODEL_TIMEOUT", "1800")),
+        executable=codex_executable,
+        timeout=int(os.getenv("REWARD_FRAMEWORK_MODEL_TIMEOUT", "600")),
         session_file=sessions / "reward_agent.session",
         sandbox="read-only",
+        fresh_each_run=True,
+        isolation_image=codex_isolation_image or None,
+        isolation_auth_file=codex_auth_file,
     )
     training_root_value = os.getenv("REWARD_FRAMEWORK_TRAINING_ROOT", "").strip()
+    spec_cache_root = (
+        Path(training_root_value).resolve() / "spec_cache"
+        if training_root_value else None
+    )
     trainer = None
-    harness_version = 1
+    harness_version = int(os.getenv(
+        "REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION", "1"
+    ))
+    episode_analyzer = EpisodeAnalyzer(backend)
     if os.getenv("REWARD_FRAMEWORK_CROSS_SAMPLE_TRAINING", "0") == "1":
         if not training_root_value:
             raise RuntimeError("adaptive harness training requires REWARD_FRAMEWORK_TRAINING_ROOT")
@@ -102,12 +174,16 @@ def main() -> None:
                 "REWARD_FRAMEWORK_PATCHER_MODEL",
                 os.getenv("REWARD_FRAMEWORK_MODEL", "gpt-5.5"),
             ),
-            timeout=int(os.getenv("REWARD_FRAMEWORK_MODEL_TIMEOUT", "1800")),
+            timeout=int(os.getenv("REWARD_FRAMEWORK_MODEL_TIMEOUT", "600")),
+            executable=codex_executable,
             session_file=training_root / "codex_sessions/harness_patcher.session",
             sandbox="workspace-write",
+            fresh_each_run=True,
+            isolation_image=codex_isolation_image or None,
+            isolation_auth_file=codex_auth_file,
         )
         trainer = CrossSampleTrainer(
-            analyzer=EpisodeAnalyzer(backend),
+            analyzer=episode_analyzer,
             pool=ExperiencePool(training_root / "experience_pool"),
             patcher=CrossSampleHarnessPatcher(patcher_backend),
             repository=repository,
@@ -151,6 +227,7 @@ def main() -> None:
                 baseline_profile=baseline_profile,
                 harness_version=harness_version,
                 max_iterations=max_iterations,
+                spec_cache_root=spec_cache_root,
             )
         frameworks.append(framework)
         installed.append(install_openhands_reward_framework(
@@ -161,18 +238,63 @@ def main() -> None:
     oh_main.create_controller = create_controller
     completed = False
     try:
-        asyncio.run(oh_main.run_controller(
+        final_state = asyncio.run(oh_main.run_controller(
             config=config, initial_user_action=initial_user_action, sid=sid,
             fake_user_response_fn=(
                 None if args.no_auto_continue else oh_main.auto_continue_response
             ),
         ))
-        completed = True
+        error_state = bool(
+            final_state is not None
+            and final_state.agent_state == AgentState.ERROR
+        )
+        iteration_limit = _is_iteration_limit_error(final_state)
+        if error_state and not iteration_limit:
+            # Exhausted provider retries are infrastructure evidence, not
+            # Subject/harness-quality evidence. Preserve diagnosis but never
+            # train the cross-sample Patcher on the partial episode.
+            for framework in frameworks:
+                framework.record_event(
+                    source="controller",
+                    kind="episode_aborted",
+                    payload={
+                        "reason": "openhands_error",
+                        "last_error": str(final_state.last_error or "")[:1000],
+                    },
+                )
+                atomic_json(
+                    framework.store.root / "episode_abort.json",
+                    {
+                        "reason": "openhands_error",
+                        "last_error": str(final_state.last_error or "")[:1000],
+                        "experience_pool_updated": False,
+                    },
+                )
+        else:
+            if iteration_limit:
+                # OpenHands 0.33 represents ordinary iteration-budget
+                # exhaustion as AgentState.ERROR.  It is still a completed
+                # benchmark episode and must contribute experience to the
+                # cross-sample Patcher.
+                for framework in frameworks:
+                    framework.reach_iteration_limit(
+                        iteration=max_iterations, maximum=max_iterations
+                    )
+            completed = True
     finally:
         try:
-            if completed and trainer is not None:
+            if completed:
                 for framework in frameworks:
                     try:
+                        if trainer is None:
+                            # Frozen held-out episodes still need deterministic
+                            # stage-control analysis. Freezing disables pool
+                            # writes and harness patches, not measurement.
+                            episode_analyzer.analyze(
+                                store=framework.store,
+                                harness_version=harness_version,
+                            )
+                            continue
                         trainer.finish_episode(
                             framework.store, harness_version=harness_version
                         )
@@ -180,16 +302,27 @@ def main() -> None:
                         # Post-episode training must never erase a valid Subject
                         # result. Persist the optimizer failure for the pool
                         # maintainer and leave the active fork unchanged.
-                        atomic_json(
-                            framework.store.root / "cross_sample_update.json",
-                            {
-                                "episode_harness_version": harness_version,
-                                "next_harness_version": harness_version,
-                                "patch": None,
-                                "patch_error": f"{type(exc).__name__}: {exc}",
-                                "gt_used": False,
-                            },
-                        )
+                        if trainer is None:
+                            atomic_json(
+                                framework.store.root / "episode_analysis_error.json",
+                                {
+                                    "episode_harness_version": harness_version,
+                                    "analysis_error": f"{type(exc).__name__}: {exc}",
+                                    "experience_pool_updated": False,
+                                    "gt_used": False,
+                                },
+                            )
+                        else:
+                            atomic_json(
+                                framework.store.root / "cross_sample_update.json",
+                                {
+                                    "episode_harness_version": harness_version,
+                                    "next_harness_version": harness_version,
+                                    "patch": None,
+                                    "patch_error": f"{type(exc).__name__}: {exc}",
+                                    "gt_used": False,
+                                },
+                            )
         finally:
             for transport in installed:
                 transport.close()

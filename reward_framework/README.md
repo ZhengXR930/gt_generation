@@ -4,13 +4,23 @@ This package separates task-local runtime reward from cross-sample OpenHands
 harness evolution. Ground truth is never materialized in an Agent view and is
 not an optimization signal.
 
+The method has a task-local assertion protocol and a platform-neutral ordered
+control graph. The assertion protocol consists of alternative Admission
+locations plus Required safety obligations, Observed unsafe-state predicates,
+and optional ordered Transition predicates. The control graph (`Activation ->
+Availability -> Consumption -> Progress -> Success`) identifies the first
+broken feedback boundary. Episode analysis persists that result as
+`stage_control`; the cross-sample Patcher may act only on the earliest
+harness-owned blocked stage, never on a downstream symptom or on Subject causal
+stagnation by itself.
+
 ## Two time scales
 
 ```text
 one episode (frozen harness_vN)
 issue + vulnerable source -> Reward Spec
 Subject trajectory -> submit_candidate -> checkpoint
-PoC + trace -> runtime probes -> ordered stage assessment -> factual Reward
+PoC + trace -> assertion probes -> deterministic assessment -> factual Reward
 trigger success or iteration limit
                          |
                          v
@@ -29,6 +39,22 @@ next process loads harness_vN+1
 The harness is immutable for every retry belonging to one sample. There is no
 in-episode source patch, process restart, or policy hot swap.
 
+## Subject-model recovery
+
+Reward-harness runs bound every Subject-model request and use OpenHands' native
+in-place retry loop. Defaults are 90 seconds and three total attempts with
+bounded exponential backoff. A transient failure and its later recovery are
+persisted as `subject_llm_retryable_error` and `subject_llm_recovered` events.
+If every attempt fails, the episode is marked `episode_aborted` and is excluded
+from the cross-sample experience pool.
+
+The defaults can be overridden with
+`REWARD_FRAMEWORK_SUBJECT_LLM_TIMEOUT`,
+`REWARD_FRAMEWORK_SUBJECT_LLM_ATTEMPTS`,
+`REWARD_FRAMEWORK_SUBJECT_LLM_RETRY_MIN_WAIT`, and
+`REWARD_FRAMEWORK_SUBJECT_LLM_RETRY_MAX_WAIT`. Baseline evaluation does not use
+these reward-harness settings.
+
 ## Information boundary
 
 The task-local Reward Agent sees only:
@@ -42,16 +68,20 @@ The task-local Reward Agent sees only:
 It does not see GT fine traces, invariant graphs, known PoCs, historical crash
 states, held-out results, patches, or sanitizer traces supplied by the dataset.
 
-The cross-sample Harness Patcher sees even less task content:
+The cross-sample Harness Patcher consumes the same canonical training
+trajectory after an episode completes. Its isolated view contains:
 
 - a complete isolated OpenHands source fork;
-- generalized episode metrics;
-- enumerated experience categories and local trajectory sequence references;
-- prior harness version and Patch history.
+- the frozen full Subject trajectory, including factual Reward interactions;
+- a value-free control-plane index into important lifecycle boundaries;
+- generalized episode metrics and prior error history;
+- prior harness version and Patch effectiveness.
 
-It does not receive task ids, issue text, vulnerable source, PoCs, candidate
-traces, runtime prose, or GT. Source validation also rejects dataset-specific
-literals in a proposed OpenHands Patch.
+Training trajectories can contain the public task semantics and source/tool
+output already observed by the Subject. The Patcher does not receive GT,
+known-success PoCs, hidden dataset sanitizer ground truth, or held-out episode
+results. It cannot modify its trajectory/experience inputs, and source
+validation rejects dataset-specific literals in a proposed OpenHands Patch.
 
 ## Task-local state
 
@@ -68,18 +98,23 @@ Each episode state directory contains:
 
 ## Reward Agent
 
-One persistent read-only Codex CLI session is resumed across four task-local
-roles:
+A single logical read-only Reward Agent serves four task-local roles, but its
+memory is the controller-owned files above rather than an unbounded model
+conversation. Each model turn is fresh and ephemeral, reads the current
+observation/evidence state, and therefore cannot fail because an old Codex
+thread needs pre-sampling compaction:
 
-1. compile `Admission -> Source -> Root -> Propagation -> Target` from public
+1. compile Admission and Required/Observed/Transition assertions from public
    issue plus source;
 2. observe the full trajectory and request submission at semantic readiness;
-3. align untrusted trace claims with source-valid passive probes;
+3. compile the frozen task assertions into source-valid passive probes;
 4. turn trusted runtime evidence into factual, non-prescriptive feedback.
 
-Stage status remains deterministic and controller-owned. Absence of evidence is
-`unresolved`, not `refuted`; later observations behind a failed causal gate are
-`observed_but_blocked`.
+Assertion truth and polarity remain deterministic and controller-owned. A
+Required assertion describes a safety obligation, so violation is vulnerable
+progress; Observed and Transition assertions describe vulnerable facts, so
+satisfaction is vulnerable progress. Admission alternatives use OR. Absence of
+runtime evidence is `unresolved`, never silently treated as refutation.
 
 ## Experience Pool and multi-objective optimization
 
@@ -87,6 +122,10 @@ Every completed episode contributes exact metrics for:
 
 - trigger success;
 - no-submission behavior and first-submission sequence;
+- semantic supervisor reminders, artifact-preparation reminders, and formal
+  submission reminders;
+- valid submissions occurring after a reminder and episodes where reminders
+  never produce a candidate;
 - total, unique, duplicate, and invalid submissions;
 - Reward events followed by Subject action;
 - distinct retries after Reward;
@@ -94,22 +133,33 @@ Every completed episode contributes exact metrics for:
 - instrumentation unavailability and premature finish attempts.
 
 The Experience Analyzer may classify only enumerated, evidence-bound categories
-such as `missing_submission`, `duplicate_candidate_loop`,
+such as `missing_submission`, `candidate_materialization_failure`,
+`duplicate_candidate_loop`,
 `reward_context_loss`, `productive_retry`, or `causal_stagnation`. The pool
-stores successes as controls as well as failures. Raw submission count is never
-the sole objective.
+stores successes as controls as well as failures. Harness optimization targets
+submission conversion only after the semantic observer reports readiness; raw
+reminder or submission count is never an objective, and duplicate/invalid
+submission rates act as counter-objectives against over-eager submission.
+The compact pool index references a frozen canonical trajectory for every
+training episode. Control-plane records are navigation indexes, not substitutes
+for the full trajectory and not additional model-generated traces.
 
 ## Cross-sample Harness Patcher
 
-A separate persistent workspace-write Codex CLI session runs only after an
-episode ends. It may change real files under OpenHands controller, CodeAct,
-memory, core loop, and prompt source. The controller checks:
+A separate workspace-write Codex role runs only after an episode ends. Every
+patch deliberation starts in a fresh ephemeral model context and receives the
+GT-free Experience Pool, referenced full training trajectories, previous error
+history, and the current isolated OpenHands worktree; these controller-owned
+files, not hidden conversation history, are its cross-sample memory. It may change real files
+under OpenHands controller, CodeAct, memory, core loop, and prompt source. A
+bounded proposal/contract-error/redeliberation loop rejects silent `keep`
+decisions for high-confidence controller-owned failures. The controller checks:
 
 - changed files exactly match the structured declaration;
 - the Patch stays inside the allowed OpenHands harness surface;
 - Python files parse and files are not deleted;
 - no dataset/result/GT literals appear;
-- controller-owned Experience Pool input remains unchanged.
+- controller-owned Experience Pool and trajectory inputs remain unchanged.
 
 Rejected changes restore the complete pre-Patch worktree. Accepted changes are
 stored as a unified diff, changed-file snapshot, metadata, and a monotonically

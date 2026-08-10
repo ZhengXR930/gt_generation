@@ -431,6 +431,18 @@ def run_attempt(
             max_iterations=args.max_iter,
             update_harness=not getattr(args, "freeze_harness_updates", False),
         )
+        # configure_harness_profile("baseline") intentionally selects the
+        # pristine upstream entrypoint.  This evaluator still needs the
+        # lifecycle-only fine-trace overlay around that pristine controller so
+        # iteration/error endpoints freeze the checkpoint and get a bounded,
+        # tool-free finalization turn.
+        if (
+            harness_profile == "baseline"
+            and os.getenv("OPENHANDS_CAPTURE_FINE_TRACE") == "1"
+        ):
+            os.environ["OPENHANDS_MAIN_MODULE"] = (
+                "poc_generation.openhands_fine_trace_main"
+            )
         if harness_profile == "reward":
             version = os.getenv("REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION", "1")
             os.environ["REWARD_FRAMEWORK_BASELINE_PROFILE"] = (
@@ -815,6 +827,26 @@ def main():
             repository.worktree, adaptive_python_root,
             ignore=shutil.ignore_patterns(".harness_optimizer", "__pycache__", "*.pyc"),
         )
+        active_record = json.loads(repository.active_path.read_text())
+        expected_sha256 = str(active_record["source_sha256"])
+        launch_sha256 = HarnessRepository.tree_sha256(adaptive_python_root)
+        if launch_sha256 != expected_sha256:
+            shutil.rmtree(adaptive_python_root, ignore_errors=True)
+            raise RuntimeError(
+                "isolated OpenHands launch does not match the active harness: "
+                f"version={version}, expected={expected_sha256}, actual={launch_sha256}"
+            )
+        (adaptive_python_root / ".reward_harness_launch.json").write_text(
+            json.dumps(
+                {
+                    "version": version,
+                    "source_sha256": launch_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
         atexit.register(shutil.rmtree, adaptive_python_root, True)
         if not args.freeze_harness_updates:
             os.environ["REWARD_FRAMEWORK_TRAINING_ROOT"] = str(training_root)
@@ -822,6 +854,7 @@ def main():
             args.openhands_repo.expanduser().resolve()
         )
         os.environ["REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION"] = str(version)
+        os.environ["REWARD_FRAMEWORK_EPISODE_HARNESS_SHA256"] = launch_sha256
         os.environ["REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT"] = str(
             adaptive_python_root
         )
@@ -858,9 +891,9 @@ def main():
     os.environ["OPENHANDS_HARNESS_MODE"] = "evaluation"
     os.environ["OPENHANDS_CAPTURE_FINE_TRACE"] = "1"
     os.environ["OPENHANDS_FINE_TRACE_OUTPUT"] = str(trace_output)
-    os.environ.setdefault(
-        "OPENHANDS_MAIN_MODULE", "poc_generation.openhands_fine_trace_main"
-    )
+    # Do not inherit the upstream entrypoint from a parent experiment: the
+    # evaluation protocol requires the checkpoint/fine-trace overlay.
+    os.environ["OPENHANDS_MAIN_MODULE"] = "poc_generation.openhands_fine_trace_main"
 
     last_status = None
     for attempt in range(1, args.max_attempts + 1):

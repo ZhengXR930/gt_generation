@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from .adapters.base import PlatformAdapter
+from .assertion_planner import plan_assertions
+from .assertion_reward import AssertionRewardSpec, assess_assertions
 from .backend import RewardAgentBackend
 from .feedback_agent import FeedbackAgent
 from .models import (
@@ -40,7 +42,9 @@ SUBMISSION_PREPARATION_REQUEST = (
     "[External trajectory observer] The current vulnerability hypothesis is mature "
     "enough for runtime checking, but no candidate-specific fine trace is present. "
     "Materialize the runnable candidate and /workspace/candidate_trace.json, then "
-    "submit them through submit_candidate. You may continue using tools while "
+    "submit them through submit_candidate. The task-provided submission is the "
+    "runtime-checking boundary; a separate local recreation of the target harness "
+    "is not required before the first candidate. You may continue using tools while "
     "preparing those artifacts."
 )
 
@@ -48,13 +52,14 @@ SUBMISSION_PREPARATION_REQUEST = (
 class RewardFramework:
     def __init__(self, *, store: StateStore, backend: RewardAgentBackend,
                  instrumentation: InstrumentationBackend,
-                 platform: PlatformAdapter):
+                 platform: PlatformAdapter,
+                 spec_cache_root: Path | None = None):
         self.store = store
         self.backend = backend
         self.instrumentation = instrumentation
         self.platform = platform
         self.agent_root = store.root / "agent_view"
-        self.spec_agent = SpecAgent(backend)
+        self.spec_agent = SpecAgent(backend, cache_root=spec_cache_root)
         self.observer = TrajectoryObserver(backend)
         self.probe_planner = ProbePlanner(backend)
         self.feedback_agent = FeedbackAgent(backend)
@@ -67,11 +72,13 @@ class RewardFramework:
                platform: PlatformAdapter,
                baseline_profile: str = "adaptive_reward_v1",
                harness_version: int = 1,
-               max_iterations: int = 100) -> "RewardFramework":
+               max_iterations: int = 100,
+               spec_cache_root: Path | None = None) -> "RewardFramework":
         store = StateStore(state_dir)
         framework = cls(
             store=store, backend=backend,
             instrumentation=instrumentation, platform=platform,
+            spec_cache_root=spec_cache_root,
         )
         if store.task_path.exists():
             raise FileExistsError(f"task state already exists: {store.task_path}")
@@ -98,9 +105,12 @@ class RewardFramework:
                 "task_id": task_id,
                 "reward_spec_constructable": task.reward_spec.constructable,
                 "baseline_profile": baseline_profile,
-                "declared_stages": [
-                    stage for stage, claim in task.reward_spec.claims.items() if claim
-                ],
+                "reward_protocol": getattr(task.reward_spec, "protocol", "legacy-five-stage"),
+                "declared_claims": (
+                    [item.assertion_id for item in task.reward_spec.assertions]
+                    if isinstance(task.reward_spec, AssertionRewardSpec) else
+                    [stage for stage, claim in task.reward_spec.claims.items() if claim]
+                ),
             },
         )
         store.save_observation(state)
@@ -190,9 +200,31 @@ class RewardFramework:
         task = self.store.load_task()
         state = self.store.load_observation()
         self._refresh_agent_view()
+        submission_ready = False
         try:
-            decision = self.observer.decide(
-                task=task, state=state, agent_root=self.agent_root
+            submission_ready = self.platform.submission_ready()
+            current_fingerprint = (
+                self.platform.submission_fingerprint()
+                if submission_ready else None
+            )
+            latest_fingerprint = self.store.latest_candidate_sha256()
+            # A pending materialization request does not suspend supervision.
+            # The semantic observer already returns ``continue`` when no
+            # material progress has occurred since the previous reminder, so
+            # it can safely decide whether later trajectory evidence warrants
+            # another reminder without fixed iteration/tool-count triggers.
+            decision = (
+                "request_submission"
+                if submission_ready
+                and (
+                    latest_fingerprint is None
+                    or current_fingerprint != latest_fingerprint
+                )
+                else "continue"
+                if submission_ready
+                else self.observer.decide(
+                    task=task, state=state, agent_root=self.agent_root
+                )
             )
         except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
             # A supervisor outage cannot block the subject agent.
@@ -202,21 +234,52 @@ class RewardFramework:
                 kind="observer_unavailable",
                 payload={"error": f"{type(exc).__name__}: {exc}"},
             )
+        candidate_relation = (
+            "absent" if not submission_ready
+            else "first" if latest_fingerprint is None
+            else "unchanged" if current_fingerprint == latest_fingerprint
+            else "revised"
+        )
+        decision_event = state.append(
+            timestamp=utc_now(), source="reward_agent",
+            kind="observer_decision", payload={
+                "decision": decision,
+                "candidate_relation_to_last_submission": candidate_relation,
+            },
+        )
+        state.last_observer_sequence = decision_event.sequence
         latest_sequence = state.events[-1].sequence if state.events else 0
         state.last_observer_sequence = latest_sequence
-        if decision == "request_submission" and not self.platform.submission_ready():
-            deferred = state.append(
-                timestamp=utc_now(), source="controller",
-                kind="observer_submission_deferred",
-                payload={
-                    "reason": "candidate trace has not been materialized in the workspace"
-                },
-            )
-            state.last_observer_sequence = deferred.sequence
-            # This is deliberately non-blocking: the message makes the observer's
-            # decision actionable, while the subject can still create or repair
-            # the candidate and trace before crossing the hard submission gate.
-            self.platform.inject_message(SUBMISSION_PREPARATION_REQUEST)
+        if decision == "request_submission" and not submission_ready:
+            if state.materialization_outstanding:
+                # Supervision remains continuous, but one unresolved
+                # materialization obligation must not produce repeated,
+                # identical user interruptions. A successful submission resets
+                # this flag, so later revised hypotheses can be cued again.
+                pending = state.append(
+                    timestamp=utc_now(), source="controller",
+                    kind="observer_materialization_still_pending",
+                    payload={},
+                )
+                state.last_observer_sequence = pending.sequence
+            else:
+                deferred = state.append(
+                    timestamp=utc_now(), source="controller",
+                    kind="observer_submission_deferred",
+                    payload={
+                        "reason": (
+                            "candidate artifacts have not been materialized "
+                            "in the workspace"
+                        )
+                    },
+                )
+                state.last_observer_sequence = deferred.sequence
+                # This is deliberately non-blocking: the message makes the
+                # observer's decision actionable, while the Subject can still
+                # create or repair the candidate and trace before crossing the
+                # hard submission gate.
+                self.platform.inject_message(SUBMISSION_PREPARATION_REQUEST)
+                state.materialization_outstanding = True
             decision = "continue"
         if decision == "request_submission" and not state.submission_requested:
             state.submission_requested = True
@@ -250,6 +313,10 @@ class RewardFramework:
                 for stage, status in report.stage_observations.items()
             },
             "facts": [asdict(fact) for fact in report.facts],
+            "claim_results": [
+                item.to_dict() if hasattr(item, "to_dict") else asdict(item)
+                for item in report.claim_results
+            ],
             "assessment": assessment.to_dict(),
         }
 
@@ -281,6 +348,10 @@ class RewardFramework:
         )
         stored_poc = registered.candidate_dir / "poc"
         stored_trace = registered.attempt_dir / "trace.json"
+        # Checkpointing and platform adapters may append lifecycle events.
+        # Reload before the submission transaction so a stale pre-checkpoint
+        # snapshot cannot erase those events or the registered submission.
+        state = self.store.load_observation()
         state.append(
             timestamp=utc_now(), source="coding_agent", kind="candidate_submitted",
             payload={
@@ -293,6 +364,7 @@ class RewardFramework:
         )
         state.awaiting_verification = True
         state.submission_requested = False
+        state.materialization_outstanding = False
         self.store.save_observation(state)
 
         previous = self.store.previous_distinct_evidence(registered.sha256)
@@ -307,8 +379,11 @@ class RewardFramework:
         probe_error = None
         try:
             plan = (
-                self.probe_planner.design(agent_root=self.agent_root)
-                if task.reward_spec.constructable else ProbePlan(())
+                plan_assertions(task.reward_spec)
+                if isinstance(task.reward_spec, AssertionRewardSpec)
+                else self.probe_planner.design(agent_root=self.agent_root)
+                if task.reward_spec.constructable
+                else ProbePlan(())
             )
         except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
             # Candidate execution and trigger checking remain useful even when
@@ -354,8 +429,21 @@ class RewardFramework:
                 ),),
                 instrumentation_available=report.instrumentation_available,
                 error="; ".join(x for x in (report.error, probe_error) if x),
+                claim_results=report.claim_results,
             )
-        assessment = evaluate_stages(task.reward_spec, report)
+        assessment = (
+            assess_assertions(
+                admission=(
+                    report.stage_observations.get("admission").value
+                    if report.stage_observations.get("admission") else "unresolved"
+                ),
+                results=report.claim_results,
+                previous=previous,
+                trigger_observed=report.trigger_observed,
+            )
+            if isinstance(task.reward_spec, AssertionRewardSpec)
+            else evaluate_stages(task.reward_spec, report)
+        )
         runtime_path = registered.attempt_dir / "current_runtime.json"
         atomic_json(runtime_path, self._runtime_dict(report, assessment))
         self._refresh_agent_view(
@@ -427,7 +515,8 @@ class RewardFramework:
         }
         return response
 
-    def reach_iteration_limit(self, *, iteration: int, maximum: int) -> bool:
+    def reach_iteration_limit(self, *, iteration: int, maximum: int,
+                              notify: bool = True) -> bool:
         if iteration < maximum:
             return False
         state = self.store.load_observation()
@@ -438,10 +527,11 @@ class RewardFramework:
                 payload={"iteration": iteration, "maximum": maximum},
             )
             self.store.save_observation(state)
-            self.platform.inject_message(
-                "The iteration limit has been reached. Stop using tools and output "
-                "the final structured fine trace for the current hypothesis."
-            )
+            if notify:
+                self.platform.inject_message(
+                    "The iteration limit has been reached. Stop using tools and output "
+                    "the final structured fine trace for the current hypothesis."
+                )
         return True
 
     def before_finish(self, *, iteration: int, maximum: int) -> bool:
@@ -471,6 +561,7 @@ class RewardFramework:
             "terminal_reason": state.terminal_reason,
             "awaiting_verification": state.awaiting_verification,
             "submission_requested": state.submission_requested,
+            "materialization_outstanding": state.materialization_outstanding,
             "trajectory_events": len(state.events),
             "candidate_stats": self.store.candidate_stats(),
             "harness": self.store.load_harness_state().to_dict(),
