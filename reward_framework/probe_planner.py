@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 from .backend import RewardAgentBackend
+from dataclasses import replace
+
 from .models import ProbePlan
+from .source_view import resolve_public_source_path
 
 
 SCHEMA = Path(__file__).resolve().with_name("schemas") / "probe_plan.json"
 
 PROBE_PROMPT = """You are the runtime-observation design role of one persistent
-Reward Agent. Read global_state.json, current_trace.json, and
-prior_evidence.json when present. Inspect source/ as
-needed. The public issue and frozen Reward Spec are authoritative task claims;
+Reward Agent. The controller supplies exact JSON snapshots below. Inspect
+source/ as needed. The public issue and frozen Reward Spec are authoritative task claims;
 the candidate trace is an untrusted hypothesis.
 
 Align the issue stages with the trace, then select passive observations at two
@@ -42,6 +45,18 @@ event. Never turn a weak proxy into a condition.
 """
 
 
+def _planning_snapshot(agent_root: Path) -> str:
+    sections = []
+    for name in ("global_state.json", "current_trace.json", "prior_evidence.json"):
+        path = agent_root / name
+        if path.is_file():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            sections.append(
+                f"\n{name}:\n" + json.dumps(value, ensure_ascii=False, sort_keys=True)
+            )
+    return "\nCONTROLLER-SUPPLIED STATE (verbatim):\n" + "".join(sections)
+
+
 def validate_probe_sources(plan: ProbePlan, source_root: Path) -> None:
     source_root = source_root.resolve()
     for probe in plan.probes:
@@ -64,6 +79,21 @@ def validate_probe_sources(plan: ProbePlan, source_root: Path) -> None:
                 raise ValueError(f"unsafe probe condition: {probe.condition!r}")
 
 
+def canonicalize_probe_sources(plan: ProbePlan, source_root: Path) -> ProbePlan:
+    return ProbePlan(
+        tuple(
+            replace(
+                probe,
+                file=resolve_public_source_path(
+                    source_root, probe.file, probe.function
+                ),
+            )
+            for probe in plan.probes
+        ),
+        plan.trace_claims,
+    )
+
+
 class ProbePlanner:
     def __init__(self, backend: RewardAgentBackend):
         self.backend = backend
@@ -81,12 +111,14 @@ class ProbePlanner:
                 )
             raw = self.backend.run_json(
                 role="design_probes" if attempt == 0 else "repair_probes",
-                prompt=PROBE_PROMPT + correction,
+                prompt=PROBE_PROMPT + correction + _planning_snapshot(agent_root),
                 schema=SCHEMA,
                 cwd=agent_root,
             )
             try:
-                plan = ProbePlan.from_dict(raw)
+                plan = canonicalize_probe_sources(
+                    ProbePlan.from_dict(raw), agent_root / "source"
+                )
                 validate_probe_sources(plan, agent_root / "source")
                 return plan
             except (ValueError, TypeError) as exc:

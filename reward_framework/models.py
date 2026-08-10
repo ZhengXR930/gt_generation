@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+from .assertion_reward import AssertionRewardSpec
+
 
 STAGES = ("admission", "source", "root", "propagation", "target")
 
@@ -92,7 +94,7 @@ class TaskContext:
     issue_description: str
     codebase_root: str
     source_manifest_sha256: str
-    reward_spec: RewardSpec
+    reward_spec: RewardSpec | AssertionRewardSpec
     spec_model: str
     created_at: str
 
@@ -104,7 +106,12 @@ class TaskContext:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "TaskContext":
         copied = dict(value)
-        copied["reward_spec"] = RewardSpec.from_dict(copied["reward_spec"])
+        raw_spec = copied["reward_spec"]
+        copied["reward_spec"] = (
+            AssertionRewardSpec.from_dict(raw_spec)
+            if raw_spec.get("protocol") == "assertion-reward-v1"
+            else RewardSpec.from_dict(raw_spec)
+        )
         return cls(**copied)
 
 
@@ -123,6 +130,7 @@ class TrajectoryState:
     last_observer_sequence: int = 0
     last_submission_sequence: int = 0
     submission_requested: bool = False
+    materialization_outstanding: bool = False
     awaiting_verification: bool = False
     terminal_reason: str | None = None
 
@@ -144,6 +152,7 @@ class TrajectoryState:
             "last_observer_sequence": self.last_observer_sequence,
             "last_submission_sequence": self.last_submission_sequence,
             "submission_requested": self.submission_requested,
+            "materialization_outstanding": self.materialization_outstanding,
             "awaiting_verification": self.awaiting_verification,
             "terminal_reason": self.terminal_reason,
         }
@@ -285,6 +294,13 @@ class Probe:
     captures: tuple[str, ...] = ()
     condition: str | None = None
     purpose: str = ""
+    line: int | None = None
+    claim_id: str | None = None
+    claim_kind: str | None = None
+    endpoint: str = "at"
+    check_op: str | None = None
+    left_operand: Any = None
+    right_operand: Any = None
 
     def __post_init__(self) -> None:
         if self.stage not in STAGES:
@@ -345,6 +361,7 @@ class RawRuntimeReport:
     facts: tuple[RuntimeFact, ...]
     instrumentation_available: bool
     error: str | None = None
+    claim_results: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -367,7 +384,7 @@ class Feedback:
     contradiction: str | None
     delta: str
     evidence_ids: tuple[str, ...]
-    assessment: StageAssessment
+    assessment: Any
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -387,7 +404,7 @@ class EvidenceRecord:
     duplicate_of: str | None
     probe_plan: ProbePlan
     runtime: RawRuntimeReport
-    assessment: StageAssessment
+    assessment: Any
     feedback: Feedback
     created_at: str
 

@@ -21,6 +21,7 @@ from evaluator.reachability.arvo_gdb import (
     target_arguments,
 )
 
+from ..assertion_reward import AssertionResult, check_value
 from ..models import Probe, ProbePlan, RawRuntimeReport, RuntimeFact, StageStatus
 from ..runtime import default_trigger_oracle
 from ..state_store import atomic_json
@@ -69,10 +70,26 @@ def resolve_statement_line(source_root: Path, probe: Probe) -> int | None:
 def compile_checkpoints(source_root: Path, plan: ProbePlan) -> list[dict[str, Any]]:
     checkpoints: list[dict[str, Any]] = []
     for index, probe in enumerate(plan.probes, 1):
-        captures = {
-            f"capture_{capture_index}": expression
-            for capture_index, expression in enumerate(probe.captures, 1)
-        }
+        captures = {}
+        if probe.claim_id:
+            operands = []
+            if probe.claim_kind == "transition":
+                operands = [
+                    ("left", probe.left_operand)
+                    if probe.endpoint == "from" else
+                    ("right", probe.right_operand)
+                ]
+            elif probe.claim_kind in {"required", "observed"}:
+                operands = [("left", probe.left_operand), ("right", probe.right_operand)]
+            for name, expression in operands:
+                if _operand_literal(expression)[0]:
+                    continue
+                captures[name] = str(expression)
+        else:
+            captures = {
+                f"capture_{capture_index}": expression
+                for capture_index, expression in enumerate(probe.captures, 1)
+            }
         if probe.condition:
             captures["__reward_condition"] = probe.condition
         checkpoints.append({
@@ -82,7 +99,7 @@ def compile_checkpoints(source_root: Path, plan: ProbePlan) -> list[dict[str, An
             "expected_order": index - 1,
             "file": probe.file,
             "function": probe.function,
-            "line": resolve_statement_line(source_root, probe),
+            "line": resolve_statement_line(source_root, probe) or probe.line,
             "captures": captures,
             "reward_probe": {
                 "stage": probe.stage,
@@ -90,9 +107,139 @@ def compile_checkpoints(source_root: Path, plan: ProbePlan) -> list[dict[str, An
                 "statement": probe.statement,
                 "condition": probe.condition,
                 "purpose": probe.purpose,
+                "claim_id": probe.claim_id,
+                "claim_kind": probe.claim_kind,
+                "endpoint": probe.endpoint,
+                "check_op": probe.check_op,
+                "left_operand": probe.left_operand,
+                "right_operand": probe.right_operand,
             },
         })
     return checkpoints
+
+
+def _operand_literal(value: Any) -> tuple[bool, Any]:
+    if not isinstance(value, str):
+        return True, value
+    text = value.strip()
+    lowered = text.lower()
+    if lowered in {"true", "false"}:
+        return True, lowered == "true"
+    if lowered in {"null", "none", "nullptr"}:
+        return True, None
+    try:
+        return True, int(text, 0)
+    except ValueError:
+        return False, None
+
+
+def _operand_value(raw: Any, fields: dict[str, Any], name: str) -> Any:
+    literal, value = _operand_literal(raw)
+    if literal:
+        return value
+    if name not in fields:
+        raise KeyError(f"missing captured operand: {name}")
+    return fields[name]
+
+
+def evaluate_claim_hits(
+    checkpoints: list[dict[str, Any]], hits: list[dict[str, Any]], checked: bool,
+) -> tuple[str, tuple[AssertionResult, ...]]:
+    ordered_hits = []
+    for order, hit in enumerate(hits):
+        if hit.get("line") is not None:
+            ordered_hits.append((order, hit))
+    checkpoint_by_point = {
+        str(item["event_point"]): item for item in checkpoints
+        if item.get("reward_probe", {}).get("claim_id")
+    }
+    admission_points = {
+        point for point, checkpoint in checkpoint_by_point.items()
+        if checkpoint["reward_probe"].get("claim_kind") == "admission"
+    }
+    if any(str(hit.get("event_point")) in admission_points for _, hit in ordered_hits):
+        admission = "confirmed"
+    elif not checked or any(
+        hit.get("breakpoint_error") and str(hit.get("event_point")) in admission_points
+        for hit in hits
+    ):
+        admission = "unresolved"
+    else:
+        admission = "not_reached"
+
+    groups: dict[str, list[tuple[str, int, dict[str, Any], dict[str, Any]]]] = {}
+    for order, hit in ordered_hits:
+        point = str(hit.get("event_point") or "")
+        checkpoint = checkpoint_by_point.get(point)
+        if not checkpoint:
+            continue
+        meta = checkpoint["reward_probe"]
+        kind = str(meta.get("claim_kind") or "")
+        if kind == "admission":
+            continue
+        groups.setdefault(str(meta["claim_id"]), []).append(
+            (str(meta.get("endpoint") or "at"), order, hit, meta)
+        )
+    declared: dict[str, dict[str, Any]] = {}
+    for checkpoint in checkpoints:
+        meta = checkpoint.get("reward_probe") or {}
+        if meta.get("claim_id") and meta.get("claim_kind") != "admission":
+            declared[str(meta["claim_id"])] = meta
+
+    results = []
+    for claim_id, meta in declared.items():
+        kind = str(meta["claim_kind"])
+        entries = groups.get(claim_id, [])
+        values: list[tuple[bool, Any, Any]] = []
+        errors = False
+        if kind == "transition":
+            sources = [item for item in entries if item[0] == "from"]
+            targets = [item for item in entries if item[0] == "at"]
+            for _, source_order, source_hit, _ in sources:
+                for _, target_order, target_hit, _ in targets:
+                    if source_order >= target_order:
+                        continue
+                    try:
+                        left = _operand_value(
+                            meta.get("left_operand"), source_hit.get("fields") or {}, "left"
+                        )
+                        right = _operand_value(
+                            meta.get("right_operand"), target_hit.get("fields") or {}, "right"
+                        )
+                        values.append((check_value(str(meta["check_op"]), left, right), left, right))
+                    except (KeyError, TypeError, ValueError):
+                        errors = True
+            reached = bool(sources and targets)
+        else:
+            reached = bool(entries)
+            for _, _, hit, _ in entries:
+                try:
+                    fields = hit.get("fields") or {}
+                    left = _operand_value(meta.get("left_operand"), fields, "left")
+                    right = _operand_value(meta.get("right_operand"), fields, "right")
+                    values.append((check_value(str(meta["check_op"]), left, right), left, right))
+                except (KeyError, TypeError, ValueError):
+                    errors = True
+        evaluated = bool(values)
+        expected = False if kind == "required" else True
+        matched = any(item[0] is expected for item in values) if evaluated else None
+        if not reached:
+            status = "not_reached"
+        elif not evaluated:
+            status = "unresolved"
+        elif kind == "required":
+            status = "violated" if matched else "safety_satisfied"
+        else:
+            status = "confirmed" if matched else "not_observed"
+        representative = next((item for item in values if item[0] is expected), values[-1] if values else None)
+        results.append(AssertionResult(
+            claim_id, kind, status, reached, evaluated,
+            representative[0] if representative else None,
+            matched,
+            representative[1] if representative else None,
+            representative[2] if representative else None,
+        ))
+    return admission, tuple(results)
 
 
 def _truth(value: Any) -> bool | None:
@@ -286,6 +433,12 @@ class ArvoGDBInstrumentationBackend:
             except (subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
                 gdb_error = f"{type(exc).__name__}: {exc}"
         observations, facts = self._observations(checkpoints, hits, checked)
+        _admission, claim_results = evaluate_claim_hits(checkpoints, hits, checked)
+        if claim_results or any(
+            item.get("reward_probe", {}).get("claim_kind") == "admission"
+            for item in checkpoints
+        ):
+            observations["admission"] = StageStatus(_admission)
         triggered = default_trigger_oracle(exit_code, stdout, stderr)
         facts += (RuntimeFact(
             "TRIGGER-ORACLE", "trigger", "trigger_oracle",
@@ -299,4 +452,5 @@ class ArvoGDBInstrumentationBackend:
             exit_code=exit_code, stdout=stdout, stderr=stderr,
             trigger_observed=triggered, stage_observations=observations,
             facts=facts, instrumentation_available=checked, error=error,
+            claim_results=claim_results,
         )

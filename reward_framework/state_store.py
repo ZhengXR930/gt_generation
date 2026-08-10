@@ -284,3 +284,11 @@ class StateStore:
             "duplicate_submissions": total - unique,
             "unique_ratio": (unique / total) if total else 0.0,
         }
+
+    def latest_candidate_sha256(self) -> str | None:
+        """Return the last candidate identity recorded at the submission boundary."""
+        attempts = self._index().get("attempts") or []
+        if not attempts:
+            return None
+        value = str(attempts[-1].get("sha256") or "").strip()
+        return value or None

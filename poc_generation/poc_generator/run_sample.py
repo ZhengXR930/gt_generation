@@ -827,6 +827,26 @@ def main():
             repository.worktree, adaptive_python_root,
             ignore=shutil.ignore_patterns(".harness_optimizer", "__pycache__", "*.pyc"),
         )
+        active_record = json.loads(repository.active_path.read_text())
+        expected_sha256 = str(active_record["source_sha256"])
+        launch_sha256 = HarnessRepository.tree_sha256(adaptive_python_root)
+        if launch_sha256 != expected_sha256:
+            shutil.rmtree(adaptive_python_root, ignore_errors=True)
+            raise RuntimeError(
+                "isolated OpenHands launch does not match the active harness: "
+                f"version={version}, expected={expected_sha256}, actual={launch_sha256}"
+            )
+        (adaptive_python_root / ".reward_harness_launch.json").write_text(
+            json.dumps(
+                {
+                    "version": version,
+                    "source_sha256": launch_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
         atexit.register(shutil.rmtree, adaptive_python_root, True)
         if not args.freeze_harness_updates:
             os.environ["REWARD_FRAMEWORK_TRAINING_ROOT"] = str(training_root)
@@ -834,6 +854,7 @@ def main():
             args.openhands_repo.expanduser().resolve()
         )
         os.environ["REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION"] = str(version)
+        os.environ["REWARD_FRAMEWORK_EPISODE_HARNESS_SHA256"] = launch_sha256
         os.environ["REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT"] = str(
             adaptive_python_root
         )
