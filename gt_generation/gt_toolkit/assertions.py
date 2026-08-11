@@ -8,11 +8,15 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import operator
 import re
+import sys
 from pathlib import Path
 from typing import Any
+
+from evaluator.field_bindings import binding_expr
 
 
 _CASE_RE = re.compile(r"^CASE name=(\S+) rc=(-?\d+) result=(\S+)$")
@@ -25,6 +29,7 @@ _OPS = {
     "gt": operator.gt,
     "ge": operator.ge,
 }
+_FIXED_GUARD_STATUSES = {"guarded", "avoided"}
 _SYMBOLS = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 _MISSING = object()
 # MSAN prints the poison boundary as e.g.
@@ -35,6 +40,20 @@ _MISSING = object()
 _MSAN_UNINIT_RE = re.compile(
     r"[Uu]ninitialized bytes? in \S+ at offset (\d+) inside \[(?:0x)?[0-9a-fA-F]+,\s*(\d+)\)"
 )
+
+
+def _load_assertion_reward_module():
+    module_name = "_gt_assertion_reward"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    path = Path(__file__).resolve().parents[2] / "reward_framework" / "assertion_reward.py"
+    spec = importlib.util.spec_from_file_location(module_name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load assertion reward module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def parse_msan_uninit(sanitizer_text: str) -> dict[str, int] | None:
@@ -140,9 +159,15 @@ def freeze_spec(spec_path: Path, marker_path: Path) -> dict[str, Any]:
 def validate_invariant_bindings(
     verified_invariants: dict[str, Any], spec: dict[str, Any]
 ) -> dict[str, Any]:
-    """Require every selected reasoning invariant to have assertion coverage."""
+    """Require the invariant graph to already satisfy the GT contract.
+
+    Stage 04A must write the new graph shape directly. There is no legacy
+    root-cause side channel: root_cause_criterion is only a pointer to a real
+    root_cause node, and nodes/edges both carry source operands plus relation.
+    """
     selected: set[str] = set()
     errors: list[str] = []
+    skipped_unverified: list[str] = []
     nodes = [
         item
         for item in verified_invariants.get("nodes", [])
@@ -154,29 +179,53 @@ def validate_invariant_bindings(
         if isinstance(item, dict)
     ]
     criterion = verified_invariants.get("root_cause_criterion")
-    edge_ids = {
-        str(item.get("invariant_id")) for item in edges if item.get("invariant_id")
-    }
-    strict_edges = spec.get("schema_version") == "assertion-spec-v3"
     sections = [("node", item) for item in nodes] + [("edge", item) for item in edges]
-    if isinstance(criterion, dict):
-        sections.append(("root", criterion))
+    section_by_id: dict[str, str] = {}
     if "refuted" in verified_invariants:
         errors.append("verified_invariants.json must not contain a refuted section")
     for section, item in sections:
-        if "verified" in item and item.get("verified") is not True:
-            errors.append(
-                f"{section} invariant {item.get('invariant_id', '<missing>')} is not verified"
-            )
         invariant_id = str(item.get("invariant_id") or "").strip()
+        verified_flag = item.get("verified", True)
+        if verified_flag is not True:
+            if item.get("verification_status") != "omitted_not_runtime_verified":
+                errors.append(
+                    f"{section} invariant {item.get('invariant_id', '<missing>')} "
+                    "is not verified"
+                )
+                continue
+            if invariant_id:
+                skipped_unverified.append(invariant_id)
+            continue
         if not invariant_id:
             errors.append("selected invariant is missing invariant_id")
         elif invariant_id in selected:
             errors.append(f"duplicate invariant_id: {invariant_id}")
         else:
             selected.add(invariant_id)
+            section_by_id[invariant_id] = section
+        if not item.get("operands"):
+            errors.append(f"{section} invariant {invariant_id or '<missing>'} missing operands")
+        if not isinstance(item.get("relation"), dict):
+            errors.append(f"{section} invariant {invariant_id or '<missing>'} missing relation")
+
+    node_ids = {
+        str(item.get("invariant_id"))
+        for item in nodes
+        if item.get("invariant_id") and str(item.get("invariant_id")) in selected
+    }
+    for edge in edges:
+        edge_id = str(edge.get("invariant_id") or "")
+        if edge_id not in selected:
+            continue
+        if edge.get("from_node") not in node_ids or edge.get("to_node") not in node_ids:
+            errors.append(f"edge {edge_id} has unresolved from_node/to_node")
 
     covered: set[str] = set()
+    edge_ids = {
+        str(item.get("invariant_id"))
+        for item in edges
+        if item.get("invariant_id") and str(item.get("invariant_id")) in selected
+    }
     edge_transition_coverage: dict[str, list[str]] = {
         invariant_id: [] for invariant_id in edge_ids
     }
@@ -186,75 +235,76 @@ def validate_invariant_bindings(
             str(invariant_id) for invariant_id in assertion.get("invariants", [])
         }
         assertion_edges = sorted(assertion_invariants & edge_ids)
-        if strict_edges:
-            if assertion.get("kind") == "transition":
-                if len(assertion_edges) != 1:
-                    errors.append(
-                        f"transition assertion {assertion_id} must cover exactly one edge; "
-                        f"got {assertion_edges}"
-                    )
-                else:
-                    edge_transition_coverage[assertion_edges[0]].append(str(assertion_id))
-            elif assertion_edges:
+        if assertion.get("kind") == "transition":
+            if assertion_edges and len(assertion_edges) != 1:
                 errors.append(
-                    f"non-transition assertion {assertion_id} cannot cover edges: "
-                    + ", ".join(assertion_edges)
+                    f"transition assertion {assertion_id} must cover exactly one edge; "
+                    f"got {assertion_edges}"
                 )
+            elif assertion_edges:
+                edge_transition_coverage[assertion_edges[0]].append(str(assertion_id))
+        elif assertion_edges:
+            errors.append(
+                f"non-transition assertion {assertion_id} cannot cover edges: "
+                + ", ".join(assertion_edges)
+            )
         for invariant_id in assertion.get("invariants", []):
             if invariant_id not in selected:
-                errors.append(
-                    f"assertion {assertion_id} references unknown invariant {invariant_id}"
-                )
+                if assertion.get("kind") == "required":
+                    errors.append(
+                        f"required assertion {assertion_id} references unselected "
+                        f"invariant {invariant_id}"
+                    )
             else:
                 covered.add(invariant_id)
-    for invariant_id in sorted(selected - covered):
+    source_identity_nodes = {
+        str(node.get("invariant_id"))
+        for node in nodes
+        if node.get("role") == "source"
+        and isinstance(node.get("relation"), dict)
+        and node["relation"].get("op") == "same_object"
+    }
+    for invariant_id in sorted(selected - covered - source_identity_nodes):
         errors.append(f"invariant {invariant_id} has no assertion")
 
-    # Root-cause criterion gate. The Mechanism dimension is built from the
-    # required assertion bound to root_cause_criterion, so the criterion must
-    # be present and either (a) bound to a required assertion, or (b) an
-    # explicitly declared missing-operation criterion (an omitted op -- e.g.
-    # a buffer never initialized, a pointer never null-terminated -- has no
-    # comparison relation to assert, but is still a real, probeable mechanism).
-    # Audit basis: arvo_19723 shipped with a null criterion despite a ready
-    # required assertion (REQ_ihbytes_valid) that was simply never linked;
-    # arvo_42470156 shipped a criterion with no required assertion and an
-    # undeclared type. Both slipped through and were only patched downstream.
-    # This gate forces Stage 04 to resolve them at generation time instead.
     if not isinstance(criterion, dict) or not str(criterion.get("invariant_id") or "").strip():
         errors.append(
-            "root_cause_criterion is null/missing: Stage 04 must identify the root-cause "
-            "invariant (populate root_cause_criterion with the invariant_id that its "
-            "required assertion covers)"
+            "root_cause_criterion is null/missing: Stage 04 must point it at the "
+            "root_cause node covered by the required assertion"
         )
     else:
         criterion_id = str(criterion.get("invariant_id") or "").strip()
+        root_nodes = [
+            node for node in nodes
+            if str(node.get("invariant_id") or "") == criterion_id
+            and node.get("role") == "root_cause"
+        ]
+        if not root_nodes:
+            errors.append(
+                f"root_cause_criterion {criterion_id!r} does not point to a "
+                "nodes[] entry with role='root_cause'"
+            )
         linked = [
             str(assertion.get("id"))
             for assertion in spec.get("assertions", [])
             if assertion.get("kind") == "required"
             and criterion_id in {str(x) for x in assertion.get("invariants", [])}
         ]
-        is_missing_op = str(criterion.get("type") or "").startswith("missing_")
-        if not linked and not is_missing_op:
+        if not linked:
             errors.append(
-                f"root_cause_criterion {criterion_id!r} has no required assertion bound to it "
-                "and does not declare a missing-operation type: either bind a required assertion "
-                "to this invariant, or (if the bug is an omitted operation with no comparison to "
-                "assert) set its type to a missing_* value such as missing_initialization or "
-                "missing_null_termination"
+                f"root_cause_criterion {criterion_id!r} has no required assertion bound to it"
             )
-    if strict_edges:
-        for invariant_id, assertion_ids in sorted(edge_transition_coverage.items()):
-            if len(assertion_ids) != 1:
-                errors.append(
-                    f"edge {invariant_id} requires exactly one transition assertion; "
-                    f"got {assertion_ids}"
-                )
+    for invariant_id, assertion_ids in sorted(edge_transition_coverage.items()):
+        if len(assertion_ids) != 1:
+            errors.append(
+                f"edge {invariant_id} requires exactly one transition assertion; "
+                f"got {assertion_ids}"
+            )
     return {
         "valid": not errors,
         "invariant_count": len(selected),
         "assertion_count": len(spec.get("assertions", [])),
+        "skipped_unverified": skipped_unverified,
         "errors": errors,
     }
 
@@ -343,6 +393,13 @@ def validate_binding_coverage(
         "errors": errors,
         "warnings": warnings,
     }
+
+
+def _load_map_file(path: Path | None, key: str) -> dict[str, Any]:
+    if not path or not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data.get(key, {}) if isinstance(data, dict) else {}
 
 
 def parse_trace_matrix(text: str) -> dict[str, dict[str, Any]]:
@@ -575,7 +632,7 @@ def validate_assertions(
             verified = vulnerable_status == "satisfied"
         elif assertion.get("protects"):
             genuine_witness_case = None
-            if fixed_status == "guarded":
+            if fixed_status in _FIXED_GUARD_STATUSES:
                 genuine_witness_case = next(
                     (
                         name
@@ -586,12 +643,13 @@ def validate_assertions(
                 )
             verified = vulnerable_status == "violated" and (
                 fixed_status == "genuine"
-                or (fixed_status == "guarded" and genuine_witness_case is not None)
+                or (fixed_status in _FIXED_GUARD_STATUSES and genuine_witness_case is not None)
             )
         else:
             verified = vulnerable_status == "refuted" and fixed_status == "satisfied"
         item = {
             "id": assertion["id"],
+            "invariants": list(assertion.get("invariants", [])),
             "kind": assertion["kind"],
             "verified": verified,
             "matrix": matrix,
@@ -606,11 +664,11 @@ def validate_assertions(
                 if assertion["kind"] == "required"
                 else "vulnerable_side_only"
             )
-        if assertion.get("protects") and fixed_status == "guarded":
+        if assertion.get("protects") and fixed_status in _FIXED_GUARD_STATUSES:
             item["genuine_witness_case"] = genuine_witness_case
             if genuine_witness_case is None:
                 item["verification_error"] = (
-                    "fixed original is guarded; add a perturbation that executes the "
+                    f"fixed original is {fixed_status}; add a perturbation that executes the "
                     "protected event while the required predicate is true"
                 )
         if (
@@ -631,6 +689,18 @@ def validate_assertions(
                 "block entry observes reaching the block, not performing the operation"
             )
         results.append(item)
+    required_results = [item for item in results if item.get("kind") == "required"]
+    propagation_results = [
+        item for item in results if item.get("kind") in {"observed", "transition"}
+    ]
+    required_verified = bool(required_results) and all(
+        item["verified"] for item in required_results
+    )
+    propagation_all_verified = all(
+        item["verified"] for item in propagation_results
+    )
+    all_verified = bool(results) and required_verified and propagation_all_verified
+
     if not differential_applicable:
         # e.g. an MSAN use-of-uninitialized-value bug: the safety property is
         # per-byte definedness, which cannot be a vulnerable/fixed comparison of
@@ -654,7 +724,9 @@ def validate_assertions(
         "sample_id": spec.get("sample_id"),
         "candidate_content_hash": spec.get("content_hash"),
         "original_case": original,
-        "all_verified": bool(results) and all(item["verified"] for item in results),
+        "required_verified": required_verified,
+        "propagation_all_verified": propagation_all_verified,
+        "all_verified": all_verified,
         "differential_status": differential_status,
         "assertions": results,
     }
@@ -710,15 +782,218 @@ def build_verified_assertions(
 ) -> dict[str, Any]:
     verified = {item["id"] for item in results.get("assertions", []) if item["verified"]}
     return {
-        "schema_version": (
-            "verified-assertions-v3"
-            if spec.get("schema_version") == "assertion-spec-v3"
-            else "verified-assertions-v2"
-        ),
         "sample_id": spec.get("sample_id"),
         "content_hash": spec.get("content_hash"),
         "assertions": [item for item in spec.get("assertions", []) if item["id"] in verified],
     }
+
+
+def _claim_location(event_id: str, event_locations: dict[str, Any]) -> dict[str, Any]:
+    location = event_locations.get(event_id)
+    if not isinstance(location, dict):
+        raise ValueError(f"event_locations missing location for {event_id!r}")
+    file = str(location.get("file") or "").strip()
+    function = str(location.get("function") or "").strip()
+    line = location.get("line")
+    if not file or not function or not isinstance(line, int) or line < 1:
+        raise ValueError(f"event_locations has invalid location for {event_id!r}")
+    return {"file": file, "function": function, "line": line}
+
+
+def _claim_operand(
+    value: Any,
+    field_bindings: dict[str, Any],
+    default_event: str | None,
+) -> str:
+    if isinstance(value, str) and value.startswith("$"):
+        suffix = value[1:].rsplit(".", 1)[-1]
+        literal_values = {
+            "zero_literal": "0",
+            "null_literal": "nullptr",
+            "true_literal": "true",
+            "false_literal": "false",
+        }
+        if suffix in literal_values:
+            return literal_values[suffix]
+    expression = _resolve_operand_expr(value, field_bindings, default_event).strip()
+    if not expression:
+        raise ValueError(f"empty expression for assertion operand {value!r}")
+    return expression
+
+
+def _admission_from_ground_truth(ground_truth: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(ground_truth, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    reachability = ground_truth.get("reachability_checkpoints")
+    if isinstance(reachability, dict):
+        parser = reachability.get("parser_admitted")
+        if isinstance(parser, dict):
+            admitted = parser.get("admitted_location")
+            if isinstance(admitted, dict):
+                candidates.append(admitted)
+            candidates.append(parser)
+    for key in ("source", "tainted_value_origin"):
+        item = ground_truth.get(key)
+        if isinstance(item, dict):
+            candidates.append(item)
+    admission = []
+    seen: set[tuple[str, str, int]] = set()
+    for item in candidates:
+        file = str(item.get("file") or "").strip()
+        function = str(item.get("function") or "").strip()
+        line = item.get("line")
+        if not file or not function or not isinstance(line, int) or line < 1:
+            continue
+        key = (file, function, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        admission.append(
+            {
+                "id": f"admission_{len(admission) + 1:02d}",
+                "at": {"file": file, "function": function, "line": line},
+            }
+        )
+        if len(admission) == 3:
+            break
+    return admission
+
+
+def build_assertion_reward_spec(
+    verified_assertions: dict[str, Any],
+    field_bindings: dict[str, Any] | None,
+    event_locations: dict[str, Any] | None,
+    *,
+    ground_truth: dict[str, Any] | None = None,
+    source_root: Path | None = None,
+) -> dict[str, Any]:
+    """Project verified GT assertions into the reward framework claim schema."""
+    field_bindings = field_bindings or {}
+    event_locations = event_locations or {}
+    assertions = [
+        item
+        for item in verified_assertions.get("assertions", [])
+        if isinstance(item, dict)
+    ]
+    required = [item for item in assertions if item.get("kind") == "required"]
+    admission = _admission_from_ground_truth(ground_truth)
+    admission_events = list(
+        dict.fromkeys(
+            str(item.get("at"))
+            for item in required
+            if str(item.get("at") or "").strip()
+        )
+    )
+    if not admission_events:
+        admission_events = list(
+            dict.fromkeys(
+                str(item.get("at"))
+                for item in assertions
+                if str(item.get("at") or "").strip()
+            )
+        )
+    if not admission:
+        admission = [
+            {"id": f"admission_{index:02d}", "at": _claim_location(event_id, event_locations)}
+            for index, event_id in enumerate(admission_events[:3], 1)
+        ]
+    claims = []
+    for assertion in assertions:
+        kind = str(assertion.get("kind") or "")
+        if kind not in {"required", "observed", "transition"}:
+            continue
+        check = assertion.get("check")
+        if not isinstance(check, list) or len(check) != 3:
+            raise ValueError(f"assertion {assertion.get('id')} has invalid check")
+        at_event = str(assertion.get("at") or "")
+        claim = {
+            "id": str(assertion.get("id") or ""),
+            "kind": kind,
+            "at": _claim_location(at_event, event_locations),
+            "from": None,
+            "check": {
+                "op": str(check[0]),
+                "left": _claim_operand(check[1], field_bindings, at_event),
+                "right": _claim_operand(check[2], field_bindings, at_event),
+            },
+        }
+        if kind == "transition":
+            from_event = str(assertion.get("from") or "")
+            if not from_event:
+                raise ValueError(f"transition assertion {assertion.get('id')} is missing from")
+            claim["from"] = _claim_location(from_event, event_locations)
+        claims.append(claim)
+    spec = {
+        "protocol": "assertion-reward-v1",
+        "admission": admission,
+        "claims": claims,
+    }
+    reward_module = _load_assertion_reward_module()
+
+    parsed = reward_module.AssertionRewardSpec.from_dict(spec)
+    if source_root is not None:
+        reward_module.validate_spec_sources(parsed, source_root)
+    return parsed.to_dict()
+
+
+def build_verified_invariants(
+    candidate: dict[str, Any], results: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep only the runtime-verified subset of a new-contract invariant graph."""
+    verified_invariant_ids: set[str] = set()
+    for assertion in results.get("assertions", []):
+        if not assertion.get("verified"):
+            continue
+        verified_invariant_ids.update(
+            str(invariant_id) for invariant_id in assertion.get("invariants", [])
+        )
+
+    candidate_nodes = [
+        item for item in candidate.get("nodes", []) if isinstance(item, dict)
+    ]
+    candidate_edges = [
+        item for item in candidate.get("edges", []) if isinstance(item, dict)
+    ]
+    selected_edges = [
+        item
+        for item in candidate_edges
+        if str(item.get("invariant_id") or "") in verified_invariant_ids
+    ]
+    edge_endpoint_ids = {
+        str(item.get(key) or "")
+        for item in selected_edges
+        for key in ("from_node", "to_node")
+        if item.get(key)
+    }
+
+    def keep_node(node: dict[str, Any]) -> bool:
+        invariant_id = str(node.get("invariant_id") or "")
+        relation = node.get("relation")
+        is_source_identity = (
+            node.get("role") == "source"
+            and isinstance(relation, dict)
+            and relation.get("op") == "same_object"
+        )
+        return (
+            invariant_id in verified_invariant_ids
+            or invariant_id in edge_endpoint_ids
+            or is_source_identity
+        )
+
+    output = dict(candidate)
+    output.pop("schema_version", None)
+    criterion = candidate.get("root_cause_criterion")
+    if isinstance(criterion, dict):
+        criterion_id = str(criterion.get("invariant_id") or "")
+        output["root_cause_criterion"] = {"invariant_id": criterion_id}
+    output["nodes"] = [
+        item
+        for item in candidate_nodes
+        if keep_node(item)
+    ]
+    output["edges"] = selected_edges
+    return output
 
 
 def build_perturbation_results(
@@ -733,7 +1008,10 @@ def build_perturbation_results(
     needed_ids = [
         str(item["id"])
         for item in required
-        if item["matrix"].get("fixed", {}).get(original, {}).get("status") == "guarded"
+        if (
+            item["matrix"].get("fixed", {}).get(original, {}).get("status")
+            in _FIXED_GUARD_STATUSES
+        )
     ]
     case_names = list(dict.fromkeys(
         name
@@ -768,9 +1046,9 @@ def build_perturbation_results(
         "sample_id": spec.get("sample_id"),
         "needed": bool(needed_ids),
         "reason": (
-            "fixed original was guarded for: " + ", ".join(needed_ids)
+            "fixed original skipped protected operation for: " + ", ".join(needed_ids)
             if needed_ids else
-            "fixed original did not leave a guarded required assertion"
+            "fixed original did not leave a guarded/avoided required assertion"
         ),
         "cases": cases,
         "genuine_witness_cases": witnesses,
@@ -807,8 +1085,8 @@ def _resolve_operand_expr(
         else stripped
     )
     if contextual in field_bindings:
-        return str(field_bindings[contextual])
-    return str(field_bindings.get(stripped, contextual))
+        return binding_expr(field_bindings, contextual)
+    return binding_expr(field_bindings, stripped, contextual)
 
 
 def _norm_expr(text: str) -> str:
@@ -926,6 +1204,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verified-invariants", type=Path)
     parser.add_argument("--verified-assertions-out", type=Path)
     parser.add_argument("--perturbation-results-out", type=Path)
+    parser.add_argument("--assertion-reward-spec-out", type=Path)
+    parser.add_argument("--ground-truth", type=Path)
+    parser.add_argument("--source-root", type=Path)
     parser.add_argument("--check-bindings-only", action="store_true")
     parser.add_argument("--field-bindings", type=Path, help="field_bindings.json for the binding-coverage gate")
     parser.add_argument("--event-locations", type=Path, help="event_locations.json for the binding-coverage gate")
@@ -955,16 +1236,10 @@ def main(argv: list[str] | None = None) -> int:
         ok = binding["valid"]
         # Binding-coverage gate over the Stage-04 side maps, when provided.
         if args.field_bindings or args.event_locations:
-            def _load_map(path: Path | None, key: str) -> dict[str, Any]:
-                if not path or not path.exists():
-                    return {}
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return data.get(key, {}) if isinstance(data, dict) else {}
-
             coverage = validate_binding_coverage(
                 spec,
-                _load_map(args.field_bindings, "bindings"),
-                _load_map(args.event_locations, "locations"),
+                _load_map_file(args.field_bindings, "bindings"),
+                _load_map_file(args.event_locations, "locations"),
             )
             report["binding_coverage"] = coverage
             ok = ok and coverage["valid"]
@@ -989,25 +1264,67 @@ def main(argv: list[str] | None = None) -> int:
     )
     if msan:
         results["msan_offset_check"] = check_msan_offset(results, msan)
+    verified_invariants = None
     if args.verified_invariants:
+        verified_invariants = json.loads(
+            args.verified_invariants.read_text(encoding="utf-8")
+        )
         results["invariant_binding"] = validate_invariant_bindings(
-            json.loads(args.verified_invariants.read_text(encoding="utf-8")), spec
+            build_verified_invariants(verified_invariants, results), spec
         )
         if not results["invariant_binding"]["valid"]:
             raise ValueError("invalid invariant bindings")
     args.results_out.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    if args.verified_assertions_out:
-        args.verified_assertions_out.write_text(
-            json.dumps(build_verified_assertions(spec, results), indent=2) + "\n",
+    if args.verified_invariants and verified_invariants is not None:
+        args.verified_invariants.write_text(
+            json.dumps(
+                build_verified_invariants(verified_invariants, results),
+                indent=2,
+            )
+            + "\n",
             encoding="utf-8",
         )
+    if args.verified_assertions_out:
+        verified_assertions = build_verified_assertions(spec, results)
+        args.verified_assertions_out.write_text(
+            json.dumps(verified_assertions, indent=2) + "\n", encoding="utf-8"
+        )
+    else:
+        verified_assertions = build_verified_assertions(spec, results)
     if args.perturbation_results_out:
         args.perturbation_results_out.write_text(
             json.dumps(build_perturbation_results(spec, results), indent=2) + "\n",
             encoding="utf-8",
         )
+    if args.assertion_reward_spec_out:
+        if not args.field_bindings or not args.event_locations:
+            parser.error(
+                "--assertion-reward-spec-out requires --field-bindings and --event-locations"
+            )
+        field_bindings = _load_map_file(args.field_bindings, "bindings")
+        event_locations = _load_map_file(args.event_locations, "locations")
+        ground_truth = (
+            json.loads(args.ground_truth.read_text(encoding="utf-8"))
+            if args.ground_truth and args.ground_truth.exists()
+            else None
+        )
+        args.assertion_reward_spec_out.write_text(
+            json.dumps(
+                build_assertion_reward_spec(
+                    verified_assertions,
+                    field_bindings,
+                    event_locations,
+                    ground_truth=ground_truth,
+                    source_root=args.source_root,
+                ),
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     offset_error = bool(results.get("msan_offset_check", {}).get("error"))
-    if not results["all_verified"] or offset_error:
+    if not results["required_verified"] or offset_error:
         raise SystemExit(1)
     return 0
 

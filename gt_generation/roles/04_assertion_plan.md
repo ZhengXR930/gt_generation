@@ -36,7 +36,15 @@ are immutable inputs.
    vulnerable-source expression. Record every synthetic event in
    `event_locations.json` with its real vulnerable-source function, file, and
    line.
-5. Stop at the semantic commitment. Do not create instrumentation patches,
+5. Write `candidate_invariants.json` directly in the GT contract graph shape:
+   no artifact-level `schema_version`; `root_cause_criterion` is only
+   `{"invariant_id": "<root node id>"}` and that id must point to a real
+   `nodes[]` entry with `role: "root_cause"`. Every node and every edge must
+   have `operands` as source-expression strings and `relation` as
+   `{ "op": "...", "left": "...", "right": "..." }`. Every edge must have
+   `from_node` and `to_node` pointing at node `invariant_id`s. `type` is
+   optional free text, not a required schema field.
+6. Stop at the semantic commitment. Do not create instrumentation patches,
    compile either version, or execute the target. Later isolated stages map this
    frozen plan onto the real vulnerable and fixed source independently.
 
@@ -48,6 +56,90 @@ the vulnerable execution using the accepted fine trace, sanitizer trace, and
 vulnerable source.
 For a guarded fix, `protects` names the dangerous operation whose absence will
 be distinguished during execution.
+
+## GT Contract Outputs
+
+Do not write artifact-level `schema_version` in `candidate_invariants.json`,
+`field_bindings.json`, or `event_locations.json`. The assertion spec itself
+still uses `schema_version: "assertion-spec-v3"` because the assertion freeze
+hash needs a stable protocol marker.
+
+`field_bindings.json` binding values must use the alias-capable object form:
+
+```json
+{
+  "sample_id": "<sample_id>",
+  "bindings": {
+    "<event>.<field>": {
+      "expr": "<exact vulnerable-original source expression>",
+      "aliases": ["<same expression>", "<macro or spelling alias if applicable>"]
+    }
+  }
+}
+```
+
+`event_locations.json` is:
+
+```json
+{
+  "sample_id": "<sample_id>",
+  "locations": {
+    "<event_id>": {"function": "<real function>", "file": "<repo-relative file>", "line": <int>}
+  }
+}
+```
+
+`candidate_invariants.json` is:
+
+```json
+{
+  "sample_id": "<sample_id>",
+  "nodes": [
+    {
+      "invariant_id": "N_SOURCE",
+      "role": "source",
+      "file": "...",
+      "function": "...",
+      "line": 1,
+      "operands": ["source_expr"],
+      "relation": {"op": "same_object", "left": "source_expr", "right": "source_expr"},
+      "verified": true
+    },
+    {
+      "invariant_id": "N_ROOT",
+      "role": "root_cause",
+      "file": "...",
+      "function": "...",
+      "line": 2,
+      "operands": ["lhs", "rhs"],
+      "relation": {"op": "lt", "left": "lhs", "right": "rhs"},
+      "verified": true
+    },
+    {
+      "invariant_id": "N_SINK",
+      "role": "sink",
+      "file": "...",
+      "function": "...",
+      "line": 3,
+      "operands": ["sink_expr", "bound_expr"],
+      "relation": {"op": "ge", "left": "sink_expr", "right": "bound_expr"},
+      "verified": true
+    }
+  ],
+  "edges": [
+    {
+      "invariant_id": "E_ROOT_TO_SINK",
+      "type": "data",
+      "from_node": "N_ROOT",
+      "to_node": "N_SINK",
+      "operands": ["carried_expr"],
+      "relation": {"op": "eq", "left": "root_expr", "right": "sink_expr"},
+      "verified": true
+    }
+  ],
+  "root_cause_criterion": {"invariant_id": "N_ROOT"}
+}
+```
 
 ## Freeze
 

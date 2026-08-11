@@ -15,26 +15,55 @@ either instrumentation patch, `.assertion_spec_frozen.json`, or
 - `verified_assertions.json`
 - `verified_invariants.json`
 
-Before execution, verify `assertion_preflight.json`,
+`assertion_reward_spec.json` is an optional reward-framework projection. Do not
+let its absence block a GT package whose core assertion, invariant, and
+reachability evidence is complete.
+
+Do not add artifact-level `schema_version` to `verified_assertions.json`,
+`verified_invariants.json`, `field_bindings.json`, or `event_locations.json`.
+The only schema-versioned file in this stage is the frozen assertion spec
+protocol (`candidate_assertions.json` / `.assertion_spec_frozen.json`).
+
+Before execution, read `prepare_report.json` and choose the matching lifecycle:
+ARVO samples use `gt_toolkit arvo-workspace`; repo-track samples
+(`prepare_report.track` starts with `repo/`) use `<result_dir>/build.sh`.
+Verify `assertion_preflight.json`,
 `vulnerable_instrumentation_preflight.json`, and
-`fixed_instrumentation_preflight.json` all have `ok: true` and bind the current
-assertion hash and patch hashes. If a frozen patch unexpectedly fails during
-execution, report which side failed; rerun only that side's instrumentation
-stage. Do not edit the plan or either patch here.
+`fixed_instrumentation_preflight.json` all have `ok: true`, bind the current
+assertion hash and patch hashes, and report the expected track. A repo-track
+preflight report must have `track` starting with `repo/`; an ARVO preflight
+must not be reused for a repo-track sample. If a frozen patch unexpectedly fails
+during execution, report which side failed; rerun only that side's
+instrumentation stage. Do not edit the plan or either patch here.
 
 ## Execution order
 
 1. Apply the frozen vulnerable instrumentation, build, and run the original PoC.
-   Observed assertions must hold, and required obligations must be violated when
-   their protected operation executes.
+   Required root obligations must be violated when their protected operation
+   executes. Propagation-node `observed` assertions and propagation-edge
+   `transition` assertions are accepted only when they hold in this real
+   vulnerable execution; assertions that do not hold are omitted from the final
+   verified subset instead of blocking a package whose root differential is
+   proven.
 2. Restore/switch to the true fixed side, apply the frozen fixed
-   instrumentation, build, and run the same PoC.
-3. Classify each required assertion as `genuine`, `guarded`, or
-   `not_exercised`. If the fixed original is guarded or vacuous, run only the
-   closest source-grounded PoC perturbation needed to obtain a genuine witness.
-   Stop after the first valid witness; do not sweep values.
+   instrumentation, build, and run the same PoC. The fixed run is required for
+   the root `required` differential; fixed-side outcomes of `observed` and
+   `transition` assertions are diagnostic only and do not gate propagation
+   verification.
+3. Classify each required assertion as `genuine`, `guarded`, `avoided`, or
+   `not_exercised`. If the fixed original is `guarded` or `avoided` because the
+   protected operation did not execute, run exactly one closest source-grounded
+   PoC perturbation to obtain a genuine witness of normal execution after the
+   guard. This is a hard maximum of one non-original case across the fixed
+   trace: never try a second fallback, enumerate values, or fuzz. Stop
+   immediately after that one case, whether it succeeds or fails.
 4. Keep only runtime-verified candidate invariants in
-   `verified_invariants.json`.
+   `verified_invariants.json`. Preserve the GT contract shape from
+   `candidate_invariants.json`: `root_cause_criterion` is only a pointer to the
+   `role: "root_cause"` node, every node/edge keeps `operands` and structured
+   `relation`, and every edge keeps `from_node`/`to_node` references. The
+   root-cause criterion is mandatory; propagation nodes and edges may be a
+   verified subset of the candidate graph.
 5. Run the deterministic assertion and binding gates:
 
 ```bash
@@ -46,7 +75,10 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit assertions \
   --sanitizer-trace <result_dir>/sanitizer_trace.txt \
   --results-out <result_dir>/assertion_results.json \
   --perturbation-results-out <result_dir>/perturbation_results.json \
-  --verified-assertions-out <result_dir>/verified_assertions.json
+  --verified-assertions-out <result_dir>/verified_assertions.json \
+  --field-bindings <result_dir>/field_bindings.json \
+  --event-locations <result_dir>/event_locations.json \
+  --ground-truth <result_dir>/ground_truth.json
 
 PYTHONPATH=gt_generation python3 -m gt_toolkit assertions \
   --check-bindings-only \
@@ -55,6 +87,11 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit assertions \
   --field-bindings <result_dir>/field_bindings.json \
   --event-locations <result_dir>/event_locations.json
 ```
+
+If the fixed original was `guarded` or `avoided`, include exactly one
+non-original CASE in the fixed trace for the closest source-grounded
+perturbation. Keep its raw runtime events as normal `CASE`/`ASSERT_EVT`
+records; do not hand-edit CASE framing.
 
 Do not run reachability and do not clean the ARVO container or images. The next
 deterministic stage owns debugger reachability, and cleanup occurs only after
@@ -96,5 +133,33 @@ accept it as evidence that the vulnerability was repaired.
 ## Repo-track lifecycle
 
 Run every build and target invocation through `<result_dir>/build.sh`; paths
-inside that environment are under `/gt`. Reuse the reproduction command from
-`reproduction_report.json`. Never run the target directly on the host.
+inside that environment are under `/gt`. Reuse the setup and reproduction
+commands from `reproduction_report.json`; if those commands were recorded as
+`<result_dir>/build.sh '<inner command>'`, execute only the inner command
+through the current `<result_dir>/build.sh`. Never run the target directly on
+the host.
+
+Use the deterministic repo runner so the toolkit owns reset, fixed checkout,
+patch application, setup, target invocation, and `CASE ... ENDCASE` framing:
+
+```bash
+PYTHONPATH=gt_generation python3 -m gt_toolkit repo-workspace run \
+  --result-dir <result_dir> \
+  --version vulnerable \
+  --patch <result_dir>/vulnerable-instrumentation.patch \
+  --expect crash \
+  --case-name original
+
+PYTHONPATH=gt_generation python3 -m gt_toolkit repo-workspace run \
+  --result-dir <result_dir> \
+  --version fixed \
+  --patch <result_dir>/fixed-instrumentation.patch \
+  --expect clean \
+  --case-name original
+```
+
+Do not hand-write, replace, or post-process either repo-track assertion trace.
+If the fixed original is `guarded` or `avoided`, add exactly one closest
+source-grounded perturbation case to the same fixed trace with
+`repo-workspace run --version fixed --append-trace --case-name <name> ...` and
+stop.

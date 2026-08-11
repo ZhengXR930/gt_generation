@@ -20,6 +20,19 @@ def _write_patch(path, added):
     )
 
 
+def _root_node():
+    return {
+        "invariant_id": "root.invariant",
+        "role": "root_cause",
+        "verified": True,
+        "file": "src/parser.c",
+        "function": "parse",
+        "line": 10,
+        "operands": ["index", "count"],
+        "relation": {"op": "lt", "left": "index", "right": "count"},
+    }
+
+
 def test_preflight_rejects_harness_invariant_before_runtime(tmp_path):
     spec = {
         "schema_version": "assertion-spec-v3",
@@ -44,21 +57,18 @@ def test_preflight_rejects_harness_invariant_before_runtime(tmp_path):
     }
     spec["content_hash"] = assertion_content_hash(spec)
     invariants = {
-        "root_cause_criterion": {
-            "invariant_id": "root.invariant",
-            "type": "missing_guard",
-            "verified": True,
-            "file": "src/parser.c",
-            "function": "parse",
-            "line": 10,
-        },
+        "root_cause_criterion": {"invariant_id": "root.invariant"},
         "nodes": [
+            _root_node(),
             {
                 "invariant_id": "sink.invariant",
+                "role": "sink",
                 "verified": True,
                 "file": "tests/fuzz/parser_fuzzer.c",
                 "function": "LLVMFuzzerTestOneInput",
                 "line": 20,
+                "operands": ["left", "right"],
+                "relation": {"op": "eq", "left": "left", "right": "right"},
             }
         ],
         "edges": [],
@@ -118,15 +128,8 @@ def test_preflight_commits_both_instrumentation_patches(tmp_path):
     }
     spec["content_hash"] = assertion_content_hash(spec)
     invariants = {
-        "root_cause_criterion": {
-            "invariant_id": "root.invariant",
-            "type": "missing_guard",
-            "verified": True,
-            "file": "src/parser.c",
-            "function": "parse",
-            "line": 10,
-        },
-        "nodes": [],
+        "root_cause_criterion": {"invariant_id": "root.invariant"},
+        "nodes": [_root_node()],
         "edges": [],
     }
     _write(tmp_path / "spec.json", spec)
@@ -195,15 +198,8 @@ def test_preflight_rejects_malformed_instrumentation_patch(tmp_path):
     _write(
         tmp_path / "invariants.json",
         {
-            "root_cause_criterion": {
-                "invariant_id": "root.invariant",
-                "type": "missing_guard",
-                "verified": True,
-                "file": "src/parser.c",
-                "function": "parse",
-                "line": 10,
-            },
-            "nodes": [],
+            "root_cause_criterion": {"invariant_id": "root.invariant"},
+            "nodes": [_root_node()],
             "edges": [],
         },
     )

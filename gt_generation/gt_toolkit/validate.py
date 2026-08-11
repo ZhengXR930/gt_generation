@@ -34,7 +34,6 @@ TOP_LEVEL_REQUIRED = [
     "sink",
     "root_cause",
     "tainted_value_origin",
-    "coarse_trace",
     "fine_trace",
     "sanitizer_ground_truth",
     "poc",
@@ -134,6 +133,18 @@ def _check_location(data: dict, key: str, report: Report) -> None:
         report.warn(f"{key} missing non-empty description")
     if key == "source" and not str(loc.get("value_from", "")).strip():
         report.warn("source missing value_from (untrusted-input provenance)")
+    if key in ("source", "sink", "root_cause"):
+        operands = loc.get("operands")
+        if not isinstance(operands, list) or not operands or not all(
+            isinstance(item, str) and item.strip() for item in operands
+        ):
+            report.err(f"{key} missing non-empty operands")
+    if key in ("sink", "root_cause"):
+        relation = loc.get("relation")
+        if not isinstance(relation, dict) or not all(
+            field_name in relation for field_name in ("op", "left", "right")
+        ):
+            report.err(f"{key} missing relation {{op,left,right}}")
 
 
 def _normalize_function_name(value: Any) -> str:
@@ -308,14 +319,8 @@ def validate_data(
                                 f"admitted_location missing {key}"
                             )
 
-    coarse = data.get("coarse_trace")
-    if not isinstance(coarse, list) or not coarse:
-        report.err("coarse_trace must be a non-empty list")
-    else:
-        for idx, step in enumerate(coarse):
-            _require_keys(step, ["step", "file", "function", "summary"], f"coarse_trace[{idx}]", report)
-            if isinstance(step, dict) and ({"role", "kind"} & step.keys()):
-                report.err(f"coarse_trace[{idx}] must not contain role or kind")
+    if "coarse_trace" in data:
+        report.err("coarse_trace is not part of the GT contract")
 
     fine = data.get("fine_trace")
     if not isinstance(fine, list) or not fine:

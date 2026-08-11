@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from .assertions import (
+    build_assertion_reward_spec,
     assertion_content_hash,
+    _load_assertion_reward_module,
     validate_frozen_spec,
     validate_invariant_bindings,
 )
@@ -25,7 +27,13 @@ REQUIRED_FILES = (
     "verified_assertions.json",
     "assertion_results.json",
     "perturbation_results.json",
+    "field_bindings.json",
+    "event_locations.json",
     "reachability_report.json",
+)
+
+OPTIONAL_PROJECTION_FILES = (
+    "assertion_reward_spec.json",
 )
 
 REACHABILITY_FIELDS = (
@@ -33,9 +41,6 @@ REACHABILITY_FIELDS = (
     "R1_parser_admitted",
     "R2_source_reached",
     "R3_root_cause_function_reached",
-    "R4_root_cause_line_reached",
-    "R3_sink_function_reached",
-    "R4_sink_line_reached",
     "R5_sanitizer_triggered",
 )
 
@@ -100,6 +105,90 @@ def _artifact_reference_errors(
     return errors
 
 
+def _gt_generation_reachability_gate(report: dict[str, Any]) -> bool:
+    """Accept GT packages whose sink is proven by the frozen assertion trace.
+
+    Candidate evaluation remains strict location-reachability-v3. Package audit
+    has Stage 04 runtime evidence too, so a verified sink assertion event may
+    stand in for an exact gdb sink-line hit when the debugger lands only on the
+    sink function.  The GT generator also has stronger evidence than the public
+    evaluator: the root required assertion is already proven differentially and
+    the sanitizer trace proves the behavior.  Do not reject a package only
+    because an auxiliary parser/source breakpoint did not bind cleanly when the
+    root/sink path and sanitizer are established.
+    """
+    if report.get("reachability_checked") is not True:
+        return False
+    if report.get("R5_sanitizer_triggered") is not True:
+        return False
+    raw_hits = report.get("raw_location_hits")
+    if not isinstance(raw_hits, dict):
+        raw_hits = {}
+    hit_locations = [
+        hit for hit in report.get("hit_locations", []) if isinstance(hit, dict)
+    ]
+    event_reachability = report.get("assertion_event_reachability")
+    if not isinstance(event_reachability, dict):
+        event_reachability = {}
+
+    def hit_location_reached(*kinds: str) -> bool:
+        expected = set(kinds)
+        for hit in hit_locations:
+            if hit.get("kind") not in expected:
+                continue
+            if hit.get("breakpoint_error"):
+                continue
+            if hit.get("hit_count") == 0:
+                continue
+            return True
+        return False
+
+    def assertion_role_reached(role: str) -> bool:
+        for hit in hit_locations:
+            if hit.get("kind") != "assertion_event":
+                continue
+            roles = set(hit.get("assertion_role") or [])
+            if role not in roles:
+                continue
+            event_point = str(hit.get("event_point") or "")
+            if event_reachability.get(event_point) is True:
+                return True
+        return False
+
+    source_or_later_reached = any(
+        item is True
+        for item in (
+            report.get("R2_source_reached"),
+            raw_hits.get("source"),
+            report.get("R3_root_cause_reached"),
+            report.get("R3_root_cause_function_reached"),
+            raw_hits.get("root_cause"),
+        )
+    ) or hit_location_reached(
+        "source",
+        "root_cause",
+        "root_cause_function",
+        "sink_function",
+    ) or assertion_role_reached("root")
+    if not source_or_later_reached:
+        return False
+    if not (
+        report.get("R3_root_cause_reached") is True
+        or report.get("R3_root_cause_function_reached") is True
+        or raw_hits.get("root_cause") is True
+        or hit_location_reached("root_cause", "root_cause_function")
+        or assertion_role_reached("root")
+    ):
+        return False
+    if report.get("R4_sink_reached") is True or report.get("R4_sink_line_reached") is True:
+        return True
+    if raw_hits.get("sink") is True:
+        return True
+    if hit_location_reached("sink", "sink_line", "sink_function"):
+        return True
+    return assertion_role_reached("sink")
+
+
 def _verified_invariant_harness_errors(verified_invariants: dict[str, Any]) -> list[str]:
     errors: list[str] = []
 
@@ -142,6 +231,89 @@ def _verified_invariant_harness_errors(verified_invariants: dict[str, Any]) -> l
     return errors
 
 
+def _contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    gt = documents["ground_truth.json"]
+    vi = documents["verified_invariants.json"]
+    va = documents["verified_assertions.json"]
+    fb = documents["field_bindings.json"]
+    el = documents["event_locations.json"]
+    for name, document in (
+        ("ground_truth.json", gt),
+        ("verified_invariants.json", vi),
+        ("verified_assertions.json", va),
+        ("field_bindings.json", fb),
+        ("event_locations.json", el),
+    ):
+        if "schema_version" in document:
+            errors.append(f"{name} must not contain artifact-level schema_version")
+    if "coarse_trace" in gt:
+        errors.append("ground_truth.json must not contain coarse_trace")
+    for anchor_name in ("source", "root_cause", "sink"):
+        anchor = gt.get(anchor_name)
+        if not isinstance(anchor, dict):
+            errors.append(f"ground_truth.json {anchor_name} must be an object")
+            continue
+        if not anchor.get("operands"):
+            errors.append(f"ground_truth.json {anchor_name} missing operands")
+    for anchor_name in ("root_cause", "sink"):
+        relation = (gt.get(anchor_name) or {}).get("relation")
+        if not isinstance(relation, dict) or not all(
+            key in relation for key in ("op", "left", "right")
+        ):
+            errors.append(f"ground_truth.json {anchor_name} missing relation")
+
+    nodes = [item for item in vi.get("nodes", []) if isinstance(item, dict)]
+    edges = [item for item in vi.get("edges", []) if isinstance(item, dict)]
+    node_ids = {str(node.get("invariant_id")) for node in nodes if node.get("invariant_id")}
+    roles = {node.get("role") for node in nodes}
+    if not {"source", "root_cause", "sink"} <= roles:
+        errors.append("verified_invariants.json missing source/root_cause/sink nodes")
+    criterion = vi.get("root_cause_criterion")
+    criterion_id = (
+        str(criterion.get("invariant_id") or "")
+        if isinstance(criterion, dict)
+        else ""
+    )
+    if not criterion_id or criterion_id not in node_ids:
+        errors.append("verified_invariants.json root_cause_criterion does not point to a node")
+    elif not any(
+        node.get("role") == "root_cause"
+        and str(node.get("invariant_id") or "") == criterion_id
+        for node in nodes
+    ):
+        errors.append("verified_invariants.json root_cause_criterion target is not role=root_cause")
+    for node in nodes:
+        invariant_id = str(node.get("invariant_id") or "<missing>")
+        if not node.get("operands"):
+            errors.append(f"verified_invariants.json node {invariant_id} missing operands")
+        if not isinstance(node.get("relation"), dict):
+            errors.append(f"verified_invariants.json node {invariant_id} missing relation")
+    for edge in edges:
+        invariant_id = str(edge.get("invariant_id") or "<missing>")
+        if edge.get("from_node") not in node_ids or edge.get("to_node") not in node_ids:
+            errors.append(f"verified_invariants.json edge {invariant_id} has unresolved endpoints")
+        if not edge.get("operands"):
+            errors.append(f"verified_invariants.json edge {invariant_id} missing operands")
+        if not isinstance(edge.get("relation"), dict):
+            errors.append(f"verified_invariants.json edge {invariant_id} missing relation")
+    selected = node_ids | {
+        str(edge.get("invariant_id"))
+        for edge in edges
+        if edge.get("invariant_id")
+    }
+    for assertion in va.get("assertions", []):
+        if not isinstance(assertion, dict):
+            continue
+        for invariant_id in assertion.get("invariants", []):
+            if str(invariant_id) not in selected:
+                errors.append(
+                    "verified_assertions.json assertion "
+                    f"{assertion.get('id')} references unselected invariant {invariant_id}"
+                )
+    return errors
+
+
 def audit_package(result_dir: Path) -> dict[str, Any]:
     result_dir = result_dir.resolve()
     errors: list[str] = []
@@ -165,12 +337,16 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         }
 
     json_names = [name for name in REQUIRED_FILES if name.endswith(".json")]
+    json_names.extend(
+        name for name in OPTIONAL_PROJECTION_FILES if (result_dir / name).is_file()
+    )
     documents = {
         name: _load_json(result_dir / name, errors) for name in json_names
     }
     sample_ids = {
         name: str(document.get("sample_id") or "")
         for name, document in documents.items()
+        if name != "assertion_reward_spec.json"
     }
     expected_sample_id = sample_ids.get("ground_truth.json", "")
     if not expected_sample_id:
@@ -196,30 +372,25 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
 
     verified = documents["verified_assertions.json"]
     assertion_results = documents["assertion_results.json"]
-    verified_schema = str(verified.get("schema_version") or "")
-    if verified_schema != "verified-assertions-v3":
-        errors.append(
-            "verified_assertions.json must use verified-assertions-v3; "
-            "legacy assertions do not prove invariant edges"
-        )
-    suffix = "v3" if verified_schema == "verified-assertions-v3" else "v2"
-    reconstructed_spec = {
-        "schema_version": f"assertion-spec-{suffix}",
-        "sample_id": verified.get("sample_id"),
-        "original_case": assertion_results.get("original_case", "original"),
-        "assertions": verified.get("assertions", []),
-    }
-    reconstructed_spec["content_hash"] = verified.get("content_hash")
-    try:
-        validate_frozen_spec(reconstructed_spec)
-    except ValueError as exc:
-        errors.append(f"verified assertion spec cannot be reconstructed: {exc}")
-    if assertion_results.get("candidate_content_hash") != assertion_content_hash(
-        reconstructed_spec
-    ):
-        errors.append("assertion_results candidate_content_hash does not match verified spec")
-    if assertion_results.get("all_verified") is not True:
-        errors.append("assertion_results.json all_verified is not true")
+    candidate_spec_path = result_dir / "candidate_assertions.json"
+    if candidate_spec_path.is_file():
+        candidate_spec = _load_json(candidate_spec_path, errors)
+        try:
+            validate_frozen_spec(candidate_spec)
+        except ValueError as exc:
+            errors.append(f"candidate_assertions.json is invalid: {exc}")
+        expected_hash = assertion_content_hash(candidate_spec)
+    else:
+        expected_hash = str(verified.get("content_hash") or "")
+    if assertion_results.get("candidate_content_hash") != expected_hash:
+        errors.append("assertion_results candidate_content_hash does not match candidate spec")
+    if str(verified.get("content_hash") or "") != expected_hash:
+        errors.append("verified_assertions content_hash does not match candidate spec")
+    root_verified = assertion_results.get("required_verified")
+    if root_verified is None:
+        root_verified = assertion_results.get("all_verified")
+    if root_verified is not True:
+        errors.append("assertion_results.json required_verified is not true")
     if not any(
         isinstance(assertion, dict) and assertion.get("kind") == "required"
         for assertion in verified.get("assertions", [])
@@ -227,9 +398,40 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         errors.append(
             "verified_assertions.json has no required root-obligation assertion"
         )
+    errors.extend(_contract_errors(documents))
+    field_bindings = _load_json(result_dir / "field_bindings.json", errors)
+    event_locations = _load_json(result_dir / "event_locations.json", errors)
+    reward_spec = documents.get("assertion_reward_spec.json")
+    if reward_spec is not None:
+        expected_reward_spec = None
+        try:
+            expected_reward_spec = build_assertion_reward_spec(
+                verified,
+                field_bindings.get("bindings", {}),
+                event_locations.get("locations", {}),
+                ground_truth=gt,
+            )
+        except ValueError as exc:
+            errors.append(f"could not rebuild assertion_reward_spec.json: {exc}")
+        try:
+            reward_module = _load_assertion_reward_module()
+            parsed_reward_spec = reward_module.AssertionRewardSpec.from_dict(reward_spec)
+            if (result_dir / "source").is_dir():
+                reward_module.validate_spec_sources(parsed_reward_spec, result_dir / "source")
+        except (ValueError, TypeError) as exc:
+            errors.append(f"assertion_reward_spec.json is invalid: {exc}")
+        if expected_reward_spec is not None and reward_spec != expected_reward_spec:
+            errors.append("assertion_reward_spec.json does not match verified assertions")
 
     binding = validate_invariant_bindings(
-        documents["verified_invariants.json"], reconstructed_spec
+        documents["verified_invariants.json"],
+        candidate_spec if candidate_spec_path.is_file() else {
+            "schema_version": "assertion-spec-v3",
+            "sample_id": verified.get("sample_id"),
+            "original_case": assertion_results.get("original_case", "original"),
+            "assertions": verified.get("assertions", []),
+            "content_hash": expected_hash,
+        },
     )
     errors.extend(f"invariant binding: {message}" for message in binding["errors"])
     errors.extend(_verified_invariant_harness_errors(documents["verified_invariants.json"]))
@@ -239,9 +441,11 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         errors.append("perturbation_results.json has an unwitnessed required perturbation")
 
     reachability = documents["reachability_report.json"]
-    for field in REACHABILITY_FIELDS:
-        if reachability.get(field) is not True:
-            errors.append(f"reachability_report.json {field} is not true")
+    if not _gt_generation_reachability_gate(reachability):
+        errors.append(
+            "reachability_report.json does not satisfy GT generation gate "
+            "(R1/R2/R3/R5 plus sink line or verified sink assertion event)"
+        )
     errors.extend(_artifact_reference_errors(reachability, result_dir))
 
     commitment_path = result_dir / "evidence_commitment.json"

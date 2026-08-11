@@ -109,7 +109,8 @@ branch conditions, order, and missing safety obligations.
 Name trace fields after recoverable source expressions or explicit semantic views such
 as `label_before`, `label_after`, and `free_argument`. Do not use opaque temporary names
 whose relation to source code exists only in instrumentation. The root criterion's
-`variable` must be the source expression represented by the required assertion operand.
+`operands` and structured `relation` must be the source expressions represented by the
+required assertion operands.
 
 The required assertion must recover the source-level conjunct that is absent from the
 vulnerable program relative to its existing checks. Do not replace it with an equivalent
@@ -139,7 +140,7 @@ fixed version as one operand of the before/after evidence. When the obligation i
 upstream of the sink (input rejected or corrected before the unsafe operation), it lives
 at that upstream site: the vulnerable version violates it there (or reaches the unsafe
 operation with it unmet) while the fixed version satisfies it, or per step 5 the fixed
-original is `guarded`/`not_exercised` and needs a genuine-witness perturbation. Do not
+original is `guarded`/`avoided`/`not_exercised` and needs a genuine-witness perturbation. Do not
 phrase the obligation as a derived relation measured at the sink (for example
 `buf_len >= read_len`) when it holds identically in the vulnerable and fixed runs: such an
 obligation distinguishes nothing and cannot verify. If the vulnerable and fixed
@@ -171,9 +172,12 @@ invented cases.
 
 ## Minimal assertion schema
 
-Top-level fields are only `schema_version`, `sample_id`, `original_case`,
-`content_hash`, and `assertions`. Each assertion has `id`, `invariants`, `kind`, `at`,
-`check`, and optional `protects`. `kind` is `observed`, `required`, or `transition`.
+`candidate_assertions.json` is the only artifact in this group that carries a protocol
+`schema_version`; `candidate_invariants.json`, `field_bindings.json`, and
+`event_locations.json` must not have artifact-level schema versions. Assertion top-level
+fields are only `schema_version`, `sample_id`, `original_case`, `content_hash`, and
+`assertions`. Each assertion has `id`, `invariants`, `kind`, `at`, `check`, and optional
+`protects`. `kind` is `observed`, `required`, or `transition`.
 A transition additionally has `from`, and its check must directly relate one
 `$from_event.field` to one `$at_event.field`; runtime order must be from before at.
 Checks are `[op, left, right]` with `eq`, `ne`, `lt`, `le`, `gt`, or `ge`; `$field`
@@ -190,8 +194,8 @@ an added guard that returns early, so probes hoisted above it fire on both sides
 and observe nothing about whether the operation ran.
 
 This matters most for the `protects` target. Its event is the evidence that the
-dangerous operation actually executed, which is what makes `guarded` -- predicate
-false, operation skipped -- the state a correct fix produces. A probe that fires
+dangerous operation actually executed, which is what makes `guarded`/`avoided` --
+operation skipped by a fixed-side guard -- the state a correct fix produces. A probe that fires
 before the guard can never produce it, and the sample fails as though the patch
 were wrong.
 
@@ -211,10 +215,12 @@ finishes. Write it to `<result_dir>/field_bindings.json`:
 
 ```json
 {
-  "schema_version": "field-bindings-v1",
   "sample_id": "<sample_id>",
   "bindings": {
-    "<event>.<field>": "<exact vulnerable-original source expression, e.g. asn1_com_prkey_attr[0].parm>"
+    "<event>.<field>": {
+      "expr": "<exact vulnerable-original source expression, e.g. asn1_com_prkey_attr[0].parm>",
+      "aliases": ["<same expression>", "<macro or spelling alias if applicable>"]
+    }
   }
 }
 ```
@@ -238,7 +244,6 @@ locatable position. Write it to `<result_dir>/event_locations.json`:
 
 ```json
 {
-  "schema_version": "event-locations-v1",
   "sample_id": "<sample_id>",
   "locations": {
     "<event_id>": {"function": "<real function name>", "file": "<path relative to the vulnerable repo root>", "line": <int, for audit only>}

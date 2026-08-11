@@ -60,10 +60,19 @@ def run_preflight(
 
     try:
         invariants = _load(invariants_path)
-        field_bindings = _load(field_bindings_path).get("bindings", {})
-        event_locations = _load(event_locations_path).get("locations", {})
+        field_bindings_doc = _load(field_bindings_path)
+        event_locations_doc = _load(event_locations_path)
+        field_bindings = field_bindings_doc.get("bindings", {})
+        event_locations = event_locations_doc.get("locations", {})
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return {"ok": False, "errors": [f"invalid assertion side map: {exc}"]}
+    for name, document in (
+        ("candidate_invariants.json", invariants),
+        ("field_bindings.json", field_bindings_doc),
+        ("event_locations.json", event_locations_doc),
+    ):
+        if "schema_version" in document:
+            errors.append(f"{name} must not contain artifact-level schema_version")
 
     binding = validate_invariant_bindings(invariants, spec)
     errors.extend(binding["errors"])

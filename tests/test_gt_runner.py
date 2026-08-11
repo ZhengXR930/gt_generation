@@ -254,14 +254,19 @@ def test_assertion_preflight_must_precede_runtime_traces(tmp_path):
                 },
             },
         )
+    root_node = {
+        "invariant_id": "root",
+        "role": "root_cause",
+        "file": "src/a.c",
+        "function": "parse",
+        "line": 10,
+        "operands": ["length", "capacity"],
+        "relation": {"op": "le", "left": "length", "right": "capacity"},
+        "verified": True,
+    }
     candidate_graph = {
-        "root_cause_criterion": {
-            "invariant_id": "root",
-            "file": "src/a.c",
-            "function": "parse",
-            "line": 10,
-        },
-        "nodes": [],
+        "root_cause_criterion": {"invariant_id": "root"},
+        "nodes": [root_node],
         "edges": [],
     }
     runner.write_json(tmp_path / "candidate_invariants.json", candidate_graph)
@@ -585,19 +590,27 @@ def test_stage_bounds_reject_unknown_and_reversed_ranges():
 
 def test_verified_graph_cannot_add_or_move_candidate_invariants():
     candidate = {
-        "root_cause_criterion": {
-            "invariant_id": "root",
-            "file": "src/a.c",
-            "function": "parse",
-            "line": 10,
-            "relation": "length <= capacity",
-        },
+        "root_cause_criterion": {"invariant_id": "root"},
         "nodes": [
             {
+                "invariant_id": "root",
+                "role": "root_cause",
+                "file": "src/a.c",
+                "function": "parse",
+                "line": 10,
+                "operands": ["length", "capacity"],
+                "relation": {"op": "le", "left": "length", "right": "capacity"},
+                "verified": True,
+            },
+            {
                 "invariant_id": "sink",
+                "role": "sink",
                 "file": "src/a.c",
                 "function": "parse",
                 "line": 20,
+                "operands": ["buf"],
+                "relation": {"op": "same_object", "left": "buf", "right": "buf"},
+                "verified": True,
             }
         ],
         "edges": [],
@@ -607,7 +620,7 @@ def test_verified_graph_cannot_add_or_move_candidate_invariants():
         "nodes": [],
     }
 
-    assert runner.verified_graph_is_candidate_subset(candidate, verified) is True
+    assert runner.verified_graph_is_candidate_subset(candidate, verified) is False
     verified["nodes"] = [
         {
             "invariant_id": "sink",
@@ -618,16 +631,15 @@ def test_verified_graph_cannot_add_or_move_candidate_invariants():
     ]
     assert runner.verified_graph_is_candidate_subset(candidate, verified) is False
     verified["nodes"] = []
-    verified["root_cause_criterion"] = {
-        **candidate["root_cause_criterion"],
-        "relation": "length > capacity",
-        "verified_by": "assertion.root",
-    }
+    verified["nodes"] = [
+        {
+            **candidate["nodes"][0],
+            "relation": {"op": "gt", "left": "length", "right": "capacity"},
+            "verified_by": "assertion.root",
+        }
+    ]
     assert runner.verified_graph_is_candidate_subset(candidate, verified) is False
-    verified["root_cause_criterion"] = {
-        **candidate["root_cause_criterion"],
-        "verified_by": "assertion.root",
-    }
+    verified["nodes"] = [{**candidate["nodes"][0], "verified_by": "assertion.root"}]
     assert runner.verified_graph_is_candidate_subset(candidate, verified) is True
 
 

@@ -8,7 +8,9 @@ from gt_generation.gt_toolkit import assertions as assertions_module
 from gt_generation.gt_toolkit.assertions import (
     annotate_scored_invariants,
     assertion_content_hash,
+    build_assertion_reward_spec,
     build_perturbation_results,
+    build_verified_invariants,
     build_verified_assertions,
     check_msan_offset,
     evaluate_assertion,
@@ -30,6 +32,61 @@ def _inputs():
     vulnerable = parse_trace_matrix((FIXTURE / "vulnerable_trace.txt").read_text())
     fixed = parse_trace_matrix((FIXTURE / "fixed_trace.txt").read_text())
     return spec, vulnerable, fixed
+
+
+def _contract_node(invariant_id, role, operands=None, relation=None):
+    operand_list = operands or [invariant_id]
+    if relation is None:
+        relation = {"op": "same_object", "left": operand_list[0], "right": operand_list[0]}
+    return {
+        "invariant_id": invariant_id,
+        "role": role,
+        "file": "src/parser.c",
+        "function": "parse",
+        "line": 10,
+        "operands": operand_list,
+        "relation": relation,
+        "verified": True,
+    }
+
+
+def _contract_edge(invariant_id, from_node, to_node, operands=None, relation=None):
+    operand_list = operands or ["value"]
+    if relation is None:
+        relation = {"op": "eq", "left": operand_list[0], "right": operand_list[0]}
+    return {
+        "invariant_id": invariant_id,
+        "type": "data",
+        "from_node": from_node,
+        "to_node": to_node,
+        "operands": operand_list,
+        "relation": relation,
+        "verified": True,
+    }
+
+
+def _root_node(invariant_id="root_cause_criterion"):
+    return _contract_node(
+        invariant_id,
+        "root_cause",
+        ["raw_count", "-3"],
+        {"op": "ge", "left": "raw_count", "right": "-3"},
+    )
+
+
+def _freeze_dict(spec):
+    spec["content_hash"] = assertion_content_hash(spec)
+    return spec
+
+
+def _minimal_v3_spec(assertions):
+    spec = {
+        "schema_version": "assertion-spec-v3",
+        "sample_id": "sample",
+        "original_case": "original",
+        "assertions": assertions,
+    }
+    return _freeze_dict(spec)
 
 
 def test_required_assertion_distinguishes_violation_guard_and_genuine_execution():
@@ -133,6 +190,47 @@ def test_assertion_cli_exits_nonzero_when_perturbation_gate_fails(tmp_path, monk
     perturbations = json.loads(perturbations_path.read_text())
     assert perturbations["needed"] is True
     assert perturbations["all_needed_witnessed"] is False
+
+
+def test_avoided_required_assertion_requests_genuine_perturbation():
+    spec = {
+        "schema_version": "assertion-spec-v3",
+        "sample_id": "avoided",
+        "original_case": "original",
+        "assertions": [
+            {
+                "id": "required.guard",
+                "invariants": ["root"],
+                "kind": "required",
+                "at": "guard",
+                "protects": "sink",
+                "check": ["eq", "$guard.is_separator", "$guard.branch_taken"],
+            }
+        ],
+    }
+    spec = _freeze_dict(spec)
+    vulnerable = parse_trace_matrix(
+        "CASE name=original rc=1 result=crash\n"
+        "ASSERT_EVT point=guard is_separator=1 branch_taken=0\n"
+        "ASSERT_EVT point=sink value=1\n"
+        "ENDCASE\n"
+    )
+    fixed = parse_trace_matrix(
+        "CASE name=original rc=0 result=clean\n"
+        "ASSERT_EVT point=guard is_separator=1 branch_taken=1\n"
+        "ENDCASE\n"
+    )
+
+    results = validate_assertions(spec, vulnerable, fixed)
+
+    required = results["assertions"][0]
+    assert required["matrix"]["fixed"]["original"]["status"] == "avoided"
+    assert required["verified"] is False
+    assert required["genuine_witness_case"] is None
+    assert "fixed original is avoided" in required["verification_error"]
+    perturbations = build_perturbation_results(spec, results)
+    assert perturbations["needed"] is True
+    assert perturbations["genuine_witness_cases"] == {"required.guard": None}
 
 
 def test_frozen_hash_detects_post_execution_rewrite():
@@ -256,6 +354,61 @@ def test_annotate_marks_eq_identity_flow_as_connectivity_not_scored():
     # sizeof(oid) > len + 1 is a real relation -> scored reasoning
     assert edges["I-DECL-TO-READ"]["scored"] is True
     assert edges["I-DECL-TO-READ"]["scored_role"] == "reasoning"
+
+
+def test_build_assertion_reward_spec_projects_source_expressions():
+    verified_assertions = {
+        "schema_version": "verified-assertions-v3",
+        "sample_id": "sample",
+        "assertions": [
+            {
+                "id": "REQ.bounds",
+                "kind": "required",
+                "at": "append",
+                "check": ["lt", "$append.index", "$append.capacity"],
+            },
+            {
+                "id": "OBS.bad_index",
+                "kind": "observed",
+                "at": "read",
+                "check": ["ge", "$read.index", "$read.zero_literal"],
+            },
+            {
+                "id": "TR.index_flow",
+                "kind": "transition",
+                "from": "append",
+                "at": "read",
+                "check": ["eq", "$append.index", "$read.index"],
+            },
+        ],
+    }
+    field_bindings = {
+        "append.index": "st->num_fields",
+        "append.capacity": "MAX_FIELDS",
+        "read.index": "i",
+    }
+    event_locations = {
+        "append": {"file": "parser.c", "function": "parse", "line": 10},
+        "read": {"file": "free.c", "function": "destroy", "line": 20},
+    }
+    ground_truth = {
+        "source": {"file": "input.c", "function": "entry", "line": 5},
+    }
+
+    spec = build_assertion_reward_spec(
+        verified_assertions, field_bindings, event_locations, ground_truth=ground_truth
+    )
+
+    assert spec["protocol"] == "assertion-reward-v1"
+    assert spec["admission"][0]["at"]["file"] == "input.c"
+    assert spec["claims"][0]["from"] is None
+    assert spec["claims"][0]["check"] == {
+        "op": "lt",
+        "left": "st->num_fields",
+        "right": "MAX_FIELDS",
+    }
+    assert spec["claims"][1]["check"]["right"] == "0"
+    assert spec["claims"][2]["from"] == event_locations["append"]
 
 
 def test_annotate_marks_observed_sink_inequality_as_mechanism():
@@ -411,14 +564,65 @@ def test_observed_assertions_reject_runtime_literal_answers():
 
 
 def test_binding_uses_one_direction_without_assertion_ids_in_invariants():
-    spec, _, _ = _inputs()
+    spec = _minimal_v3_spec([
+        {
+            "id": "observed.materialization",
+            "kind": "observed",
+            "at": "materialize",
+            "check": ["eq", "$materialize.stored_count", "$materialize.source_count"],
+            "invariants": ["node.materialization"],
+        },
+        {
+            "id": "observed.normalization",
+            "kind": "observed",
+            "at": "read",
+            "check": ["eq", "$read.read_count", "$read.normalized_count"],
+            "invariants": ["node.normalization"],
+        },
+        {
+            "id": "observed.read_size",
+            "kind": "observed",
+            "at": "read",
+            "check": ["gt", "$read.requested_bytes", "$read.destination_bytes"],
+            "invariants": ["node.read_size"],
+        },
+        {
+            "id": "transition.count_dataflow",
+            "kind": "transition",
+            "from": "source",
+            "at": "materialize",
+            "check": ["eq", "$source.source_count", "$materialize.stored_count"],
+            "invariants": ["edge.count_dataflow"],
+        },
+        {
+            "id": "required.raw_count_lower_bound",
+            "kind": "required",
+            "at": "range_decision",
+            "check": ["ge", "$range_decision.raw_count", "$range_decision.lower_bound"],
+            "invariants": ["root_cause_criterion"],
+        },
+    ])
     verified_invariants = {
         "nodes": [
-            {"invariant_id": "node.materialization"},
-            {"invariant_id": "node.normalization"},
-            {"invariant_id": "node.read_size"},
+            _contract_node("node.source", "source", ["source_count"]),
+            _contract_node("node.materialization", "intermediate", ["stored_count"]),
+            _contract_node("node.normalization", "intermediate", ["normalized_count"]),
+            _contract_node(
+                "node.read_size",
+                "sink",
+                ["requested_bytes", "destination_bytes"],
+                {"op": "gt", "left": "requested_bytes", "right": "destination_bytes"},
+            ),
+            _root_node(),
         ],
-        "edges": [{"invariant_id": "edge.count_dataflow"}],
+        "edges": [
+            _contract_edge(
+                "edge.count_dataflow",
+                "node.source",
+                "node.materialization",
+                ["source_count", "stored_count"],
+            )
+        ],
         "root_cause_criterion": {"invariant_id": "root_cause_criterion"},
     }
 
@@ -428,24 +632,51 @@ def test_binding_uses_one_direction_without_assertion_ids_in_invariants():
 
 
 def test_every_selected_reasoning_invariant_requires_assertion_coverage():
-    spec, _, _ = _inputs()
+    spec = _minimal_v3_spec([
+        {
+            "id": "observed.static_anchor",
+            "kind": "observed",
+            "at": "post_read",
+            "check": ["ne", "$post_read.before", "$post_read.after"],
+            "invariants": ["node.static_anchor"],
+        },
+        {
+            "id": "transition.dynamic",
+            "kind": "transition",
+            "from": "post_read",
+            "at": "decision",
+            "check": ["eq", "$post_read.dynamic_value", "$decision.dynamic_value"],
+            "invariants": ["edge.dynamic"],
+        },
+        {
+            "id": "required.root",
+            "kind": "required",
+            "at": "decision",
+            "check": ["ge", "$decision.raw_count", "$decision.lower_bound"],
+            "invariants": ["root"],
+        },
+    ])
     verified_invariants = {
-        "nodes": [{"invariant_id": "node.static_anchor", "verified": True}],
-        "edges": [{"invariant_id": "edge.dynamic", "verified": True}],
-        "root_cause_criterion": {"invariant_id": "root", "verified": True},
+        "nodes": [
+            _contract_node("node.static_anchor", "intermediate", ["static_anchor"]),
+            _root_node("root"),
+        ],
+        "edges": [
+            _contract_edge("edge.dynamic", "node.static_anchor", "root", ["dynamic_value"])
+        ],
+        "root_cause_criterion": {"invariant_id": "root"},
     }
-    spec["assertions"] = [
-        {**spec["assertions"][0], "invariants": ["node.static_anchor", "edge.dynamic"]},
-        {**spec["assertions"][-1], "invariants": ["root"]},
-    ]
     assert validate_invariant_bindings(verified_invariants, spec)["valid"] is True
-    spec["assertions"] = spec["assertions"][1:]
+    spec["assertions"] = [spec["assertions"][-1]]
+    spec["content_hash"] = assertion_content_hash(spec)
     result = validate_invariant_bindings(verified_invariants, spec)
     assert result["valid"] is False
-    assert result["errors"] == [
-        "invariant edge.dynamic has no assertion",
-        "invariant node.static_anchor has no assertion",
-    ]
+    assert "invariant edge.dynamic has no assertion" in result["errors"]
+    assert "invariant node.static_anchor has no assertion" in result["errors"]
+    assert (
+        "edge edge.dynamic requires exactly one transition assertion; got []"
+        in result["errors"]
+    )
 
 
 def test_verified_invariant_file_rejects_false_null_and_refuted_entries():
@@ -453,15 +684,22 @@ def test_verified_invariant_file_rejects_false_null_and_refuted_entries():
     data = {
         "nodes": [{
             "invariant_id": "node.materialization",
+            "role": "intermediate",
+            "operands": ["stored_count"],
+            "relation": {"op": "same_object", "left": "stored_count", "right": "stored_count"},
             "verified": None,
         }],
         "edges": [{
             "invariant_id": "edge.count_dataflow",
+            "type": "data",
+            "from_node": "node.materialization",
+            "to_node": "root_cause_criterion",
+            "operands": ["stored_count"],
+            "relation": {"op": "same_object", "left": "stored_count", "right": "stored_count"},
             "verified": False,
         }],
         "root_cause_criterion": {
             "invariant_id": "root_cause_criterion",
-            "verified": True,
         },
         "refuted": [],
     }
@@ -470,6 +708,138 @@ def test_verified_invariant_file_rejects_false_null_and_refuted_entries():
     assert "verified_invariants.json must not contain a refuted section" in result["errors"]
     assert "node invariant node.materialization is not verified" in result["errors"]
     assert "edge invariant edge.count_dataflow is not verified" in result["errors"]
+
+
+def test_binding_allows_unverified_propagation_subset_but_keeps_root_required():
+    spec = _minimal_v3_spec([
+        {
+            "id": "observed.read_size",
+            "kind": "observed",
+            "at": "read",
+            "check": ["gt", "$read.requested_bytes", "$read.destination_bytes"],
+            "invariants": ["node.read_size"],
+        },
+        {
+            "id": "required.raw_count_lower_bound",
+            "kind": "required",
+            "at": "range_decision",
+            "check": ["ge", "$range_decision.raw_count", "$range_decision.lower_bound"],
+            "invariants": ["root_cause_criterion"],
+        },
+    ])
+    data = {
+        "nodes": [
+            _contract_node("node.materialization", "source", ["stored_count"]),
+            _root_node(),
+            _contract_node(
+                "node.read_size",
+                "sink",
+                ["requested_bytes", "destination_bytes"],
+                {"op": "gt", "left": "requested_bytes", "right": "destination_bytes"},
+            ),
+        ],
+        "edges": [
+            {
+                **_contract_edge(
+                    "edge.count_dataflow",
+                    "node.materialization",
+                    "node.read_size",
+                    ["stored_count"],
+                ),
+                "invariant_id": "edge.count_dataflow",
+                "verified": False,
+                "verification_status": "omitted_not_runtime_verified",
+            },
+        ],
+        "root_cause_criterion": {
+            "invariant_id": "root_cause_criterion",
+        },
+    }
+
+    result = validate_invariant_bindings(data, spec)
+
+    assert result["valid"] is True
+    assert result["skipped_unverified"] == ["edge.count_dataflow"]
+
+
+def test_binding_rejects_required_assertion_when_root_is_filtered_out():
+    spec = _minimal_v3_spec([
+        {
+            "id": "required.raw_count_lower_bound",
+            "kind": "required",
+            "at": "range_decision",
+            "check": ["ge", "$range_decision.raw_count", "$range_decision.lower_bound"],
+            "invariants": ["root_cause_criterion"],
+        },
+    ])
+    root = _contract_node("root_cause_criterion", "root_cause", ["raw_count"])
+    root.pop("relation")
+    data = {
+        "nodes": [
+            root,
+        ],
+        "edges": [],
+        "root_cause_criterion": {
+            "invariant_id": "root_cause_criterion",
+        },
+    }
+
+    result = validate_invariant_bindings(data, spec)
+
+    assert result["valid"] is False
+    assert (
+        "node invariant root_cause_criterion missing relation"
+    ) in result["errors"]
+
+
+def test_build_verified_invariants_preserves_source_identity_and_edge_endpoints():
+    candidate = {
+        "schema_version": "legacy-must-be-dropped",
+        "sample_id": "sample",
+        "nodes": [
+            _contract_node("node.source", "source", ["input"]),
+            _root_node("node.root"),
+            _contract_node("node.sink", "sink", ["dst"]),
+            _contract_node("node.unverified", "intermediate", ["tmp"]),
+        ],
+        "edges": [
+            _contract_edge("edge.root_to_sink", "node.root", "node.sink", ["dst"]),
+            _contract_edge("edge.unverified", "node.source", "node.unverified", ["tmp"]),
+        ],
+        "root_cause_criterion": {
+            "invariant_id": "node.root",
+            "file": "src/old.c",
+            "line": 99,
+        },
+    }
+    results = {
+        "assertions": [
+            {"id": "required.root", "kind": "required", "verified": True, "invariants": ["node.root"]},
+            {
+                "id": "transition.root_to_sink",
+                "kind": "transition",
+                "verified": True,
+                "invariants": ["edge.root_to_sink"],
+            },
+            {
+                "id": "transition.unverified",
+                "kind": "transition",
+                "verified": False,
+                "invariants": ["edge.unverified"],
+            },
+        ]
+    }
+
+    verified = build_verified_invariants(candidate, results)
+
+    assert "schema_version" not in verified
+    assert verified["root_cause_criterion"] == {"invariant_id": "node.root"}
+    assert {node["invariant_id"] for node in verified["nodes"]} == {
+        "node.source",
+        "node.root",
+        "node.sink",
+    }
+    assert [edge["invariant_id"] for edge in verified["edges"]] == ["edge.root_to_sink"]
 
 
 def test_v3_transition_assertion_verifies_ordered_cross_event_value_flow():
@@ -570,13 +940,25 @@ def test_v3_transition_must_compare_fields_from_both_endpoints():
 def test_v3_binding_requires_one_dedicated_transition_per_edge():
     invariants = {
         "nodes": [
-            {"invariant_id": "node.corrupted", "verified": True},
-            {"invariant_id": "node.sink", "verified": True},
+            _contract_node("node.source", "source", ["input"]),
+            _contract_node(
+                "node.corrupted",
+                "intermediate",
+                ["label_before", "label_after"],
+                {"op": "ne", "left": "label_before", "right": "label_after"},
+            ),
+            _contract_node("node.sink", "sink", ["free_argument"]),
+            _root_node("root.required"),
         ],
         "edges": [
-            {"invariant_id": "edge.corruption_to_sink", "verified": True},
+            _contract_edge(
+                "edge.corruption_to_sink",
+                "node.corrupted",
+                "node.sink",
+                ["label_after", "free_argument"],
+            ),
         ],
-        "root_cause_criterion": {"invariant_id": "root.required", "verified": True},
+        "root_cause_criterion": {"invariant_id": "root.required"},
     }
     assertions = [
         {
@@ -623,10 +1005,16 @@ def test_v3_binding_requires_one_dedicated_transition_per_edge():
 
 def test_v3_transition_cannot_claim_multiple_edges():
     invariants = {
+        "nodes": [
+            _contract_node("node.source", "source", ["value"]),
+            _root_node("node.root"),
+            _contract_node("node.sink", "sink", ["value"]),
+        ],
         "edges": [
-            {"invariant_id": "edge.one", "verified": True},
-            {"invariant_id": "edge.two", "verified": True},
-        ]
+            _contract_edge("edge.one", "node.source", "node.root", ["value"]),
+            _contract_edge("edge.two", "node.root", "node.sink", ["value"]),
+        ],
+        "root_cause_criterion": {"invariant_id": "node.root"},
     }
     assertion = {
         "id": "transition.overclaimed",

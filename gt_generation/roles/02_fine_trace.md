@@ -45,12 +45,18 @@ operation and its sink are reached. Every noninitial step has typed `depends_on`
 (`data`, `control`, or lifetime-only `order`), but an edge may skip over ordinary call
 plumbing.
 
-Do not emit `role`, `kind`, or an open-ended semantic label on coarse- or fine-trace
-steps. The top-level `source`, `root_cause`, and `sink` objects are the only semantic
-anchors; each has a `trace_step` integer that directly names its exact fine-trace node.
-Everything between them is simply an ordered trace step; its exact semantics belong in
-`code`, `var`, the concise `note`, and typed `depends_on` edges. A coarse-trace step is
-only a function-level waypoint with `step`, `file`, `function`, and `summary`.
+Do not emit `coarse_trace`, `role`, `kind`, or an open-ended semantic label on
+fine-trace steps. The top-level `source`, `root_cause`, and `sink` objects are the
+only semantic anchors; each has a `trace_step` integer that directly names its exact
+fine-trace node. Everything between them is simply an ordered trace step; its exact
+semantics belong in `code`, `var`, the concise `note`, and typed `depends_on` edges.
+`coarse_trace` is not part of the GT contract.
+
+Each top-level `source`, `root_cause`, and `sink` anchor must include
+`operands`, a non-empty array of source-expression strings. `root_cause` and `sink`
+must also include `relation` as `{ "op": "...", "left": "...", "right": "..." }`.
+Use the same source expression spelling that appears in the vulnerable code; Stage 04
+will bind assertion operands to these expressions.
 
 `source` is the first *project-code* statement that consumes attacker-controlled input
 and creates vulnerability-relevant data or state: a parser/load/read/materialization
