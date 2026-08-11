@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import operator
 import os
@@ -18,6 +19,7 @@ from typing import Any
 _IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 _DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)(.*)$")
 _COMMENT_RE = re.compile(r"/\*.*?\*/|//.*?$", re.DOTALL | re.MULTILINE)
+_STRING_OR_CHAR_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _C_INT_SUFFIX_RE = re.compile(r"\b(0[xX][0-9A-Fa-f]+|\d+)(?:[uUlL]+)\b")
 _NON_MACRO_IDENTIFIERS = {
     "sizeof",
@@ -26,6 +28,27 @@ _NON_MACRO_IDENTIFIERS = {
     "true",
     "false",
     "NULL",
+}
+_C_TYPE_KEYWORDS = {
+    "char",
+    "const",
+    "double",
+    "enum",
+    "float",
+    "int",
+    "long",
+    "short",
+    "signed",
+    "size_t",
+    "static",
+    "struct",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "uint8_t",
+    "uintptr_t",
+    "unsigned",
+    "void",
 }
 
 
@@ -91,6 +114,31 @@ def _looks_safe_object_macro(value: str) -> bool:
     )
 
 
+def _looks_compile_time_macro_value(value: str) -> bool:
+    text = _code_view(value)
+    if not text:
+        return False
+    if any(token in text for token in ("->", ".", "[", "]", "++", "--", "=", ";", "{", "}")):
+        return False
+    if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\(", text):
+        return False
+    for match in _IDENT_RE.finditer(text):
+        name = match.group(0)
+        if name in _NON_MACRO_IDENTIFIERS or name in _C_TYPE_KEYWORDS:
+            continue
+        if _is_strong_macro_token(name):
+            continue
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_\s()+\-*/%<>=!&|^~?:,]+", text))
+
+
+def _macro_has_constant_value(macro: Macro, macros: dict[str, Macro]) -> bool:
+    if not _looks_compile_time_macro_value(macro.value):
+        return False
+    expanded = expand_macro_value(macro.value, macros)
+    return _looks_compile_time_macro_value(expanded)
+
+
 def _parse_macro_definitions(text: str) -> dict[str, Macro]:
     macros: dict[str, Macro] = {}
     for raw_line in text.splitlines():
@@ -108,21 +156,64 @@ def _parse_macro_definitions(text: str) -> dict[str, Macro]:
     return macros
 
 
+def _blank_matches(pattern: re.Pattern[str], text: str) -> str:
+    return pattern.sub(lambda match: " " * len(match.group(0)), text)
+
+
+def _code_view(expr: str) -> str:
+    return _blank_matches(_STRING_OR_CHAR_RE, _blank_matches(_COMMENT_RE, expr))
+
+
+def _previous_nonspace(text: str, index: int) -> tuple[str, int]:
+    pos = index - 1
+    while pos >= 0 and text[pos].isspace():
+        pos -= 1
+    return (text[pos] if pos >= 0 else "", pos)
+
+
+def _next_nonspace(text: str, index: int) -> tuple[str, int]:
+    pos = index
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    return (text[pos] if pos < len(text) else "", pos)
+
+
+def _is_member_identifier(text: str, start: int) -> bool:
+    prev, prev_pos = _previous_nonspace(text, start)
+    if prev == ".":
+        return True
+    if prev == ">" and prev_pos > 0 and text[prev_pos - 1] == "-":
+        return True
+    if prev == ":" and prev_pos > 0 and text[prev_pos - 1] == ":":
+        return True
+    return False
+
+
+def _is_strong_macro_token(name: str) -> bool:
+    stripped = name.strip("_")
+    if not stripped:
+        return False
+    if stripped.upper() == stripped and any(ch.isalpha() for ch in stripped):
+        return True
+    if name.startswith("k") and len(name) > 1 and name[1].isupper():
+        return True
+    return bool(re.fullmatch(r"[A-Z][A-Za-z0-9]*_[A-Za-z0-9_]+", name))
+
+
 def _candidate_macro_tokens(expr: str) -> set[str]:
     tokens: set[str] = set()
-    for match in _IDENT_RE.finditer(expr):
+    code = _code_view(expr)
+    for match in _IDENT_RE.finditer(code):
         name = match.group(0)
         if name in _NON_MACRO_IDENTIFIERS:
+            continue
+        if _is_member_identifier(code, match.start()):
+            continue
+        next_char, _ = _next_nonspace(code, match.end())
+        if next_char == "(":
+            continue
+        if _is_strong_macro_token(name):
             tokens.add(name)
-            continue
-        if not any(ch.isupper() for ch in name):
-            continue
-        index = match.end()
-        while index < len(expr) and expr[index].isspace():
-            index += 1
-        if index < len(expr) and expr[index] == "(":
-            continue
-        tokens.add(name)
     return tokens
 
 
@@ -310,11 +401,16 @@ def _search_static_macros_once(
     allow_tree_scan: bool,
 ) -> dict[str, Macro]:
     lines = _parse_define_lines_from_files(nearby_files, tokens)
-    if not lines and allow_tree_scan:
-        lines = _rg_define_lines(source_root, tokens)
-    if not lines and allow_tree_scan:
-        lines = _walk_define_lines(source_root, tokens)
-    return _parse_static_macro_lines(lines)
+    macros = _parse_static_macro_lines(lines)
+    remaining = tokens - set(macros)
+    if remaining and allow_tree_scan:
+        rg_lines = _rg_define_lines(source_root, remaining)
+        macros.update(_parse_static_macro_lines(rg_lines))
+        remaining = tokens - set(macros)
+    if remaining and allow_tree_scan:
+        walk_lines = _walk_define_lines(source_root, remaining)
+        macros.update(_parse_static_macro_lines(walk_lines))
+    return macros
 
 
 def _find_static_macros_for_tokens(
@@ -365,6 +461,37 @@ def _merge_macros(primary: dict[str, Macro], fallback: dict[str, Macro]) -> dict
     return merged
 
 
+def _git_stdout(args: list[str], cwd: Path | None = None, timeout: int = 30) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _checkout_matches_commit(path: Path, commit: str) -> bool:
+    if not path.is_dir():
+        return False
+    if not commit:
+        return True
+    head = _git_stdout(["-C", str(path), "rev-parse", "HEAD"])
+    if not head:
+        return False
+    expected = _git_stdout(["-C", str(path), "rev-parse", commit])
+    if not expected:
+        return head.startswith(commit) or commit.startswith(head)
+    return head == expected
+
+
 def _normalize_alias(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").strip())
 
@@ -387,6 +514,8 @@ def _expand_macros_once(expr: str, macros: dict[str, Macro], fully_expanded: boo
         name = match.group(0)
         macro = macros.get(name)
         if macro is None:
+            return name
+        if not _macro_has_constant_value(macro, macros):
             return name
         value = expand_macro_value(macro.value, macros) if fully_expanded else macro.value
         return value
@@ -532,16 +661,27 @@ def alias_variants_for_expr(expr: str, macros: dict[str, Macro]) -> list[str]:
 def _candidate_source_roots(result_dir: Path, explicit_roots: list[Path]) -> list[Path]:
     roots: list[Path] = []
     roots.extend(explicit_roots)
+    info_path = result_dir / "sample_info.json"
+    sample_info = _load_json(info_path) if info_path.is_file() else {}
+    vulnerable_commit = str(
+        sample_info.get("vulnerable_commit")
+        or sample_info.get("vul_commit")
+        or ""
+    ).strip()
     for candidate in (
         result_dir / "source",
+        result_dir / "_work" / "src",
         result_dir / "repo-vul" / "src-vul",
         result_dir / "workspace" / "repo-vul" / "src-vul",
     ):
-        if candidate.is_dir():
+        if candidate.is_dir() and (
+            candidate in explicit_roots
+            or candidate.name != "src"
+            or candidate.parent.name != "_work"
+            or _checkout_matches_commit(candidate, vulnerable_commit)
+        ):
             roots.append(candidate)
 
-    info_path = result_dir / "sample_info.json"
-    sample_info = _load_json(info_path) if info_path.is_file() else {}
     sample_id = str(sample_info.get("sample_id") or result_dir.name)
     project = str(sample_info.get("project") or "")
     if sample_id.startswith("arvo_"):
@@ -565,6 +705,72 @@ def _candidate_source_roots(result_dir: Path, explicit_roots: list[Path]) -> lis
         seen.add(real)
         resolved.append(real)
     return resolved
+
+
+def _source_cache_root() -> Path:
+    configured = os.environ.get("GT_SOURCE_CACHE", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".cache" / "gt_generation" / "source_checkouts"
+
+
+def _source_cache_path(sample_info: dict[str, Any], result_dir: Path) -> Path:
+    sample_id = str(sample_info.get("sample_id") or result_dir.name)
+    repo = str(sample_info.get("repo") or sample_info.get("repo_url") or "").strip()
+    commit = str(
+        sample_info.get("vulnerable_commit")
+        or sample_info.get("vul_commit")
+        or ""
+    ).strip()
+    digest = hashlib.sha1(f"{repo}\n{commit}".encode("utf-8")).hexdigest()[:12]
+    safe_sample = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_id)
+    return _source_cache_root() / f"{safe_sample}-{digest}"
+
+
+def _ensure_vulnerable_source_checkout(sample_info: dict[str, Any], result_dir: Path) -> Path | None:
+    sample_id = str(sample_info.get("sample_id") or result_dir.name)
+    if sample_id.startswith("arvo_"):
+        return None
+
+    repo = str(sample_info.get("repo") or sample_info.get("repo_url") or "").strip()
+    commit = str(
+        sample_info.get("vulnerable_commit")
+        or sample_info.get("vul_commit")
+        or ""
+    ).strip()
+    if not repo or not commit or shutil.which("git") is None:
+        return None
+
+    cache_path = _source_cache_path(sample_info, result_dir)
+    if _checkout_matches_commit(cache_path, commit):
+        return cache_path
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if cache_path.exists() and not (cache_path / ".git").is_dir():
+        shutil.rmtree(cache_path, ignore_errors=True)
+
+    if not cache_path.exists():
+        try:
+            proc = subprocess.run(
+                ["git", "clone", "--no-checkout", repo, str(cache_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1800,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            shutil.rmtree(cache_path, ignore_errors=True)
+            return None
+    else:
+        _git_stdout(["-C", str(cache_path), "fetch", "--all", "--tags", "--prune"], timeout=1800)
+
+    if _git_stdout(["-C", str(cache_path), "checkout", "-q", commit], timeout=300) is None:
+        return None
+    if _checkout_matches_commit(cache_path, commit):
+        return cache_path
+    return None
 
 
 def _resolve_source_file(
@@ -641,7 +847,7 @@ def _macros_for_source(
         static_cache,
         searched_cache,
         recursive_dependencies=False,
-        allow_tree_scan=False,
+        allow_tree_scan=source_file is not None,
     )
     return _merge_macros(primary, fallback)
 
@@ -670,6 +876,7 @@ def augment_field_bindings(
     searched_cache: dict[Path, set[str]] = {}
     pp_cache: dict[Path, dict[str, Macro]] = {}
     updates: list[BindingUpdate] = []
+    cache_source_root: Path | None = None
 
     for key, raw_value in sorted(bindings.items()):
         key_text = str(key)
@@ -696,6 +903,14 @@ def augment_field_bindings(
         event = key_text.rsplit(".", 1)[0] if "." in key_text else key_text
         location = locations.get(event) if isinstance(locations.get(event), dict) else {}
         source_file = _resolve_source_file(str(location.get("file") or ""), roots, project)
+        if source_file is None and cache_source_root is None:
+            cache_source_root = _ensure_vulnerable_source_checkout(sample_info, result_dir)
+            if cache_source_root is not None:
+                roots = _candidate_source_roots(result_dir, [*(source_roots or []), cache_source_root])
+                source_file = _resolve_source_file(str(location.get("file") or ""), roots, project)
+        elif source_file is None and cache_source_root is not None and cache_source_root not in roots:
+            roots = _candidate_source_roots(result_dir, [*(source_roots or []), cache_source_root])
+            source_file = _resolve_source_file(str(location.get("file") or ""), roots, project)
         macros = _macros_for_source(
             source_file,
             roots,
@@ -726,6 +941,7 @@ def augment_field_bindings(
         "result_dir": str(result_dir),
         "sample_id": field_doc.get("sample_id") or result_dir.name,
         "source_roots": [str(root) for root in roots],
+        "cache_source_root": str(cache_source_root) if cache_source_root else None,
         "updated": len(updates),
         "dry_run": dry_run,
         "use_preprocessor": use_preprocessor,
