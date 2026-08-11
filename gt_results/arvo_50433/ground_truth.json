@@ -31,7 +31,17 @@
     "code": "uint8_t* chunk = malloc(nbytes + BLOSC2_MAX_OVERHEAD);",
     "description": "First project-side materialization of attacker-derived size into the heap buffer that is later overrun by the header's `bstarts` table.",
     "value_from": "The staged `poc` at `gt_results/arvo_50433/poc` is exactly 2 bytes: `5b 21`. In `tests/fuzz/fuzz_compress_frame.c`, the only loop iteration reduces `chunksize` to `size - i = 2` before calling `blosc2_schunk_append_buffer`, so `nbytes == 2` here and the allocation size becomes `2 + BLOSC2_MAX_OVERHEAD = 34`. Earlier in the same fuzz iteration, byte `0x5b` made `cparams.clevel = data[0] % 10 = 1`, so the `schunk->cctx` used by this append call will later keep `write_compression_header()` out of the `clevel == 0` memcpy path.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "chunk",
+      "nbytes"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "chunk",
+      "right": "chunk",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "tainted_value_origin": {
     "file": "blosc/blosc2.c",
@@ -40,7 +50,13 @@
     "var": "context->dest, context->destsize, context->sourcesize, context->clevel",
     "code": "context->dest = (uint8_t*)dest;\ncontext->output_bytes = 0;\ncontext->destsize = destsize;\ncontext->sourcesize = srcsize;\ncontext->clevel = clevel;",
     "description": "This is where the attacker-derived destination extent (`34`), source size (`2`), and previously configured compression level (`1`) become the active compression-context state consumed by block tuning, header layout, and the later non-memcpy decision.",
-    "value_from": "For the saved witness, `dest` points to the 34-byte heap allocation from step 1, `srcsize == 2`, `destsize == 34`, and `clevel == 1` because the fuzzer created `schunk->cctx` from `cparams.clevel = 0x5b % 10` before the append call."
+    "value_from": "For the saved witness, `dest` points to the 34-byte heap allocation from step 1, `srcsize == 2`, `destsize == 34`, and `clevel == 1` because the fuzzer created `schunk->cctx` from `cparams.clevel = 0x5b % 10` before the append call.",
+    "operands": [
+      "context->dest",
+      "context->destsize",
+      "context->sourcesize",
+      "context->clevel"
+    ]
   },
   "sink": {
     "file": "blosc/blosc-private.h",
@@ -50,7 +66,16 @@
     "code": "*(int32_t *)dest_ = a;",
     "description": "AddressSanitizer crash site. The 4-byte little-endian store writes the first block-start offset into `chunk + 32` even though the heap allocation is only 34 bytes long.",
     "note": "In the saved ASan run, `dest_ == chunk + 32` and `a == 36`, so this store spans bytes 32-35 of the 34-byte region `[chunk, chunk + 34)`. The sanitizer reports `WRITE of size 4` at `blosc/blosc-private.h:128:23` with stack `_sw32 -> serial_blosc -> do_job`.",
-    "trace_step": 10
+    "trace_step": 10,
+    "operands": [
+      "context->bstarts",
+      "dest_"
+    ],
+    "relation": {
+      "op": "eq",
+      "left": "context->bstarts",
+      "right": "dest_"
+    }
   },
   "root_cause": {
     "file": "blosc/blosc2.c",
@@ -60,7 +85,16 @@
     "code": "if (context->clevel == 0) {\n  context->header_flags |= (uint8_t)BLOSC_MEMCPYED;\n}\nbool memcpyed = context->header_flags & (uint8_t)BLOSC_MEMCPYED;",
     "description": "Root cause. The vulnerable header builder only marks the chunk as memcpy-only when `clevel == 0`; it omits the patch's missing `context->sourcesize < BLOSC_MIN_BUFFERSIZE` check, so the witnessed 2-byte buffer is handled as a normal compressed chunk and later gets a `bstarts` table that does not fit.",
     "note": "For this witness `clevel == 1` and `sourcesize == 2`, so `memcpyed` remains false even though the input is far below the small-buffer threshold. The fix inserts `if (context->sourcesize < BLOSC_MIN_BUFFERSIZE) { context->header_flags |= (uint8_t)BLOSC_MEMCPYED; }` at this point.",
-    "trace_step": 5
+    "trace_step": 5,
+    "operands": [
+      "1",
+      "memcpyed"
+    ],
+    "relation": {
+      "op": "eq",
+      "left": "1",
+      "right": "memcpyed"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -71,38 +105,6 @@
       "description": "For the 2-byte witness the fuzz loop executes exactly once, reduces `chunksize` to `2`, and enters project compression through `blosc2_schunk_append_buffer`. The same iteration already set `cparams.clevel = 1` from byte `0x5b`, and the saved ASan stack confirms the crash descends from this append call."
     }
   },
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "blosc/schunk.c",
-      "function": "blosc2_schunk_append_buffer",
-      "summary": "The 2-byte witness reaches the project compressor as a single append call, and c-blosc2 allocates a 34-byte heap buffer (`2 + BLOSC2_MAX_OVERHEAD`) to hold the compressed chunk."
-    },
-    {
-      "step": 2,
-      "file": "blosc/blosc2.c / blosc/stune.c",
-      "function": "initialize_context_compression / blosc_stune_next_blocksize / blosc2_calculate_blocks",
-      "summary": "The active compression context is initialized with `sourcesize = 2`, `destsize = 34`, and `clevel = 1`; automatic tuning clamps `blocksize` to 2 and the block calculator derives `nblocks = 1`."
-    },
-    {
-      "step": 3,
-      "file": "blosc/blosc2.c",
-      "function": "write_compression_header",
-      "summary": "Because the vulnerable code lacks the small-buffer `BLOSC_MEMCPYED` guard, the extended-header path leaves `memcpyed` false and lays out `bstarts = dest + 32` with `output_bytes = 36` inside the 34-byte buffer."
-    },
-    {
-      "step": 4,
-      "file": "blosc/blosc2.c",
-      "function": "blosc_compress_context / do_job / serial_blosc",
-      "summary": "The non-memcpy compression path enters `do_job()`, takes the serial branch, and immediately calls `_sw32(bstarts + 0, 36)` on the first and only block."
-    },
-    {
-      "step": 5,
-      "file": "blosc/blosc-private.h",
-      "function": "_sw32",
-      "summary": "The 4-byte store to `dest + 32` overruns the 34-byte heap allocation by 2 bytes and matches the saved ASan crash."
-    }
-  ],
   "fine_trace": [
     {
       "step": 1,

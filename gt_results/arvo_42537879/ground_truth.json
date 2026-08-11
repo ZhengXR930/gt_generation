@@ -26,7 +26,7 @@
   "bug_description": {
     "original": "OSS-Fuzz issue 42537879 (gpsd): Use-of-uninitialized-value found by fuzz target FuzzPacket [msan]. https://issues.oss-fuzz.com/issues/42537879",
     "original_source": "sample_info.json / sanitizer_trace.txt / default_crash_trace.txt / reproduction_report.json / patch.diff / staged vulnerable source snapshot / staged poc",
-      "normalized": "The exact staged 12-byte witness is `01 20 ba ce 00 00 20 20 20 20 20 20`. `packet_parse()` first feeds the prefix `01 20` into `nextstate()`'s `SUPERSTAR2` logic: `0x01` selects `SUPERSTAR2_LEADER`, `0x20` is saved in `ctmp`, and the following `0xba` fails the complement check, so `character_pushback()` rewinds only one byte and restarts parsing at that same `0xba` without discarding the earlier two prefix bytes from `lexer->inbuffer[0..1]`. Reprocessing from the pushed-back `0xba`, the remaining 10 bytes are accepted as a zero-payload CASIC packet, so `packet_parse()` reaches `CASIC_RECOGNIZED` with `inbufptr - inbuffer == 12`. Vulnerable code then assumes the CASIC packet starts at `inbuffer[0]` and executes `data_len = getleu16(lexer->inbuffer, 2)`, which misreads the leader bytes `ba ce` as `data_len = 0xceba` (52922) instead of the real zero payload length stored at offsets 4 and 5. Because the vulnerable code lacks the later patch guard `if (inbuflen < (data_len + 10))`, it first passes that bogus length to `casic_checksum(lexer->inbuffer + 2, data_len + 4)`. `casic_checksum()` then adds 4-byte words sequentially from `lexer->inbuffer + 2` for 52926 bytes, so that walk runs far past the 12-byte witness, through later `gps_lexer_t` fields including `lexer->errout`, and beyond the `inbuffer` array. `lexer->errout` was structure-copied from the harness's uninitialized `errout`, and the harness later writes only `lexer.errout.debug = 0`; those copied bytes first become causally relevant when the oversized checksum walk reaches them and contaminates `crc_computed`. Vulnerable code then performs a second unchecked far-offset read `getleu32(lexer->inbuffer, data_len + 6)` for `crc_expected`. The branch `if (crc_computed == crc_expected)` at `packet_parse():2372` is therefore the saved MemorySanitizer `use-of-uninitialized-value` sink. The staged patch resolves this exact path by inserting `if (inbuflen < (data_len + 10))` before the checksum reads, which rejects the misparsed `0xceba` length against `inbuflen == 12`."
+    "normalized": "The exact staged 12-byte witness is `01 20 ba ce 00 00 20 20 20 20 20 20`. `packet_parse()` first feeds the prefix `01 20` into `nextstate()`'s `SUPERSTAR2` logic: `0x01` selects `SUPERSTAR2_LEADER`, `0x20` is saved in `ctmp`, and the following `0xba` fails the complement check, so `character_pushback()` rewinds only one byte and restarts parsing at that same `0xba` without discarding the earlier two prefix bytes from `lexer->inbuffer[0..1]`. Reprocessing from the pushed-back `0xba`, the remaining 10 bytes are accepted as a zero-payload CASIC packet, so `packet_parse()` reaches `CASIC_RECOGNIZED` with `inbufptr - inbuffer == 12`. Vulnerable code then assumes the CASIC packet starts at `inbuffer[0]` and executes `data_len = getleu16(lexer->inbuffer, 2)`, which misreads the leader bytes `ba ce` as `data_len = 0xceba` (52922) instead of the real zero payload length stored at offsets 4 and 5. Because the vulnerable code lacks the later patch guard `if (inbuflen < (data_len + 10))`, it first passes that bogus length to `casic_checksum(lexer->inbuffer + 2, data_len + 4)`. `casic_checksum()` then adds 4-byte words sequentially from `lexer->inbuffer + 2` for 52926 bytes, so that walk runs far past the 12-byte witness, through later `gps_lexer_t` fields including `lexer->errout`, and beyond the `inbuffer` array. `lexer->errout` was structure-copied from the harness's uninitialized `errout`, and the harness later writes only `lexer.errout.debug = 0`; those copied bytes first become causally relevant when the oversized checksum walk reaches them and contaminates `crc_computed`. Vulnerable code then performs a second unchecked far-offset read `getleu32(lexer->inbuffer, data_len + 6)` for `crc_expected`. The branch `if (crc_computed == crc_expected)` at `packet_parse():2372` is therefore the saved MemorySanitizer `use-of-uninitialized-value` sink. The staged patch resolves this exact path by inserting `if (inbuflen < (data_len + 10))` before the checksum reads, which rejects the misparsed `0xceba` length against `inbuflen == 12`."
   },
   "source": {
     "file": "gpsd/packet.c",
@@ -37,7 +37,16 @@
     "description": "First non-harness parser step on the vulnerable path. The first witness byte `0x01` is consumed as `SOH`, which diverts parsing into the `SUPERSTAR2` state machine instead of leaving the prefix in ordinary ground-state discard logic.",
     "value_from": "The staged `poc` is the exact 12-byte file `gt_results/arvo_42537879/poc` with SHA-256 `37992bd9ac56fa7c09229e7c9160e56c2a261778a6fc27558f9bd4a5f1016512`, hex `0120bace0000202020202020`. This statement consumes byte 0 `0x01`; the following bytes `0x20` and `0xba` then drive the failed `SUPERSTAR2` complement check that leaves the stale two-byte prefix in front of the later CASIC parse.",
     "note": "The `SUPERSTAR2` state code is guarded by `#ifdef SUPERSTAR2_ENABLE` in the staged source, and the saved vulnerable run proves that the reproduced image included the packet-recognition path needed for this prefix-preserving behavior.",
-    "trace_step": 2
+    "trace_step": 2,
+    "operands": [
+      "lexer->state"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "lexer->state",
+      "right": "lexer->state",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "tainted_value_origin": {
     "file": "gpsd/packet.c",
@@ -46,7 +55,10 @@
     "var": "data_len",
     "code": "data_len = getleu16(lexer->inbuffer, 2);",
     "description": "This statement materializes the attacker-controlled bogus length that drives the unsafe reads. Because the stale prefix remains at `inbuffer[0..1]`, offsets 2 and 3 are the CASIC leader bytes `0xba 0xce`, so `data_len` becomes `0xceba` (52922) instead of the real zero payload length at offsets 4 and 5.",
-    "value_from": "After the failed `SUPERSTAR2` pushback, the same exact witness bytes are still laid out as `01 20 ba ce 00 00 20 20 20 20 20 20` in `lexer->inbuffer`. Re-reading offset 2 from that stale base directly converts attacker bytes `ba ce` into `data_len = 52922`."
+    "value_from": "After the failed `SUPERSTAR2` pushback, the same exact witness bytes are still laid out as `01 20 ba ce 00 00 20 20 20 20 20 20` in `lexer->inbuffer`. Re-reading offset 2 from that stale base directly converts attacker bytes `ba ce` into `data_len = 52922`.",
+    "operands": [
+      "data_len"
+    ]
   },
   "root_cause": {
     "file": "gpsd/packet.c",
@@ -54,9 +66,18 @@
     "line": 2370,
     "var": "crc_computed, data_len, inbuflen",
     "code": "crc_computed = casic_checksum(lexer->inbuffer + 2, data_len + 4);",
-      "description": "Root cause. `packet_parse()` uses the misparsed `data_len` to size the CASIC checksum read without first enforcing the later patch predicate `inbuflen < (data_len + 10)`. On the staged witness, `inbuflen` is only 12 while `data_len + 10` is 52932, so this call walks far beyond the current packet and into later `gps_lexer_t` storage, including the copied `lexer->errout` bytes that poison the checksum result.",
+    "description": "Root cause. `packet_parse()` uses the misparsed `data_len` to size the CASIC checksum read without first enforcing the later patch predicate `inbuflen < (data_len + 10)`. On the staged witness, `inbuflen` is only 12 while `data_len + 10` is 52932, so this call walks far beyond the current packet and into later `gps_lexer_t` storage, including the copied `lexer->errout` bytes that poison the checksum result.",
     "note": "The staged `patch.diff` inserts the missing `if (inbuflen < (data_len + 10))` rejection immediately before this call and before `crc_expected = getleu32(...)`, preventing the out-of-bounds checksum reads for this exact witness.",
-    "trace_step": 8
+    "trace_step": 8,
+    "operands": [
+      "data_len + 10",
+      "inbuflen"
+    ],
+    "relation": {
+      "op": "le",
+      "left": "data_len + 10",
+      "right": "inbuflen"
+    }
   },
   "sink": {
     "file": "gpsd/packet.c",
@@ -66,7 +87,16 @@
     "code": "if (crc_computed == crc_expected) {",
     "description": "MemorySanitizer crash site. The branch consumes `crc_computed`, already contaminated by the unchecked `casic_checksum()` walk, while comparing it against `crc_expected` from a second unchecked far-offset read.",
     "note": "The saved origin trace shows the uninitialized bytes were copied into `lexer->errout` by `lexer_init()` and originally came from the harness stack allocation of `errout`; the project bug is the earlier unchecked CASIC overread that reaches those bytes.",
-    "trace_step": 10
+    "trace_step": 10,
+    "operands": [
+      "crc_computed",
+      "sizeof(crc_computed)"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "crc_computed",
+      "right": "sizeof(crc_computed)"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -80,32 +110,6 @@
   "evidence_limitations": [
     "The staged source snapshot is workspace commit `52a9fc9a933b9e084c3eacf759b7f1e64daf7310`, not the metadata vulnerable commit `2ab29d3034ca0c942147642a24c07332e01fb71c`; however the staged checkout is still vulnerable, reproduces the saved MSan crash, and the staged patch fixes the same `gpsd/packet.c` hunk there.",
     "The authoritative runtime evidence is the staged default MemorySanitizer trace in `sanitizer_trace.txt` / `default_crash_trace.txt`. `reproduction_report.json` notes that a rebuilt workspace run still matched the vulnerable-crash expectation but lost MSan fidelity and degraded to `MemorySanitizer: SEGV` in `casic_checksum`, so `cross_tool_confirmed` remains false and the saved default trace is treated as ground truth."
-  ],
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "gpsd/packet.c",
-      "function": "lexer_init",
-      "summary": "`lexer_init()` copies the harness `errout` into `lexer->errout`, seeding the later uninitialized bytes that the unchecked CASIC checksum walk will reach."
-    },
-    {
-      "step": 2,
-      "file": "gpsd/packet.c",
-      "function": "nextstate / character_pushback",
-      "summary": "The witness prefix `01 20` enters the `SUPERSTAR2` state machine, then byte `ba` fails the complement check and is pushed back without discarding the stale two-byte prefix from the buffer start."
-    },
-    {
-      "step": 3,
-      "file": "gpsd/packet.c",
-      "function": "nextstate / packet_parse",
-      "summary": "Reprocessing from the pushed-back `ba`, the parser reaches `CASIC_RECOGNIZED`, computes `inbuflen = 12`, and then misreads `data_len` from `inbuffer[2..3]` as `0xceba` because it assumes the CASIC packet begins at `inbuffer[0]`."
-    },
-    {
-      "step": 4,
-      "file": "gpsd/packet.c",
-      "function": "casic_checksum / packet_parse",
-      "summary": "Without the later `inbuflen < data_len + 10` guard, the `casic_checksum()` walk runs far beyond the 12-byte witness and across `lexer->errout`; `packet_parse()` then fetches `crc_expected` from another unchecked far offset before the final comparison becomes the saved MSan sink."
-    }
   ],
   "fine_trace": [
     {

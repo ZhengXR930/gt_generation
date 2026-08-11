@@ -29,7 +29,16 @@
     "description": "Source. NFLOG parsing materializes the attacker-controlled payload TLV view from the first TLV bytes of the 82-byte packet.",
     "value_from": "A static parse of the staged `gt_results/arvo_42526050/poc` shows a pcap global-header linktype of 239 (NFLOG), first-packet caplen 82, and packet bytes `01 00 09 00` at offsets 4-7. This statement asks the NFLOG TLV reader for `NFULA_PAYLOAD`, so the returned `payloadInfo` aliases those exact attacker-controlled bytes.",
     "note": "This is the first project statement on the vulnerable path that turns the malformed NFLOG packet bytes into vulnerability-relevant parser state after the outer pcap container has already been admitted.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "payloadInfo"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "payloadInfo",
+      "right": "payloadInfo",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "root_cause": {
     "file": "Packet++/header/NflogLayer.h",
@@ -39,7 +48,16 @@
     "var": "m_Data->recordLen",
     "description": "Root cause. NFLOG TLV size derivation returns the raw 16-bit `recordLen` with no 4-byte alignment or minimum-size enforcement, so the malformed payload TLV contributes a total size of 1 byte even though the TLV header itself is 4 bytes.",
     "note": "The staged fix changes this exact method to `return align<4>(m_Data->recordLen);`. On this witness, raw bytes `01 00` become total size 1 here; the aligned fixed code would normalize that to 4, making the downstream `payloadLen` calculation zero instead of underflowing. The patch also changes `assign()`, but this PoC closes on the alignment change alone.",
-    "trace_step": 2
+    "trace_step": 2,
+    "operands": [
+      "sizeof(uint16_t) * 2",
+      "payloadInfo.getTotalSize()"
+    ],
+    "relation": {
+      "op": "le",
+      "left": "sizeof(uint16_t) * 2",
+      "right": "payloadInfo.getTotalSize()"
+    }
   },
   "sink": {
     "file": "Packet++/src/DnsResource.cpp",
@@ -49,7 +67,16 @@
     "var": "getRawData() + sizeToRead",
     "description": "ASan crash site. The third fabricated DNS answer reads its 2-byte `dataLength` field past the 82-byte packet allocation.",
     "note": "Stage 01's saved AddressSanitizer trace reports `heap-buffer-overflow READ of size 2` at this exact line, with callers `getSize` and `pcpp::DnsLayer::parseResources`.",
-    "trace_step": 13
+    "trace_step": 13,
+    "operands": [
+      "m_DnsLayer->m_Packet->getRawPacket()->getRawDataLen()",
+      "(size_t)((getRawData() + sizeToRead + sizeof(uint16_t)) - m_DnsLayer->m_Packet->getRawPacket()->getRawData())"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "m_DnsLayer->m_Packet->getRawPacket()->getRawDataLen()",
+      "right": "(size_t)((getRawData() + sizeToRead + sizeof(uint16_t)) - m_DnsLayer->m_Packet->getRawPacket()->getRawData())"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -68,46 +95,11 @@
     "var": "m_Data->recordLen",
     "description": "The vulnerability-relevant tainted scalar is the NFLOG payload TLV length. On the reproduced little-endian build, this method reads raw bytes `01 00` as host-endian value 1 and returns it unchanged.",
     "value_from": "Static parsing of the staged 82-byte NFLOG packet shows TLV bytes `01 00 09 00` at packet offsets 4-7, so this method sees `recordLen` bytes `01 00` and `recordType` bytes `09 00` in the first TLV, yielding `recordLen == 1` and `recordType == 9 (NFULA_PAYLOAD)` on the reproduced host.",
-    "note": "That under-sized length is reused as the basis for the NFLOG payload span and, after successive unsigned subtractions, as the effective IPv4, UDP, and DNS layer extent that defeats the downstream DNS bounds check."
+    "note": "That under-sized length is reused as the basis for the NFLOG payload span and, after successive unsigned subtractions, as the effective IPv4, UDP, and DNS layer extent that defeats the downstream DNS bounds check.",
+    "operands": [
+      "m_Data->recordLen"
+    ]
   },
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "Packet++/src/NflogLayer.cpp / Packet++/header/NflogLayer.h",
-      "function": "pcpp::NflogLayer::parseNextLayer / pcpp::NflogTlv::getTotalSize",
-      "summary": "NFLOG parsing materializes the first TLV as `NFULA_PAYLOAD`; its raw `recordLen == 1` is returned unchanged as the TLV's total size."
-    },
-    {
-      "step": 2,
-      "file": "Packet++/src/NflogLayer.cpp",
-      "function": "pcpp::NflogLayer::parseNextLayer",
-      "summary": "Subtracting the 4-byte TLV header from that 1-byte size wraps `payloadLen` to a huge `size_t`, and NFLOG dispatch accepts the misframed bytes as IPv4."
-    },
-    {
-      "step": 3,
-      "file": "Packet++/src/IPv4Layer.cpp",
-      "function": "pcpp::IPv4Layer::initLayerInPacket / pcpp::IPv4Layer::parseNextLayer",
-      "summary": "IPv4 parsing keeps the wrapped `m_DataLen`, computes a 24-byte header, and constructs `UdpLayer` with the resulting huge payload extent."
-    },
-    {
-      "step": 4,
-      "file": "Packet++/src/UdpLayer.cpp",
-      "function": "pcpp::UdpLayer::parseNextLayer",
-      "summary": "UDP parsing subtracts the 8-byte header to derive a huge `udpDataLen`, sees destination port 53, and constructs `DnsLayer` with that bogus DNS extent."
-    },
-    {
-      "step": 5,
-      "file": "Packet++/src/DnsLayer.cpp",
-      "function": "pcpp::DnsLayer::parseResources",
-      "summary": "The DNS header counts decode to four resources, and `parseResources()` walks two zero-filled 11-byte answers before the third answer begins at DNS offset 34."
-    },
-    {
-      "step": 6,
-      "file": "Packet++/src/DnsResource.cpp",
-      "function": "pcpp::DnsResource::getDataLength() const",
-      "summary": "The DNS bounds check compares the third answer's offset against the wrapped DNS extent, stays false, and the next 2-byte `dataLength` read overruns the 82-byte packet allocation."
-    }
-  ],
   "fine_trace": [
     {
       "step": 1,

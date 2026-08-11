@@ -28,7 +28,19 @@
     "code": "bytesread = psf_binheader_readf (psf, \"224422\",\n\t\t\t\t\t&(wav_fmt->format), &(wav_fmt->min.channels),\n\t\t\t\t\t&(wav_fmt->min.samplerate), &(wav_fmt->min.bytespersec),\n\t\t\t\t\t&(wav_fmt->min.blockalign), &(wav_fmt->min.bitwidth)) ;",
     "description": "First project statement that consumes the attacker-controlled WAV `fmt ` bytes and materializes the IMA ADPCM channel/block geometry later used by the vulnerable allocation and decoder.",
     "value_from": "In the exact 51-byte witness, these bytes decode as `format = 0x0011 (WAVE_FORMAT_IMA_ADPCM)`, `channels = 1`, `blockalign = 5`, and `bitwidth = 4`.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "wav_fmt->format",
+      "wav_fmt->min.channels",
+      "wav_fmt->min.blockalign",
+      "wav_fmt->min.bitwidth"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "wav_fmt->format",
+      "right": "wav_fmt->format",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "sink": {
     "file": "src/ima_adpcm.c",
@@ -38,7 +50,16 @@
     "code": "pima->samples [indx] = bytecode & 0x0F ;",
     "description": "ASan crash site. On the final inner-loop iteration for the witness block, `indx` becomes 7 and this 2-byte store lands at the first byte beyond the 86-byte heap allocation created in `ima_reader_init()`.",
     "note": "Stage 01's ASan trace reports `WRITE of size 2` at `src/ima_adpcm.c:432` and says the faulting address is 0 bytes to the right of the 86-byte region allocated in `ima_reader_init()`.",
-    "trace_step": 15
+    "trace_step": 15,
+    "operands": [
+      "pima->blocksize * pima->channels + 3 * pima->channels * pima->samplesperblock",
+      "sizeof (short) * (indx + 1)"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "pima->blocksize * pima->channels + 3 * pima->channels * pima->samplesperblock",
+      "right": "sizeof (short) * (indx + 1)"
+    }
   },
   "root_cause": {
     "file": "src/ima_adpcm.c",
@@ -48,7 +69,16 @@
     "code": "pimasize = sizeof (IMA_ADPCM_PRIVATE) + blockalign * psf->sf.channels + 3 * psf->sf.channels * samplesperblock ;",
     "description": "The allocation-size formula underestimates the scratch space needed by `wavlike_ima_decode_block()`: it sizes the flexible-array tail directly from `blockalign` and `samplesperblock`, but the decoder unpacks WAV IMA blocks in 8-nibble groups and can therefore require more temporary `short` slots than this formula reserves.",
     "note": "For the witness values `blockalign=5`, `channels=1`, and `samplesperblock=3`, this computes `sizeof(IMA_ADPCM_PRIVATE) + 14`. The patch adds the missing rounded-up count `((samplesperblock - 2) | 7) + 2`, which is 9 here, and sizes the allocation from that count instead.",
-    "trace_step": 9
+    "trace_step": 9,
+    "operands": [
+      "sizeof (IMA_ADPCM_PRIVATE) + psf->sf.channels * (blockalign + samplesperblock + sizeof (short) * (((samplesperblock - 2) | 7) + 2))",
+      "pimasize"
+    ],
+    "relation": {
+      "op": "ge",
+      "left": "pimasize",
+      "right": "sizeof (IMA_ADPCM_PRIVATE) + psf->sf.channels * (blockalign + samplesperblock + sizeof (short) * (((samplesperblock - 2) | 7) + 2))"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -66,34 +96,12 @@
     "var": "wav_fmt->ima.extrabytes, wav_fmt->ima.samplesperblock",
     "code": "bytesread += psf_binheader_readf (psf, \"22\", &(wav_fmt->ima.extrabytes), &(wav_fmt->ima.samplesperblock)) ;",
     "description": "The IMA-specific extension fields complete the vulnerable block geometry. For the exact witness, this reads `samplesperblock=3`, the value later reused by both the allocation-size formula and the `samplesperblock != count` guard.",
-    "value_from": "In the exact witness, the `fmt ` chunk bytes `05 00 04 00 20 20 03 00` encode `blockalign=5`, `bitwidth=4`, `extrabytes=0x2020`, and `samplesperblock=3`."
+    "value_from": "In the exact witness, the `fmt ` chunk bytes `05 00 04 00 20 20 03 00` encode `blockalign=5`, `bitwidth=4`, `extrabytes=0x2020`, and `samplesperblock=3`.",
+    "operands": [
+      "wav_fmt->ima.extrabytes",
+      "wav_fmt->ima.samplesperblock"
+    ]
   },
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "src/wavlike.c",
-      "function": "wavlike_read_fmt_chunk / wav_read_header",
-      "summary": "The WAV header parser reads attacker-controlled IMA ADPCM fields and stores `channels=1`, `blockalign=5`, `samplesperblock=3`, and the IMA format tag into `psf` state and `wav_read_header()` outputs."
-    },
-    {
-      "step": 2,
-      "file": "src/wav.c",
-      "function": "wav_open / wavlike_ima_init / ima_reader_init",
-      "summary": "The forwarded `blockalign`/`framesperblock` locals and `psf->sf.channels` reach `ima_reader_init()`, where `pimasize` is computed too small and `calloc` allocates an undersized decoder object."
-    },
-    {
-      "step": 3,
-      "file": "src/ima_adpcm.c",
-      "function": "ima_reader_init",
-      "summary": "The present WAV IMA consistency check still accepts `blocksize=5`, `channels=1`, and `samplesperblock=3`, and the WAV container arm binds `pima->decode_block` to `wavlike_ima_decode_block()`."
-    },
-    {
-      "step": 4,
-      "file": "src/ima_adpcm.c",
-      "function": "wavlike_ima_decode_block",
-      "summary": "The mono unpack loop expands the first 5-byte block as one predictor plus 8 nibble slots, so writing `pima->samples[7]` overruns the 86-byte allocation and triggers ASan."
-    }
-  ],
   "fine_trace": [
     {
       "step": 1,

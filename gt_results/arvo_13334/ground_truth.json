@@ -29,7 +29,17 @@
     "description": "First direct project-side consumption of the attacker-controlled Thread Network Data TLV payload on the vulnerability path. Leader registration starts parsing the raw network-data byte span that came from the received Server Data message.",
     "value_from": "The exact staged 68-byte `poc` is injected as `frame.mPsdu` into `otPlatRadioReceiveDone`. After OpenThread's radio, IPv6, CoAP, and Thread TLV parsing, `Leader::HandleServerData` extracts a valid `ThreadNetworkDataTlv` from the message and forwards `networkData.GetTlvs()` / `networkData.GetLength()` as `aTlvs` / `aTlvsLength` into `RegisterNetworkData`.",
     "note": "This source is the first bug-relevant project statement after the earlier packet/container parsing has admitted a Thread Network Data TLV.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "aTlvs",
+      "aTlvsLength"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "aTlvs",
+      "right": "aTlvs",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "tainted_value_origin": {
     "file": "src/core/thread/network_data_leader_ftd.cpp",
@@ -37,7 +47,10 @@
     "line": 468,
     "var": "prefix->mPrefixLength",
     "code": "prefix = static_cast<PrefixTlv *>(cur);",
-    "description": "The current attacker-controlled Prefix TLV entry inside `aTlvs`; its stored `mPrefixLength` field is the tainted value later expanded by `BitVectorBytes(...)` into the 25-byte copy span."
+    "description": "The current attacker-controlled Prefix TLV entry inside `aTlvs`; its stored `mPrefixLength` field is the tainted value later expanded by `BitVectorBytes(...)` into the 25-byte copy span.",
+    "operands": [
+      "prefix->mPrefixLength"
+    ]
   },
   "sink": {
     "file": "src/core/thread/network_data.cpp",
@@ -47,7 +60,16 @@
     "code": "memcpy(&aConfig->mPrefix.mPrefix, prefix->GetPrefix(), BitVectorBytes(prefix->GetPrefixLength()));",
     "description": "ASan sink. `GetNextOnMeshPrefix` copies `BitVectorBytes(prefix->GetPrefixLength())` bytes from the stored malformed Prefix TLV into the stack-local `otBorderRouterConfig config`, but the destination field `mPrefix.mPrefix` is only a 16-byte IPv6 address.",
     "note": "Stage 01 reproduces `WRITE of size 25` here. Because `config` is a 24-byte stack object and `mPrefix.mPrefix` starts at its beginning, the 25-byte memcpy overwrites 9 bytes beyond the 16-byte address field and 1 byte past the end of `config` itself.",
-    "trace_step": 16
+    "trace_step": 16,
+    "operands": [
+      "sizeof(aConfig->mPrefix.mPrefix)",
+      "BitVectorBytes(prefix->GetPrefixLength())"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "sizeof(aConfig->mPrefix.mPrefix)",
+      "right": "BitVectorBytes(prefix->GetPrefixLength())"
+    }
   },
   "root_cause": {
     "file": "src/core/thread/network_data_leader_ftd.cpp",
@@ -57,7 +79,16 @@
     "code": "VerifyOrExit(prefix->IsValid(), error = OT_ERROR_PARSE);",
     "description": "Executed admission check that lets the malformed Prefix TLV survive registration. In the vulnerable commit, `PrefixTlv::IsValid()` only checks TLV-internal length consistency and does not require `BitVectorBytes(mPrefixLength) <= sizeof(Ip6::Address)`, so an oversized prefix length still passes validation.",
     "note": "The fixing diff adds `&& (BitVectorBytes(mPrefixLength) <= sizeof(Ip6::Address))` inside `PrefixTlv::IsValid()`. With that extra conjunct, this `VerifyOrExit` would reject the witness before `AddNetworkData` persists the prefix and before `OT_CHANGED_THREAD_NETDATA` triggers the later crash.",
-    "trace_step": 3
+    "trace_step": 3,
+    "operands": [
+      "BitVectorBytes(prefix->GetPrefixLength())",
+      "sizeof(Ip6::Address)"
+    ],
+    "relation": {
+      "op": "le",
+      "left": "BitVectorBytes(prefix->GetPrefixLength())",
+      "right": "sizeof(Ip6::Address)"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -77,44 +108,6 @@
       "description": "The harness creates a fresh `otInstance` for each input and immediately calls `otThreadBecomeLeader()`. `BecomeLeader()` resets leader network data to `mLength = 0` and then `SetEmptyCommissionerData()` seeds only a Commissioning Data TLV, so no stored Prefix TLV exists before the attacker frame reaches Server Data registration."
     }
   },
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "tests/fuzz/radio_receive_done.cpp",
-      "function": "LLVMFuzzerTestOneInput",
-      "summary": "The harness copies the exact staged 68-byte witness into `frame.mPsdu`, calls `otPlatRadioReceiveDone`, and then processes queued tasklets until the reproduced crash occurs."
-    },
-    {
-      "step": 2,
-      "file": "src/core/thread/network_data_leader_ftd.cpp",
-      "function": "Leader::HandleServerData",
-      "summary": "Leader-side Server Data handling extracts a Thread Network Data TLV from the received message and forwards its raw TLV payload into `RegisterNetworkData`."
-    },
-    {
-      "step": 3,
-      "file": "src/core/thread/network_data_leader_ftd.cpp",
-      "function": "Leader::RegisterNetworkData",
-      "summary": "On the fresh leader instance created by the harness, registration parses the incoming Prefix TLV, both weak `PrefixTlv::IsValid()` checks accept it, `FindPrefix` misses because leader netdata still contains only commissioning data, and `AddBorderRouter` allocates/stores a new malformed Prefix TLV plus copied BorderRouter entry in `mTlvs`."
-    },
-    {
-      "step": 4,
-      "file": "src/core/thread/network_data_leader_ftd.cpp",
-      "function": "Leader::RegisterNetworkData",
-      "summary": "After persisting the malformed prefix and BorderRouter sub-TLV state, leader registration signals `OT_CHANGED_THREAD_NETDATA`, making the bad stored network data visible to later consumers."
-    },
-    {
-      "step": 5,
-      "file": "src/core/net/dhcp6_client.cpp",
-      "function": "Dhcp6Client::UpdateAddresses",
-      "summary": "The netdata-change notifier drives `Mle::HandleStateChanged`, which invokes `UpdateAddresses`; that refresh iterates on-mesh prefixes into stack `otBorderRouterConfig config`."
-    },
-    {
-      "step": 6,
-      "file": "src/core/thread/network_data.cpp",
-      "function": "NetworkData::GetNextOnMeshPrefix",
-      "summary": "The no-filter iterator re-reads the stored malformed Prefix TLV and copied BorderRouter entry, zeros stack `config`, and then memcpy's 25 bytes into the 16-byte `config.mPrefix.mPrefix` field, producing the reproduced ASan stack-buffer-overflow write."
-    }
-  ],
   "fine_trace": [
     {
       "step": 1,

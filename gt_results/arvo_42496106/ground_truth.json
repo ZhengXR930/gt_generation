@@ -29,7 +29,17 @@
     "description": "Source. On the earlier decoded AV1 frame, `av1_read_frame_size()` consumes attacker-controlled frame-header bits and materializes the geometry that seeds the initial CDEF row allocation.",
     "value_from": "The staged `poc` is exactly the 2100-byte IVF file with SHA-256 `d3b94d98ddf235149369cf5c19aefe60a1fc5e766a107cdda6e47ec73ef64443`. Static parsing of that file shows two IVF frame records: the first starts at offset 32 with declared size 50, and the second starts at offset 94 with declared size 3735660 but is truncated to the remaining 1994 bytes. This statement is the first project-code read of the attacker-controlled AV1 frame-size bits inside those frame payloads.",
     "note": "The libFuzzer entry point is only the unscored container boundary. This statement is the first project parser read that creates vulnerability-relevant frame-geometry state.",
-    "trace_step": 2
+    "trace_step": 2,
+    "operands": [
+      "width",
+      "height"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "width",
+      "right": "width",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "root_cause": {
     "file": "av1/common/alloccommon.c",
@@ -39,7 +49,16 @@
     "var": "is_frame_scaled, cdef_row_mt, cdef_info->allocated_mi_rows",
     "description": "Root cause. On the later frame, `av1_alloc_cdef_buffers()` computes current-frame `mi_cols` and `num_mi_rows`, but its reallocation guard omits any `allocated_mi_rows != num_mi_rows` case, so the earlier `cdef_row_mt` can remain live while the function records a larger row count.",
     "note": "The staged patch adds an explicit `else if (cdef_info->allocated_mi_rows != num_mi_rows)` branch that frees and rebuilds `cdef_sync->cdef_row_mt`. In the vulnerable source, AddressSanitizer proves only that the crashing object was allocated at `alloccommon.c:199`; the smaller-earlier-allocation conclusion comes from source semantics, because both same-frame allocation here and later scheduling in `cdef_sb_row_worker_hook()` derive their row bounds from the current `cm->mi_params.mi_rows` with the same ceil(rows/64x64) formula. A row-sync array rebuilt for the later frame would therefore match the later schedule, so the saved overread requires a smaller earlier allocation to have remained live.",
-    "trace_step": 16
+    "trace_step": 16,
+    "operands": [
+      "*cdef_row_mt",
+      "NULL"
+    ],
+    "relation": {
+      "op": "eq",
+      "left": "*cdef_row_mt",
+      "right": "NULL"
+    }
   },
   "sink": {
     "file": "av1/common/thread_common.c",
@@ -49,7 +68,16 @@
     "var": "cdef_row_mt[row].row_mutex_",
     "description": "ASan crash site. `cdef_row_mt_sync_write()` indexes the stale row-sync array with the later frame's row number and reads the mutex pointer from an element past the allocation.",
     "note": "Stage 01's saved AddressSanitizer trace reports a heap-buffer-overflow READ of size 8 at this exact statement, 0 bytes to the right of a 119-byte allocation created by `av1_alloc_cdef_buffers()`.",
-    "trace_step": 22
+    "trace_step": 22,
+    "operands": [
+      "cdef_info->allocated_mi_rows",
+      "row"
+    ],
+    "relation": {
+      "op": "le",
+      "left": "cdef_info->allocated_mi_rows",
+      "right": "row"
+    }
   },
   "tainted_value_origin": {
     "file": "av1/decoder/decoder.c",
@@ -59,7 +87,10 @@
     "var": "mi_params->mi_rows",
     "description": "The later frame's aligned height becomes `cm->mi_params.mi_rows`, the attacker-controlled row-count state used both to derive the needed `num_mi_rows` in `av1_alloc_cdef_buffers()` and the later `nvfb` row-dispatch bound in multithreaded CDEF.",
     "value_from": "This assignment uses the later frame's `aligned_height` value from fine-trace step 12, which in turn came from the later `height` parsed at step 10.",
-    "note": "The sink does not consume raw bytes directly; it consumes a row index later scheduled from this current-frame row count."
+    "note": "The sink does not consume raw bytes directly; it consumes a row index later scheduled from this current-frame row count.",
+    "operands": [
+      "mi_params->mi_rows"
+    ]
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -71,50 +102,6 @@
       "note": "Static PoC parsing shows two IVF frame records, and the saved run reaches `aom_decode_frame_from_obus()` before the later CDEF worker crash."
     }
   },
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "examples/av1_dec_fuzzer.cc",
-      "function": "LLVMFuzzerTestOneInput",
-      "summary": "The staged IVF is decoded as two consecutive frames through one persistent decoder context, and byte 32 selects 51 threads so multithreaded CDEF state can survive from the earlier frame into the later one."
-    },
-    {
-      "step": 2,
-      "file": "av1/decoder/decodeframe.c / av1/decoder/decoder.c",
-      "function": "av1_read_frame_size / dec_set_mb_mi",
-      "summary": "The earlier frame's attacker-controlled size fields are parsed, rounded to `aligned_width` and `aligned_height`, and normalized into `mi_cols` and `mi_rows`."
-    },
-    {
-      "step": 3,
-      "file": "av1/common/alloccommon.c",
-      "function": "av1_alloc_cdef_buffers",
-      "summary": "The earlier frame snapshots its CDEF geometry and allocates `cdef_sync->cdef_row_mt` for that earlier row count."
-    },
-    {
-      "step": 4,
-      "file": "av1/decoder/decodeframe.c / av1/decoder/decoder.c / av1/common/alloccommon.c",
-      "function": "av1_read_frame_size / dec_set_mb_mi / av1_alloc_cdef_buffers",
-      "summary": "A later frame recomputes aligned geometry and current `num_mi_rows`, but vulnerable `av1_alloc_cdef_buffers()` has no row-count-specific reallocation path and leaves the smaller row-sync array live."
-    },
-    {
-      "step": 5,
-      "file": "av1/common/thread_common.c",
-      "function": "cdef_sb_row_worker_hook / get_cdef_row_next_job",
-      "summary": "Later multithreaded CDEF scheduling derives `nvfb` from the current frame's `mi_rows`, assigns `cur_fbr` from `cdef_sync->fbr`, and dispatches that row."
-    },
-    {
-      "step": 6,
-      "file": "av1/common/cdef.c / av1/common/thread_common.c",
-      "function": "av1_cdef_fb_row / av1_cdef_init_fb_row_mt",
-      "summary": "The dispatched later-frame row index is forwarded through `av1_cdef_fb_row()` into `cdef_row_mt_sync_write()`."
-    },
-    {
-      "step": 7,
-      "file": "av1/common/thread_common.c",
-      "function": "cdef_row_mt_sync_write",
-      "summary": "`cdef_row_mt_sync_write()` indexes `cdef_row_mt[row]` with that later-frame row number and performs the saved 8-byte heap-buffer-overflow read from the stale array."
-    }
-  ],
   "fine_trace": [
     {
       "step": 1,

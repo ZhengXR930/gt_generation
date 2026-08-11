@@ -29,7 +29,17 @@
     "code": "m->cmd = (uint8_t)(buf[0] >> 4);\nm->qos = (buf[0] >> 1) & 3;",
     "description": "First project-side decode of the raw witness bytes. The MQTT fixed-header byte is split into the command and QoS fields that select the PUBLISH parser arm and its QoS-gated packet-id handling.",
     "value_from": "Step 1 passes the exact 7-byte witness into `mg_mqtt_parse(data, size, 5, &mm)`. Inside `mg_mqtt_parse`, the first project read of that buffer is `buf[0]`; for this witness it is `0x30`, which decodes to `MQTT_CMD_PUBLISH` with QoS 0.",
-    "trace_step": 2
+    "trace_step": 2,
+    "operands": [
+      "m->cmd",
+      "m->qos"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "m->cmd",
+      "right": "m->cmd",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "tainted_value_origin": {
     "file": "src/mqtt.c",
@@ -38,7 +48,12 @@
     "var": "m->qos, p, end",
     "code": "if (m->qos > 0) {\n  if (p + 2 > end) return MQTT_MALFORMED;\n  m->id = (uint16_t)((((uint16_t) p[0]) << 8) | p[1]);\n  p += 2;\n}",
     "description": "This QoS-gated packet-id branch is the final project-side decision that determines where the MQTT v5 properties-length varint begins.",
-    "value_from": "Step 4 advances `p` to `buf + 4` after decoding a zero-length topic, and step 2 set `m->qos == 0` from header byte `0x30`. Therefore the branch at lines 392-396 is skipped, no packet-id bytes are consumed, and the remaining three bytes `ff ff ff` become the entire input to `decode_variable_length`."
+    "value_from": "Step 4 advances `p` to `buf + 4` after decoding a zero-length topic, and step 2 set `m->qos == 0` from header byte `0x30`. Therefore the branch at lines 392-396 is skipped, no packet-id bytes are consumed, and the remaining three bytes `ff ff ff` become the entire input to `decode_variable_length`.",
+    "operands": [
+      "m->qos",
+      "p",
+      "end"
+    ]
   },
   "sink": {
     "file": "src/mqtt.c",
@@ -48,7 +63,16 @@
     "code": "encoded_byte = p[offset];\nvalue += (encoded_byte & 0x7F) * multiplier;",
     "description": "AddressSanitizer crash site. On the fourth varint iteration, the helper reads one byte past the 7-byte MQTT datagram.",
     "note": "The saved Stage 01 trace reports `AddressSanitizer: use-after-poison READ of size 1` at `src/mqtt.c:69:20` in `decode_variable_length`; source-level analysis shows that read is `p[3]` when only `p[0..2]` exist after the QoS-0 branch leaves `p` at `buf + 4`.",
-    "trace_step": 9
+    "trace_step": 9,
+    "operands": [
+      "end - p",
+      "offset"
+    ],
+    "relation": {
+      "op": "le",
+      "left": "end - p",
+      "right": "offset"
+    }
   },
   "root_cause": {
     "file": "src/mqtt.c",
@@ -58,7 +82,16 @@
     "code": "for (offset = 0; offset < 4; offset++) {",
     "description": "Root cause. The MQTT variable-length decoder is bounded only by the protocol maximum of four bytes and has no caller-supplied remaining length, so it never proves that another byte is still inside the packet before reading `p[offset]`.",
     "note": "The staged fix confirms the missing obligation by replacing this helper with `decode_varint(const uint8_t *buf, size_t len, size_t *value)` and changing the loop condition to `offset < 4 && offset < len`, returning failure when the varint is truncated.",
-    "trace_step": 8
+    "trace_step": 8,
+    "operands": [
+      "0",
+      "decode_variable_length((char *) p, &len_len)"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "0",
+      "right": "decode_variable_length((char *) p, &len_len)"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -72,44 +105,6 @@
   "evidence_limitations": [
     "Stage 02 did not dynamically validate the fixed image; `patch_resolves: true` is source-grounded from `patch.diff` plus the saved vulnerable run, not from a vulnerable-versus-fixed execution pair.",
     "The saved detector context is the AFL driver's poisoned testcase slab rather than a malloc owned by Mongoose itself, so ASan names the fault `use-after-poison`. The project-side bug is still a one-byte read past the logical 7-byte MQTT datagram."
-  ],
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "test/fuzz.c",
-      "function": "LLVMFuzzerTestOneInput",
-      "summary": "The staged harness passes the raw 7-byte witness directly to `mg_mqtt_parse(data, size, 5, &mm)`, enabling the MQTT v5 property parser on attacker-controlled bytes."
-    },
-    {
-      "step": 2,
-      "file": "src/mqtt.c",
-      "function": "mg_mqtt_parse",
-      "summary": "The parser decodes the fixed header as PUBLISH/QoS0, decodes remaining length `0x05`, and fixes the logical packet extent at `end = buf + 7`."
-    },
-    {
-      "step": 3,
-      "file": "src/mqtt.c",
-      "function": "mg_mqtt_parse",
-      "summary": "The PUBLISH arm reads a zero-length topic and advances `p` to `buf + 4`, leaving the three trailing bytes `ff ff ff` before `end`."
-    },
-    {
-      "step": 4,
-      "file": "src/mqtt.c",
-      "function": "mg_mqtt_parse",
-      "summary": "Because `m->qos > 0` is false, no packet-id field is consumed; `version == 5 && p + 2 < end` then admits properties-length decoding on that 3-byte suffix."
-    },
-    {
-      "step": 5,
-      "file": "src/mqtt.c",
-      "function": "decode_variable_length",
-      "summary": "The helper consumes the three continuation bytes, but because it lacks any remaining-length bound and loops only on `offset < 4`, it still permits a fourth iteration."
-    },
-    {
-      "step": 6,
-      "file": "src/mqtt.c",
-      "function": "decode_variable_length",
-      "summary": "On that fourth iteration, `encoded_byte = p[offset]` reads `p[3]`, one byte past the 7-byte datagram, reproducing the saved ASan read at line 69."
-    }
   ],
   "fine_trace": [
     {

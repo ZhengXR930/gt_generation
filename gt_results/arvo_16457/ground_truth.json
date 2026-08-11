@@ -28,7 +28,17 @@
     "var": "x, header_warmup[1]",
     "description": "First project-side statement that materializes attacker-controlled stream state used by the bug. After `frame_sync_` has already matched the leading `0xff`, this assignment records the second sync/header byte of a candidate frame and admits the parser into `read_frame_`, which immediately seeds CRC bookkeeping from the current bitreader cursor.",
     "value_from": "Attacker-controlled stream bytes returned by `FLAC::Decoder::FuzzerStream::read_callback()` into the FLAC bitreader buffer. `frame_sync_` consumes them 8 bits at a time; the accepted `0xff`/`x` candidate sync pair is the direct input that leads to CRC state initialization.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "x",
+      "header_warmup[1]"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "x",
+      "right": "x",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "sink": {
     "file": "src/libFLAC/crc.c",
@@ -37,7 +47,16 @@
     "code": "crc = FLAC__crc16_table[7][crc >> 8               ] ^ FLAC__crc16_table[6][crc & 0xFF             ] ^\n      FLAC__crc16_table[5][(words[0] >>  8) & 0xFF] ^ FLAC__crc16_table[4][ words[0]        & 0xFF] ^\n      FLAC__crc16_table[3][ words[1] >> 24        ] ^ FLAC__crc16_table[2][(words[1] >> 16) & 0xFF] ^\n      FLAC__crc16_table[1][(words[1] >>  8) & 0xFF] ^ FLAC__crc16_table[0][ words[1]        & 0xFF];",
     "var": "words[0], words[1], len",
     "description": "MSan sink. The wrapped `len` and advanced `words` pointer from `crc16_update_block_()` make this CRC loop dereference past `br->buffer`, and the staged sanitizer trace reports `MemorySanitizer: SEGV` on a READ at line 404 in this expression.",
-    "trace_step": 7
+    "trace_step": 7,
+    "operands": [
+      "2",
+      "len"
+    ],
+    "relation": {
+      "op": "le",
+      "left": "2",
+      "right": "len"
+    }
   },
   "root_cause": {
     "file": "src/libFLAC/bitreader.c",
@@ -46,7 +65,16 @@
     "code": "br->read_crc16 = FLAC__crc16_update_words32(br->buffer + br->crc16_offset, br->consumed_words - br->crc16_offset, br->read_crc16);",
     "var": "br->buffer + br->crc16_offset, br->consumed_words - br->crc16_offset",
     "description": "Missing wraparound guard. This bulk CRC call assumes `consumed_words >= crc16_offset`, but `FLAC__bitreader_clear()` can zero `consumed_words` without resetting `crc16_offset`. When the current resync scan later consumes only a smaller number of words, the unsigned subtraction underflows and the CRC helper reads out of bounds. The fix adds the missing predicate `if (br->consumed_words > br->crc16_offset)` around this call.",
-    "trace_step": 6
+    "trace_step": 6,
+    "operands": [
+      "br->crc16_offset",
+      "br->consumed_words"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "br->crc16_offset",
+      "right": "br->consumed_words"
+    }
   },
   "tainted_value_origin": {
     "file": "src/libFLAC/bitreader.c",
@@ -54,7 +82,10 @@
     "line": 335,
     "code": "br->crc16_offset = br->consumed_words;",
     "var": "br->crc16_offset",
-    "description": "First concrete vulnerability-relevant state. CRC tracking snapshots the current bitreader cursor into `crc16_offset`; if `consumed_words` is later cleared independently, this saved offset becomes stale and is reused in the wrapped subtraction at the root cause."
+    "description": "First concrete vulnerability-relevant state. CRC tracking snapshots the current bitreader cursor into `crc16_offset`; if `consumed_words` is later cleared independently, this saved offset becomes stale and is reused in the wrapped subtraction at the root cause.",
+    "operands": [
+      "br->crc16_offset"
+    ]
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -68,38 +99,6 @@
   "evidence_limitations": [
     "The saved artifacts do not preserve which `read_frame_header_()` rejection branch or which public decoder method / internal path reached `FLAC__stream_decoder_flush()` before the crashing `skip_single_frame()` call.",
     "The source-grounded fact is narrower and sufficient for closure: `FLAC__stream_decoder_flush()` calls `FLAC__bitreader_clear()`, and that clear zeros `consumed_words` without also resetting `crc16_offset`, so some path on the same decoder object must have reached that flush before the final crashing resync."
-  ],
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "src/flac-fuzzers/fuzzer_decoder.cpp",
-      "function": "LLVMFuzzerTestOneInput",
-      "summary": "The staged 133-byte datasource drives one `FLAC::Decoder::FuzzerStream` object through a sequence of decoder method calls. The saved crash occurs on `skip_single_frame()`, and beforehand some path on the same decoder object reaches `FLAC__stream_decoder_flush()` / `FLAC__bitreader_clear()`, which is how the staged source clears bitreader consumption counters while leaving CRC state stale."
-    },
-    {
-      "step": 2,
-      "file": "src/libFLAC/stream_decoder.c",
-      "function": "frame_sync_",
-      "summary": "Attacker-controlled stream bytes are accepted as a candidate frame sync, so `read_frame_()` seeds CRC bookkeeping from the current bitreader cursor. A later `skip_single_frame()` resync again reads bytes one at a time until buffer refill re-enters the bitreader slow path."
-    },
-    {
-      "step": 3,
-      "file": "src/libFLAC/bitreader.c",
-      "function": "FLAC__bitreader_clear",
-      "summary": "The clear path zeros `words`, `bytes`, `consumed_words`, and `consumed_bits`, but leaves `read_crc16`, `crc16_offset`, and `crc16_align` untouched, creating the stale-state precondition for wraparound."
-    },
-    {
-      "step": 4,
-      "file": "src/libFLAC/bitreader.c",
-      "function": "bitreader_read_from_client_",
-      "summary": "On the final `skip_single_frame()` resync, a later refill occurs after some post-clear bytes have been consumed but before `consumed_words` has caught up to the stale `crc16_offset`, so refill calls `crc16_update_block_()` on inconsistent counters."
-    },
-    {
-      "step": 5,
-      "file": "src/libFLAC/crc.c",
-      "function": "FLAC__crc16_update_words32",
-      "summary": "The wrapped length from `crc16_update_block_()` makes the bulk CRC loop dereference `words[0]` / `words[1]` beyond `br->buffer`, producing the saved MSan READ-side SEGV."
-    }
   ],
   "fine_trace": [
     {

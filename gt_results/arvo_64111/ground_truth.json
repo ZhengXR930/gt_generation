@@ -35,7 +35,18 @@
     "description": "Source. The BGP parser materializes the attacker-controlled fourth TCP-payload segment as a mutable `BgpUpdateMessageLayer` after checking only the outer BGP header length floor and `messageType == 2`.",
     "value_from": "A static parse of the staged `gt_results/arvo_64111/poc` shows a single 337-byte packet whose TCP payload is split into BGP UPDATE lengths 68, 68, 66, and 67. The fourth UPDATE begins at payload offset 202 / raw packet offset 270 with bytes `ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 00 43 02 fc 00 00 28 ...`; this statement consumes that 67-byte slice and constructs `BgpUpdateMessageLayer` from it.",
     "note": "This is the first project parser statement on the vulnerable path that turns the exact witness bytes into the malformed UPDATE object later edited by the fuzzer helper.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "data",
+      "dataLen",
+      "bgpHeader->messageType"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "data",
+      "right": "data",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "root_cause": {
     "file": "Packet++/src/BgpLayer.cpp",
@@ -45,7 +56,16 @@
     "code": "case 2: // UPDATE\n\treturn new BgpUpdateMessageLayer(data, dataLen, prevLayer, packet);",
     "description": "Root cause. `parseBgpLayer()` instantiates an UPDATE layer without validating that the withdrawn-routes and path-attributes sublengths fit inside `dataLen`, so later mutators operate on an internally inconsistent 67-byte UPDATE.",
     "note": "The staged patch changes this exact return to `BgpUpdateMessageLayer::isDataValid(data, dataLen) ? new BgpUpdateMessageLayer(...) : nullptr;`, and `isDataValid()` rejects the witness because `withdrLen == 0xfc00` leaves no in-bounds location for the path-attributes-length field.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "sizeof(bgp_common_header) + 2*sizeof(uint16_t) + be16toh(*(uint16_t*)(data + sizeof(bgp_common_header)))",
+      "dataLen"
+    ],
+    "relation": {
+      "op": "le",
+      "left": "sizeof(bgp_common_header) + 2*sizeof(uint16_t) + be16toh(*(uint16_t*)(data + sizeof(bgp_common_header)))",
+      "right": "dataLen"
+    }
   },
   "sink": {
     "file": "Packet++/src/RawPacket.cpp",
@@ -55,7 +75,16 @@
     "code": "memmove((uint8_t*)m_RawData + atIndex + dataToInsertLen, (uint8_t*)m_RawData + atIndex, m_RawDataLen - atIndex);",
     "description": "ASan sink. `insertData()` calls `memmove()` with a negative size after `extendLayer()` computes an insertion point two bytes past the current raw-packet end.",
     "note": "Stage 01's saved AddressSanitizer trace reports `AddressSanitizer: negative-size-param (size=-2)` in `__asan_memmove`, with this `insertData()` call as the first project frame and callers `pcpp::Packet::extendLayer()` and `pcpp::BgpUpdateMessageLayer::setNetworkLayerReachabilityInfo()`.",
-    "trace_step": 9
+    "trace_step": 9,
+    "operands": [
+      "m_RawDataLen",
+      "atIndex"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "m_RawDataLen",
+      "right": "atIndex"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -75,40 +104,12 @@
     "code": "uint16_t res = be16toh(*(uint16_t*)(m_Data + sizeof(bgp_common_header)));",
     "description": "The vulnerability-relevant tainted scalar is the fourth UPDATE's withdrawn-routes length. This method reads the raw bytes `fc 00` as 64512 and then clamps that impossible value to the 46 bytes remaining in the 67-byte message.",
     "value_from": "Static parsing of the staged witness shows that the fourth BGP UPDATE at raw packet offset 270 stores common-header length `0x0043` (67) and withdrawn-routes bytes `fc 00`. On this tree, `getHeaderLen()` returns 67 for that layer, so this method materializes `res == 64512` and the later comparison against `headerLen - 21 == 46` reduces the effective withdrawn-routes span to 46 bytes.",
-    "note": "That clamped 46-byte span is later reused as the amount of data to erase from the malformed UPDATE, which is why the layer collapses below the minimum size assumed by the NLRI setter."
+    "note": "That clamped 46-byte span is later reused as the amount of data to erase from the malformed UPDATE, which is why the layer collapses below the minimum size assumed by the NLRI setter.",
+    "operands": [
+      "res",
+      "headerLen"
+    ]
   },
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "Packet++/src/TcpLayer.cpp / Packet++/src/BgpLayer.cpp",
-      "function": "pcpp::TcpLayer::parseNextLayer / pcpp::BgpLayer::parseBgpLayer",
-      "summary": "TCP port 179 dispatch admits the payload into BGP parsing, and vulnerable `parseBgpLayer()` materializes the final 67-byte segment as a `BgpUpdateMessageLayer` without UPDATE-specific length validation."
-    },
-    {
-      "step": 2,
-      "file": "Packet++/src/BgpLayer.cpp",
-      "function": "pcpp::BgpUpdateMessageLayer::getWithdrawnRoutesLength / pcpp::BgpUpdateMessageLayer::parsePrefixAndIPData",
-      "summary": "The fourth UPDATE's forged withdrawn-routes field `0xfc00` is clamped to 46 bytes, and parsing that slice stops immediately on leading byte `0x00`, leaving the original withdrawn-routes vector empty."
-    },
-    {
-      "step": 3,
-      "file": "Packet++/src/BgpLayer.cpp",
-      "function": "pcpp::BgpUpdateMessageLayer::setWithdrawnRoutes",
-      "summary": "The helper's withdraw-route edits first shorten the malformed UPDATE from 67 to 36 bytes and then, after `clearWithdrawnRoutes()`, to the 21-byte minimum with zero withdrawn routes."
-    },
-    {
-      "step": 4,
-      "file": "Packet++/src/BgpLayer.cpp",
-      "function": "pcpp::BgpUpdateMessageLayer::getNetworkLayerReachabilityInfoLength / pcpp::BgpUpdateMessageLayer::setNetworkLayerReachabilityInfo",
-      "summary": "On the shortened 21-byte layer the NLRI accessor reports no data, but the setter still tries to insert one new `/24` prefix at fixed offset 23."
-    },
-    {
-      "step": 5,
-      "file": "Packet++/src/Packet.cpp / Packet++/src/RawPacket.cpp",
-      "function": "pcpp::Packet::extendLayer / pcpp::RawPacket::insertData",
-      "summary": "Because the malformed UPDATE is the last layer and only 21 bytes long, `extendLayer()` translates offset 23 into a packet index two bytes past `m_RawDataLen`, and `insertData()` reaches the saved `memmove(size=-2)` sink."
-    }
-  ],
   "fine_trace": [
     {
       "step": 1,

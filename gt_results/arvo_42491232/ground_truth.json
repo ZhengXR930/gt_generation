@@ -35,7 +35,18 @@
     "code": "*nbytes = (size_t)sw32_(_src + BLOSC2_CHUNK_NBYTES);\n*blocksize = (size_t)sw32_(_src + BLOSC2_CHUNK_BLOCKSIZE);\n*cbytes = (size_t)sw32_(_src + BLOSC2_CHUNK_CBYTES);",
     "description": "First project-side parse of the attacker-controlled Blosc chunk header. These statements materialize the outer chunk sizes that the harness later validates and reuses as the decompression input/output sizes.",
     "value_from": "The exact 64-byte witness in `poc` begins `02 00 80 02 0c 00 00 00 01 00 00 00 40 00 00 00 ...`; bytes 4..15 decode little-endian as `nbytes = 12`, `blocksize = 1`, and `cbytes = 64`.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "*nbytes",
+      "*blocksize",
+      "*cbytes"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "*nbytes",
+      "right": "*nbytes",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "sink": {
     "file": "internal-complibs/zstd-1.4.5/decompress/zstd_decompress_block.c",
@@ -45,7 +56,15 @@
     "code": "if (dst != dctx->previousDstEnd) {",
     "description": "MemorySanitizer crash site. `dst` is the uninitialized output pointer propagated from `blosc_d()`, and this branch is the first observed use of that poisoned value.",
     "note": "The staged sanitizer trace reports `MemorySanitizer: use-of-uninitialized-value` at `/src/c-blosc2/internal-complibs/zstd-1.4.5/decompress/zstd_decompress_block.c:1414:9` in `ZSTD_checkContinuity`, with stack `ZSTD_checkContinuity -> ZSTD_decompressMultiFrame -> zstd_wrap_decompress -> blosc_d`.",
-    "trace_step": 13
+    "trace_step": 13,
+    "operands": [
+      "dst"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "dst@zstd_continuity_sink.dst_initialized_prefix_len",
+      "right": "dst@zstd_continuity_sink.dst_read_bytes"
+    }
   },
   "root_cause": {
     "file": "blosc/blosc2.c",
@@ -55,7 +74,15 @@
     "code": "else if (cbytes < 0) {\n  uint8_t token = src[0];\n  src += 1;\n  ctbytes += 1;\n  if (token & 0x1) {\n    uint8_t value = -cbytes;\n    memset(_dest, value, (unsigned int) neblock);\n    nbytes = neblock;\n    cbytes = 0;  // everything is encoded in the cbytes token\n  }\n}",
     "description": "Root cause. The negative-`cbytes` decoding arm initializes `nbytes` and normalizes `cbytes` only when `token & 0x1` is true. When the token-clear path executes, the common loop epilogue still uses `nbytes` and `cbytes`, so `nbytes` is read before initialization and `src` is rewound by the stale negative `cbytes` value.",
     "note": "The staged `patch.diff` moves `nbytes = neblock` and `cbytes = 0` out of the inner `if (token & 0x1)` block, confirming that every negative-token path was supposed to define those bookkeeping variables before the later `src += cbytes; _dest += nbytes; ntbytes += nbytes;` epilogue.",
-    "trace_step": 9
+    "trace_step": 9,
+    "operands": [
+      "nbytes"
+    ],
+    "relation": {
+      "op": "ge",
+      "left": "nbytes@negative_token_root.nbytes_initialized_prefix_len",
+      "right": "nbytes@negative_token_root.nbytes_size"
+    }
   },
   "tainted_value_origin": {
     "file": "blosc/blosc2.c",
@@ -63,7 +90,10 @@
     "line": 997,
     "var": "nbytes",
     "code": "int32_t nbytes;                /* number of decompressed bytes in split */",
-    "description": "Source-grounded origin of the uninitialized scalar that later poisons `_dest`. MemorySanitizer's origin tracking for this sample is invalid (`ORIGIN: invalid (0)`), so the vulnerable local declaration plus the untaken assignments in the negative-`cbytes` arm are the concrete origin evidence."
+    "description": "Source-grounded origin of the uninitialized scalar that later poisons `_dest`. MemorySanitizer's origin tracking for this sample is invalid (`ORIGIN: invalid (0)`), so the vulnerable local declaration plus the untaken assignments in the negative-`cbytes` arm are the concrete origin evidence.",
+    "operands": [
+      "nbytes"
+    ]
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -77,32 +107,6 @@
   "evidence_limitations": [
     "The staged source snapshot is workspace commit `cb15f1b2904c0c4087bb5422cf18a7091fc5ac82`, not the metadata vulnerable commit `986aabad378ad0d819ddb0b6db7469e95ec21985`; however the staged checkout is still vulnerable, reproduces the saved MSan crash, and the staged patch fixes the same `blosc_d()` hunk there.",
     "MemorySanitizer origin tracking reports `ORIGIN: invalid (0)` for this sample, so `allocation_context` is null. The uninitialized-value origin is therefore established source-side from the vulnerable local `nbytes` declaration plus the missing assignments in the negative-`cbytes` path."
-  ],
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "blosc/blosc2.c",
-      "function": "blosc_cbuffer_sizes / blosc_cbuffer_validate",
-      "summary": "The outer Blosc header is parsed as `nbytes = 12`, `blocksize = 1`, and `cbytes = 64`, and those values admit the exact 64-byte witness to decompression."
-    },
-    {
-      "step": 2,
-      "file": "blosc/blosc2.c",
-      "function": "initialize_context_decompression",
-      "summary": "The decompressor reparses the same chunk as a regular-header Zstd chunk, computes `nblocks = 12`, sets `context->bstarts` to the block-start table at offset 16, and keeps `context->use_dict = 0` on this call."
-    },
-    {
-      "step": 3,
-      "file": "blosc/blosc2.c",
-      "function": "serial_blosc / blosc_d",
-      "summary": "For block 0, `serial_blosc()` keeps `leftoverblock = 0` and loads `src_offset = 24`; `blosc_d()` then uses `dont_split = 0` and `use_dict = 0` to choose `nstreams = 2` and `neblock = 0`, after which the first negative-`cbytes` stream leaves `nbytes` uninitialized and rewinds `src`."
-    },
-    {
-      "step": 4,
-      "file": "blosc/blosc2.c / internal-complibs/zstd-1.4.5/decompress/zstd_decompress_block.c",
-      "function": "zstd_wrap_decompress / ZSTD_checkContinuity",
-      "summary": "The rewound second stream reuses bytes `10 00 00 00` as positive `cbytes = 16`, dispatches Zstd with uninitialized `_dest`, and `ZSTD_checkContinuity()` branches on that poisoned `dst` pointer, matching the saved MSan crash."
-    }
   ],
   "fine_trace": [
     {

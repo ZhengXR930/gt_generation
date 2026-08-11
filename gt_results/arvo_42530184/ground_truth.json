@@ -35,7 +35,18 @@
     "description": "Source. `GreLayer::parseNextLayer()` first materializes the vulnerability-relevant PPP payload extent from the attacker-controlled GRE flags and packet length.",
     "value_from": "`gt_results/arvo_42530184/poc` contains exactly 31 trailing packet-data bytes after its savefile record header, and the saved ASan allocation proves `PcapFileReaderDevice::getNextPacket()` later materialized a 31-byte raw packet before the crash. Those 31 bytes have a 20-byte IPv4 header followed by GRE bytes `20 20 88 0b 20 20 20 20`. On this tree, `getHeaderLen()` interprets GRE flags byte `0x20` as `keyBit == 1`, so `headerLen == 8`; with 11 bytes total in the GRE layer, this statement computes `payloadLen == 3` and `payload` points to the trailing bytes `20 20 20`.",
     "note": "This is the first project parser statement on the crashing path that turns the saved witness packet tail into the short PPP slice later cast to `ppp_pptp_header`.",
-    "trace_step": 1
+    "trace_step": 1,
+    "operands": [
+      "headerLen",
+      "payload",
+      "payloadLen"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "headerLen",
+      "right": "headerLen",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "root_cause": {
     "file": "Packet++/src/GreLayer.cpp",
@@ -45,7 +56,16 @@
     "code": "m_NextLayer = new PPP_PPTPLayer(payload, payloadLen, this, m_Packet);",
     "description": "Root cause. The PPP branch constructs `PPP_PPTPLayer` from a 3-byte payload without validating that `payloadLen` covers the 4-byte `ppp_pptp_header`.",
     "note": "The staged patch changes this exact site to `PPP_PPTPLayer::isDataValid(payload, payloadLen) ? static_cast<Layer*>(new PPP_PPTPLayer(...)) : static_cast<Layer*>(new PayloadLayer(...))`, and defines `isDataValid()` as `data && dataLen >= sizeof(ppp_pptp_header)`.",
-    "trace_step": 3
+    "trace_step": 3,
+    "operands": [
+      "sizeof(ppp_pptp_header)",
+      "payloadLen"
+    ],
+    "relation": {
+      "op": "le",
+      "left": "sizeof(ppp_pptp_header)",
+      "right": "payloadLen"
+    }
   },
   "sink": {
     "file": "Packet++/src/GreLayer.cpp",
@@ -55,7 +75,16 @@
     "code": "header->protocol = 0;",
     "description": "ASan sink. The `m_NextLayer == nullptr` arm zeros the 2-byte PPP protocol field even though the layer has only 3 backing bytes.",
     "note": "The saved AddressSanitizer trace reports `heap-buffer-overflow` / `WRITE of size 2` in `pcpp::PPP_PPTPLayer::computeCalculateFields()` and says the first invalid byte is 0 bytes to the right of the 31-byte heap region allocated by `pcpp::PcapFileReaderDevice::getNextPacket()`. On the witnessed `payloadLen == 3` path, this line is the only reachable 2-byte store in that function.",
-    "trace_step": 5
+    "trace_step": 5,
+    "operands": [
+      "m_DataLen",
+      "offsetof(ppp_pptp_header, protocol) + sizeof(header->protocol)"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "m_DataLen",
+      "right": "offsetof(ppp_pptp_header, protocol) + sizeof(header->protocol)"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -75,45 +104,23 @@
     "code": "size_t payloadLen = m_DataLen - headerLen;",
     "description": "The vulnerability-relevant tainted scalar is the GRE payload length. This statement computes the would-be PPP payload size as 3 bytes.",
     "value_from": "The witnessed 31-byte packet buffer leaves 11 bytes after the 20-byte IPv4 header. Because GRE flags byte `0x20` sets `keyBit`, `getHeaderLen()` returns 8, and this subtraction materializes `payloadLen == 3`.",
-    "note": "That 3-byte extent is reused at the missing validation site in step 3 and explains why the later PPP parser immediately returns on `m_DataLen <= headerLen`."
+    "note": "That 3-byte extent is reused at the missing validation site in step 3 and explains why the later PPP parser immediately returns on `m_DataLen <= headerLen`.",
+    "operands": [
+      "headerLen",
+      "payloadLen"
+    ]
   },
   "evidence_limitations": [
     "Stage 01 reproduced only the vulnerable build. This Stage 02 trace uses the exact `patch.diff` to ground the missing validation obligation, but it did not execute a fixed build, so the remediation claim is source-grounded rather than runtime-confirmed.",
     "The staged savefile packet-record header bytes do not themselves decode to `incl_len == 31`; they decode to `ts_sec=0x20202020`, `ts_usec=0x20202020`, `incl_len=0x20202020`, and `orig_len=31`. This trace therefore grounds the 31-byte packet extent only via the saved run (`PcapFileReaderDevice::getNextPacket()` allocation, the printed IPv4/GRE/PPP layer chain, and the file's trailing 31 packet bytes), not via a reconstructed libpcap malformed-record recovery rule.",
     "The saved ASan frame for `pcpp::PPP_PPTPLayer::computeCalculateFields()` does not include a source line. Line 615 is derived source-groundedly because step 4 proves `m_NextLayer` remains null on the witnessed 3-byte PPP layer, leaving `header->protocol = 0;` as the only reachable 2-byte store in that function."
   ],
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "Packet++/src/IPv4Layer.cpp / Packet++/src/GreLayer.cpp",
-      "function": "pcpp::IPv4Layer::parseNextLayer / pcpp::GreLayer::parseNextLayer",
-      "summary": "The 31-byte packet buffer witnessed in the saved run is admitted as IPv4/GREv0, and `GreLayer::parseNextLayer()` uses the GRE `keyBit` to derive an 8-byte GRE header and a 3-byte PPP payload."
-    },
-    {
-      "step": 2,
-      "file": "Packet++/src/GreLayer.cpp",
-      "function": "pcpp::GreLayer::parseNextLayer",
-      "summary": "The GRE protocol field `0x880b` selects the PPP branch, and vulnerable code still constructs `PPP_PPTPLayer` from `payloadLen == 3` with no `sizeof(ppp_pptp_header)` check."
-    },
-    {
-      "step": 3,
-      "file": "Packet++/src/GreLayer.cpp",
-      "function": "pcpp::PPP_PPTPLayer::parseNextLayer",
-      "summary": "The new PPP layer immediately hits `m_DataLen <= headerLen` (`3 <= 4`) and returns without parsing a next layer, leaving `m_NextLayer == nullptr`."
-    },
-    {
-      "step": 4,
-      "file": "Packet++/src/Packet.cpp / Packet++/src/GreLayer.cpp",
-      "function": "pcpp::Packet::computeCalculateFields / pcpp::PPP_PPTPLayer::computeCalculateFields",
-      "summary": "When packet field recomputation reaches the truncated PPP layer, the null-next-layer arm writes the 2-byte `protocol` field into a 3-byte buffer and ASan reports the saved heap-buffer-overflow write."
-    }
-  ],
   "fine_trace": [
     {
       "step": 1,
       "file": "Packet++/src/GreLayer.cpp",
       "function": "pcpp::GreLayer::parseNextLayer()",
-      "line": 196,
+      "line": 202,
       "line_end": 202,
       "var": "headerLen, payload, payloadLen",
       "code": "size_t headerLen = getHeaderLen();\nif (m_DataLen <= headerLen)\n\treturn;\n\ngre_basic_header* header = (gre_basic_header*)m_Data;\nuint8_t* payload = m_Data + headerLen;\nsize_t payloadLen = m_DataLen - headerLen;",

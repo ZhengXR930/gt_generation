@@ -35,7 +35,18 @@
     "code": "slen = fr_struct_from_network(ctx, cursor, attr, p, end - p, true,\n\t\t\t      packet_ctx, decode_value_trampoline, NULL);",
     "description": "First project-side handoff of the exact malformed second RR slice into structured RR decoding. On iteration 1 this call presents `p = packet + 62`, `end - p = 2`, and trailing bytes `c0 0d`, while `packet_ctx` still carries the full packet and the label blocks accumulated from earlier RR names.",
     "value_from": "RR iteration 0 returned `slen == 50`, which advanced `p` from `packet + 12` to `packet + 62` and left `packet_ctx->lb` containing the first RR name block `12..15`. The staged witness ends with `c0 0d`, so this call is where that two-byte compressed name becomes the current RR input.",
-    "trace_step": 3
+    "trace_step": 3,
+    "operands": [
+      "p",
+      "end - p",
+      "packet_ctx"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "p",
+      "right": "p",
+      "description": "Source identity relation for the vulnerability-relevant value."
+    }
   },
   "tainted_value_origin": {
     "file": "src/protocols/dns/decode.c",
@@ -43,7 +54,12 @@
     "line": 392,
     "var": "data, labels_len, data + total",
     "code": "slen = fr_dns_label_to_value_box(vp, &vp->data, data, labels_len, data + total, true, packet_ctx->lb);",
-    "description": "This call turns the second RR name into the exact helper input that later reaches the sink: after the first positive length-probe return, `decode_dns_labels()` has `labels_len = 2`, so it passes `src = packet + 62`, `label = data + total = packet + 62`, and the accumulated `lb` state into `fr_dns_label_to_value_box()`."
+    "description": "This call turns the second RR name into the exact helper input that later reaches the sink: after the first positive length-probe return, `decode_dns_labels()` has `labels_len = 2`, so it passes `src = packet + 62`, `label = data + total = packet + 62`, and the accumulated `lb` state into `fr_dns_label_to_value_box()`.",
+    "operands": [
+      "data",
+      "labels_len",
+      "data + total"
+    ]
   },
   "root_cause": {
     "file": "src/lib/util/dns.c",
@@ -53,7 +69,16 @@
     "code": "offset = p[1];\noffset += ((*p & ~0xc0) << 8);\np = buf + offset;",
     "description": "Root cause. On the second decode pass, only reachable because both prior length probes returned positive `48`, `dns_label_decode()` treats bytes `ff 20` as a compressed-label pointer, computes attacker-controlled offset `0x3f20`, and assigns `p = buf + offset` without checking that the target is backward and within the current packet extent. The patch adds packet/end arguments and rejects exactly these invalid targets before `*p` is used.",
     "note": "This location is the unfixed hunk in `patch.diff`: the vulnerable helper has no equivalent of the patch's `q >= p`, `*p >= 0xc0`, or `(p + *p + 1) > end` checks, and the caller at `fr_dns_label_to_value_box()` now returns immediately on negative `slen`.",
-    "trace_step": 11
+    "trace_step": 11,
+    "operands": [
+      "buf + offset",
+      "*start"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "buf + offset",
+      "right": "*start"
+    }
   },
   "sink": {
     "file": "src/lib/util/dns.c",
@@ -63,7 +88,16 @@
     "code": "*next = p + *p + 1;",
     "description": "ASan crash site. After step 11 sets `p` to `packet + 0x3f20`, this statement dereferences `*p` at that wild address to compute the next label pointer.",
     "note": "The saved ASan trace reports `heap-buffer-overflow READ of size 1` in `dns_label_decode` at `src/lib/util/dns.c:1166:14`, with stack `dns_label_decode -> fr_dns_label_to_value_box -> decode_dns_labels`.",
-    "trace_step": 12
+    "trace_step": 12,
+    "operands": [
+      "*start",
+      "p"
+    ],
+    "relation": {
+      "op": "lt",
+      "left": "*start",
+      "right": "p"
+    }
   },
   "reachability_checkpoints": {
     "parser_admitted": {
@@ -77,32 +111,6 @@
   "evidence_limitations": [
     "Runtime disambiguation is disabled in `run_flags.json`, so the chain is grounded only in the staged vulnerable source, `patch.diff`, the saved AddressSanitizer traces, `reproduction_report.json`, and the exact staged `poc` bytes. Those artifacts are sufficient here because both the pointer-manipulation logic and the crashing dereference are visible in source.",
     "Stage 02 did not execute a fixed build. `sanitizer_ground_truth.patch_resolves` below is source-grounded from the patch text matching the vulnerable helper and caller, not from dynamic differential validation."
-  ],
-  "coarse_trace": [
-    {
-      "step": 1,
-      "file": "src/protocols/dns/decode.c",
-      "function": "decode_record",
-      "summary": "Answer-count bytes `0x20 0x20` make `decode_record()` iterate through answer RRs; the first RR consumes bytes `12..61`, advances `p` to `62`, and leaves `packet_ctx->lb` tracking the first RR name block `12..15`."
-    },
-    {
-      "step": 2,
-      "file": "src/protocols/dns/decode.c / src/lib/util/dns.c",
-      "function": "decode_dns_labels / fr_dns_label_uncompressed_length",
-      "summary": "For the second RR name `c0 0d`, the first `fr_dns_label_uncompressed_length()` call jumps to offset `13`, reaches invalid byte `0x00` at offset `14`, and returns positive `48`, so `decode_dns_labels()` keeps `labels_len = 2` instead of falling back to raw bytes."
-    },
-    {
-      "step": 3,
-      "file": "src/protocols/dns/decode.c / src/lib/util/dns.c",
-      "function": "decode_dns_labels / fr_dns_label_to_value_box / dns_label_decode",
-      "summary": "`fr_dns_label_to_value_box()` repeats the same length probe, again gets positive `48` and `after = packet + 64`, then the first `dns_label_decode()` treats byte `0x2d` as length 45 and advances `current` into prior RR data at offset `59`, where the bytes are `ff 20`."
-    },
-    {
-      "step": 4,
-      "file": "src/lib/util/dns.c",
-      "function": "dns_label_decode",
-      "summary": "A second `dns_label_decode()` call interprets `ff 20` as compression-pointer offset `0x3f20`, assigns `p = packet + 0x3f20` with no target validation, and dereferences `*p` at line 1166, matching the saved ASan heap-buffer-overflow."
-    }
   ],
   "fine_trace": [
     {
