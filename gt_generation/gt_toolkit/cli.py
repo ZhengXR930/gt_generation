@@ -9,6 +9,7 @@ Subcommands:
   assertion-preflight Reject invalid assertion plans before instrumentation.
   audit-package  Validate a completed GT result directory and all evidence references.
   bind-evidence  Commit the final GT and evidence files by content hash.
+  macro-aliases  Add per-sample constant macro aliases to field_bindings.json.
   compact-result Remove generation-only files from a validated result directory.
   arvo-workspace Reuse one ARVO container across vulnerable/fixed validation.
   gdb-watch      Emit / run the GDB python recorder for watchpoint coverage.
@@ -31,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = [
         "prepare", "validate", "state", "reachability", "assertions",
         "assertion-preflight", "audit-package", "bind-evidence",
-        "compact-result", "arvo-workspace",
+        "macro-aliases", "compact-result", "arvo-workspace",
         "gdb-watch", "schema-path",
     ]
     parser = argparse.ArgumentParser(prog="gt-toolkit", description=__doc__)
@@ -74,6 +75,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "bind-evidence":
         from . import evidence
         return evidence.main(rest)
+    if ns.command == "macro-aliases":
+        from . import macro_aliases
+        return macro_aliases.main(rest)
     if ns.command == "compact-result":
         from . import compact_result
         return compact_result.main(rest)
