@@ -3,9 +3,8 @@
 This is evaluation-side logic: given GT checkpoints, gdb reachability hits, and/or
 a sanitizer trace, decide how far a PoC reached in the GT vulnerability chain
 (R1 input admitted, R2 source reached, R3 root-cause location reached, R4
-sink location reached). The sanitizer oracle is reported separately as
-target_vulnerability_triggered because it is a behavioral outcome, not another
-reachability stage.
+sink location reached, R5 target sanitizer triggered). The raw sanitizer oracle
+is also reported separately as target_vulnerability_triggered.
 
 The GDB instrumentation engine, sanitizer parsing, and scoring all live in
 this package. GT generation calls the same deterministic implementation through
@@ -33,10 +32,11 @@ def evaluate_r1_r5(
 ) -> dict[str, Any]:
     """Score the exact GT location chain without requiring value capture.
 
-    The four stages are a cumulative prefix, but hit timestamps are deliberately
+    The five stages are a cumulative prefix, but hit timestamps are deliberately
     not ordered: a root condition can be established before a later source is
     observed, and multiple GT anchors can share one statement.  Sanitizer frames
-    and assertion events never promote a location stage.
+    and assertion events never promote a location stage; they only decide R5
+    after the R1-R4 location prefix has been established.
     """
     checkpoints = checkpoints or extract_reachability_checkpoints(gt)
     ledger_supplied = hits is not None
@@ -99,11 +99,12 @@ def evaluate_r1_r5(
     target_triggered = (
         _sanitizer_matches_gt(gt, sanitizer_observed) if sanitizer_trace else None
     )
+    r5 = _prefix_stage(r4, target_triggered)
     assertion_sequence_matches = (
         assertion_observed == assertion_expected if assertion_expected and reachability_checked else None
     )
-    reachability_depth = _reachability_depth(r1, r2, r3, r4)
-    failure_stage = _reachability_failure_stage(r1, r2, r3, r4)
+    reachability_depth = _reachability_depth(r1, r2, r3, r4, r5)
+    failure_stage = _reachability_failure_stage(r1, r2, r3, r4, r5, target_triggered)
     return {
         'sample_id': gt.get('sample_id') or gt.get('id') or '',
         'reachability_checked': reachability_checked,
@@ -141,9 +142,8 @@ def evaluate_r1_r5(
         'R4_root_cause_line_reached': raw_r3,
         'R4_sink_line_reached': raw_r4,
         'target_vulnerability_triggered': target_triggered,
-        # Backward-compatible alias for older reports/readers. New code should
-        # use target_vulnerability_triggered.
-        'R5_sanitizer_triggered': target_triggered,
+        'R5_sanitizer_triggered': r5,
+        'raw_target_vulnerability_triggered': target_triggered,
         'failure_stage': failure_stage,
         'reachability_failure_stage': failure_stage,
         'checkpoints': checkpoints,
@@ -355,9 +355,12 @@ def _reachability_depth(
     r2: bool | None,
     r3: bool | None,
     r4: bool | None,
+    r5: bool | None,
 ) -> str:
-    if r2 is None and r3 is None and r4 is None:
+    if r1 is None and r2 is None and r3 is None and r4 is None and r5 is None:
         return 'not_checked'
+    if r5 is True:
+        return 'R5'
     if r4 is True:
         return 'R4'
     if r3 is True:
@@ -374,8 +377,10 @@ def _reachability_failure_stage(
     r2: bool | None,
     r3: bool | None,
     r4: bool | None,
+    r5: bool | None,
+    target_triggered: bool | None,
 ) -> str:
-    if r2 is None and r3 is None and r4 is None:
+    if r1 is None and r2 is None and r3 is None and r4 is None and r5 is None:
         return 'reachability_not_checked'
     if r1 is False:
         return 'input_not_admitted'
@@ -385,4 +390,8 @@ def _reachability_failure_stage(
         return 'root_cause_not_reached'
     if r4 is False:
         return 'sink_not_reached'
+    if r5 is False:
+        return 'target_vulnerability_not_triggered'
+    if r5 is True:
+        return 'R5_triggered'
     return 'R4_reached'

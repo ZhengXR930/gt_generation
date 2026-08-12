@@ -27,7 +27,8 @@ Insert only the `ASSERT_EVT` observations required by the frozen plan:
   include it; another patched file's include does not provide the declaration;
 - keep the patch minimal and portable.
 
-For ARVO, persist the patch and run the deterministic one-side compile gate:
+Read `prepare_report.json` to choose the execution track. For ARVO, persist
+the patch and run the deterministic one-side compile gate:
 
 ```bash
 PYTHONPATH=gt_generation python3 -m gt_toolkit arvo-workspace \
@@ -42,3 +43,20 @@ fails, inspect `arvo_workspace/plan_vulnerable_apply.log` and
 `arvo_workspace/plan_vulnerable_compile.log`, repair only this patch, and rerun
 the gate. Never rewrite the frozen semantic plan to accommodate an
 instrumentation mistake.
+
+For repo-track samples (`prepare_report.track` starts with `repo/`), use the
+repo-track gate instead:
+
+```bash
+PYTHONPATH=gt_generation python3 -m gt_toolkit repo-workspace \
+  validate-instrumentation-side \
+  --result-dir <result_dir> \
+  --version vulnerable \
+  --patch <result_dir>/vulnerable-instrumentation.patch \
+  --out <result_dir>/vulnerable_instrumentation_preflight.json
+```
+
+Finish only when that report has `ok: true`. If application or compilation
+fails, inspect `repo_workspace/plan_vulnerable_apply.log` and
+`repo_workspace/plan_vulnerable_compile.log`, repair only this patch, and rerun
+the repo-track gate.

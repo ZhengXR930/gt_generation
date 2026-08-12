@@ -23,6 +23,7 @@ KEEP_FILES = {
     "ground_truth.json",
     "verified_invariants.json",
     "verified_assertions.json",
+    "assertion_reward_spec.json",
     "field_bindings.json",
     "event_locations.json",
     "assertion_results.json",

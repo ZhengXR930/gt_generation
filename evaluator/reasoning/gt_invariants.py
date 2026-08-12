@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from evaluator.field_bindings import binding_expr
+
 # `$event.field` suffixes that resolve to a compile-time literal rather than a
 # runtime-captured value (mirrors the GT toolkit's own literal set).
 _LITERAL_FIELD_SUFFIXES = {
@@ -30,7 +32,7 @@ def load(gt_dir: Path, name: str) -> dict[str, Any]:
     return json.loads((gt_dir / name).read_text(encoding="utf-8"))
 
 
-def load_field_bindings(gt_dir: Path) -> dict[str, str]:
+def load_field_bindings(gt_dir: Path) -> dict[str, Any]:
     path = gt_dir / "field_bindings.json"
     if not path.exists():
         return {}
@@ -54,7 +56,7 @@ def edge_for_assertion(assertion: dict[str, Any], edge_ids: set[str]) -> str | N
 
 
 def operand_name(value: Any, assertion: dict[str, Any], edge: dict[str, Any],
-                 field_bindings: dict[str, str]) -> str:
+                 field_bindings: dict[str, Any]) -> str:
     """Human-facing name for one side of a transition check.
 
     Prefers the real vulnerable-source expression from field_bindings; then a
@@ -68,7 +70,7 @@ def operand_name(value: Any, assertion: dict[str, Any], edge: dict[str, Any],
         return json.dumps(value, ensure_ascii=False)
     stripped = value[1:]
     if stripped in field_bindings:
-        return field_bindings[stripped]
+        return binding_expr(field_bindings, stripped)
     event_name, _, field = stripped.rpartition(".")
     if field in _LITERAL_FIELD_SUFFIXES:
         return _LITERAL_FIELD_SUFFIXES[field]

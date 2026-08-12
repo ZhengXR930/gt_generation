@@ -616,18 +616,36 @@ def run_stage(
             duration_seconds=round(time.monotonic() - started_monotonic, 3),
         )
 
-    proc = subprocess.run(
-        command,
-        cwd=repo_root,
-        shell=True,
-        text=True,
-        errors="replace",
-        capture_output=True,
-        timeout=int(stage.get("timeout") or config.get("default_timeout") or 1800),
-        env=stage_env(code_root, stage),
-    )
-    stdout_path.write_text(proc.stdout, encoding="utf-8", errors="replace")
-    stderr_path.write_text(proc.stderr, encoding="utf-8", errors="replace")
+    with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_stream, \
+            stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_stream:
+        proc = subprocess.run(
+            command,
+            cwd=repo_root,
+            shell=True,
+            text=True,
+            errors="replace",
+            stdout=stdout_stream,
+            stderr=stderr_stream,
+            timeout=int(stage.get("timeout") or config.get("default_timeout") or 1800),
+            env=stage_env(code_root, stage),
+        )
+
+    returncode = proc.returncode
+    if name == ASSERTION_EXECUTE_STAGE:
+        finalize_code = finalize_assertion_execute_outputs(
+            variables=variables,
+            repo_root=repo_root,
+            code_root=code_root,
+            result_dir=result_dir,
+            logs_dir=logs_dir,
+        )
+        # Stage 04B's agent owns execution and raw trace collection. The runner
+        # owns the frozen assertion contract: final JSON artifacts must be a
+        # deterministic projection of the raw traces, never a hand-authored
+        # interpretation left by the agent. If the deterministic finalizer
+        # succeeds, allow a non-zero agent exit caused by its own stale gate
+        # interpretation to be recovered. If it fails, the stage fails.
+        returncode = 0 if finalize_code == 0 else (finalize_code or proc.returncode)
 
     required_outputs_ok = check_required_outputs(stage, variables, started_ts)
     success_check_ok = (
@@ -637,14 +655,121 @@ def run_stage(
         and check_runtime_disambiguation_success(stage, variables, started_ts)
     )
     return StageResult(
-        name=name, command=command, returncode=proc.returncode, started_at=started_at,
+        name=name, command=command, returncode=returncode, started_at=started_at,
         ended_at=now(), stdout_path=str(stdout_path), stderr_path=str(stderr_path),
         required_outputs_ok=required_outputs_ok, success_check_ok=success_check_ok,
         failure_kind=stage_failure_kind(
-            name, proc.returncode, required_outputs_ok, success_check_ok
+            name, returncode, required_outputs_ok, success_check_ok
         ),
         duration_seconds=round(time.monotonic() - started_monotonic, 3),
     )
+
+
+def finalize_assertion_execute_outputs(
+    *,
+    variables: dict[str, str],
+    repo_root: Path,
+    code_root: Path,
+    result_dir: Path,
+    logs_dir: Path,
+) -> int:
+    """Rebuild Stage 04B JSON artifacts from the frozen spec and raw traces.
+
+    The isolated agent may need to inspect runtime behavior, but the committed
+    assertion contract must not depend on the agent's prose or hand-written JSON.
+    Use the full candidate invariant graph as the input and let
+    `gt_toolkit assertions` filter it to the runtime-verified subset.
+    """
+    candidate_invariants = result_dir / "candidate_invariants.json"
+    verified_invariants = result_dir / "verified_invariants.json"
+    stdout_path = logs_dir / f"{ASSERTION_EXECUTE_STAGE}.finalize.stdout.txt"
+    stderr_path = logs_dir / f"{ASSERTION_EXECUTE_STAGE}.finalize.stderr.txt"
+    if candidate_invariants.exists():
+        shutil.copyfile(candidate_invariants, verified_invariants)
+    else:
+        stderr_path.write_text(
+            f"missing candidate invariant graph: {candidate_invariants}\n",
+            encoding="utf-8",
+        )
+        stdout_path.write_text("", encoding="utf-8")
+        return 2
+
+    command = [
+        sys.executable,
+        "-m",
+        "gt_toolkit",
+        "assertions",
+        "--spec",
+        variables["candidate_assertions_path"],
+        "--vulnerable-trace",
+        str(result_dir / "vulnerable_assertion_trace.txt"),
+        "--fixed-trace",
+        str(result_dir / "fixed_assertion_trace.txt"),
+        "--verified-invariants",
+        variables["verified_invariants_path"],
+        "--sanitizer-trace",
+        str(result_dir / "sanitizer_trace.txt"),
+        "--results-out",
+        variables["assertion_results_path"],
+        "--perturbation-results-out",
+        variables["perturbation_results_path"],
+        "--verified-assertions-out",
+        variables["verified_assertions_path"],
+        "--field-bindings",
+        str(result_dir / "field_bindings.json"),
+        "--event-locations",
+        str(result_dir / "event_locations.json"),
+        "--ground-truth",
+        variables["gt_path"],
+    ]
+    env = stage_env(code_root, {"env": {}})
+    env["PYTHONPATH"] = str(code_root) + os.pathsep + str(repo_root) + (
+        os.pathsep + env["PYTHONPATH"]
+        if env.get("PYTHONPATH") and env["PYTHONPATH"] != str(code_root)
+        else ""
+    )
+    with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_stream, \
+            stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_stream:
+        proc = subprocess.run(
+            command,
+            cwd=repo_root,
+            text=True,
+            errors="replace",
+            stdout=stdout_stream,
+            stderr=stderr_stream,
+            env=env,
+        )
+    if proc.returncode != 0:
+        return proc.returncode
+
+    binding_command = [
+        sys.executable,
+        "-m",
+        "gt_toolkit",
+        "assertions",
+        "--check-bindings-only",
+        "--spec",
+        variables["candidate_assertions_path"],
+        "--verified-invariants",
+        variables["verified_invariants_path"],
+        "--field-bindings",
+        str(result_dir / "field_bindings.json"),
+        "--event-locations",
+        str(result_dir / "event_locations.json"),
+    ]
+    with stdout_path.open("a", encoding="utf-8", errors="replace") as stdout_stream, \
+            stderr_path.open("a", encoding="utf-8", errors="replace") as stderr_stream:
+        stdout_stream.write("\n--- bindings-only gate ---\n")
+        proc = subprocess.run(
+            binding_command,
+            cwd=repo_root,
+            text=True,
+            errors="replace",
+            stdout=stdout_stream,
+            stderr=stderr_stream,
+            env=env,
+        )
+    return proc.returncode
 
 
 def stage_failure_kind(
@@ -781,6 +906,17 @@ def check_success(stage: dict[str, Any], variables: dict[str, str]) -> bool:
     check = stage.get("success_check") or {}
     if not check:
         return True
+    if check.get("reachability_gate"):
+        path_text = str(check.get("path") or "")
+        if not path_text:
+            return False
+        path = Path(render(path_text, variables).strip("'"))
+        if not path.exists():
+            return False
+        try:
+            return reachability_gate_passes(load_json(path))
+        except Exception:
+            return False
     clauses = check.get("all")
     if isinstance(clauses, list):
         return bool(clauses) and all(
@@ -806,6 +942,59 @@ def _json_condition_matches(
     except Exception:
         return False
     return get_nested(data, field) == expected
+
+
+def reachability_gate_passes(report: dict[str, Any]) -> bool:
+    """GT-generation reachability gate.
+
+    Evaluation keeps location-reachability-v3 strict: assertion events do not
+    promote a candidate PoC's R score. GT generation has stronger evidence from
+    Stage 04's frozen runtime assertion trace and sanitizer oracle, so the
+    workflow publish gate accepts packages where root/sink/sanitizer evidence is
+    established even if an auxiliary parser/source breakpoint did not bind
+    cleanly.
+    """
+    if report.get("reachability_checked") is not True:
+        return False
+    if report.get("R5_sanitizer_triggered") is not True:
+        return False
+    raw_hits = report.get("raw_location_hits")
+    if not isinstance(raw_hits, dict):
+        raw_hits = {}
+    source_or_later_reached = any(
+        item is True
+        for item in (
+            report.get("R2_source_reached"),
+            raw_hits.get("source"),
+            report.get("R3_root_cause_reached"),
+            report.get("R3_root_cause_function_reached"),
+            raw_hits.get("root_cause"),
+        )
+    )
+    if not source_or_later_reached:
+        return False
+    if not (
+        report.get("R3_root_cause_reached") is True
+        or report.get("R3_root_cause_function_reached") is True
+        or raw_hits.get("root_cause") is True
+    ):
+        return False
+    if report.get("R4_sink_reached") is True or report.get("R4_sink_line_reached") is True:
+        return True
+    if raw_hits.get("sink") is True:
+        return True
+    event_reachability = report.get("assertion_event_reachability")
+    if not isinstance(event_reachability, dict):
+        return False
+    for hit in report.get("hit_locations", []):
+        if (
+            isinstance(hit, dict)
+            and hit.get("kind") == "assertion_event"
+            and "sink" in set(hit.get("assertion_role") or [])
+            and event_reachability.get(str(hit.get("event_point") or "")) is True
+        ):
+            return True
+    return False
 
 
 def check_validate_gt(
@@ -927,7 +1116,7 @@ def check_assertion_stage_success(
             return False
     if stage_name == ASSERTION_PLAN_STAGE:
         return True
-    sample_id = str(spec.get("sample_id") or "")
+    track = assertion_track(result_dir)
     required_versions: tuple[str, ...] = ()
     if stage_name == VULNERABLE_INSTRUMENTATION_STAGE:
         required_versions = ("vulnerable",)
@@ -935,7 +1124,7 @@ def check_assertion_stage_success(
         required_versions = ("fixed",)
     elif stage_name == ASSERTION_EXECUTE_STAGE:
         required_versions = ("vulnerable", "fixed")
-    if sample_id.startswith("arvo_") and stage_name != LEGACY_ASSERTION_STAGE:
+    if track in {"arvo", "repo"} and stage_name != LEGACY_ASSERTION_STAGE:
         for version in required_versions:
             patch_path = result_dir / f"{version}-instrumentation.patch"
             build_report_path = (
@@ -951,8 +1140,13 @@ def check_assertion_stage_success(
             except Exception:
                 return False
             check = build_report.get("check")
+            if track == "repo":
+                expected_track_ok = str(build_report.get("track") or "").startswith("repo/")
+            else:
+                expected_track_ok = str(build_report.get("track") or "arvo") == "arvo"
             if (
                 build_report.get("ok") is not True
+                or not expected_track_ok
                 or build_report.get("version") != version
                 or build_report.get("assertion_content_hash")
                 != spec.get("content_hash")
@@ -967,7 +1161,7 @@ def check_assertion_stage_success(
         FIXED_INSTRUMENTATION_STAGE,
     }:
         return True
-    if sample_id.startswith("arvo_") and stage_name == LEGACY_ASSERTION_STAGE:
+    if track == "arvo" and stage_name == LEGACY_ASSERTION_STAGE:
         build_report_path = result_dir / "instrumentation_build_preflight.json"
         try:
             build_report = load_json(build_report_path)
@@ -1007,6 +1201,19 @@ def check_assertion_stage_success(
         result_dir / "fixed_assertion_trace.txt",
     )
     return all(path.is_file() and path.stat().st_mtime >= preflight_mtime for path in traces)
+
+
+def assertion_track(result_dir: Path) -> str:
+    try:
+        prepare = load_json(result_dir / "prepare_report.json")
+    except Exception:
+        return ""
+    track = str(prepare.get("track") or "")
+    if track == "arvo":
+        return "arvo"
+    if track.startswith("repo/"):
+        return "repo"
+    return track
 
 
 def check_assertion_preflight_success(

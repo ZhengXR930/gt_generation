@@ -11,6 +11,14 @@ from reachability.engine import CommandResult, load_hits, write_breakpoint_spec
 from reachability.runtime_spec import RuntimeSpec, container_path_on_host
 
 
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def run_local_gdb(
     *,
     spec: RuntimeSpec,
@@ -26,14 +34,17 @@ def run_local_gdb(
     breakpoints_path = output_dir / "reachability_breakpoints.json"
     hits_path = output_dir / "reachability_hits.json"
     write_breakpoint_spec(checkpoints, breakpoints_path)
-    hits_path.unlink(missing_ok=True)
+    try:
+        hits_path.unlink()
+    except FileNotFoundError:
+        pass
 
     executable = spec.executable
     # Relative executables are intentionally retained relative to the exact
     # recorded container workdir; validation already proved the mapped file exists.
     container_path_on_host(gt_dir, executable, spec.workdir)
     candidate = str(poc_path.resolve())
-    if not Path(candidate).is_relative_to(repo_root.resolve()):
+    if not _is_relative_to(Path(candidate), repo_root.resolve()):
         raise RuntimeError("PoC path must be inside the mounted repository")
     arguments = [item.replace(spec.input_placeholder, candidate) for item in spec.arguments]
     gdb_script = repo_root / "evaluator" / "reachability" / "gdb_reachability.py"

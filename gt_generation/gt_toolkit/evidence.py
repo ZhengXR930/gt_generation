@@ -21,6 +21,10 @@ COMMITMENT_FILES = (
     "reachability_report.json",
 )
 
+OPTIONAL_COMMITMENT_FILES = (
+    "assertion_reward_spec.json",
+)
+
 
 def file_sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
@@ -39,7 +43,15 @@ def build_commitment(result_dir: Path) -> dict[str, Any]:
         "sample_id": str(ground_truth.get("sample_id") or ""),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "files": {
-            name: file_sha256(result_dir / name) for name in COMMITMENT_FILES
+            name: file_sha256(result_dir / name)
+            for name in (
+                *COMMITMENT_FILES,
+                *(
+                    optional
+                    for optional in OPTIONAL_COMMITMENT_FILES
+                    if (result_dir / optional).is_file()
+                ),
+            )
         },
     }
 
@@ -67,6 +79,15 @@ def commitment_errors(result_dir: Path, commitment: dict[str, Any]) -> list[str]
         if not path.is_file():
             errors.append(f"committed evidence file is missing: {name}")
         elif declared != file_sha256(path):
+            errors.append(f"committed evidence hash does not match {name}")
+    for name in OPTIONAL_COMMITMENT_FILES:
+        if name not in files:
+            continue
+        path = result_dir / name
+        declared = files.get(name)
+        if not path.is_file():
+            continue
+        if declared != file_sha256(path):
             errors.append(f"committed evidence hash does not match {name}")
     return errors
 

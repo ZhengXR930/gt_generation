@@ -12,7 +12,7 @@ metadata:
 - `ground_truth.json` anchors are aligned so source, root cause, and sink all
   have explicit source operands; root cause and sink also require a relation.
 - `verified_invariants.json` nodes and edges both require `relation`, making the
-  invariant graph directly comparable with semantic claims.
+  invariant graph directly comparable with subject `vuln_logic` claims.
 
 Suggested migration order:
 

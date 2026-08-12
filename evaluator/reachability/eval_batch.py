@@ -64,7 +64,7 @@ def discover_samples(
 def _arvo_image(sample_id: str, manifest: dict[str, Any]) -> str | None:
     arvo_id = str(manifest.get("arvo_id") or "").strip()
     if not arvo_id and sample_id.startswith("arvo_"):
-        arvo_id = sample_id.removeprefix("arvo_")
+        arvo_id = sample_id[len("arvo_"):]
     return f"n132/arvo:{arvo_id}-vul" if arvo_id else None
 
 
@@ -76,7 +76,7 @@ def _candidate_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
         "occurrence_count": candidate.get("occurrence_count"),
         "original_exit_code": candidate.get("representative_vul_exit_code"),
         "poc_path": candidate.get("representative_poc_path"),
-        "trace_path": candidate.get("representative_trace_path"),
+        "analysis_path": candidate.get("representative_analysis_path"),
         "runtime_output_path": candidate.get(
             "representative_runtime_output_path"
         ),

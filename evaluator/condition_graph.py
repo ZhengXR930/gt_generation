@@ -11,6 +11,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .field_bindings import binding_expr
+
 LITERAL_SUFFIXES = {
     "null_literal": None,
     "zero_literal": 0,
@@ -97,7 +99,7 @@ def _location(value: Any) -> Location:
 
 def _operand(
     value: Any,
-    bindings: dict[str, str],
+    bindings: dict[str, Any],
     *,
     default_event: str,
 ) -> Operand:
@@ -114,8 +116,8 @@ def _operand(
     if not separator:
         if key not in LITERAL_SUFFIXES:
             expression = (
-                bindings.get(f"{default_event}.{key}")
-                or bindings.get(key)
+                binding_expr(bindings, f"{default_event}.{key}")
+                or binding_expr(bindings, key)
                 or ""
             )
             return Operand(
@@ -130,7 +132,7 @@ def _operand(
             raw=value,
             event=None,
             field=None,
-            source_expression=str(bindings.get(key) or literal or ""),
+            source_expression=str(binding_expr(bindings, key) or literal or ""),
             literal=literal,
         )
     if field in LITERAL_SUFFIXES:
@@ -139,11 +141,11 @@ def _operand(
             raw=value,
             event=None,
             field=None,
-            source_expression=str(bindings.get(key) or field),
+            source_expression=str(binding_expr(bindings, key) or field),
             literal=literal,
         )
     literal = None
-    expression = bindings.get(key) or ""
+    expression = binding_expr(bindings, key) or ""
     return Operand(
         raw=value,
         event=event or None,

@@ -13,6 +13,10 @@ from typing import Any
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _remove_prefix(value: str, prefix: str) -> str:
+    return value[len(prefix):] if value.startswith(prefix) else value
+
+
 class RuntimeSpecError(RuntimeError):
     """The frozen package cannot currently reconstruct its target runtime."""
 
@@ -40,7 +44,7 @@ def compile_runtime_spec(
     gt_dir = gt_dir.resolve()
     sample_id = gt_dir.name
     if sample_id.startswith("arvo_"):
-        arvo_id = sample_id.removeprefix("arvo_")
+        arvo_id = _remove_prefix(sample_id, "arvo_")
         return RuntimeSpec(
             sample_id=sample_id,
             backend="arvo_image",
@@ -115,10 +119,10 @@ def validate_runtime_spec(
 
 def container_path_on_host(gt_dir: Path, value: str, workdir: str) -> Path:
     if value.startswith("/gt/"):
-        return gt_dir / value.removeprefix("/gt/")
+        return gt_dir / _remove_prefix(value, "/gt/")
     if value.startswith("/"):
         raise RuntimeSpecError(f"runtime path is outside /gt: {value}")
-    host_workdir = gt_dir / workdir.removeprefix("/gt/")
+    host_workdir = gt_dir / _remove_prefix(workdir, "/gt/")
     return (host_workdir / value).resolve()
 
 
@@ -318,7 +322,7 @@ def _unwrap_libtool_executable(spec: RuntimeSpec, gt_dir: Path) -> RuntimeSpec:
         relative = actual.relative_to(gt_dir).as_posix()
         value = f"/gt/{relative}"
     else:
-        workdir_host = gt_dir / spec.workdir.removeprefix("/gt/")
+        workdir_host = gt_dir / _remove_prefix(spec.workdir, "/gt/")
         value = f"./{actual.relative_to(workdir_host).as_posix()}"
     environment = dict(spec.environment)
     library_match = re.search(
@@ -350,14 +354,14 @@ def _resolve_source_file(source_root: Path, value: str) -> Path | None:
     normalized = value.replace("\\", "/").lstrip("/")
     candidates = [source_root / normalized]
     if normalized.startswith("src/"):
-        candidates.append(source_root / normalized.removeprefix("src/"))
+        candidates.append(source_root / _remove_prefix(normalized, "src/"))
     candidates.append(source_root / Path(normalized).name)
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     basename = Path(normalized).name
     matches = list(source_root.rglob(basename)) if basename else []
-    suffix = normalized.removeprefix("src/")
+    suffix = _remove_prefix(normalized, "src/")
     return next(
         (item for item in matches if str(item).replace("\\", "/").endswith(suffix)),
         matches[0] if len(matches) == 1 else None,

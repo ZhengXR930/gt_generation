@@ -232,7 +232,10 @@ def run_arvo_gdb(
     breakpoints_path = output_dir / "reachability_breakpoints.json"
     hits_path = output_dir / "reachability_hits.json"
     write_breakpoint_spec(checkpoints, breakpoints_path)
-    hits_path.unlink(missing_ok=True)
+    try:
+        hits_path.unlink()
+    except FileNotFoundError:
+        pass
 
     gdb_script = repo_root / "evaluator" / "reachability" / "gdb_reachability.py"
     if prepared.container_id:

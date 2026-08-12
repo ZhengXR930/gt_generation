@@ -12,6 +12,7 @@ Subcommands:
   macro-aliases  Add per-sample constant macro aliases to field_bindings.json.
   compact-result Remove generation-only files from a validated result directory.
   arvo-workspace Reuse one ARVO container across vulnerable/fixed validation.
+  repo-workspace Run repo-track instrumentation gates through build.sh.
   gdb-watch      Emit / run the GDB python recorder for watchpoint coverage.
   schema-path    Print the path to the canonical ground_truth schema.
 
@@ -32,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = [
         "prepare", "validate", "state", "reachability", "assertions",
         "assertion-preflight", "audit-package", "bind-evidence",
-        "macro-aliases", "compact-result", "arvo-workspace",
+        "macro-aliases", "compact-result", "arvo-workspace", "repo-workspace",
         "gdb-watch", "schema-path",
     ]
     parser = argparse.ArgumentParser(prog="gt-toolkit", description=__doc__)
@@ -84,6 +85,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "arvo-workspace":
         from . import arvo_workspace
         return arvo_workspace.main(rest)
+    if ns.command == "repo-workspace":
+        from . import repo_workspace
+        return repo_workspace.main(rest)
     if ns.command == "gdb-watch":
         from . import instrument
         return instrument.main(rest)

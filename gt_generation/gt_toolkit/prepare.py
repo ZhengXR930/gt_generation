@@ -73,7 +73,10 @@ def _is_arvo(sample: dict[str, Any]) -> bool:
     are kept as fallbacks for entries that predate source_family. Everything
     else (osv / secbench / nvd / ghsa) takes the gt-memory-env repo track.
     """
-    if str(sample.get("source_family", "")).strip().lower() == "arvo":
+    source_family = str(sample.get("source_family", "")).strip().lower()
+    if source_family and source_family != "arvo":
+        return False
+    if source_family == "arvo":
         return True
     if sample.get("arvo_image_vul"):
         return True
@@ -602,6 +605,9 @@ def _synthesize_ossfuzz_bug_report(sample: dict[str, Any], d: Path, sid: str) ->
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             cfg = {}
+    if cfg.get("build_sh"):
+        _stage_ossfuzz_build_recipe(d, cfg)
+
     if not crash and not target and not cfg:
         return False
 
@@ -744,6 +750,16 @@ def _synthesize_ossfuzz_bug_report(sample: dict[str, Any], d: Path, sid: str) ->
     return True
 
 
+def _stage_ossfuzz_build_recipe(d: Path, cfg: dict[str, Any]) -> bool:
+    build_sh = str(cfg.get("build_sh") or "").rstrip()
+    if not build_sh:
+        return False
+    recipe = d / "oss_fuzz_build.sh"
+    recipe.write_text(build_sh + "\n", encoding="utf-8")
+    recipe.chmod(0o755)
+    return True
+
+
 def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dict[str, Any]:
     """Copy the benchmark's own reproduction material next to the PoC.
 
@@ -752,7 +768,7 @@ def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dic
     crash trace, and a libFuzzer testcase fed to a command line tool reproduces
     nothing.
     """
-    staged: dict[str, Any] = {"bug_report": False, "harness_downloads": 0}
+    staged: dict[str, Any] = {"bug_report": False, "harness_downloads": 0, "oss_fuzz_build_recipe": False}
     pocdir = _poc_source_dir(sample, sid)
     if pocdir is None or not pocdir.is_dir():
         if _synthesize_ossfuzz_bug_report(sample, d, sid):
@@ -764,6 +780,19 @@ def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dic
     if report.is_file():
         shutil.copy(report, d / "bug_report.md")
         staged["bug_report"] = True
+
+    project = str(sample.get("project") or sample.get("oss_fuzz_project") or "").strip()
+    cfg_path = (
+        Path(__file__).resolve().parents[2]
+        / "dataset" / "ossfuzz_project_config" / f"{project}.json"
+    )
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
+        if cfg:
+            staged["oss_fuzz_build_recipe"] = _stage_ossfuzz_build_recipe(d, cfg)
 
     downloads = pocdir / "downloads"
     if downloads.is_dir():

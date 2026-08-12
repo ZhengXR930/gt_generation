@@ -5,6 +5,10 @@ You are a fresh isolated coding-agent CLI session. Enter only when
 fine trace into a minimal, source-derived assertion plan. Do not execute the
 target, run reachability, rewrite the GT, or inspect prior runtime assertion
 results.
+If `<result_dir>/assertion_plan_feedback.md` exists, read it before planning:
+it records a human-confirmed diagnosis of why the previous frozen assertion was
+not a valid vulnerable/fixed differential. Treat that file as a constraint on
+what not to repeat, not as runtime evidence to copy.
 
 ## Required outputs
 
@@ -32,6 +36,11 @@ are immutable inputs.
 3. Compile one semantic assertion per selected invariant. A required assertion
    captures the missing root obligation. Every selected edge has exactly one
    `transition` assertion directly relating its source and target event fields.
+   A required assertion is the safety-obligation predicate: it must be false in
+   the vulnerable execution when the protected operation runs, and true in the
+   fixed execution or in the single fixed perturbation after a guard. Do not use
+   a predicate that the vulnerable runtime already satisfies, even if it names
+   the right function or operands.
 4. Record every assertion operand in `field_bindings.json` as an exact
    vulnerable-source expression. Record every synthetic event in
    `event_locations.json` with its real vulnerable-source function, file, and

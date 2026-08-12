@@ -101,3 +101,34 @@ nearby harnesses. If `sample_info.json` or `prepare_report.json` contains
 `oss_fuzz_target`, `oss_fuzz_engine`, `oss_fuzz_sanitizer`, or `oss_fuzz_job`, treat
 those as authoritative reproduction metadata. Build and execute that exact fuzz target
 with the matching sanitizer/job configuration when the project supports it.
+
+When `<result_dir>/oss_fuzz_build.sh` exists, it is the staged copy of the
+google/oss-fuzz project recipe. Prefer executing that recipe over reconstructing a
+project-specific CMake/autotools command from memory:
+
+```bash
+<result_dir>/build.sh 'set -euo pipefail
+export SRC=/gt/_work OUT=/gt/_out WORK=/gt/_work
+export CC=clang CXX=clang++
+export CFLAGS="-O1 -fno-omit-frame-pointer -gline-tables-only -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address"
+export CXXFLAGS="$CFLAGS"
+export LIB_FUZZING_ENGINE="-fsanitize=fuzzer"
+export SANITIZER=address FUZZING_ENGINE=libfuzzer
+rm -rf "$OUT" && mkdir -p "$OUT"
+bash /gt/oss_fuzz_build.sh'
+```
+
+Adjust only `SANITIZER`, `FUZZING_ENGINE`, compiler flags, and the final target copied
+from `$OUT` to match the authoritative job in `bug_report.md`. The sanitizer named in
+the job must be present in the global compile flags (`-fsanitize=address`,
+`-fsanitize=memory`, or `-fsanitize=undefined` as appropriate), while
+`LIB_FUZZING_ENGINE` supplies the libFuzzer entry point. Keep the official recipe's
+project configuration and dependency steps intact unless the failure proves a specific
+local package is missing.
+
+For CMake projects, never pass `-fsanitize=fuzzer` or libFuzzer's main through global
+`CMAKE_C_FLAGS`, `CMAKE_CXX_FLAGS`, or `CMAKE_EXE_LINKER_FLAGS` during the initial
+CMake compiler checks: CMake probe binaries define their own `main`, so libFuzzer main
+causes a false "compiler does not work" failure. Use `-fsanitize=fuzzer-no-link` for
+global compile coverage and link only the final fuzzer executable with
+`$LIB_FUZZING_ENGINE`, or use the staged OSS-Fuzz recipe which already does this.

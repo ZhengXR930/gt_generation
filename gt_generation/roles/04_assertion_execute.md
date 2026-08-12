@@ -161,5 +161,7 @@ PYTHONPATH=gt_generation python3 -m gt_toolkit repo-workspace run \
 Do not hand-write, replace, or post-process either repo-track assertion trace.
 If the fixed original is `guarded` or `avoided`, add exactly one closest
 source-grounded perturbation case to the same fixed trace with
-`repo-workspace run --version fixed --append-trace --case-name <name> ...` and
-stop.
+`repo-workspace run --version fixed --append-trace --case-name <name> --poc
+<result-dir-local-mutated-poc> ...` and stop. The perturbation PoC must be a
+single file under `<result_dir>` so the deterministic runner records the real
+input path and writes a normal `CASE` block; never edit the trace by hand.

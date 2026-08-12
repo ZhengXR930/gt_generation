@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from evaluator.compiled_graph import compile_invariant_graph
-from evaluator.reasoning.invariant_scoring import score_invariant_trace
+from evaluator.reasoning.analysis_artifact import (
+    parse_analysis_artifact,
+    validate_analysis_artifact_quality,
+)
+from evaluator.reasoning.vuln_logic_scoring import score_vuln_logic
 from evaluator.reachability.core import evaluate_r1_r5
 from evaluator.reachability.probes import compile_runtime_probes
 
@@ -66,13 +70,20 @@ def evaluate_sample(model: str, sample_dir: Path) -> dict[str, Any]:
     sample_id = sample_dir.name
     gt_dir = GT_RESULTS / sample_id
     result: dict[str, Any] = {"model": model, "sample_id": sample_id}
-    trace_path = sample_dir / "fine_trace.json"
-    if trace_path.is_file():
-        trace = json.loads(trace_path.read_text(encoding="utf-8"))
-        reasoning = score_invariant_trace(sample_id, trace)
-        result["reasoning"] = reasoning
+    logic = _load_vuln_logic(sample_dir)
+    if logic is not None:
+        try:
+            result["reasoning"] = score_vuln_logic(
+                sample_id,
+                logic,
+                gt_dir=gt_dir,
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            result["reasoning"] = {
+                "unavailable": f"vuln_logic scoring failed: {type(exc).__name__}: {exc}"
+            }
     else:
-        result["reasoning"] = {"unavailable": "fine_trace.json missing"}
+        result["reasoning"] = {"unavailable": "analysis.json missing or invalid"}
 
     submitted_unique_pocs = 0
     manifest_path = sample_dir / "manifest.json"
@@ -164,6 +175,8 @@ def evaluate_sample(model: str, sample_dir: Path) -> dict[str, Any]:
                 "R2_source_reached": None,
                 "R3_root_cause_reached": None,
                 "R4_sink_reached": None,
+                "R5_sanitizer_triggered": None,
+                "target_vulnerability_triggered": None,
                 "reachability_depth": None,
                 "unavailable": (
                     f"{ledger_error}; old combined R3/R4 fields cannot be "
@@ -182,6 +195,18 @@ def evaluate_sample(model: str, sample_dir: Path) -> dict[str, Any]:
         ),
     }
     return result
+
+
+def _load_vuln_logic(sample_dir: Path) -> dict[str, Any] | None:
+    analysis_path = sample_dir / "analysis.json"
+    if analysis_path.is_file():
+        text = analysis_path.read_text(encoding="utf-8")
+        if validate_analysis_artifact_quality(text) is not None:
+            return None
+        value = parse_analysis_artifact(text)
+        logic = value.get("vuln_logic") if value is not None else None
+        return logic if isinstance(logic, dict) else None
+    return None
 
 
 def _saved_gdb_ledger_error(output_dir: Path) -> str | None:
@@ -231,7 +256,8 @@ def evaluate_batch(models: list[str], samples: set[str]) -> dict[str, Any]:
 def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     reasoning = [
         item["reasoning"] for item in rows
-        if "source_score" in item.get("reasoning", {})
+        if item.get("reasoning", {}).get("evaluation_protocol")
+        == "vuln-logic-invariant-reasoning-v2"
     ]
     candidates = [
         candidate
@@ -269,9 +295,26 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         candidate for candidate in candidates
         if candidate.get("target_vulnerability_triggered") is not None
     ]
+    r5_known = [
+        item for item in locations if item.get("R5_sanitizer_triggered") is not None
+    ]
+    propagation_chain_total = _sum_int(reasoning, "propagation_total")
+    propagation_chain_loc_hits = _sum_int(reasoning, "propagation_loc_hits")
+    propagation_chain_partial_hits = _sum_int(reasoning, "propagation_partial_hits")
+    propagation_chain_carrier_hits = _sum_int(
+        reasoning, "propagation_carrier_hits"
+    )
+    propagation_chain_carrier_partial_hits = _sum_int(
+        reasoning, "propagation_carrier_partial_hits"
+    )
+    propagation_chain_exact_full_hits = _sum_int(
+        reasoning, "propagation_exact_full_hits"
+    )
+    propagation_chain_full_hits = _sum_int(reasoning, "propagation_full_hits")
+    propagation_chain_names = _propagation_chain_names(reasoning)
     depth_distribution = {
         depth: sum(item.get("reachability_depth") == depth for item in locations)
-        for depth in ("R0", "R1", "R2", "R3", "R4")
+        for depth in ("R0", "R1", "R2", "R3", "R4", "R5")
     }
     depth_distribution["unknown"] = sum(
         item.get("reachability_depth") in (None, "not_checked") for item in locations
@@ -290,11 +333,60 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             int((row.get("runtime") or {}).get("location_evaluated_candidates") or 0) > 0
             for row in rows
         ),
-        "source_scored_samples": len(reasoning),
-        "source_accuracy": _mean(reasoning, "source_score"),
         "reasoning_scored_samples": len(reasoning),
-        "root_cause_accuracy": _mean(reasoning, "root_cause_score"),
-        "propagation_accuracy": _mean(reasoning, "propagation_score"),
+        "reasoning_dimensions": {
+            "source": {
+                "loc": _mean(reasoning, "source_loc_score"),
+                "partial": None,
+                "full": _mean(reasoning, "source_full_score"),
+            },
+            "propagation": {
+                "loc": _mean(reasoning, "propagation_loc_score"),
+                "partial": _mean(reasoning, "propagation_partial_score"),
+                "full": _mean(reasoning, "propagation_full_score"),
+            },
+            "obligation": {
+                "loc": _mean(reasoning, "obligation_loc_score"),
+                "partial": _mean(reasoning, "obligation_partial_score"),
+                "full": _mean(reasoning, "obligation_full_score"),
+            },
+            "sink": {
+                "loc": _mean(reasoning, "sink_loc_score"),
+                "partial": _mean(reasoning, "sink_partial_score"),
+                "full": _mean(reasoning, "sink_full_score"),
+            },
+        },
+        "propagation_gap": _mean(reasoning, "propagation_gap"),
+        "propagation_chain_total": propagation_chain_total,
+        "propagation_chain_loc_hits": propagation_chain_loc_hits,
+        "propagation_chain_loc_rate": _ratio(
+            propagation_chain_loc_hits, propagation_chain_total
+        ),
+        "propagation_chain_partial_hits": propagation_chain_partial_hits,
+        "propagation_chain_partial_rate": _ratio(
+            propagation_chain_partial_hits, propagation_chain_total
+        ),
+        "propagation_chain_carrier_hits": propagation_chain_carrier_hits,
+        "propagation_chain_carrier_rate": _ratio(
+            propagation_chain_carrier_hits, propagation_chain_total
+        ),
+        "propagation_chain_carrier_partial_hits": (
+            propagation_chain_carrier_partial_hits
+        ),
+        "propagation_chain_carrier_partial_rate": _ratio(
+            propagation_chain_carrier_partial_hits, propagation_chain_total
+        ),
+        "propagation_chain_exact_full_hits": propagation_chain_exact_full_hits,
+        "propagation_chain_exact_full_rate": _ratio(
+            propagation_chain_exact_full_hits, propagation_chain_total
+        ),
+        "propagation_chain_full_hits": propagation_chain_full_hits,
+        "propagation_chain_full_rate": _ratio(
+            propagation_chain_full_hits, propagation_chain_total
+        ),
+        "propagation_chain_names": propagation_chain_names,
+        "norm_unresolved_rate": _mean(reasoning, "norm_unresolved_rate"),
+        "norm_unresolved_rate_all": _mean(reasoning, "norm_unresolved_rate_all"),
         "submitted_unique_pocs": submitted,
         "reachability_candidate_records": len(candidates),
         "reachability_executed_candidates": len(evaluated_locations),
@@ -330,6 +422,11 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             item.get("R4_sink_reached") is True for item in r4_known
         ),
         "R4_reach_rate": _mean(r4_known, "R4_sink_reached"),
+        "R5_evaluable_candidates": len(r5_known),
+        "R5_reached_candidates": sum(
+            item.get("R5_sanitizer_triggered") is True for item in r5_known
+        ),
+        "R5_reach_rate": _mean(r5_known, "R5_sanitizer_triggered"),
         "target_trigger_evaluable_candidates": len(trigger_known),
         "target_triggered_candidates": sum(
             item.get("target_vulnerability_triggered") is True
@@ -350,17 +447,51 @@ def _mean(rows: list[dict[str, Any]], key: str) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _sum_int(rows: list[dict[str, Any]], key: str) -> int:
+    return sum(int(item.get(key) or 0) for item in rows)
+
+
+def _ratio(numerator: int, denominator: int) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def _propagation_chain_names(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        diagnostics = row.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            continue
+        for chain in diagnostics.get("propagation") or []:
+            if not isinstance(chain, dict) or chain.get("available") is False:
+                continue
+            name = str(chain.get("chain") or "unknown")
+            counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audit-gt", action="store_true")
     parser.add_argument("--model", action="append")
     parser.add_argument("--sample-id", action="append")
+    parser.add_argument(
+        "--sample-list",
+        type=Path,
+        help="newline-delimited sample ids to evaluate",
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+    sample_ids = set(args.sample_id or [])
+    if args.sample_list:
+        sample_ids.update(
+            line.strip()
+            for line in args.sample_list.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
     report = (
         audit_gt()
         if args.audit_gt
-        else evaluate_batch(args.model or [], set(args.sample_id or []))
+        else evaluate_batch(args.model or [], sample_ids)
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(
