@@ -134,7 +134,7 @@ def run_one(arvo_id: str, cfg: dict[str, Any], logs_dir: Path,
 
     # Read back what the episode produced (run_sample writes these to poc_results).
     manifest = cfg["results_dir"] / sample_id / "manifest.json"
-    trace = cfg["results_dir"] / sample_id / "fine_trace.json"
+    analysis = cfg["results_dir"] / sample_id / "analysis.json"
     status, poc_success = None, None
     if manifest.is_file():
         m = json.loads(manifest.read_text())
@@ -145,7 +145,7 @@ def run_one(arvo_id: str, cfg: dict[str, Any], logs_dir: Path,
         "returncode": completed.returncode,
         "status": status,
         "poc_success": poc_success,
-        "fine_trace_produced": trace.is_file(),
+        "analysis_produced": analysis.is_file(),
         "duration_seconds": round(time.monotonic() - started, 3),
         "log": str(log_path),
     }
@@ -199,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         "base_url": cfg["base_url"], "api_key_env": cfg["api_key_env"],
         "results_namespace": cfg["results_namespace"],
         "requested": len(cfg["arvo_ids"]),
-        "fine_traces_produced": sum(1 for r in results if r["fine_trace_produced"]),
+        "analysis_artifacts_produced": sum(1 for r in results if r["analysis_produced"]),
         "pocs_succeeded": sum(1 for r in results if r["poc_success"]),
         "results": results,
     }

@@ -2,33 +2,64 @@
 
 # Display help message if no arguments provided or help flag used
 if [ "$1" == "-h" ] || [ "$1" == "--help" ] || [ -z "$1" ]; then
-    echo "Usage: $0 <poc_file_path> <candidate_trace_json>"
+    echo "Usage: $0 <poc_file_path> <analysis_json>"
     echo ""
-    echo "Submit a vulnerability proof-of-concept file to the CyberGym server"
+    echo "Submit a benchmark reproducer candidate to the CyberGym server"
     echo ""
     echo "Arguments:"
-    echo "  <poc_file_path>         Path to the proof-of-concept file to submit"
-    echo "  <candidate_trace_json>  Fine trace JSON for this exact PoC candidate"
+    echo "  <poc_file_path>  Path to the reproducer candidate to submit"
+    echo "  <analysis_json>  analysis.json with sample_id, fine_trace, and vuln_logic"
     echo ""
     echo "Examples:"
-    echo "  $0 /path/to/poc /workspace/candidate_trace.json"
+    echo "  $0 /path/to/poc /workspace/analysis.json"
     exit 0
 fi
 
 POC_FILE="$1"
-TRACE_FILE="$2"
+ANALYSIS_FILE="$2"
 
 # Check if file exists
 if [ ! -f "$POC_FILE" ]; then
     echo "Error: File '$POC_FILE' not found!"
     exit 1
 fi
-if [ -z "$TRACE_FILE" ] || [ ! -f "$TRACE_FILE" ]; then
-    echo "Error: candidate trace file '$TRACE_FILE' not found!"
+if [ -z "$ANALYSIS_FILE" ] || [ ! -f "$ANALYSIS_FILE" ]; then
+    echo "Error: analysis file '$ANALYSIS_FILE' not found!"
     exit 1
 fi
 
 RESPONSE_FILE="$(mktemp)"
+TRACE_FILE="$(mktemp)"
+set +e
+python3 - "$ANALYSIS_FILE" "$TRACE_FILE" "##TASK_ID##" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+
+if not isinstance(value, dict):
+    raise SystemExit("analysis input must be one JSON object, not a legacy fine_trace array")
+if set(value) != {"sample_id", "fine_trace", "vuln_logic"}:
+    raise SystemExit("analysis.json must contain exactly sample_id, fine_trace, and vuln_logic")
+expected_sample_id = sys.argv[3].replace(":", "_")
+if value.get("sample_id") != expected_sample_id:
+    raise SystemExit("analysis.json sample_id must be exactly %r" % expected_sample_id)
+trace = value.get("fine_trace")
+if not isinstance(trace, list) or not trace:
+    raise SystemExit("analysis.json fine_trace must be a non-empty array")
+
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(trace, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+PY
+TRACE_EXIT="$?"
+set -e
+if [ "$TRACE_EXIT" -ne 0 ]; then
+    rm -f "$RESPONSE_FILE" "$TRACE_FILE"
+    exit 2
+fi
+
 SERVER_URL="${CYBERGYM_SUBMIT_SERVER:-##SERVER##}"
 set +e
 curl --connect-timeout 10 --max-time 90 --fail-with-body -sS \
@@ -40,7 +71,7 @@ CURL_EXIT="${PIPESTATUS[0]}"
 set -e
 
 if [ "$CURL_EXIT" -ne 0 ]; then
-    rm -f "$RESPONSE_FILE"
+    rm -f "$RESPONSE_FILE" "$TRACE_FILE"
     exit "$CURL_EXIT"
 fi
 
@@ -57,7 +88,7 @@ PY
 )"
 PARSE_EXIT="$?"
 if [ "$PARSE_EXIT" -ne 0 ]; then
-    rm -f "$RESPONSE_FILE"
+    rm -f "$RESPONSE_FILE" "$TRACE_FILE"
     exit "$PARSE_EXIT"
 fi
 
@@ -67,13 +98,14 @@ ATTEMPT_ID="$(printf '%s\n' "$PARSED" | sed -n '3p')"
 if [ "$TRACE_VALID" != "true" ]; then
     echo ""
     echo "Error: server rejected the candidate trace format; fix it and resubmit."
-    rm -f "$RESPONSE_FILE"
+    rm -f "$RESPONSE_FILE" "$TRACE_FILE"
     exit 2
 fi
 
 cp "$TRACE_FILE" /workspace/.latest_candidate_trace.json
+cp "$ANALYSIS_FILE" /workspace/.latest_analysis.json
 printf '%s\n' "$ATTEMPT_ID" > /workspace/.poc_submission_recorded
-rm -f "$RESPONSE_FILE"
+rm -f "$RESPONSE_FILE" "$TRACE_FILE"
 
 case "$TARGET_EXIT_CODE" in
     0|300) exit 0 ;;

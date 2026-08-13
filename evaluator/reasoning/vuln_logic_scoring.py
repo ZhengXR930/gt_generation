@@ -34,6 +34,10 @@ _TOKEN_RE = re.compile(
 _NUMERIC_SUFFIX_RE = re.compile(r"(?<=\d)[uUlLfF]+")
 _SIZEOF_STRING_RE = re.compile(r"""^sizeof\(\s*((?:"(?:\\.|[^"\\])*")|(?:'(?:\\.|[^'\\])*'))\s*\)$""")
 _OUTER_PARENS_RE = re.compile(r"^\((.*)\)$", re.DOTALL)
+_CXX_NAMED_CAST_RE = re.compile(
+    r"^(?:const|static|reinterpret|dynamic)_cast\s*<[^<>]+>\s*\((.*)\)$",
+    re.DOTALL,
+)
 _SIMPLE_CAST_RE = re.compile(
     r"\(\s*(?:const\s+|volatile\s+|struct\s+|enum\s+|union\s+|"
     r"[A-Za-z_][A-Za-z0-9_]*\s+)*[A-Za-z_][A-Za-z0-9_]*(?:\s*\*)+\s*\)"
@@ -166,7 +170,10 @@ class ExpressionNormalizer:
                 continue
             keys.add(f"partial:{token}")
             if "." in token:
-                keys.add(f"partial:{token.rsplit('.', 1)[-1]}")
+                parts = [part for part in token.split(".") if part]
+                keys.add(f"partial:{parts[-1]}")
+                for index in range(1, len(parts)):
+                    keys.add(f"partial:{'.'.join(parts[:index])}")
         return keys
 
     @classmethod
@@ -178,7 +185,7 @@ class ExpressionNormalizer:
         forms = {no_space}
         stripped = cls._strip_outer_parens(no_space)
         forms.add(stripped)
-        no_cast = _SIMPLE_CAST_RE.sub("", stripped)
+        no_cast = cls._strip_cast_wrappers(stripped)
         forms.add(no_cast)
         arrow = no_cast.replace("->", ".")
         forms.add(arrow)
@@ -210,6 +217,20 @@ class ExpressionNormalizer:
             if not balanced:
                 return text
             text = inner
+
+    @classmethod
+    def _strip_cast_wrappers(cls, value: str) -> str:
+        text = value
+        while True:
+            match = _CXX_NAMED_CAST_RE.match(text)
+            if match:
+                text = cls._strip_outer_parens(match.group(1))
+                continue
+            no_c_cast = _SIMPLE_CAST_RE.sub("", text)
+            if no_c_cast != text:
+                text = cls._strip_outer_parens(no_c_cast)
+                continue
+            return text
 
     @classmethod
     def _constant_key(cls, value: Any) -> str | None:
@@ -333,7 +354,7 @@ def score_vuln_logic(
         normalizer,
         line_tolerance=line_tolerance,
         require_relation=True,
-        allow_flipped_relation=False,
+        allow_flipped_relation=True,
     )
     sink_result = _match_point(
         sink_chain,
@@ -489,9 +510,10 @@ def _point_scores(result: dict[str, Any], *, require_relation: bool) -> dict[str
         result.get("location_match") is True
         and operand.get("partial_matched") is True
     )
+    relation_required = bool(require_relation and relation.get("required") is not False)
     full = bool(
         partial
-        and (not require_relation or relation.get("matched") is True)
+        and (not relation_required or relation.get("matched") is True)
     )
     return {
         "loc": _bool_score(result.get("location_match"), available=available),
@@ -580,10 +602,11 @@ def _match_point(
             normalizer,
             allow_flipped=allow_flipped_relation,
         )
+    relation_required = bool(require_relation and relation_match.get("required") is not False)
     exact_hit = bool(
         loc_match
         and operand_match.get("matched")
-        and (not require_relation or relation_match.get("matched"))
+        and (not relation_required or relation_match.get("matched"))
     )
     relation_operands_match = bool(
         isinstance(relation_match, dict)
@@ -591,12 +614,12 @@ def _match_point(
     )
     semantic_operand_hit = bool(
         operand_match.get("partial_matched")
-        or (require_relation and relation_operands_match)
+        or (relation_required and relation_operands_match)
     )
     semantic_hit = bool(
         loc_match
         and semantic_operand_hit
-        and (not require_relation or relation_match.get("matched"))
+        and (not relation_required or relation_match.get("matched"))
     )
     return {
         "available": True,
@@ -686,15 +709,13 @@ def _match_propagation_chains(
         relation_hit = (
             relation_match.get("matched") is True if relation_required else True
         )
-        partial_hit = bool(loc_hit and type_hit and relation_hit)
+        partial_hit = bool(loc_hit and carrier_match.get("partial_matched"))
         exact_full_hit = bool(
-            partial_hit
+            loc_hit
             and carrier_match.get("matched")
+            and relation_hit
         )
-        full_hit = bool(
-            partial_hit
-            and carrier_match.get("partial_matched")
-        )
+        full_hit = bool(partial_hit and relation_hit)
         rows.append({
             "chain": name,
             "available": True,
@@ -716,9 +737,10 @@ def _match_propagation_chains(
                 "from": _node_summary(start_node or {}),
                 "to": _node_summary(end_node or {}),
                 "types": sorted(gt_types),
-                "type_match_mode": "any_overlap",
                 "carriers": gt_carriers,
                 "carrier_match_mode": "any_key_carrier",
+                "headline_partial": "loc_plus_carrier_operand",
+                "headline_full": "loc_plus_carrier_operand_plus_relation",
                 "edges": [_edge_summary(edge) for edge in gt_chain_edges],
             },
             "agent": {
@@ -744,18 +766,19 @@ def _chain_anchor_node(
     if not isinstance(anchor, dict):
         return fallback
     node = dict(fallback or {})
+    anchor_operands = anchor.get("operands") or _split_anchor_var(anchor.get("var"))
     node.update({
         "invariant_id": _chain_anchor_id(role),
         "role": role,
-        "file": anchor.get("file"),
-        "function": anchor.get("function"),
-        "line": anchor.get("line"),
-        "line_end": anchor.get("line_end"),
-        "operands": anchor.get("operands") or _split_anchor_var(anchor.get("var")),
-        "relation": anchor.get("relation") or (fallback or {}).get("relation"),
-        "trace_step": anchor.get("trace_step"),
-        "fine_trace_step": anchor.get("trace_step"),
-        "code": anchor.get("code"),
+        "file": node.get("file") or anchor.get("file"),
+        "function": node.get("function") or anchor.get("function"),
+        "line": node.get("line") if node.get("line") is not None else anchor.get("line"),
+        "line_end": node.get("line_end") if node.get("line_end") is not None else anchor.get("line_end"),
+        "operands": node.get("operands") or anchor_operands,
+        "relation": node.get("relation") or anchor.get("relation"),
+        "trace_step": node.get("trace_step") or anchor.get("trace_step"),
+        "fine_trace_step": node.get("fine_trace_step") or anchor.get("trace_step"),
+        "code": node.get("code") or anchor.get("code"),
     })
     return node
 
@@ -1111,7 +1134,12 @@ def _match_chain_relations(
     rows = []
     for gt_relation in gt_relations:
         comparisons = [
-            _match_relation(gt_relation, agent_relation, normalizer, allow_flipped=False)
+            _match_relation(
+                gt_relation,
+                agent_relation,
+                normalizer,
+                allow_flipped=False,
+            )
             for agent_relation in agent_relations
         ]
         rows.append({
@@ -1191,9 +1219,15 @@ def _match_edge(
             "relation_match": relation_match,
         }
         loc_candidates.append(candidate)
-        if type_match and carrier_match.get("matched"):
+        relation_required = isinstance(gt_edge.get("relation"), dict)
+        relation_hit = (
+            relation_match.get("matched") is True
+            if isinstance(relation_match, dict)
+            else not relation_required
+        )
+        if carrier_match.get("matched") and relation_hit:
             exact_full_candidates.append(candidate)
-        if type_match and carrier_match.get("partial_matched"):
+        if carrier_match.get("partial_matched") and relation_hit:
             full_candidates.append(candidate)
     best_loc = loc_candidates[0] if loc_candidates else None
     best_type = _best_candidate(loc_candidates, "type_match")
@@ -1288,6 +1322,17 @@ def _match_relation(
 ) -> dict[str, Any]:
     if not isinstance(gt_relation, dict):
         return {"required": True, "matched": False, "reason": "gt_relation_missing"}
+    if _is_identity_relation(gt_relation, normalizer):
+        return {
+            "required": False,
+            "matched": None,
+            "mode": "gt_identity_relation_unscored",
+            "reason": "gt_identity_relation_unscored",
+            "gt_op": str(gt_relation.get("op") or ""),
+            "agent_op": str((agent_relation or {}).get("op") or "")
+            if isinstance(agent_relation, dict)
+            else "",
+        }
     if not isinstance(agent_relation, dict):
         return {"required": True, "matched": False, "reason": "agent_relation_missing"}
     gt_op = str(gt_relation.get("op") or "")
@@ -1299,17 +1344,10 @@ def _match_relation(
     )
     exact_partial_operands = bool(exact_left["matched"] and exact_right["matched"])
     exact = bool(gt_op == agent_op and exact_operands)
-    identity_equiv = bool(
-        gt_op in IDENTITY_OPS
-        and agent_op in IDENTITY_OPS
-        and _is_identity_relation(gt_relation, normalizer)
-        and _is_identity_relation(agent_relation, normalizer)
-        and _is_hard_match(exact_left)
-        and _is_hard_match(exact_right)
-    )
     flipped_left = flipped_right = {"matched": False, "norm_tier": "unresolved"}
     flipped = False
     flipped_partial_operands = False
+    identity_equiv = False
     if allow_flipped and gt_op in FLIPPED_OPS:
         flipped_left = normalizer.compare(gt_relation.get("left"), agent_relation.get("right"))
         flipped_right = normalizer.compare(gt_relation.get("right"), agent_relation.get("left"))
@@ -1321,15 +1359,50 @@ def _match_relation(
             FLIPPED_OPS[gt_op] == agent_op
             and flipped_operands
         )
+    if gt_op in IDENTITY_OPS and agent_op in IDENTITY_OPS:
+        identity_equiv = bool(exact_operands)
+        if not identity_equiv:
+            if flipped_left.get("norm_tier") == "unresolved":
+                flipped_left = normalizer.compare(gt_relation.get("left"), agent_relation.get("right"))
+                flipped_right = normalizer.compare(gt_relation.get("right"), agent_relation.get("left"))
+                flipped_partial_operands = bool(flipped_left["matched"] and flipped_right["matched"])
+            identity_equiv = bool(_is_hard_match(flipped_left) and _is_hard_match(flipped_right))
     operand_matched = exact_operands or (flipped if allow_flipped else False)
     operand_partial_matched = exact_partial_operands or flipped_partial_operands
+    partial_equiv = bool(
+        (gt_op == agent_op and exact_partial_operands)
+        or (
+            allow_flipped
+            and gt_op in FLIPPED_OPS
+            and FLIPPED_OPS[gt_op] == agent_op
+            and flipped_partial_operands
+        )
+        or (
+            gt_op in IDENTITY_OPS
+            and agent_op in IDENTITY_OPS
+            and operand_partial_matched
+        )
+    )
     return {
         "required": True,
-        "matched": exact or flipped or identity_equiv,
-        "mode": "exact" if exact else ("flipped" if flipped else ("identity_equiv" if identity_equiv else "miss")),
+        "matched": exact or flipped or identity_equiv or partial_equiv,
+        "mode": (
+            "exact"
+            if exact
+            else (
+                "flipped"
+                if flipped
+                else (
+                    "identity_equiv"
+                    if identity_equiv
+                    else ("partial_equiv" if partial_equiv else "miss")
+                )
+            )
+        ),
         "op_match": gt_op == agent_op or identity_equiv,
         "operand_matched": operand_matched or identity_equiv,
         "operand_partial_matched": operand_partial_matched or identity_equiv,
+        "partial_equiv_matched": partial_equiv,
         "gt_op": gt_op,
         "agent_op": agent_op,
         "exact": {
@@ -1395,6 +1468,8 @@ def _best_carrier_candidate(rows: list[dict[str, Any]], *, partial: bool = False
 
 
 def _is_identity_relation(relation: dict[str, Any], normalizer: ExpressionNormalizer) -> bool:
+    if str(relation.get("op") or "") not in IDENTITY_OPS:
+        return False
     left = relation.get("left")
     right = relation.get("right")
     comparison = normalizer.compare(left, right)

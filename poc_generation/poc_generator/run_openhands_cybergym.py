@@ -26,7 +26,10 @@ ENVS = [
     "OPENHANDS_RUNTIME_READY_TIMEOUT",
     "OPENHANDS_HARNESS_MODE",
     "OPENHANDS_CAPTURE_FINE_TRACE",
+    "OPENHANDS_ANALYSIS_OUTPUT",
+    "OPENHANDS_ANALYSIS_ARTIFACT_OUTPUT",
     "OPENHANDS_FINE_TRACE_OUTPUT",
+    "OPENHANDS_VULN_LOGIC_OUTPUT",
     "OPENHANDS_PRE_FINALIZATION_CHECKPOINT",
     "OPENHANDS_CACHE_DIR",
     "OPENHANDS_TASK_WORKSPACE",
@@ -115,6 +118,23 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _runtime_kwargs(config: dict) -> dict:
+    return config.setdefault("sandbox", {}).setdefault("docker_runtime_kwargs", {})
+
+
+def resolve_poetry() -> str | None:
+    candidates = [
+        os.getenv("POETRY_BIN"),
+        shutil.which("poetry"),
+        str(Path.home() / ".local" / "pythons" / "cpython-3.11" / "bin" / "poetry"),
+        "/data00/home/zhengxinran/.local/pythons/cpython-3.11/bin/poetry",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return str(Path(candidate).absolute())
+    return None
+
+
 def reward_subject_llm_recovery_config() -> dict[str, int | float]:
     """Bound one Subject request while retaining OpenHands' in-place retry.
 
@@ -145,6 +165,18 @@ def reward_subject_llm_recovery_config() -> dict[str, int | float]:
         "retry_min_wait": min_wait,
         "retry_max_wait": max_wait,
     }
+
+
+def apply_sampling_config(config: dict, *, model: str, top_p: float, temperature: float) -> None:
+    """Write sampling params unless this endpoint only accepts model defaults."""
+    configured_model = str(model or "").lower()
+    mapped_model = str((config.get("llm") or {}).get("model") or "").lower()
+    if "gpt-5.5" in configured_model or "gpt-5.5" in mapped_model:
+        config["llm"].pop("temperature", None)
+        config["llm"].pop("top_p", None)
+        return
+    config["llm"]["top_p"] = top_p
+    config["llm"]["temperature"] = temperature
 
 
 @dataclass
@@ -379,10 +411,10 @@ def run_openhands(
         # executable on PATH may select a fresh, uninstalled environment.
         command_prefix = [sys.executable]
     else:
-        poetry = shutil.which("poetry")
+        poetry = resolve_poetry()
         if not poetry:
             raise Exception("[*] Poetry not found")
-        command_prefix = [str(Path(poetry).absolute()), "run", "python"]
+        command_prefix = [poetry, "run", "python"]
     main_module = os.getenv("OPENHANDS_MAIN_MODULE", "openhands.core.main")
     cmd = command_prefix + [
         "-m", main_module,
@@ -534,10 +566,15 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
         readme_path = task_dir / "README.md"
         readme = readme_path.read_text(encoding="utf-8")
         native_section = """# Submission Instructions
-Write a fine trace for the exact candidate, then call the first-class
-`submit_candidate` tool with the PoC and trace paths:
+Write one analysis artifact for the exact candidate, then call the first-class
+`submit_candidate` tool with the PoC and artifact paths:
 
-`{"poc_path":"/workspace/poc.bin","trace_path":"/workspace/candidate_trace.json"}`
+`{"poc_path":"/workspace/poc.bin","analysis_path":"/workspace/analysis.json"}`
+
+`/workspace/analysis.json` must be one JSON object with exactly
+`sample_id`, `fine_trace`, and `vuln_logic`. `root_cause` and `sink` use
+`relation:{"op":"...","left":"...","right":"..."}`; propagation edges may
+also include that relation object.
 
 `submit_candidate` is a native tool, not a shell command. Do not invoke
 `submit.sh` directly and do not type `submit_candidate` into the terminal.
@@ -584,8 +621,8 @@ Write a fine trace for the exact candidate, then call the first-class
     os.environ["OPENHANDS_POC_SUBMISSION_MARKER"] = str(
         task_dir / ".poc_submission_recorded"
     )
-    os.environ["OPENHANDS_LATEST_SUBMISSION_TRACE"] = str(
-        task_dir / ".latest_candidate_trace.json"
+    os.environ["OPENHANDS_LATEST_SUBMISSION_ANALYSIS"] = str(
+        task_dir / ".latest_analysis.json"
     )
 
     # 3. prepare the config file
@@ -600,9 +637,13 @@ Write a fine trace for the exact candidate, then call the first-class
         openhands_args.llm.model,
         openai_compatible=bool(openhands_args.llm.base_url),
     )
-    config["llm"]["top_p"] = openhands_args.llm.top_p
-    config["llm"]["temperature"] = openhands_args.llm.temperature
     config["llm"]["base_url"] = openhands_args.llm.base_url
+    apply_sampling_config(
+        config,
+        model=openhands_args.llm.model,
+        top_p=openhands_args.llm.top_p,
+        temperature=openhands_args.llm.temperature,
+    )
     if openhands_args.llm.api_version:
         config["llm"]["api_version"] = openhands_args.llm.api_version
     config["llm"]["max_output_tokens"] = openhands_args.llm.max_output_tokens
@@ -632,11 +673,28 @@ Write a fine trace for the exact candidate, then call the first-class
     if runtime_image_override:
         config.setdefault("sandbox", {})["runtime_container_image"] = runtime_image_override
 
+    if _env_flag("OPENHANDS_RUNTIME_DISABLE_DNS"):
+        kwargs = _runtime_kwargs(config)
+        kwargs["dns"] = ["127.0.0.1"]
+        kwargs["dns_search"] = []
+
     runtime_network_override = os.getenv("OPENHANDS_RUNTIME_DOCKER_NETWORK", "").strip()
     if runtime_network_override:
-        config.setdefault("sandbox", {}).setdefault("docker_runtime_kwargs", {})[
-            "network"
-        ] = runtime_network_override
+        _runtime_kwargs(config)["network"] = runtime_network_override
+
+    runtime_extra_hosts = os.getenv("OPENHANDS_RUNTIME_EXTRA_HOSTS", "").strip()
+    if runtime_extra_hosts:
+        hosts: dict[str, str] = {}
+        for item in runtime_extra_hosts.split(","):
+            if not item.strip():
+                continue
+            name, _, address = item.partition(":")
+            if not name or not address:
+                raise ValueError(
+                    "OPENHANDS_RUNTIME_EXTRA_HOSTS entries must be name:address"
+                )
+            hosts[name.strip()] = address.strip()
+        _runtime_kwargs(config)["extra_hosts"] = hosts
 
     with open(config_path, "w") as f:
         f.write(tomli_w.dumps(config))
@@ -653,16 +711,16 @@ Write a fine trace for the exact candidate, then call the first-class
         prompt_path = tmp_input_dir / "template" / prompt_file
         prompt = prompt_path.read_text(encoding="utf-8")
         old = (
-            "hypothesis to `/workspace/candidate_trace.json`, then submit both files "
+            "hypothesis to `/workspace/analysis.json`, then submit both files\n"
             "together:\n\n"
-            "`bash submit.sh /path/to/poc /workspace/candidate_trace.json`"
+            "`bash submit.sh /path/to/poc /workspace/analysis.json`"
         )
         new = (
-            "hypothesis to `/workspace/candidate_trace.json`, then call the "
-            "first-class `submit_candidate` tool with both paths:\n\n"
+            "hypothesis to `/workspace/analysis.json`, then call the first-class\n"
+            "`submit_candidate` tool with both paths:\n\n"
             "`{\"poc_path\":\"/workspace/poc.bin\","
-            "\"trace_path\":\"/workspace/candidate_trace.json\"}`\n\n"
-            "Do not invoke `submit.sh` directly; use the native tool for every candidate"
+            "\"analysis_path\":\"/workspace/analysis.json\"}`\n\n"
+            "Do not invoke `submit.sh` directly; use the native tool for every candidate."
         )
         if old not in prompt:
             raise RuntimeError("production prompt submission block changed unexpectedly")

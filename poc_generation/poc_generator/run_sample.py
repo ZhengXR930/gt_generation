@@ -6,7 +6,7 @@ scratch dir, then copies only the durable checkpoint pieces (file_store,
 trajectory, config.toml, args.json -- NOT the extracted repo/workspace, which
 can be 1-2GB and is not part of the durable session state) into
 poc_generation/<sample_id>/checkpoint/, and writes poc_generation/<sample_id>/manifest.json.
-The subject's GT-shaped final fine trace is captured as part of the same task.
+The subject's final analysis artifact is captured as part of the same task.
 """
 import argparse
 import atexit
@@ -40,6 +40,7 @@ from cybergym.task.types import TaskDifficulty  # noqa: E402
 from check_success import check as check_success  # noqa: E402
 from poc_dedup import deduplicate_submission_attempts  # noqa: E402
 from reward_framework.harness_repository import HarnessRepository  # noqa: E402
+from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
 
 
 def cleanup_scratch(scratch: Path) -> None:
@@ -170,7 +171,7 @@ def default_api_key_env(model: str) -> str:
 def native_tool_calling_for_model(model: str) -> bool | None:
     """Override old OpenHands capability tables for newer official models."""
     normalized = model[len("openai/"):] if model.startswith("openai/") else model
-    if normalized.startswith("gpt-5.4"):
+    if normalized.startswith(("gpt-5.4", "gpt-5.5")):
         return True
     return None
 
@@ -197,6 +198,35 @@ def copy_json_redacted(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
         return
     dst.write_text(json.dumps(redact_secrets(payload), indent=2), encoding="utf-8")
+
+
+def unlink_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def materialize_attempt_analysis_files(attempt_dir: Path, analysis_name: str = "analysis.json") -> bool:
+    """Persist one immutable submission analysis artifact beside its PoC files."""
+    analysis_path = attempt_dir / analysis_name
+    try:
+        raw = analysis_path.read_text(encoding="utf-8")
+        artifact = json.loads(raw)
+    except (OSError, TypeError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact) != {"sample_id", "fine_trace", "vuln_logic"}
+    ):
+        return False
+    if validate_analysis_artifact_quality(raw) is not None:
+        return False
+    (attempt_dir / "analysis.json").write_text(
+        json.dumps(artifact, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return True
 
 
 def runtime_server_url(server: str) -> str:
@@ -229,7 +259,10 @@ def find_run_dir(log_dir: Path, task_id_safe: str, agent_id: str | None) -> Path
 
 
 def persist_submission_attempts(
-    sample_dir: Path, cybergym_agent_id: str, attempts: list[dict]
+    sample_dir: Path,
+    cybergym_agent_id: str,
+    attempts: list[dict],
+    fallback_analysis: Path | None = None,
 ) -> list[dict]:
     """Copy the immutable server ledger into this model/sample result tree."""
     source_root = ROOT / "server" / "logs" / "submissions" / cybergym_agent_id
@@ -244,6 +277,13 @@ def persist_submission_attempts(
         destination = destination_root / attempt_id
         if source.is_dir() and not destination.exists():
             shutil.copytree(source, destination)
+        if destination.is_dir():
+            materialize_attempt_analysis_files(destination)
+            if fallback_analysis is not None and not (destination / "analysis.json").is_file():
+                try:
+                    shutil.copy2(fallback_analysis, destination / "analysis.json")
+                except OSError:
+                    pass
         record = dict(attempt)
         record["result_path"] = (
             f"submissions/{attempt_id}/" if destination.is_dir() else None
@@ -289,14 +329,18 @@ def persist_reward_framework_state(
             if evidence_path.is_file() else {}
         )
         runtime = evidence.get("runtime") or {}
-        trace_rel = attempt_rel / "trace.json"
+        analysis_rel = attempt_rel / "analysis.json"
         poc_rel = Path("reward_framework/candidates") / candidate_id / "poc"
         runtime_rel = attempt_rel / "current_runtime.json"
-        trace_path = sample_dir / trace_rel
-        trace_valid = False
+        analysis_path = sample_dir / analysis_rel
+        materialize_attempt_analysis_files(analysis_path.parent)
+        analysis_valid = False
         try:
-            trace_value = json.loads(trace_path.read_text(encoding="utf-8"))
-            trace_valid = isinstance(trace_value, (list, dict))
+            analysis_value = json.loads(analysis_path.read_text(encoding="utf-8"))
+            analysis_valid = (
+                isinstance(analysis_value, dict)
+                and set(analysis_value) == {"sample_id", "fine_trace", "vuln_logic"}
+            )
         except (OSError, TypeError, json.JSONDecodeError):
             pass
         normalized.append({
@@ -307,14 +351,14 @@ def persist_reward_framework_state(
             "candidate_id": candidate_id,
             "duplicate_of": metadata.get("duplicate_of"),
             "poc_hash": metadata.get("sha256"),
-            "trace_valid": trace_valid,
+            "analysis_valid": analysis_valid,
             "vul_exit_code": runtime.get("exit_code"),
             "crashed": runtime.get("trigger_observed") is True,
             "trigger_observed": runtime.get("trigger_observed") is True,
             "assessment": evidence.get("assessment"),
             "feedback": evidence.get("feedback"),
             "result_path": f"{attempt_rel.as_posix()}/",
-            "trace_path": trace_rel.as_posix(),
+            "analysis_path": analysis_rel.as_posix(),
             "poc_path": poc_rel.as_posix(),
             "runtime_output_path": (
                 runtime_rel.as_posix()
@@ -357,10 +401,39 @@ def clear_previous_result(sample_dir: Path) -> None:
             shutil.rmtree(path)
     for name in (
         "manifest.json",
+        "analysis_artifact.json",
+        "analysis.json",
+        "analysis_artifact.response.txt",
         "fine_trace.json",
         "fine_trace.response.txt",
+        "vuln_logic.json",
     ):
-        (sample_dir / name).unlink(missing_ok=True)
+        unlink_if_exists(sample_dir / name)
+
+
+def persist_analysis_artifact(candidate_path: Path, sample_dir: Path) -> bool:
+    try:
+        raw = candidate_path.read_text(encoding="utf-8")
+        artifact = json.loads(raw)
+    except (OSError, TypeError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(artifact, dict)
+        or not isinstance(artifact.get("sample_id"), str)
+        or not artifact["sample_id"].strip()
+        or not isinstance(artifact.get("fine_trace"), list)
+        or not isinstance(artifact.get("vuln_logic"), dict)
+    ):
+        return False
+    if artifact.get("sample_id") != sample_dir.name:
+        return False
+    if validate_analysis_artifact_quality(raw) is not None:
+        return False
+    (sample_dir / "analysis.json").write_text(
+        json.dumps(artifact, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return True
 
 
 def count_agent_actions(trajectory_path: Path) -> int:
@@ -489,7 +562,11 @@ def run_attempt(
         try:
             returned_agent_id = run_with_configs(openhands_args, task_args)
         except Exception as exc:
-            logging.warning(f"run_with_configs raised {exc!r}; still attempting checkpoint save from partial state")
+            logging.exception(
+                "run_with_configs raised %r; still attempting checkpoint save "
+                "from partial state",
+                exc,
+            )
             returned_agent_id = None
 
         run_dir = find_run_dir(openhands_args.log_dir, task_id_safe, returned_agent_id)
@@ -510,46 +587,45 @@ def run_attempt(
                 check_success(db_path, cybergym_agent_id)
                 if db_path.exists() else {"ok": False, "error": "db not found"}
             )
+            task_workspace = Path(os.environ.get("OPENHANDS_TASK_WORKSPACE") or "")
+            fallback_analysis = task_workspace / ".latest_analysis.json"
+            if not fallback_analysis.is_file():
+                fallback_analysis = sample_dir / "analysis.json"
             persisted_attempts = persist_submission_attempts(
                 sample_dir,
                 cybergym_agent_id,
                 success_info.get("submission_attempts") or [],
+                fallback_analysis if fallback_analysis.is_file() else None,
             )
         poc_deduplication, deduplicated_pocs = (
             deduplicate_submission_attempts(persisted_attempts)
         )
-        trace_source = "task_finalization"
+        analysis_source = "task_finalization"
         valid_attempts = [
-            attempt for attempt in persisted_attempts if attempt.get("trace_valid")
+            attempt for attempt in persisted_attempts if attempt.get("analysis_valid")
         ]
         if valid_attempts:
             latest = valid_attempts[-1]
             candidate_path = (
-                sample_dir / str(latest["trace_path"])
-                if latest.get("trace_path")
-                else sample_dir / str(latest["result_path"]) / "candidate_trace.json"
+                sample_dir / str(latest["analysis_path"])
+                if latest.get("analysis_path")
+                else sample_dir / str(latest["result_path"]) / "analysis.json"
             )
             if candidate_path.is_file():
-                trace_output = sample_dir / "fine_trace.json"
-                shutil.copy2(candidate_path, trace_output)
-                shutil.copy2(
-                    candidate_path,
-                    trace_output.with_name("fine_trace.response.txt"),
-                )
-                trace_source = (
-                    "reward_framework_last_valid_submission"
-                    if reward_result is not None else "last_valid_poc_submission"
-                )
+                if persist_analysis_artifact(candidate_path, sample_dir):
+                    analysis_source = (
+                        "reward_framework_last_valid_submission"
+                        if reward_result is not None else "last_valid_poc_submission"
+                    )
 
-        # A final fine trace is written ONLY when the episode reaches a clean
+        # A final analysis artifact is written ONLY when the episode reaches a clean
         # endpoint (iteration limit / agent finished). Its
         # presence is therefore the reliable signal that the run terminated
         # cleanly -- unlike a trajectory-length heuristic, which a stuck loop
         # inflates past max_iter and so misreports an early death as a genuine
-        # iteration cap. No trace + no success => the episode died early
+        # iteration cap. No artifact + no success => the episode died early
         # (stuck loop / error) and should be re-run (see main).
-        trace_produced = (results_dir / sample_id / "fine_trace.json").exists()
-        trace_response = results_dir / sample_id / "fine_trace.response.txt"
+        analysis_produced = (results_dir / sample_id / "analysis.json").exists()
         trajectory_path = run_dir / "trajectory"
         agent_action_count = count_agent_actions(trajectory_path)
         terminal_finish_observed = trajectory_has_finish_action(trajectory_path)
@@ -567,7 +643,7 @@ def run_attempt(
         effective_controller_iterations = agent_action_count + blocked_finish_count
         finalization_marker_seen = (
             trajectory_path.is_file()
-            and "[Fine Trace Finalization]" in trajectory_path.read_text(
+            and "[Analysis Artifact Finalization]" in trajectory_path.read_text(
                 encoding="utf-8", errors="replace"
             )
         )
@@ -590,14 +666,12 @@ def run_attempt(
         )
         if success_info.get("success"):
             status = "success"
-        elif trace_produced and reached_iteration_cap:
-            status = "iteration_cap"
-        elif trace_produced and terminal_finish_observed:
+        elif analysis_produced and persisted_attempts:
             status = "agent_finished"
-        elif trace_response.is_file() and reached_iteration_cap:
-            status = "iteration_cap_invalid_trace"
-        elif trace_response.is_file() and terminal_finish_observed:
-            status = "agent_finished_invalid_trace"
+        elif analysis_produced and reached_iteration_cap:
+            status = "iteration_cap"
+        elif analysis_produced and terminal_finish_observed:
+            status = "agent_finished"
         else:
             status = "incomplete"
 
@@ -647,7 +721,7 @@ def run_attempt(
             shutil.rmtree(frozen_checkpoint)
 
         manifest_entry = {
-            "evaluation_protocol": "poc_trace_per_submission_v2",
+            "evaluation_protocol": "poc_analysis_artifact_per_submission_v3",
             "arvo_id": args.arvo_id,
             "task_id": task_id,
             "sample_id": sample_id,
@@ -668,19 +742,16 @@ def run_attempt(
             "submission_attempts": persisted_attempts,
             "poc_deduplication": poc_deduplication,
             "deduplicated_pocs": deduplicated_pocs,
-            "fine_trace": {
-                "path": "fine_trace.json",
-                "produced": trace_produced,
-                "raw_response_path": (
-                    "fine_trace.response.txt" if trace_response.is_file() else None
-                ),
-                "format": "GT fine_trace JSON array",
-                "source": trace_source,
+            "analysis": {
+                "path": "analysis.json",
+                "produced": (sample_dir / "analysis.json").is_file(),
+                "format": "JSON object with sample_id, fine_trace, and vuln_logic",
+                "source": analysis_source,
             },
             "checkpoint": {
                 "dir": "checkpoint/",
                 "phase": (
-                    "pre_fine_trace_finalization"
+                    "pre_analysis_artifact_finalization"
                     if frozen_checkpoint is not None
                     else "terminal"
                 ),
@@ -795,7 +866,7 @@ def main():
     ap.add_argument("--max-attempts", type=int, default=3,
                     help="Re-run the whole episode up to this many times if it dies early "
                          "(stuck loop / no normal endpoint), since every completed task "
-                         "must yield a final fine trace.")
+                         "must yield a final analysis artifact.")
     args = ap.parse_args()
     results_dir = args.results_dir.expanduser().resolve()
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -883,39 +954,46 @@ def main():
     sample_id = f"arvo_{args.arvo_id}"
     ensure_arvo_source(args.arvo_id)
 
-    # The initial task prompt declares the GT-shaped fine trace as a required
-    # final deliverable. The harness only supplies a bounded format-only final
-    # turn at the iteration limit; it does not start a probe or reveal GT.
-    trace_output = results_dir / sample_id / "fine_trace.json"
-    trace_output.parent.mkdir(parents=True, exist_ok=True)
+    # The initial task prompt declares the analysis artifact as a required final
+    # deliverable. The harness only supplies a bounded format-only final turn at
+    # the iteration limit; it does not start a probe or reveal GT.
+    analysis_output = results_dir / sample_id / "analysis.json"
+    sample_output_dir = results_dir / sample_id
+    analysis_output = sample_output_dir / "analysis.json"
+    sample_output_dir.mkdir(parents=True, exist_ok=True)
     os.environ["OPENHANDS_HARNESS_MODE"] = "evaluation"
     os.environ["OPENHANDS_CAPTURE_FINE_TRACE"] = "1"
-    os.environ["OPENHANDS_FINE_TRACE_OUTPUT"] = str(trace_output)
+    os.environ.pop("OPENHANDS_ANALYSIS_ARTIFACT_OUTPUT", None)
+    os.environ["OPENHANDS_ANALYSIS_OUTPUT"] = str(analysis_output)
+    os.environ.pop("OPENHANDS_FINE_TRACE_OUTPUT", None)
+    os.environ.pop("OPENHANDS_VULN_LOGIC_OUTPUT", None)
+    os.environ["OPENHANDS_EXPECTED_SAMPLE_ID"] = sample_id
     # Do not inherit the upstream entrypoint from a parent experiment: the
     # evaluation protocol requires the checkpoint/fine-trace overlay.
     os.environ["OPENHANDS_MAIN_MODULE"] = "poc_generation.openhands_fine_trace_main"
 
     last_status = None
     for attempt in range(1, args.max_attempts + 1):
-        clear_previous_result(trace_output.parent)
+        clear_previous_result(sample_output_dir)
         os.environ["OPENHANDS_PRE_FINALIZATION_CHECKPOINT"] = str(
-            trace_output.parent / "checkpoint" / "pre_finalization"
+            sample_output_dir / "checkpoint" / "pre_finalization"
         )
-        # A fresh episode each attempt: overwrite this sample's fine_trace.json
-        # only when it reaches a normal endpoint. Start clean so a stale trace from a
-        # prior early-died attempt cannot be mistaken for this attempt's output.
-        trace_output.unlink(missing_ok=True)
-        trace_output.with_name("fine_trace.response.txt").unlink(missing_ok=True)
+        # A fresh episode each attempt: overwrite this sample's analysis artifact
+        # only when it reaches a normal endpoint. Start clean so stale output from
+        # a prior early-died attempt cannot be mistaken for this attempt's output.
+        unlink_if_exists(analysis_output)
+        unlink_if_exists(analysis_output.with_name("analysis_artifact.json"))
+        unlink_if_exists(analysis_output.with_name("analysis_artifact.response.txt"))
         print(f"[*] {sample_id}: generation attempt {attempt}/{args.max_attempts}")
         last_status = run_attempt(
             args, task_id, task_id_safe, sample_id, results_dir
         )
-        if last_status in ("success", "iteration_cap", "agent_finished") and trace_output.exists():
-            print(f"[*] {sample_id}: clean endpoint on attempt {attempt} (status={last_status}); fine trace captured")
+        if last_status in ("success", "iteration_cap", "agent_finished") and analysis_output.exists():
+            print(f"[*] {sample_id}: clean endpoint on attempt {attempt} (status={last_status}); analysis artifact captured")
             return
-        print(f"[*] {sample_id}: attempt {attempt} did not yield a trace "
+        print(f"[*] {sample_id}: attempt {attempt} did not yield an analysis artifact "
               f"(status={last_status}); {'retrying' if attempt < args.max_attempts else 'giving up'}")
-    print(f"[!] {sample_id}: no fine trace after {args.max_attempts} attempts (last status={last_status})")
+    print(f"[!] {sample_id}: no analysis artifact after {args.max_attempts} attempts (last status={last_status})")
     sys.exit(1)
 
 

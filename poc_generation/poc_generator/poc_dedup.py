@@ -12,8 +12,8 @@ def deduplicate_submission_attempts(
 
     The caller keeps the immutable attempt ledger.  This function builds the
     evaluation view: reachability executes one representative per PoC hash, and
-    the representative's candidate trace is the last trace submitted for those
-    exact bytes.
+    the representative's analysis artifact is the last analysis submitted for
+    those exact bytes.
     """
     groups: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []
@@ -43,9 +43,9 @@ def deduplicate_submission_attempts(
             ],
             "representative_attempt_id": latest.get("attempt_id"),
             "representative_sequence_in_run": latest.get("sequence_in_run"),
-            "representative_trace_path": (
-                latest.get("trace_path")
-                or (f"{result_path}/candidate_trace.json" if result_path else None)
+            "representative_analysis_path": (
+                latest.get("analysis_path")
+                or (f"{result_path}/analysis.json" if result_path else None)
             ),
             "representative_poc_path": (
                 latest.get("poc_path")
@@ -65,7 +65,7 @@ def deduplicate_submission_attempts(
     stats = {
         "scope": "within_model_sample",
         "key": "poc_sha256",
-        "representative_policy": "last_submission_trace",
+        "representative_policy": "last_submission_analysis",
         "total_poc_submissions": total,
         "deduplicated_poc_count": unique,
         "duplicate_poc_submissions": duplicates,

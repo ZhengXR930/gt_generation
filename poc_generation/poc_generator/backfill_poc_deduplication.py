@@ -17,7 +17,7 @@ MODEL_NAMESPACES = ("deepseek-v4-flash", "gpt-5.4-mini")
 def main() -> None:
     aggregate = {
         "deduplication_key": "(model_namespace, sample_id, poc_sha256)",
-        "representative_policy": "last_submission_trace",
+        "representative_policy": "last_submission_analysis",
         "models": {},
     }
     overall_total = 0
@@ -30,7 +30,11 @@ def main() -> None:
             (RESULTS_ROOT / namespace).glob("*/manifest.json")
         ):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("evaluation_protocol") != "poc_trace_per_submission_v2":
+            if manifest.get("evaluation_protocol") not in {
+                "poc_trace_per_submission_v2",
+                "poc_analysis_artifact_per_submission_v3",
+                "poc_analysis_artifact_per_submission_v3_local",
+            }:
                 continue
             stats, representatives = deduplicate_submission_attempts(
                 manifest.get("submission_attempts") or []

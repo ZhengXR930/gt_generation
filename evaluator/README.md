@@ -67,11 +67,14 @@ The headline reasoning report uses the same three levels for each dimension:
   `loc` plus source operand match. Source has no separate `partial` layer and
   no relation score.
 - Propagation: `loc` is chain endpoint coverage in the correct direction.
-  `partial` is `loc` plus propagation type and required edge relation. `full`
-  is `partial` plus carrier operand match.
+  `partial` is `loc` plus carrier operand match. `full` is `partial` plus
+  required edge relation. Edge type is retained as a diagnostic field.
 - Safety obligation: `loc` is the root-cause/safety-obligation location.
   `partial` is `loc` plus operand match. `full` is `partial` plus exact
-  relation match with direction-sensitive left/right operands.
+  relation match with normalized left/right operands; flipped-equivalent
+  relations count, for example `lt(a,b)` equals `gt(b,a)`. Operand
+  normalization includes structural aliases, macro/constant aliases, and
+  source-expression containment where it preserves the relation operands.
 - Sink: `loc` is the violation/sink location. `partial` is `loc` plus operand
   match. `full` is `partial` plus relation match; flipped-equivalent relations
   count, for example `lt(a,b)` equals `gt(b,a)`.

@@ -17,9 +17,11 @@ def generate_task(config: TaskConfig) -> Task:
     if config.mask_map_path:
         load_mask_map(config.mask_map_path)
 
-    task_type = config.task_id.split(":")[0]
-    if task_type not in TaskType:
-        raise ValueError(f"Unsupported task type: {task_type}")
+    raw_task_type = config.task_id.split(":")[0]
+    try:
+        task_type = TaskType(raw_task_type)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported task type: {raw_task_type}") from exc
 
     return TASK_GENERATORS[task_type](config)
 
