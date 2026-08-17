@@ -45,11 +45,20 @@ instrumentation stage. Do not edit the plan or either patch here.
    vulnerable execution; assertions that do not hold are omitted from the final
    verified subset instead of blocking a package whose root differential is
    proven.
+   If a required assertion is satisfied in the vulnerable original case, stop
+   treating this as an execution problem: the frozen GT semantics are wrong.
+   Record the concrete event values in your summary and fail the stage so Stage
+   04A can rewrite the root obligation. Do not reinterpret a satisfied required
+   predicate as observed evidence.
 2. Restore/switch to the true fixed side, apply the frozen fixed
    instrumentation, build, and run the same PoC. The fixed run is required for
    the root `required` differential; fixed-side outcomes of `observed` and
    `transition` assertions are diagnostic only and do not gate propagation
    verification.
+   If vulnerable and fixed originals have the same truth value for every
+   required assertion, the sample does not yet have a valid root differential.
+   Do not package it. Either the fixed oracle is wrong, or the required
+   predicate must be redesigned in Stage 04A.
 3. Classify each required assertion as `genuine`, `guarded`, `avoided`, or
    `not_exercised`. If the fixed original is `guarded` or `avoided` because the
    protected operation did not execute, run exactly one closest source-grounded
@@ -64,6 +73,9 @@ instrumentation stage. Do not edit the plan or either patch here.
    `relation`, and every edge keeps `from_node`/`to_node` references. The
    root-cause criterion is mandatory; propagation nodes and edges may be a
    verified subset of the candidate graph.
+   Never keep a root-cause node whose required assertion failed the
+   vulnerable/fixed differential. Never replace a failed root with a propagation
+   node just to satisfy the schema.
 5. Run the deterministic assertion and binding gates:
 
 ```bash
@@ -92,6 +104,31 @@ If the fixed original was `guarded` or `avoided`, include exactly one
 non-original CASE in the fixed trace for the closest source-grounded
 perturbation. Keep its raw runtime events as normal `CASE`/`ASSERT_EVT`
 records; do not hand-edit CASE framing.
+
+## Failure triage
+
+When the deterministic assertion command fails, classify it before retrying:
+
+- `observed assertion ... must relate two source-derived event fields` means the
+  frozen 04A plan is invalid. Observed and transition checks must be
+  `$event.field` versus `$event.field`; 04B must not edit the spec to sneak in
+  a literal. Return the failure with the offending assertion id.
+- Required assertion vulnerable status `satisfied` means the root obligation is
+  wrong for this witness. Return the vulnerable values and request a Stage 04A
+  rewrite. Example: if the trace shows `off < size` in both vulnerable and
+  fixed executions, that predicate cannot prove the vulnerability.
+- Required assertion fixed status `refuted` with a crashing fixed run means the
+  fixed oracle may be invalid. Check `sample_info.json` for fixed-range data;
+  if the recorded fix commit is first-known-bad or fixed side still crashes,
+  do not mark the package complete.
+- Missing propagation or observed assertions can be handled by verified-subset
+  packaging only after at least one required root assertion is differentially
+  verified.
+
+Do not use arbitrary numeric thresholds in 04B to rescue a bad observed/sink
+assertion. If the semantic sink fact is valid, it must be expressible through
+already captured source fields, for example `str_size > off`, not
+`str_size > 1000000`.
 
 Do not run reachability and do not clean the ARVO container or images. The next
 deterministic stage owns debugger reachability, and cleanup occurs only after
