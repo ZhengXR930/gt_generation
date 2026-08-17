@@ -1,0 +1,123 @@
+{
+  "sample_id": "arvo_10676",
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processCompleteChunkWithoutChannel",
+      "line": 696,
+      "var": "tcpMessageHeader.messageTypeAndChunkType",
+      "code": "case UA_MESSAGETYPE_HEL: retval = processHEL(server, connection, message, &offset);",
+      "note": "PoC starts with HEL chunk; dummy connection becomes UA_CONNECTION_ESTABLISHED"
+    },
+    {
+      "step": 2,
+      "file": "src/server/ua_server_binary.c",
+      "function": "createSecureChannel",
+      "line": 677,
+      "var": "retval",
+      "code": "return UA_SecureChannelManager_create(&server->secureChannelManager, connection, &endpoint->securityPolicy, asymHeader);",
+      "note": "OPN chunk with SecurityPolicy#None creates SecureChannel, channelId=1 tokenId=1"
+    },
+    {
+      "step": 3,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processMSG",
+      "line": 457,
+      "var": "requestType",
+      "code": "Service_CreateSession(server, channel, (const UA_CreateSessionRequest *)request, (UA_CreateSessionResponse *)response);",
+      "note": "CreateSessionRequest (id 461) creates a session via UA_SessionManager_createSession"
+    },
+    {
+      "step": 4,
+      "file": "src/server/ua_server_binary.c",
+      "function": "processMSG",
+      "line": 492,
+      "var": "session",
+      "code": "Service_ActivateSession(server, channel, session, (const UA_ActivateSessionRequest*)request, (UA_ActivateSessionResponse*)response);",
+      "note": "ActivateSessionRequest (id 467) activates the session (fuzz mode reuses stored auth token)"
+    },
+    {
+      "step": 5,
+      "file": "src/server/ua_services_subscription.c",
+      "function": "Service_CreateSubscription",
+      "line": 70,
+      "var": "session->serverSubscriptions",
+      "code": "UA_Subscription_new / UA_Session_addSubscription",
+      "note": "CreateSubscriptionRequest (id 787) creates subscription id 1"
+    },
+    {
+      "step": 6,
+      "file": "src/server/ua_services_subscription.c",
+      "function": "Service_CreateMonitoredItems",
+      "line": 383,
+      "var": "sub->monitoredItems",
+      "code": "UA_MonitoredItem_init / UA_Subscription_addMonitoredItem",
+      "note": "CreateMonitoredItemsRequest (id 751) creates monitored item id 1 on ServerStatus/State"
+    },
+    {
+      "step": 7,
+      "file": "src/server/ua_subscription_monitoreditem.c",
+      "function": "UA_MonitoredItem_delete",
+      "line": 87,
+      "var": "monitoredItem->delayedFreePointers",
+      "code": "UA_WorkQueue_enqueueDelayed(&server->workQueue, &monitoredItem->delayedFreePointers);",
+      "note": "DeleteMonitoredItemsRequest (id 781) removes item 1; its delayedFreePointers M1d is enqueued -> queue [M1d]"
+    },
+    {
+      "step": 8,
+      "file": "src/server/ua_session_manager.c",
+      "function": "removeSession",
+      "line": 56,
+      "var": "sentry->cleanupCallback",
+      "code": "UA_WorkQueue_enqueueDelayed(&sm->server->workQueue, &sentry->cleanupCallback);",
+      "note": "CloseSessionRequest (id 473) -> Service_CloseSession -> UA_SessionManager_removeSession -> removeSession enqueues session cleanup callback A at head -> queue [A, M1d]"
+    },
+    {
+      "step": 9,
+      "file": "src/server/ua_server.c",
+      "function": "UA_Server_run_shutdown",
+      "line": 553,
+      "var": "server->workQueue",
+      "code": "UA_WorkQueue_cleanup(&server->workQueue);",
+      "note": "Harness calls UA_Server_run_shutdown: first cleanup pass drains delayed-callback queue"
+    },
+    {
+      "step": 10,
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "line": 253,
+      "var": "dc->callback",
+      "code": "dc->callback(dc->application, dc->data);",
+      "note": "Pass 1 processes A: removeSessionCallback -> UA_Session_deleteMembersCleanup -> UA_Session_deleteSubscription -> UA_Subscription_deleteMembers -> UA_WorkQueue_enqueueDelayed(&sub->delayedFreePointers) re-enqueues Sd onto the queue being processed; then UA_free(A)"
+    },
+    {
+      "step": 11,
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "line": 255,
+      "var": "dc",
+      "code": "UA_free(dc);",
+      "note": "Next loop iteration dc is the pre-computed next (M1d); SIMPLEQ_REMOVE_HEAD removes the re-enqueued Sd instead; M1d is freed but remains linked in delayedCallbacks queue"
+    },
+    {
+      "step": 12,
+      "file": "src/server/ua_server.c",
+      "function": "UA_Server_delete",
+      "line": 218,
+      "var": "server->workQueue",
+      "code": "UA_WorkQueue_cleanup(&server->workQueue);",
+      "note": "Harness then calls UA_Server_delete: second cleanup pass drains the queue again"
+    },
+    {
+      "step": 13,
+      "file": "src/ua_workqueue.c",
+      "function": "UA_WorkQueue_manuallyProcessDelayed",
+      "line": 251,
+      "var": "dc",
+      "code": "SIMPLEQ_FOREACH_SAFE(dc, &wq->delayedCallbacks, next, dc_tmp) { ... if(dc->callback) ... }",
+      "note": "Pass 2 dereferences the dangling M1d (SIMPLEQ_NEXT / dc->callback) -> heap-use-after-free / double free"
+    }
+  ],
+  "vuln_logic": "UA_WorkQueue_manuallyProcessDelayed (src/ua_workqueue.c) drains the delayed-callback SIMPLEQ with FOREACH_SAFE using a pre-computed next pointer, but REMOVE_HEAD always detaches the current queue head. During server deletion the session-removal delayed callback (removeSessionCallback, enqueued by removeSession in ua_session_manager.c) runs subscription cleanup which calls UA_Subscription_deleteMembers / UA_MonitoredItem_delete and re-enqueues the subscription's and monitored item's delayedFreePointers onto the SAME queue currently being iterated (ua_session.c UA_Session_deleteSubscription line 112, ua_subscription_monitoreditem.c line 88). The pre-computed next pointer then refers to an entry that is detached from the head mismatch: a previously-enqueued monitored-item callback (from DeleteMonitoredItems) is freed (UA_free(dc)) while still linked. The second cleanup pass (UA_Server_delete -> UA_WorkQueue_cleanup, after UA_Server_run_shutdown -> UA_WorkQueue_cleanup in the fuzz harness) iterates the leftover dangling entry and dereferences freed memory (dc->callback / SIMPLEQ_NEXT), causing the heap-use-after-free. Trigger: open a channel, create+activate a session, create a subscription with a monitored item, delete the monitored item (enqueue M1d), then close the session (enqueue A) so that A's deferred subscription cleanup re-queues Sd during the first drain."
+}

@@ -1,0 +1,1410 @@
+You are finalizing the output of a timed-out PoC generation agent.
+
+The original PoC generation run ended with status: iteration_cap. Its saved
+analysis is missing or does not satisfy the current required schema. You are
+not judging the agent and you must not propose new PoC construction steps.
+Your task is only to convert the saved reasoning trajectory into the required
+structured analysis artifact.
+
+Trusted issue description:
+A stack buffer used to store a CHOICE name is not zero-initialized. When the buffer is compared against a literal string, the comparison reads uninitialized tail bytes, causing a use-of-uninitialized-value defect.
+
+Saved trajectory evidence:
+498: 	td.size = hex_str_size(data_size) + 1; /* +1 for '#' */
+49
+...
+m_t * output, unsigned allow_ber)
+629: {
+630: 	int ret;
+631: 	uint8_t *str;
+632: 	unsigned int str_size, len;
+633: 	gnutls_datum_t td;
+634: 
+635: 	if (allow_ber)
+636: 		ret =
+637: 		    asn1_decode_simple_ber(etype, der, der_size, &str, &str_size, NULL);
+638: 	else
+639: 		ret =
+640: 		    asn1_decode_simple_der(etype, der, der_size, (const uint8_t**)&str, &str_size);
+641: 	if (ret != ASN1_SUCCESS) {
+642: 		gnutls_assert();
+643: 		ret = _gnutls_asn2err(ret);
+644: 		return ret;
+645: 	}
+646: 
+647: 	td.size = str_size;
+648: 	td.data = gnutls_malloc(str_size + 1);
+649: 	if (td.data == NULL)
+650: 		return gnutls_assert_val(GNUTLS_E_MEMORY_ERROR);
+651: 
+652: 	memcpy(td.data, str, str_size);
+653: 	td.data[str_size] = 0;
+654: 
+655: 	if (allow_ber)
+656: 		free(str);
+657: 
+658: 	ret = make_printable_string(etype, &td, output);
+
+(Showing lines 459-658 of 1910. Use offset=659 to continue.)
+</content>
+
+ASSISTANT step 73:
+ with the system libc only partially; actually MSan needs all dependencies instrumented, but glibc is instrumented via interceptors... MSan DOES work with uninstrumented glibc in practice (it intercepts libc functions). Yes! MSan with clang works without instrumenting glibc — it uses interceptors for memcpy/strcmp etc. But uninstrumented libraries can cause false negatives, not false positives.
+
+But wait — the actual bug is a "use-of-uninitialized-value" — MSan would report it. Let me instead try to build just libtasn1 + a tiny driver with MSan and run some DN inputs. Actually, the full gnutls build is heavy. Let me first build libtasn1 standalone (it's small) and write a driver that mimics decode_complex_string: create "PKIX1.DirectoryString" element, strict-der-decode a value, read "" into a stack buffer, strcmp.
+
+But I need the pkix.asn compiled into the ASN.1 tree. gnutls' _gnutls_get_pkix() returns the PKIX1 definitions (compiled from lib/x509/pkix.asn via asn1_parser2array at build time? No — gnutls embeds the ASN.1 definitions as a C array generated from pkix.asn). Let me check gnutls lib/x509/pkix.asn and how it's compiled.
+
+Actually — simpler: I can generate the ASN.1 tree from pkix.asn at runtime using asn1_parser2tree in my driver. Or even simpler: write my own minimal ASN.1 definition with a CHOICE and test asn1_read_value behavior.
+
+Hmm, but actually, let me FIRST verify my hypothesis about WHERE the uninitialized read occurs by reading the gnutls DN printing code path fully. Let me look at how gnutls_x509_dn_get_str2 works and how decode_complex_string gets invoked with what data. Actually wait — maybe the bug is NOT in decode_complex_string's strcmp but in something else in the DN string conversion. Let me look at x509_dn.c get_str2 and the AVA iteration.
+
+TOOL CALL step 73 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/x509_dn.c", "limit": 150, "offset": 553}
+
+TOOL RESULT step 73:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/x509_dn.c</path>
+<type>file</type>
+<content>
+553:  * This is a low-level function that requires the caller to do the
+554:  * value conversions when necessary (e.g. from UCS-2).
+555:  *
+556:  * Returns: Returns 0 on success, or an error code.
+557:  **/
+558: int
+559: gnutls_x509_dn_get_rdn_ava(gnutls_x509_dn_t dn,
+560: 			   int irdn, int iava, gnutls_x509_ava_st * ava)
+561: {
+562: 	ASN1_TYPE rdn, elem;
+563: 	ASN1_DATA_NODE vnode;
+564: 	long len;
+565: 	int lenlen, remlen, ret;
+566: 	char rbuf[MAX_NAME_SIZE];
+567: 	unsigned char cls;
+568: 	const unsigned char *ptr;
+569: 
+570: 	iava++;
+571: 	irdn++;			/* 0->1, 1->2 etc */
+572: 
+573: 	snprintf(rbuf, sizeof(rbuf), "rdnSequence.?%d.?%d", irdn, iava);
+574: 	rdn = asn1_find_node(dn->asn, rbuf);
+575: 	if (!rdn) {
+576: 		gnutls_assert();
+577: 		return GNUTLS_E_ASN1_ELEMENT_NOT_FOUND;
+578: 	}
+579: 
+580: 	snprintf(rbuf, sizeof(rbuf), "?%d.type", iava);
+581: 	elem = asn1_find_node(rdn, rbuf);
+582: 	if (!elem) {
+583: 		gnutls_assert();
+584: 		return GNUTLS_E_ASN1_ELEMENT_NOT_FOUND;
+585: 	}
+586: 
+587: 	ret = asn1_read_nod
+...
+e provided DN.
+680:  * The name will be in the form "C=xxxx,O=yyyy,CN=zzzz" as
+681:  * described in RFC4514. The output string will be ASCII or UTF-8
+682:  * encoded, depending on the certificate data.
+683:  *
+684:  * When the flag %GNUTLS_X509_DN_FLAG_COMPAT is specified, the output
+685:  * format will match the format output by previous to 3.5.6 versions of GnuTLS
+686:  * which was not not fully RFC4514-compliant.
+687:  *
+688:  * Returns: On success, %GNUTLS_E_SUCCESS (0) is returned, otherwise a
+689:  *   negative error value.
+690:  *
+691:  * Since: 3.5.7
+692:  **/
+693: int
+694: gnutls_x509_dn_get_str2(gnutls_x509_dn_t dn, gnutls_datum_t *str, unsigned flags)
+695: {
+696: 	if (dn == NULL) {
+697: 		gnutls_assert();
+698: 		return GNUTLS_E_INVALID_REQUEST;
+699: 	}
+700: 
+701: 	return _gnutls_x509_get_dn(dn->asn, "rdnSequence", str, flags);
+702: }
+
+(End of file - total 702 lines)
+</content>
+
+ASSISTANT step 74:
+Let me now look at `_gnutls_x509_get_dn` (in common.c) which iterates AVAs and calls `_gnutls_x509_dn_to_string` on each value.
+
+TOOL CALL step 74 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/common.c", "limit": 210, "offset": 1290}
+
+TOOL RESULT step 74:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/common.c</path>
+<type>file</type>
+<content>
+1290: 		if (result == 0)
+1291: 			result = gnutls_pk_to_sign(params.pk, params.rsa_pss_dig);
+1292: 	} else if (sa.data) {
+1293: 		result = gnutls_oid_to_sign((char *) sa.data);
+1294: 	} else {
+1295: 		result = GNUTLS_E_UNKNOWN_ALGORITHM;
+1296: 	}
+1297: 
+1298: 	_gnutls_free_datum(&sa);
+1299: 
+1300: 	if (result == GNUTLS_SIGN_UNKNOWN)
+1301: 		result = GNUTLS_E_UNKNOWN_ALGORITHM;
+1302: 
+1303: 	return result;
+1304: }
+1305: 
+1306: 
+1307: /* Reads the DER signature from the certificate and allocates space and
+1308:  * returns them into signed_data.
+1309:  */
+1310: int
+1311: _gnutls_x509_get_signature(ASN1_TYPE src, const char *src_name,
+1312: 			   gnutls_datum_t * signature)
+1313: {
+1314: 	int result, len;
+1315: 	int bits;
+1316: 
+1317: 	signature->data = NULL;
+1318: 	signature->size = 0;
+1319: 
+1320: 	/* Read the signature 
+1321: 	 */
+1322: 	len = 0;
+1323: 	result = asn1_read_value(src, src_name, NULL, &len);
+1324: 
+1325: 	if (result != ASN1_MEM_ERROR) {
+1326: 		result = _gnutls_asn2err(result);
+1327: 		gnutls_assert(
+...
+ 0) {	/* if not writing an AttributeTypeAndValue, but an Attribute */
+1475: 		_gnutls_str_cat(tmp, sizeof(tmp), "s");	/* values */
+1476: 
+1477: 		result = asn1_write_value(asn1_struct, tmp, "NEW", 1);
+1478: 		if (result != ASN1_SUCCESS) {
+1479: 			gnutls_assert();
+1480: 			result = _gnutls_asn2err(result);
+1481: 			goto error;
+1482: 		}
+1483: 
+1484: 		_gnutls_str_cat(tmp, sizeof(tmp), ".?LAST");
+1485: 	}
+1486: 
+1487: 	if (oentry->asn_desc != NULL) {	/* write a complex string API */
+1488: 		result =
+1489: 		    write_complex_string(asn1_struct, tmp, oentry, data,
+1490: 					 data_size);
+1491: 		if (result < 0)
+1492: 			return gnutls_assert_val(result);
+1493: 	} else {		/* write a simple string */
+1494: 
+1495: 		gnutls_datum_t td;
+1496: 
+1497: 		td.data = (void *) data;
+1498: 		td.size = data_size;
+1499: 		result =
+
+(Showing lines 1290-1499 of 1910. Use offset=1500 to continue.)
+</content>
+
+ASSISTANT step 75:
+Let me find `_gnutls_x509_get_dn` — the DN-to-string function. It's probably in dn.c. Let me search.
+
+TOOL CALL step 75 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -rn \"_gnutls_x509_get_dn\" lib/x509/*.c | head -3", "description": "Find _gnutls_x509_get_dn"}
+
+TOOL RESULT step 75:
+lib/x509/crl.c:295:	return _gnutls_x509_get_dn_oid(crl->crl,
+lib/x509/crl.c:326:	return _gnutls_x509_get_dn(crl->crl,
+lib/x509/crl.c:359:	return _gnutls_x509_get_dn(crl->crl,
+
+
+TOOL CALL step 76 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -rn \"_gnutls_x509_get_dn\\b\" lib/ --include=*.c --include=*.h | head -5", "description": "Locate _gnutls_x509_get_dn definition"}
+
+TOOL RESULT step 76:
+[stderr]
+grep: unrecognized option: include=*.c
+BusyBox v1.37.0 (2025-12-16 14:19:28 UTC) multi-call binary.
+
+Usage: grep [-HhnlLoqvsrRiwFE] [-m N] [-A|B|C N] { PATTERN | -e PATTERN... | -f FILE... } [FILE]...
+
+Search for PATTERN in FILEs (or stdin)
+
+	-H	Add 'filename:' prefix
+	-h	Do not add 'filename:' prefix
+	-n	Add 'line_no:' prefix
+	-l	Show only names of files that match
+	-L	Show only names of files that don't match
+	-c	Show only count of matching lines
+	-o	Show only the matching part of line
+	-q	Quiet. Return 0 if PATTERN is found, 1 otherwise
+	-v	Select non-matching lines
+	-s	Suppress open and read errors
+	-r	Recurse
+	-R	Recurse and dereference symlinks
+	-i	Ignore case
+	-w	Match whole words only
+	-x	Match whole lines only
+	-F	PATTERN is a literal (not regexp)
+	-E	PATTERN is an extended regexp
+	-m N	Match up to N times per file
+	-A N	Print N lines of trailing context
+	-B N	Print N lines of leading context
+	-C N	Same as '-A N -B N'
+	-e PTRN	Pattern to match
+	-f FILE	Read pattern from file
+
+
+TOOL CALL step 77 grep:
+{"path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib", "pattern": "_gnutls_x509_get_dn"}
+
+TOOL RESULT step 77:
+Found 22 matches
+
+repo-vul/src-vul/gnutls/lib/x509/ocsp.c
+Line 1256: 	return _gnutls_x509_get_dn(resp->basicresp,
+
+repo-vul/src-vul/gnutls/lib/x509/x509_dn.c
+Line 670: 	return _gnutls_x509_get_dn(dn->asn, "rdnSequence", str, GNUTLS_X509_DN_FLAG_COMPAT);
+Line 701: 	return _gnutls_x509_get_dn(dn->asn, "rdnSequence", str, flags);
+
+repo-vul/src-vul/gnutls/lib/x509/x509_int.h
+Line 192: _gnutls_x509_get_dn(ASN1_TYPE asn1_struct,
+Line 207: int _gnutls_x509_get_dn_oid(ASN1_TYPE asn1_struct,
+
+repo-vul/src-vul/gnutls/lib/x509/crq.c
+Line 309: 	return _gnutls_x509_get_dn(crq->crq,
+Line 341: 	return _gnutls_x509_get_dn(crq->crq,
+Line 417: 	return _gnutls_x509_get_dn_oid(crq->crq,
+
+repo-vul/src-vul/gnutls/lib/x509/x509.c
+Line 673: 	return _gnutls_x509_get_dn(cert->cert,
+Line 706: 	return _gnutls_x509_get_dn(cert->cert,
+Line 791: 	return _gnutls_x509_get_dn_oid(cert->cert,
+Line 856: 	return _gnutls_x509_get_dn(cert->cert,
+Line 888: 	return _gnutls_x509_get_dn(cert->cert,
+Line 972: 	return _gnutls_x509_get_dn_oid(cert->cert,
+Line 1724: 		ret = _gnutls_x509_get_dn(src, nptr, dname, 0);
+
+repo-vul/src-vul/gnutls/lib/x509/crl.c
+Line 295: 	return _gnutls_x509_get_dn_oid(crl->crl,
+Line 326: 	return _gnutls_x509_get_dn(crl->crl,
+Line 359: 	return _gnutls_x509_get_dn(crl->crl,
+
+repo-vul/src-vul/gnutls/lib/x509/dn.c
+Line 200: _gnutls_x509_get_dn(ASN1_TYPE asn1_struct,
+Line 278: 	ret = _gnutls_x509_get_dn(asn1_struct, asn1_rdn_name, &dn, flags);
+Line 477: _gnutls_x509_get_dn_oid(ASN1_TYPE asn1_struct,
+Line 966: 	    _gnutls_x509_get_dn_oid(dn, "rdnSequence", indx, buf,
+
+TOOL CALL step 78 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/dn.c", "limit": 130, "offset": 160}
+
+TOOL RESULT step 78:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/dn.c</path>
+<type>file</type>
+<content>
+160: 		    _gnutls_x509_dn_to_string(oid, tvd.data,
+161: 					      tvd.size, &td);
+162: 		if (result < 0) {
+163: 			gnutls_assert();
+164: 			_gnutls_debug_log
+165: 			    ("Cannot parse OID: '%s' with value '%s'\n",
+166: 			     oid, _gnutls_bin2hex(tvd.data,
+167: 						  tvd.size,
+168: 						  tmpbuffer3,
+169: 						  sizeof
+170: 						  (tmpbuffer3),
+171: 						  NULL));
+172: 			goto cleanup;
+173: 		}
+174: 
+175: 		DATA_APPEND(td.data, td.size);
+176: 		_gnutls_free_datum(&td);
+177: 		_gnutls_free_datum(&tvd);
+178: 
+179: 		/*   Where there is a multi-valued RDN, the outputs from adjoining
+180: 		 *   AttributeTypeAndValues are separated by a plus ('+' ASCII 43)
+181: 		 *   character.
+182: 		 */
+183: 		if (k2 < max_k2) {
+184: 			STR_APPEND("+");
+185: 		} else if (!last) {
+186: 			STR_APPEND(",");
+187: 		}
+188: 	}
+189: 	while (1);
+190: 
+191: 	result = 0;
+192: 
+193:  cleanup:
+194: 	_gnutls_free_datum(&td);
+195: 	_gnutls_free_datum(&tvd);
+196: 	return result;
+197: }
+198: 
+199: int
+200: _gnutls_x509_get_dn(ASN1_TYPE asn1
+...
+uer.rdnSequence".
+258:  * That is to point in the rndSequence.
+259:  */
+260: int
+261: _gnutls_x509_parse_dn(ASN1_TYPE asn1_struct,
+262: 		      const char *asn1_rdn_name, char *buf,
+263: 		      size_t * buf_size, unsigned flags)
+264: {
+265: 	int ret;
+266: 	gnutls_datum_t dn = {NULL, 0};
+267: 
+268: 	if (buf_size == NULL) {
+269: 		gnutls_assert();
+270: 		return GNUTLS_E_INVALID_REQUEST;
+271: 	}
+272: 
+273: 	if (*buf_size > 0 && buf)
+274: 		buf[0] = 0;
+275: 	else
+276: 		*buf_size = 0;
+277: 
+278: 	ret = _gnutls_x509_get_dn(asn1_struct, asn1_rdn_name, &dn, flags);
+279: 	if (ret < 0)
+280: 		return gnutls_assert_val(ret);
+281: 
+282: 	if (dn.size >= (unsigned int) *buf_size) {
+283: 		gnutls_assert();
+284: 		*buf_size = dn.size + 1;
+285: 		ret = GNUTLS_E_SHORT_MEMORY_BUFFER;
+286: 		goto cleanup;
+287: 	}
+288: 
+289: 	if (buf) {
+
+(Showing lines 160-289 of 992. Use offset=290 to continue.)
+</content>
+
+ASSISTANT step 79:
+OK so the DN get_str path: `_gnutls_x509_get_dn` → `append_elements` (line ~100-160) → for each AVA: read `tvd` (value data) then `_gnutls_x509_dn_to_string(oid, tvd.data, tvd.size, &td)` → for complex OIDs → `decode_complex_string(oentry, value, value_size, &tmp)`.
+
+So the input to decode_complex_string is the AVA's **value** DER bytes (the raw value: tag + length + content). Then:
+1. asn1_create_element → new DirectoryString CHOICE.
+2. _asn1_strict_der_decode(&tmpasn, value, value_size) — decode the DER value into the CHOICE.
+3. asn1_read_value(tmpasn, "", str, &len) — read CHOICE name into str.
+4. strcmp(str, "teletexString")...
+
+Now, the key question remains: can step 3 leave str uninitialized (partially)?
+
+Hmm, let me look at _asn1_strict_der_decode — maybe it doesn't fully populate the tree (e.g., it uses asn1_der_decoding2 with flags, and on error it might leave things half-decoded but still return SUCCESS?). Let me look.
+
+TOOL CALL step 79 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -rn \"_asn1_strict_der_decode\" lib/ --include=*.c --include=*.h 2>/dev/null | head; grep -rn \"_asn1_strict_der_decode\" lib/x509/common.c lib/errors.c lib/*.c 2>/dev/null | grep -v \"\\.h\" | head", "description": "Find _asn1_strict_der_decode"}
+
+TOOL RESULT step 79:
+lib/x509/common.c:368:	     _asn1_strict_der_decode(&tmpasn, value, value_size,
+lib/x509/common.c:371:		_gnutls_debug_log("_asn1_strict_der_decode: %s\n", asn1_err);
+lib/pubkey.c:1108:	result = _asn1_strict_der_decode(&spk, _data.data, _data.size, NULL);
+
+
+TOOL CALL step 80 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -rn \"strict_der_decode\" lib/*.h lib/includes/ 2>/dev/null | head", "description": "Find strict_der_decode header"}
+
+TOOL RESULT step 80:
+(no output)
+
+TOOL CALL step 81 grep:
+{"path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls", "pattern": "_asn1_strict_der_decode", "include": "*.h"}
+
+TOOL RESULT step 81:
+Found 1 match
+
+repo-vul/src-vul/gnutls/lib/x509/common.h
+Line 278: inline static int _asn1_strict_der_decode (asn1_node * element, const void *ider,
+
+TOOL CALL step 82 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/common.h", "limit": 40, "offset": 265}
+
+TOOL RESULT step 82:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/common.h</path>
+<type>file</type>
+<content>
+265: int x509_crt_to_raw_pubkey(gnutls_x509_crt_t crt,
+266: 			   gnutls_datum_t * rpubkey);
+267: 
+268: typedef void (*gnutls_cert_vfunc)(gnutls_x509_crt_t);
+269: 
+270: gnutls_x509_crt_t *_gnutls_sort_clist(gnutls_x509_crt_t
+271: 				     sorted[DEFAULT_MAX_VERIFY_DEPTH],
+272: 				     gnutls_x509_crt_t * clist,
+273: 				     unsigned int *clist_size,
+274: 				     gnutls_cert_vfunc func);
+275: 
+276: int _gnutls_check_if_sorted(gnutls_x509_crt_t * crt, int nr);
+277: 
+278: inline static int _asn1_strict_der_decode (asn1_node * element, const void *ider,
+279: 		       int len, char *errorDescription)
+280: {
+281: #ifdef ASN1_DECODE_FLAG_ALLOW_INCORRECT_TIME
+282: # define _ASN1_DER_FLAGS ASN1_DECODE_FLAG_ALLOW_INCORRECT_TIME|ASN1_DECODE_FLAG_STRICT_DER
+283: #else
+284: # define _ASN1_DER_FLAGS ASN1_DECODE_FLAG_STRICT_DER
+285: #endif
+286: 	return asn1_der_decoding2(element, ider, &len, _ASN1_DER_FLAGS, errorDescription);
+287: }
+288: 
+289: #endif
+
+(End of file - total 289 lines)
+</content>
+
+ASSISTANT step 83:
+) must return the root.
+
+Let me verify asn1_find_node(root, "") behavior. Actually looking again at asn1_find_node:
+
+```c
+p = pointer;
+n_start = name;   // ""
+
+if (name[0] == '?' && name[1] == 'C' && p->name[0] == '?') {...}
+else if (p->name[0] != 0) {   // root has a name
+  n_end = strchr(n_start, '.');  // strchr("", '.') = NULL
+  if (n_end) {...}
+  else {
+    nsize = _asn1_str_cpy(n, sizeof(n), n_start);  // n = "", nsize=0
+    nhash = hash_pjw_bare(n, nsize);
+    n_start = NULL;
+  }
+  while (p) {
+    if (nhash == p->name_hash && !strcmp(p->name, n)) break;
+    else p = p->right;
+  }
+  if (p == NULL) return NULL;
+}
+else {  // root has no name
+  if (n_start[0] == 0) return p;
+}
+```
+
+Hmm, so if root has a name (e.g., "DirectoryString" for a created element?), then it looks for a node with empty name in the root's right chain. If the root has NO name → returns root directly.
+
+What name does asn1_create_element give the root? `_asn1_copy_structure3` copies names via `_asn1_cpy_name` only if `p_s->name[0] != 0`. The source node for "PKIX1.DirectoryString" — the DirectoryString definition node in the definitions tree. Does it have a name? In the ASN.1 definitions parsed from pkix.asn, `DirectoryString ::= CHOICE {...}` — the definition node IS named "DirectoryString" (from type_def: `$$=_asn1_set_name($3,$1)`).
+
+Hmm wait, so the created element root would be named "DirectoryString"! Then asn1_find_node(root, "") would search for an empty-named node... and return NULL → asn1_read_value returns ELEMENT_NOT_FOUND → decode_complex_string fails → "unknown OID" fallback → the DN value is printed as hex! That can't be right because DN printing DOES print "CN=..." normally...
+
+Hmm wait, maybe I'm wrong about asn1_create_element. Let me check asn1_create_element in structure.c:687.
+
+TOOL CALL step 83 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1/lib/structure.c", "limit": 80, "offset": 672}
+
+TOOL RESULT step 83:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1/lib/structure.c</path>
+<type>file</type>
+<content>
+672:  * asn1_create_element:
+673:  * @definitions: pointer to the structure returned by "parser_asn1" function
+674:  * @source_name: the name of the type of the new structure (must be
+675:  *   inside p_structure).
+676:  * @element: pointer to the structure created.
+677:  *
+678:  * Creates a structure of type @source_name.  Example using
+679:  *  "pkix.asn":
+680:  *
+681:  * rc = asn1_create_element(cert_def, "PKIX1.Certificate", certptr);
+682:  *
+683:  * Returns: %ASN1_SUCCESS if creation OK, %ASN1_ELEMENT_NOT_FOUND if
+684:  *   @source_name is not known.
+685:  **/
+686: int
+687: asn1_create_element (asn1_node definitions, const char *source_name,
+688: 		     asn1_node * element)
+689: {
+690:   asn1_node dest_node;
+691:   int res;
+692: 
+693:   dest_node = _asn1_copy_structure2 (definitions, source_name);
+694: 
+695:   if (dest_node == NULL)
+696:     return ASN1_ELEMENT_NOT_FOUND;
+697: 
+698:   _asn1_set_name (dest_node, "");
+699: 
+700:   res = _asn1_expand_identifier (&dest_node, definitions);
+701:   _asn1_type_choic
+...
+r the structure's tree starting
+719:  * from the @name element inside the structure @structure.
+720:  **/
+721: void
+722: asn1_print_structure (FILE * out, asn1_node structure, const char *name,
+723: 		      int mode)
+724: {
+725:   asn1_node p, root;
+726:   int k, indent = 0, len, len2, len3;
+727: 
+728:   if (out == NULL)
+729:     return;
+730: 
+731:   root = asn1_find_node (structure, name);
+732: 
+733:   if (root == NULL)
+734:     return;
+735: 
+736:   p = root;
+737:   while (p)
+738:     {
+739:       if (mode == ASN1_PRINT_ALL)
+740: 	{
+741: 	  for (k = 0; k < indent; k++)
+742: 	    fprintf (out, " ");
+743: 	  fprintf (out, "name:");
+744: 	  if (p->name[0] != 0)
+745: 	    fprintf (out, "%s  ", p->name);
+746: 	  else
+747: 	    fprintf (out, "NULL  ");
+748: 	}
+749:       else
+750: 	{
+751: 	  switch (type_field (p->type))
+
+(Showing lines 672-751 of 1207. Use offset=752 to continue.)
+</content>
+
+ASSISTANT step 84:
+`asn1_create_element` sets the root name to "" (line 698). So asn1_find_node(root, "") returns root (since root->name[0] == 0, the else branch: `if (n_start[0] == 0) return p;`).
+
+OK so decode_complex_string reads the CHOICE root. Everything checks out as SAFE in the normal flow. So the uninitialized read must come from a specific corner case.
+
+Let me look at asn1_read_value_type CHOICE handler once more... hmm.
+
+Actually — hold on! Let me look at `asn1_read_value` more carefully for the CHOICE case. `PUT_STR_VALUE(value, value_size, node->down->name)`. What if the decode did NOT match any choice alternative and deleted ALL of them... then node->down == NULL → NULL deref (ASAN crash). What if the decode matched an alternative but that alternative is a TAG/SIZE wrapper? DirectoryString alternatives are all simple strings.
+
+Hmm hmm. OK, let me now consider: maybe the bug is actually in **`asn1_read_value_type` for CHOICE where the name is stored but the buffer is `value_size` = 511 and the name is e.g. "teletexString" (13 chars)** — no issue.
+
+Alright, let me look at this from the MSan angle with fresh eyes. Where ELSE could strcmp read uninitialized bytes in the DN printing path?
+
+Actually — WAIT. What about `_gnutls_x509_dn_to_string`'s `str_escape(&tmp, str)`? And `append_elements`? Hmm.
+
+Actually, let me look at the beginning of append_elements (dn.c ~line 100) — there's `tmpbuffer3` etc.
+
+TOOL CALL step 84 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/dn.c", "limit": 130, "offset": 1}
+
+TOOL RESULT step 84:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/dn.c</path>
+<type>file</type>
+<content>
+1: /*
+2:  * Copyright (C) 2003-2014 Free Software Foundation, Inc.
+3:  *
+4:  * Author: Nikos Mavrogiannopoulos
+5:  *
+6:  * This file is part of GnuTLS.
+7:  *
+8:  * The GnuTLS is free software; you can redistribute it and/or
+9:  * modify it under the terms of the GNU Lesser General Public License
+10:  * as published by the Free Software Foundation; either version 2.1 of
+11:  * the License, or (at your option) any later version.
+12:  *
+13:  * This library is distributed in the hope that it will be useful, but
+14:  * WITHOUT ANY WARRANTY; without even the implied warranty of
+15:  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+16:  * Lesser General Public License for more details.
+17:  *
+18:  * You should have received a copy of the GNU Lesser General Public License
+19:  * along with this program.  If not, see <http://www.gnu.org/licenses/>
+20:  *
+21:  */
+22: 
+23: #include "gnutls_int.h"
+24: #include <libtasn1.h>
+25: #include <datum.h>
+26: #include <global.h>
+27: #include "errors.h"
+28: #include <str
+...
+ed */
+99: 			gnutls_assert();
+100: 			result = _gnutls_asn2err(result);
+101: 			goto cleanup;
+102: 		}
+103: 
+104: 		/* Read the OID 
+105: 		 */
+106: 		_gnutls_str_cpy(tmpbuffer3, sizeof(tmpbuffer3),
+107: 				tmpbuffer2);
+108: 		_gnutls_str_cat(tmpbuffer3, sizeof(tmpbuffer3),
+109: 				".type");
+110: 
+111: 		len = sizeof(oid) - 1;
+112: 		result =
+113: 		    asn1_read_value(asn1_struct, tmpbuffer3, oid,
+114: 				    &len);
+115: 
+116: 		if (result == ASN1_ELEMENT_NOT_FOUND)
+117: 			break;
+118: 		else if (result != ASN1_SUCCESS) {
+119: 			gnutls_assert();
+120: 			result = _gnutls_asn2err(result);
+121: 			goto cleanup;
+122: 		}
+123: 
+124: 		/* Read the Value 
+125: 		 */
+126: 		_gnutls_str_cpy(tmpbuffer3, sizeof(tmpbuffer3),
+127: 				tmpbuffer2);
+128: 		_gnutls_str_cat(tmpbuffer3, sizeof(tmpbuffer3),
+129: 				".value");
+130: 
+
+(Showing lines 1-130 of 992. Use offset=131 to continue.)
+</content>
+
+ASSISTANT step 85:
+String (SIZE (1..MAX)),
+    utf8String UTF8String (SIZE (1..MAX)),
+    bmpString BMPString (SIZE (1..MAX)),
+    ia5String IA5String (SIZE (1..MAX)),
+    visibleString VisibleString (SIZE (1..MAX)) }
+```
+
+Hmm — the choice alternatives with SIZE constraints. When decoding, for each alternative `extract_tag_der_recursive(p->down, ...)` checks the tag. For a UTF8String value (tag 0x0C), teletexString (0x14), printableString (0x13), universalString (0x1C), utf8String (0x0C), bmpString (0x1E), ia5String (0x16), visibleString (0x1A).
+
+Wait — teletexString tag = 0x14 (20), printableString = 0x13 (19), universalString = 0x1C (28), utf8String = 0x0C (12), bmpString = 0x1E (30), ia5String = 0x16 (22), visibleString = 0x1A (26). These are all distinct.
+
+OK. So decoding works, choice node gets down = matched alternative. asn1_read_value CHOICE → copies the alternative's name.
+
+Hmm, so STILL safe.
+
+Let me look at this from the actual MSan report structure. "stack buffer used to store a CHOICE name is not zero-initialized" — MSan reports "use-of-uninitialized-value" at strcmp, with a stack trace showing the buffer's origin (the stack frame where it was declared, which is "not zero-initialized"). The description writer saw the stack frame: a function declaring `char name[...]`, `strcmp(name, "literal")`.
+
+Let me search ALL gnutls + libtasn1 code for `strcmp(` where the first arg is a stack char array that got filled from asn1_read_value with a CHOICE... Actually, let me look at `lib/x509/ocsp.c` etc. Or — WAIT. What about `_gnutls_x509_san_find_type` (common.c:525): `strcmp(str_type, "dNSName")` — str_type comes from a caller's buffer. Let me check where SAN types are read: in x509.c or extensions.c, e.g. `_gnutls_x509_ext_get_subject_alt_name`. Let me look at how str_type is obtained.
+
+TOOL CALL step 85 grep:
+{"path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509", "pattern": "_gnutls_x509_san_find_type|str_type"}
+
+TOOL RESULT step 85:
+Found 9 matches
+
+repo-vul/src-vul/gnutls/lib/x509/common.h
+Line 136: gnutls_x509_subject_alt_name_t _gnutls_x509_san_find_type(char *str_type);
+
+repo-vul/src-vul/gnutls/lib/x509/common.c
+Line 525: gnutls_x509_subject_alt_name_t _gnutls_x509_san_find_type(char *str_type)
+Line 527: 	if (strcmp(str_type, "dNSName") == 0)
+Line 529: 	if (strcmp(str_type, "rfc822Name") == 0)
+Line 531: 	if (strcmp(str_type, "uniformResourceIdentifier") == 0)
+Line 533: 	if (strcmp(str_type, "iPAddress") == 0)
+Line 535: 	if (strcmp(str_type, "otherName") == 0)
+Line 537: 	if (strcmp(str_type, "directoryName") == 0)
+
+repo-vul/src-vul/gnutls/lib/x509/x509.c
+Line 1672: 	type = _gnutls_x509_san_find_type(choice_type);
+
+TOOL CALL step 86 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/x509.c", "limit": 120, "offset": 1600}
+
+TOOL RESULT step 86:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls/lib/x509/x509.c</path>
+<type>file</type>
+<content>
+1600: 
+1601: 	if (cert == NULL) {
+1602: 		gnutls_assert();
+1603: 		return GNUTLS_E_INVALID_REQUEST;
+1604: 	}
+1605: 
+1606: 
+1607: 	spki->pk = gnutls_x509_crt_get_pk_algorithm(cert, NULL);
+1608: 
+1609: 	memset(&params, 0, sizeof(params));
+1610: 
+1611: 	result = _gnutls_x509_crt_read_spki_params(cert, &params);
+1612: 	if (result < 0) {
+1613: 		gnutls_assert();
+1614: 		return result;
+1615: 	}
+1616: 
+1617: 	if (params.pk == GNUTLS_PK_UNKNOWN)
+1618: 		return gnutls_assert_val(GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE);
+1619: 
+1620: 	spki->rsa_pss_dig = params.rsa_pss_dig;
+1621: 	spki->salt_size = params.salt_size;
+1622: 
+1623: 	return 0;
+1624: }
+1625: 
+1626: /* returns the type and the name on success.
+1627:  * Type is also returned as a parameter in case of an error.
+1628:  *
+1629:  * @seq: in case of GeneralNames it will return the corresponding name.
+1630:  *       in case of GeneralName, it must be -1
+1631:  * @dname: the name returned
+1632:  * @ret_type: The type of the name
+1633:  * @othername_oid: if the name is other
+...
+_gnutls_x509_read_value(src, nptr, &tmp);
+1690: 		if (ret < 0) {
+1691: 			gnutls_assert();
+1692: 			return ret;
+1693: 		}
+1694: 
+1695: 		if (othername_oid) {
+1696: 			dname->size = tmp.size;
+1697: 			dname->data = tmp.data;
+1698: 		} else {
+1699: 			char oid[MAX_OID_SIZE];
+1700: 
+1701: 			if (src_name[0] != 0)
+1702: 				snprintf(nptr, sizeof(nptr),
+1703: 					 "%s.?%u.otherName.type-id",
+1704: 					 src_name, seq);
+1705: 			else
+1706: 				snprintf(nptr, sizeof(nptr),
+1707: 					 "?%u.otherName.type-id", seq);
+1708: 
+1709: 			len = sizeof(oid);
+1710: 
+1711: 			result = asn1_read_value(src, nptr, oid, &len);
+1712: 			if (result != ASN1_SUCCESS) {
+1713: 				gnutls_assert();
+1714: 				ret = _gnutls_asn2err(result);
+1715: 				goto cleanup;
+1716: 			}
+1717: 			if (len > 0) len--;
+1718: 
+1719: 			dname->size = tmp.size;
+
+(Showing lines 1600-1719 of 4485. Use offset=1720 to continue.)
+</content>
+
+ASSISTANT step 87:
+, even simpler: I don't need gnutls. I can test libtasn1's asn1_read_value CHOICE behavior directly with a minimal ASN.1 schema and DER input.
+
+But hold on — before building, let me reconsider whether the bug is in libtasn1 at all. The description says "A stack buffer used to store a CHOICE name is not zero-initialized." If the stack buffer is in gnutls (decode_complex_string's `str` or decode_user_notice's `choice_type`), then the "root cause" is that gnutls reads a CHOICE name into an uninitialized stack buffer and compares it — with the actual uninitialized bytes being read because libtasn1's PUT_STR_VALUE... hmm no.
+
+Actually — WAIT. Let me recheck `asn1_read_value_type`'s handling when the CHOICE node's `down` is a node whose `name` is stored in the node struct. Node name is `char name[ASN1_MAX_NAME_SIZE+1]` — a fixed array. `_asn1_strcpy(ptr, node->down->name)` reads node->down->name — which is fully initialized (NUL-terminated by _asn1_set_name).
+
+Hmm hmm hmm. OK OK. Let me look at the actual `asn1_read_value_type` CHOICE case from the CURRENT libtasn1 master to see if there's a fix I'm missing. Actually, I recall now! There IS a known libtasn1 fix in this exact area. Let me recall the libtasn1 git log around 2018:
+
+- 2018-02: "element: Ensure that CHOICE values are null terminated" or something?
+- Commit: "decoding: fix use of uninitialized value in _asn1_yylex" hmm.
+
+Actually, let me look at this from the ARVO benchmark angle. ARVO arvo:10137 — let me think about what the PoC for this would be. The server runs gnutls_dn_parser_fuzzer with the PoC as a DER-encoded DN. For the bug to trigger with MSan, we need a DER DN whose AVA value is a DirectoryString that leads to the uninitialized strcmp.
+
+Let me now actually build and test. First check available compilers.
+
+TOOL CALL step 87 bash:
+{"command": "which clang clang-14 clang-15 clang-16 clang-17 gcc 2>/dev/null; clang --version 2>/dev/null | head -2; gcc --version 2>/dev/null | head -1", "description": "Check available compilers"}
+
+TOOL RESULT step 87:
+(no output)
+
+TOOL CALL step 88 bash:
+{"command": "ls /usr/bin/ | grep -iE \"clang|gcc|cc$\" | head -20; echo ===; ls /usr/local/bin 2>/dev/null | head; echo ===; echo $PATH", "description": "Look for compilers in PATH"}
+
+TOOL RESULT step 88:
+===
+===
+/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/network_guard_bin:/home/xinran/.local/node-v24-musl/bin:/home/xinran/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+
+ASSISTANT step 89:
+he ANY value node? no wait, line 91 reads `tmpbuffer2` = "rdnSequence.?1.?1" — the AttributeTypeAndValue (a SEQUENCE)). Hmm, also VALUE_NOT_FOUND probably (SEQUENCE with no value). Then reads .type (OID — has value) and .value (the ANY — has value after decode).
+
+OK so this all works. Fine.
+
+So for the bug, we need `decode_complex_string`'s strcmp to read uninitialized bytes. Given PUT_STR_VALUE NUL-terminates... let me now actually question PUT_STR_VALUE's behavior when `data` is a node name from a **TAG** node or **SIZE** node... hmm no.
+
+Actually — WAIT!!! Let me re-read the CHOICE decode once more, this time considering `delete_unneeded_choice_fields(p->down)` and the case where `p->down` after decode is a node whose `name` is EMPTY. When is a choice alternative's name empty? In `_asn1_type_choice_config` or during creation... no, alternatives come from pkix.asn with names.
+
+Hmm, hmm. OK let me look at this from a completely different angle: let me look at the ACTUAL gnutls fix for this bug. Let me search gnutls git blame knowledge... The function `decode_complex_string` in current gnutls master:
+
+Actually! I just remembered — in current gnutls master, decode_complex_string has:
+
+```c
+	len = sizeof(str);
+	result = asn1_read_value(tmpasn, "", str, &len);
+	if (result != ASN1_SUCCESS) { ... }
+
+	str[len] = 0;
+```
+
+Hmm, wait, maybe the fix was `len = sizeof(str); str[len] = 0`... hmm.
+
+Actually, let me look at the REAL gnutls git history for decode_complex_string. I recall a commit: "x509: Fixed decoding of complex strings with invalid ASN.1" hmm.
+
+OK you know what — let me just search for all `strcmp` calls in gnutls lib/x509 with the FIRST argument being a stack array, and see which ones DON'T have a preceding NUL-guarantee. Let me do this systematically with a script.
+
+TOOL CALL step 89 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -rn \"strcmp(\" lib/x509/*.c | grep -v \"==\" | head -40", "description": "List strcmp in x509 code"}
+
+TOOL RESULT step 89:
+lib/x509/common.c:1898:	if (!strcmp(oid, GOST28147_89_TC26Z_OID))
+lib/x509/common.c:1900:	else if (!strcmp(oid, GOST28147_89_CPA_OID))
+lib/x509/common.c:1902:	else if (!strcmp(oid, GOST28147_89_CPB_OID))
+lib/x509/common.c:1904:	else if (!strcmp(oid, GOST28147_89_CPC_OID))
+lib/x509/common.c:1906:	else if (!strcmp(oid, GOST28147_89_CPD_OID))
+lib/x509/key_decode.c:345:		if (strcmp(oid, PKIX1_RSA_PSS_MGF1_OID) != 0) {
+lib/x509/pkcs12.c:67:	if (strcmp(oid, DATA_OID) != 0) {
+lib/x509/pkcs7-crypt.c:668:	if (strcmp(oid, PBKDF2_OID) != 0) {
+lib/x509/pkcs7-crypt.c:922:	if (!strcmp(params->pbes2_oid, GOST28147_89_OID)) {
+lib/x509/pkcs7-output.c:189:		if (strcmp(oid, DATA_OID) != 0
+lib/x509/pkcs7-output.c:190:		    && strcmp(oid, DIGESTED_DATA_OID) != 0) {
+lib/x509/pkcs7.c:62:	if (strcmp(pkcs7->encap_data_oid, SIGNED_DATA_OID) != 0) {
+lib/x509/pkcs7.c:104:	if (strcmp(pkcs7->encap_data_oid, DATA_OID) != 0
+lib/x509/pkcs7.c:105:	    && strcmp(pkcs7->encap_data_oid, DIGESTED_DATA_OID) != 0) {
+lib/x509/x509_ext.c:1708:	if (strcmp(choice_type, "utf8String") != 0
+lib/x509/x509_ext.c:1709:	    && strcmp(choice_type, "ia5String") != 0
+lib/x509/x509_ext.c:1710:	    && strcmp(choice_type, "bmpString") != 0
+lib/x509/x509_ext.c:1711:	    && strcmp(choice_type, "visibleString") != 0) {
+lib/x509/x509_write.c:373:		if (oid && strcmp(local_oid, oid) != 0)
+
+
+ASSISTANT step 90:
+Let me look at `common.c:1898` (`_gnutls_x509_dn_to_string`? no). Let me check what function contains line 1898. And also — what about strcmp in dn.c? None found. So in the DN path, the only strcmp is in decode_complex_string (common.c:390-395).
+
+Hmm wait, common.c:390: `if (strcmp(str, "teletexString") == 0)`. So in the DN path, only decode_complex_string's strcmp. OK.
+
+So the bug MUST be in decode_complex_string. The question is: how does `asn1_read_value(tmpasn, "", str, &len)` return SUCCESS without NUL-terminating str?
+
+Hmm wait wait wait. Let me look at `asn1_read_value_type` once more — the OBJECT_ID case with CONST_ASSIGN:
+
+```c
+case ASN1_ETYPE_OBJECT_ID:
+  if (node->type & CONST_ASSIGN)
+    {
+      *len = 0;
+      if (value) value[0] = 0;
+      p = node->down;
+      while (p) { ... ADD_STR_VALUE ... }
+      (*len)++;
+    }
+```
+
+Not relevant.
+
+Hmm — what about the case where the CHOICE's down->name is NULL? Can't be, name is an array.
+
+OK here's ANOTHER idea: what if `asn1_read_value` returns SUCCESS but `str` stays uninitialized because `ptr_size < *len` → NO WAIT that returns MEM_ERROR.
+
+Hmm, what if `ptr == NULL`? No, str is a stack array.
+
+OK, let me question the premise that PUT_STR_VALUE is used. Let me look at asn1_read_value_type in the ACTUAL compiled libtasn1 (ASN1.c is the parser; element.c is the reader). Wait — maybe there are TWO versions of element.c (libtasn1/lib/element.c vs gnutls/lib/minitasn1/element.c) and I should diff them — maybe the gnutls build actually uses minitasn1 if the external libtasn1 version check fails! Let me check LIBTASN1_MINIMUM.
+
+TOOL CALL step 90 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -rn \"LIBTASN1_MINIMUM\\|libtasn1.*version\" m4/hooks.m4 configure.ac | head; echo ===; diff <(md5sum lib/minitasn1/element.c | cut -d' ' -f1) <(md5sum /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1/lib/element.c | cut -d' ' -f1); echo \"diff exit: $?\"", "description": "Check libtasn1 min version and compare element.c files"}
+
+TOOL RESULT step 90:
+m4/hooks.m4:109:LIBTASN1_MINIMUM=4.9
+m4/hooks.m4:115:    PKG_CHECK_MODULES(LIBTASN1, [libtasn1 >= $LIBTASN1_MINIMUM], [], [included_libtasn1=yes])
+m4/hooks.m4:119:  *** Libtasn1 $LIBTASN1_MINIMUM was not found. To use the included one, use --with-included-libtasn1
+===
+--- /dev/fd/63
++++ /dev/fd/62
+@@ -1 +1 @@
+-b57a82700d9d318d8391be7074265bbe
++cbd37245206c759a077f105ad9122604
+diff exit: 1
+
+
+ASSISTANT step 91:
+what, let me look at this from the DIRECTION of "uninitialized tail bytes" — maybe it's NOT about the NUL terminator but about the strcmp reading bytes BEYOND a shorter copy. E.g., if `_asn1_strcpy` copies "utf8String" (11 chars + NUL), then strcmp(str, "teletexString") — strcmp compares:
+- str[0]='u' vs 't' → differ → return. Reads only str[0]. No tail read.
+
+To read uninitialized TAIL bytes, strcmp must scan PAST the written region. That only happens if there's NO NUL in the written region, i.e., the copy didn't NUL-terminate.
+
+So the copy must not NUL-terminate. In the CHOICE handler, `_asn1_strcpy` NUL-terminates. UNLESS the case executed is a DIFFERENT case that uses PUT_VALUE/PUT_AS_STR_VALUE/octet_der and the caller (decode_complex_string) still strcmps!
+
+For example: if the "explicitText"/"" node is NOT CHOICE but an OCTET STRING — then `asn1_get_octet_der` writes raw bytes WITHOUT NUL, and len = data size. Then `str[len] = 0` (in decode_complex_string) NUL-terminates at position len! Hmm wait — decode_complex_string DOES `str[len] = 0`. So even then it's NUL-terminated at len... and strcmp reads up to len bytes which are initialized (the octet data). Actually hmm — if len = data_size and the data was copied, then str[0..len-1] initialized, str[len]=0. strcmp reads up to len — initialized. Safe!
+
+BUT decode_user_notice does NOT have `choice_type[len] = 0`!! If the explicitText node were an OCTET STRING (or any non-NUL-terminating type), strcmp(choice_type, ...) would read uninitialized bytes!
+
+But explicitText is DisplayText (a CHOICE)... in the pkix.asn template. So asn1_read_value → CHOICE → strcpy NUL-terminates. Hmm.
+
+OK, so both gnutls sites are safe IF the templates say CHOICE. Let me look at pkix.asn to confirm DirectoryString and DisplayText are CHOICEs.
+
+TOOL CALL step 91 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -n \"DirectoryString\\|DisplayText\\|UserNotice\" lib/x509/pkix.asn | head -20", "description": "Check pkix.asn DirectoryString/DisplayText"}
+
+TOOL RESULT step 91:
+[stderr]
+grep: lib/x509/pkix.asn: No such file or directory
+
+
+TOOL CALL step 92 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && find . -name \"pkix.asn\" 2>/dev/null | head; find . -name \"*.asn\" | grep -v tests | head", "description": "Find pkix.asn"}
+
+TOOL RESULT step 92:
+./devel/libtasn1/fuzz/libtasn1_parser2tree_fuzzer.in/pkix.asn
+./devel/libtasn1/examples/pkix.asn
+./devel/libtasn1/tests/pkix.asn
+./lib/pkix.asn
+./devel/libtasn1/fuzz/libtasn1_parser2tree_fuzzer.in/pkix.asn
+./devel/libtasn1/examples/asn1Coding_test.asn
+./devel/libtasn1/examples/pkix.asn
+./lib/pkix.asn
+./lib/gnutls.asn
+
+
+ASSISTANT step 93:
+There's `devel/libtasn1/fuzz/libtasn1_parser2tree_fuzzer.in/pkix.asn` — a libtasn1 parser2tree fuzzer in gnutls/devel! But that's in `devel/` and probably not built. Let me check gnutls/devel/libtasn1/fuzz.
+
+TOOL CALL step 93 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && ls devel/libtasn1/fuzz/ | head -20; echo ===; grep -n \"DirectoryString\\|DisplayText\" lib/pkix.asn", "description": "Check devel fuzz dir and pkix.asn"}
+
+TOOL RESULT step 93:
+Makefile.am
+README.md
+asn1_decode_simple_ber_fuzzer.c
+asn1_decode_simple_ber_fuzzer.in
+asn1_decode_simple_der_fuzzer.c
+asn1_decode_simple_der_fuzzer.in
+asn1_get_length_ber_fuzzer.c
+asn1_get_length_ber_fuzzer.in
+asn1_get_length_der_fuzzer.c
+asn1_get_length_der_fuzzer.in
+asn1_get_object_id_der_fuzzer.c
+asn1_get_object_id_der_fuzzer.in
+corpus2array.c
+find_buggy_corpus
+fuzzer.h
+get_all_corpora
+get_ossfuzz_corpora
+libtasn1_array2tree_fuzzer.c
+libtasn1_array2tree_fuzzer.in
+libtasn1_array2tree_fuzzer.repro
+===
+34:DirectoryString ::= CHOICE {
+502:  explicitText     DisplayText OPTIONAL }
+505:  organization     DisplayText,
+508:DisplayText ::= CHOICE {
+
+
+ASSISTANT step 94:
+Interesting — there are libtasn1 fuzzers in gnutls/devel/libtasn1/fuzz (asn1_decode_simple_ber_fuzzer, libtasn1_array2tree_fuzzer, libtasn1_parser2tree_fuzzer, etc.). But these are in devel/, likely not built by build.sh (which builds gnutls/fuzz via `make oss-fuzz`). Let me check gnutls/devel/libtasn1/fuzz/Makefile.am and whether the oss-fuzz build includes it... The build.sh runs `make -C fuzz oss-fuzz` from gnutls dir, i.e., gnutls/fuzz. So devel fuzzers aren't built.
+
+Let me confirm the fuzzer list from the earlier probe: /out/gnutls_dn_parser_fuzzer. So the harness target is gnutls_dn_parser_fuzzer.
+
+Now — the key insight I keep missing. Let me look at DirectoryString CHOICE and its decode with SIZE constraints. In pkix.asn line 34:
+
+```
+DirectoryString ::= CHOICE {
+    teletexString TeletexString (SIZE (1..MAX)),
+    ...
+}
+```
+
+Let me view the full definition.
+
+TOOL CALL step 94 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && sed -n '30,60p' lib/pkix.asn; echo ===; sed -n '495,530p' lib/pkix.asn", "description": "View DirectoryString and UserNotice in pkix.asn"}
+
+TOOL RESULT step 94:
+KeyUsage ::= BIT STRING
+
+-- Directory string type --
+
+DirectoryString ::= CHOICE {
+      teletexString             TeletexString (SIZE (1..MAX)),
+      printableString           PrintableString (SIZE (1..MAX)),
+      universalString           UniversalString (SIZE (1..MAX)),
+      utf8String              UTF8String (SIZE (1..MAX)),
+      bmpString               BMPString (SIZE(1..MAX)),
+      -- IA5String is added here to handle old UID encoded as ia5String --
+      -- See tests/userid/ for more information.  It shouldn't be here, --
+      -- so if it causes problems, considering dropping it. --
+      ia5String               IA5String (SIZE(1..MAX)) }
+
+SubjectAltName ::= GeneralNames
+
+GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
+
+GeneralName ::= CHOICE {
+     otherName                       [0]     AnotherName,
+     rfc822Name                      [1]     IA5String,
+     dNSName                         [2]     IA5String,
+     x400Address                     [3]     ANY,
+-- Changed to work with the libtasn1 parser.
+     directoryName                   [4]     EXPLICIT SEQUENCE OF RelativeDistinguishedName, --Name,
+     ediPartyName                    [5]     ANY, --EDIPart
+...
+tion     DisplayText,
+  noticeNumbers    SEQUENCE OF INTEGER }
+
+DisplayText ::= CHOICE {
+  ia5String        IA5String      (SIZE (1..200)),
+  visibleString    VisibleString  (SIZE (1..200)),
+  bmpString        BMPString      (SIZE (1..200)),
+  utf8String       UTF8String     (SIZE (1..200)) }
+
+-- rfc2560
+
+OCSPRequest     ::=     SEQUENCE {
+    tbsRequest                  TBSRequest,
+    optionalSignature   [0]     EXPLICIT Signature OPTIONAL }
+
+TBSRequest      ::=     SEQUENCE {
+    version             [0] EXPLICIT INTEGER DEFAULT 0,
+    requestorName       [1] EXPLICIT GeneralName OPTIONAL,
+    requestList             SEQUENCE OF Request,
+    requestExtensions   [2] EXPLICIT Extensions OPTIONAL }
+
+Signature       ::=     SEQUENCE {
+    signatureAlgorithm   AlgorithmIdentifier,
+    signature            BIT STRING,
+    certs                [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }
+
+
+
+ASSISTANT step 95:
+Both are CHOICEs, confirmed. So asn1_read_value for these uses PUT_STR_VALUE → NUL-terminated.
+
+Hmm, so how does the uninitialized read occur?! Let me look at libtasn1's `asn1_read_value_type` CHOICE case in the ACTUAL source again, but this time let me look at what happens when `node->down` has a name LONGER than the buffer: MEM_ERROR. When shorter: safe copy.
+
+Wait, actually, let me look at the node structure's `name` field: `char name[ASN1_MAX_NAME_SIZE + 1]`. What is ASN1_MAX_NAME_SIZE? Probably 64. So node names are at most 64 chars. choice_type[64] in decode_user_notice — if the CHOICE name is exactly 64 chars (max possible name length 64, e.g. "teletexString" is 13) — no.
+
+OK — let me now REALLY carefully reconsider. Maybe I've been wrong about which `asn1_read_value` CHOICE handler is used! Remember, `decode_complex_string` calls `asn1_read_value(tmpasn, "", str, &len)` where tmpasn was created by `asn1_create_element(_gnutls_get_pkix(), oentry->asn_desc, &tmpasn)`.
+
+WAIT — `_gnutls_get_pkix()` — what is that? gnutls embeds the PKIX1 definitions as a static ASN.1 array (`_gnutls_pkix_asn1_tab`?) generated from pkix.asn via asn1_parser2array at BUILD time. Let me check how _gnutls_get_pkix works and whether the generated tab might differ from pkix.asn (e.g., an older template where DirectoryString alternatives were different).
+
+TOOL CALL step 95 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -rn \"_gnutls_get_pkix\" lib/x509/common.c lib/x509/*.h lib/*.h 2>/dev/null | head; grep -rn \"pkix_asn1_tab\\|_gnutls_pkix\" lib/x509/x509.c lib/x509/common.c lib/*.c 2>/dev/null | head -10", "description": "Find _gnutls_get_pkix"}
+
+TOOL RESULT step 95:
+lib/x509/common.c:361:	     asn1_create_element(_gnutls_get_pkix(), oentry->asn_desc,
+lib/x509/common.c:898:		     (_gnutls_get_pkix(), "PKIX1.pkcs-7-Data",
+lib/x509/common.c:1115:	ret = asn1_create_element(_gnutls_get_pkix(),
+lib/x509/common.c:1391:	    asn1_create_element(_gnutls_get_pkix(), oentry->asn_desc, &c2);
+lib/global.h:39:#define _gnutls_get_pkix() ((ASN1_TYPE) _gnutls_pkix1_asn)
+lib/global.c:71:extern const ASN1_ARRAY_TYPE pkix_asn1_tab[];
+lib/global.c:75:ASN1_TYPE _gnutls_pkix1_asn = ASN1_TYPE_EMPTY;
+lib/global.c:290:	_gnutls_pkix1_asn = ASN1_TYPE_EMPTY;
+lib/global.c:291:	res = asn1_array2tree(pkix_asn1_tab, &_gnutls_pkix1_asn, NULL);
+lib/global.c:417:		asn1_delete_structure(&_gnutls_pkix1_asn);
+lib/pkix_asn1_tab.c:7:const asn1_static_node pkix_asn1_tab[] = {
+
+
+ASSISTANT step 96:
+`pkix_asn1_tab.c` is the generated ASN.1 array. Let me look at the DirectoryString entry in pkix_asn1_tab.c — maybe it differs from pkix.asn (it should be the same, but let me verify). Also, importantly, the `asn1_array2tree` path is used (not parser2tree). Let me look at how the tab is structured for CHOICE — in particular, whether the alternative names are present.
+
+TOOL CALL step 96 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/gnutls && grep -n \"DirectoryString\" lib/pkix_asn1_tab.c | head; echo ===; grep -n \"DisplayText\" lib/pkix_asn1_tab.c | head", "description": "Check DirectoryString in generated tab"}
+
+TOOL RESULT step 96:
+24:  { "DirectoryString", 1610612754, NULL },
+===
+368:  { "explicitText", 16386, "DisplayText"},
+370:  { "organization", 1073741826, "DisplayText"},
+373:  { "DisplayText", 1610612754, NULL },
+
+
+ASSISTANT step 97:
+ent.
+
+OK. I'm now going to take the empirical route via the submit server, but first let me settle the question of WHERE the uninitialized read is by examining the libtasn1 CHOICE decode path ONE more time with a focus on `_asn1_extract_tag_der` for CHOICE alternatives that are **EXPLICIT tags** or **SIZE-constrained**...
+
+Hmm, hold on. Actually, let me look at `extract_tag_der_recursive` and `_asn1_extract_tag_der` again:
+
+```c
+static int
+extract_tag_der_recursive(asn1_node node, const unsigned char *der, int der_len,
+		       int *ret_len, int *inner_len, unsigned flags)
+{
+asn1_node p;
+int ris = ASN1_DER_ERROR;
+
+  if (type_field (node->type) == ASN1_ETYPE_CHOICE)
+    {
+      p = node->down;
+      while (p)
+        {
+          ris = _asn1_extract_tag_der (p, der, der_len, ret_len, inner_len, flags);
+          if (ris == ASN1_SUCCESS)
+            break;
+          p = p->right;
+        }
+
+      *ret_len = 0;
+      return ris;
+    }
+  else
+    return _asn1_extract_tag_der (node, der, der_len, ret_len, inner_len, flags);
+}
+```
+
+And in `_asn1_extract_tag_der`, for the alternative node (e.g., utf8String), it calls `asn1_get_tag_der(der + counter, der_len, &class, &len2, &tag)` and compares with `_asn1_tags[type].class/tag`. For a UTF8String alternative, `_asn1_tags[ASN1_ETYPE_UTF8_STRING]` = {ASN1_CLASS_UNIVERSAL, 12}. The input tag 0x0C matches.
+
+Hmm OK. So after the CHOICE processing, p->down = the chosen alternative. Then asn1_read_value CHOICE → strcpy(p->down->name). The alternative node's name — hmm, is it set? In asn1_array2tree / _asn1_expand_identifier / _asn1_type_choice_config, the alternative nodes have names like "teletexString". Wait — but there's a subtlety: `_asn1_type_choice_config` (structure.c:478) — let me look at it, since it manipulates CHOICE children.
+
+TOOL CALL step 97 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1/lib/structure.c", "limit": 110, "offset": 478}
+
+TOOL RESULT step 97:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1/lib/structure.c</path>
+<type>file</type>
+<content>
+478: static int
+479: _asn1_type_choice_config (asn1_node node)
+480: {
+481:   asn1_node p, p2, p3, p4;
+482:   int move, tlen;
+483: 
+484:   if (node == NULL)
+485:     return ASN1_ELEMENT_NOT_FOUND;
+486: 
+487:   p = node;
+488:   move = DOWN;
+489: 
+490:   while (!((p == node) && (move == UP)))
+491:     {
+492:       if (move != UP)
+493: 	{
+494: 	  if ((type_field (p->type) == ASN1_ETYPE_CHOICE)
+495: 	      && (p->type & CONST_TAG))
+496: 	    {
+497: 	      p2 = p->down;
+498: 	      while (p2)
+499: 		{
+500: 		  if (type_field (p2->type) != ASN1_ETYPE_TAG)
+501: 		    {
+502: 		      p2->type |= CONST_TAG;
+503: 		      p3 = _asn1_find_left (p2);
+504: 		      while (p3)
+505: 			{
+506: 			  if (type_field (p3->type) == ASN1_ETYPE_TAG)
+507: 			    {
+508: 			      p4 = _asn1_add_single_node (p3->type);
+509: 			      tlen = _asn1_strlen (p3->value);
+510: 			      if (tlen > 0)
+511: 				_asn1_set_value (p4, p3->value, tlen + 1);
+512: 			      _asn1_set_right (p4, p2->down);
+513: 			      _asn1_set_down (p2, p4);
+514: 			    }
+51
+...
+	  else
+554: 	    move = UP;
+555: 	}
+556:       if (move == UP)
+557: 	p = _asn1_find_up (p);
+558:     }
+559: 
+560:   return ASN1_SUCCESS;
+561: }
+562: 
+563: 
+564: static int
+565: _asn1_expand_identifier (asn1_node * node, asn1_node root)
+566: {
+567:   asn1_node p, p2, p3;
+568:   char name2[ASN1_MAX_NAME_SIZE + 2];
+569:   int move;
+570: 
+571:   if (node == NULL)
+572:     return ASN1_ELEMENT_NOT_FOUND;
+573: 
+574:   p = *node;
+575:   move = DOWN;
+576: 
+577:   while (!((p == *node) && (move == UP)))
+578:     {
+579:       if (move != UP)
+580: 	{
+581: 	  if (type_field (p->type) == ASN1_ETYPE_IDENTIFIER)
+582: 	    {
+583: 	      snprintf (name2, sizeof (name2), "%s.%s", root->name, p->value);
+584: 	      p2 = _asn1_copy_structure2 (root, name2);
+585: 	      if (p2 == NULL)
+586: 		{
+587: 		  return ASN1_IDENTIFIER_NOT_FOUND;
+
+(Showing lines 478-587 of 1207. Use offset=588 to continue.)
+</content>
+
+ASSISTANT step 98:
+levant (DirectoryString has no explicit tags).
+
+OK. I'm going to try a completely different strategy now: since the target is gnutls_dn_parser_fuzzer and I cannot easily reproduce locally, let me construct a DER DN that triggers the suspected paths and submit it. But first, I should make my best guess about the actual bug, then verify via the server.
+
+Let me think about the actual MSan report once more. The description: "A stack buffer used to store a CHOICE name is not zero-initialized. When the buffer is compared against a literal string, the comparison reads uninitialized tail bytes, causing a use-of-uninitialized-value defect."
+
+This EXACTLY describes `decode_user_notice`'s choice_type[64] IF asn1_read_value leaves it unterminated. And it describes `decode_complex_string`'s str[512] IF the read writes len bytes but no NUL and str[len]=0 happens at the WRONG index.
+
+Hold on — `decode_complex_string`: `str[len] = 0;` where len is *len AFTER the read. For CHOICE: *len = strlen(name)+1, so str[strlen+1] = 0. But the string is terminated at strlen (strcpy's NUL). So str[strlen+1] = 0 is harmless... UNLESS the name's length is EXACTLY... no wait, strcmp stops at the FIRST NUL, which strcpy placed at index strlen. Fine.
+
+Hmm, WAIT. What if asn1_read_value for CHOICE returns len = strlen(name)+1 but the copy is done differently... 
+
+AAAARGH. OK let me look at the actual git history of libtasn1 for this exact fix. I remember now — there's a libtasn1 commit around March 2018: **"decoding.c: fix uninitialized read in asn1_der_decoding2"** or **"Don't read uninitialized bytes when decoding CHOICE"**...
+
+Actually, you know what? Let me look at the libtasn1 ChangeLog in the repo (it's a directory? Earlier grep said "No such file or directory" for libtasn1/ChangeLog. Let me check.
+
+TOOL CALL step 98 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1 && ls | head -40", "description": "List libtasn1 root files"}
+
+TOOL RESULT step 98:
+AUTHORS
+CONTRIBUTING.md
+COPYING
+COPYING.LIB
+GNUmakefile
+Makefile.am
+NEWS
+README-alpha
+README.md
+THANKS
+build-aux
+cfg.mk
+configure.ac
+devel
+doc
+examples
+gl
+gtk-doc.make
+lib
+m4
+maint.mk
+msvc
+src
+tests
+windows
+
+
+TOOL CALL step 99 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1 && ls devel/ 2>/dev/null; echo ===; ls devel/fuzz 2>/dev/null; echo ===; find . -name \"*.repro\" -o -name \"*fuzzer*\" 2>/dev/null | grep -v tests | head -20", "description": "Look for libtasn1 devel fuzzers"}
+
+TOOL RESULT step 99:
+ABI-x86_64.dump
+===
+===
+
+
+ASSISTANT step 100:
+No fuzzers in libtasn1/devel. OK.
+
+Let me now think REALLY carefully about the `asn1_read_value` CHOICE handler and the DN path with **a key realization**: `decode_complex_string` calls `asn1_read_value(tmpasn, "", str, &len)` where tmpasn root is DirectoryString CHOICE with name "". BUT — the value read is the **CHOICE's alternative name** — this is what "store a CHOICE name" means.
+
+Now — WHEN could `asn1_read_value` return SUCCESS while `str` remains (partially) uninitialized? Only if the case executed doesn't NUL-terminate AND len is small enough that str[len]=0 doesn't cover the uninitialized region read by strcmp. 
+
+For the OCTET_STRING-like cases: `asn1_get_octet_der(node->value, node->value_len, &len2, value, value_size, len)`. Let me look at asn1_get_octet_der — does it write a NUL? It writes the raw octets (len2 bytes) and sets *len = ... let me check. If the ROOT were an OCTET STRING (not CHOICE)... but it's CHOICE.
+
+Hmm hmm. OK, let me look at `asn1_get_octet_der` to be thorough.
+
+TOOL CALL step 100 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1/lib/decoding.c", "limit": 80, "offset": 150}
+
+TOOL RESULT step 100:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_10137_9o1im619/workspace/repo-vul/src-vul/libtasn1/lib/decoding.c</path>
+<type>file</type>
+<content>
+150: 
+151:       *len = punt;
+152:     }
+153: 
+154:   sum = ans;
+155:   if (ans >= INT_MAX || INT_ADD_OVERFLOW (sum, (*len)))
+156:     return -2;
+157:   sum += *len;
+158: 
+159:   if (sum > der_len)
+160:     return -4;
+161: 
+162:   return ans;
+163: }
+164: 
+165: /**
+166:  * asn1_get_tag_der:
+167:  * @der: DER data to decode.
+168:  * @der_len: Length of DER data to decode.
+169:  * @cls: Output variable containing decoded class.
+170:  * @len: Output variable containing the length of the DER TAG data.
+171:  * @tag: Output variable containing the decoded tag (may be %NULL).
+172:  *
+173:  * Decode the class and TAG from DER code.
+174:  *
+175:  * Returns: Returns %ASN1_SUCCESS on success, or an error.
+176:  **/
+177: int
+178: asn1_get_tag_der (const unsigned char *der, int der_len,
+179: 		  unsigned char *cls, int *len, unsigned long *tag)
+180: {
+181:   unsigned int ris;
+182:   int punt;
+183: 
+184:   if (der == NULL || der_len < 2 || len == NULL)
+185:     return ASN1_DER_ERROR;
+186: 
+187:   *cls = der[0] & 0xE0;
+188:   if 
+...
+ */
+197:       punt = 1;
+198:       ris = 0;
+199:       while (punt < der_len && der[punt] & 128)
+200: 	{
+201: 
+202: 	  if (INT_MULTIPLY_OVERFLOW (ris, 128))
+203: 	    return ASN1_DER_ERROR;
+204: 	  ris *= 128;
+205: 
+206: 	  if (INT_ADD_OVERFLOW (ris, ((unsigned) (der[punt] & 0x7F))))
+207: 	    return ASN1_DER_ERROR;
+208: 	  ris += (der[punt] & 0x7F);
+209: 	  punt++;
+210: 	}
+211: 
+212:       if (punt >= der_len)
+213: 	return ASN1_DER_ERROR;
+214: 
+215:       if (INT_MULTIPLY_OVERFLOW (ris, 128))
+216: 	return ASN1_DER_ERROR;
+217:       ris *= 128;
+218: 
+219:       if (INT_ADD_OVERFLOW (ris, ((unsigned) (der[punt] & 0x7F))))
+220: 	return ASN1_DER_ERROR;
+221:       ris += (der[punt] & 0x7F);
+222:       punt++;
+223: 
+224:       *len = punt;
+225:     }
+226: 
+227:   if (tag)
+228:     *tag = ris;
+229:   return ASN1_SUCCESS;
+
+(Showing lines 150-229 of 2376. Use offset=230 to continue.)
+</content>
+
+Rules:
+- Output one bare JSON object only. No markdown, no prose.
+- sample_id must be "arvo_10137".
+- If the trajectory is uncertain, choose the most concrete vulnerability
+  hypothesis supported by the issue description and cited source snippets.
+- Keep operands/relation grounded in the same fine_trace step's var/code.
+
+Return exactly one JSON object with exactly these top-level keys:
+sample_id, fine_trace, vuln_logic.
+
+fine_trace: ordered project-source causal path. Each step has:
+step:int, file:string, function:string, line:int|null, var:string, code:string,
+note:string, role:"source"|"root_cause"|"sink"|"intermediate"|null.
+Do not output depends_on.
+
+Mark exactly one source, one root_cause, and one sink step.
+
+vuln_logic:
+- source/root_cause/sink copy file/function/line from the matching role-marked
+  fine_trace step and include operands: non-empty string array. In vuln_logic,
+  line must be an integer.
+- root_cause and sink include relation exactly {"op":"...","left":"...","right":"..."}.
+  op is one of eq, ne, lt, le, gt, ge, same_object.
+- propagation is an array of edges. Each edge contains from, to, type, via,
+  optional relation. from/to copy file/function/line from existing fine_trace
+  steps and each from/to endpoint must include operands: non-empty string array.
+  type is data, control, or order. via is non-empty string array.
+
+Use vulnerable project source only. Do not cite README, analysis files,
+checkpoint files, runtime logs, harness/test/fuzz setup, or old results.
+

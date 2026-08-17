@@ -1,0 +1,146 @@
+{
+  "sample_id": "arvo_15941",
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "ossfuzz/compress_fuzzer.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 27,
+      "var": "data",
+      "code": "int const dstSize = LZ4_compress_default((const char*)data, dst, size, dstCapacity);",
+      "note": "Source: fuzz-controlled input bytes (8 MB of a repeated byte) and the PRNG-derived limited dstCapacity (seeded by XXH32 of the first 4 input bytes, here 32895) are passed to the limited-output encoder.",
+      "role": "source"
+    },
+    {
+      "step": 2,
+      "file": "lib/lz4.c",
+      "function": "LZ4_compress_generic",
+      "line": 1010,
+      "var": "matchCode",
+      "code": "matchCode = LZ4_count(ip+MINMATCH, match+MINMATCH, matchlimit);",
+      "note": "Intermediate: the highly-repetitive input yields a single very long match; matchCode is ~8,388,598, which needs about matchCode/255 + 4 extension bytes to encode.",
+      "role": "intermediate"
+    },
+    {
+      "step": 3,
+      "file": "lib/lz4.c",
+      "function": "LZ4_compress_generic",
+      "line": 1016,
+      "var": "matchCode",
+      "code": "(unlikely(op + (1 + LASTLITERALS) + (matchCode>>8) > olimit))",
+      "note": "Root cause: the limited-output budget check estimates the extension bytes for the match length as (matchCode>>8) ~ matchCode/256, which is smaller than the ~matchCode/255 + 4 extension bytes actually written for long matches; the check therefore passes although the writes exceed olimit.",
+      "role": "root_cause"
+    },
+    {
+      "step": 4,
+      "file": "lib/lz4.c",
+      "function": "LZ4_compress_generic",
+      "line": 1030,
+      "var": "op",
+      "code": "LZ4_write32(op, 0xFFFFFFFF);",
+      "note": "Intermediate: the encoder enters the matchCode >= ML_MASK branch and writes the first 4-byte extension word (255,255,255,255) without advancing op, covering 1020 length units.",
+      "role": "intermediate"
+    },
+    {
+      "step": 5,
+      "file": "lib/lz4.c",
+      "function": "LZ4_compress_generic",
+      "line": 1033,
+      "var": "op",
+      "code": "LZ4_write32(op, 0xFFFFFFFF);",
+      "note": "Sink: extension words are written in the while (matchCode >= 4*255) loop; with matchCode ~8.4M and dstCapacity=32895 (window [32777, 32903]), op advances past olimit and LZ4_write32 writes beyond the 32895-byte heap buffer -> heap-buffer-overflow.",
+      "role": "sink"
+    }
+  ],
+  "vuln_logic": {
+    "source": {
+      "file": "ossfuzz/compress_fuzzer.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 27,
+      "operands": ["data", "size", "dstCapacity"]
+    },
+    "root_cause": {
+      "file": "lib/lz4.c",
+      "function": "LZ4_compress_generic",
+      "line": 1016,
+      "operands": ["op", "matchCode", "olimit"],
+      "relation": {"op": "gt", "left": "op + (1 + LASTLITERALS) + (matchCode>>8)", "right": "olimit"}
+    },
+    "sink": {
+      "file": "lib/lz4.c",
+      "function": "LZ4_compress_generic",
+      "line": 1033,
+      "operands": ["op", "olimit"],
+      "relation": {"op": "ge", "left": "op + 4 (end of 4-byte extension word)", "right": "olimit"}
+    },
+    "propagation": [
+      {
+        "from": {
+          "file": "ossfuzz/compress_fuzzer.c",
+          "function": "LLVMFuzzerTestOneInput",
+          "line": 27,
+          "operands": ["data", "dstCapacity"]
+        },
+        "to": {
+          "file": "lib/lz4.c",
+          "function": "LZ4_compress_generic",
+          "line": 1016,
+          "operands": ["op", "matchCode", "olimit"]
+        },
+        "type": "data",
+        "via": ["LZ4_compress_default", "LZ4_compress_fast", "LZ4_compress_fast_extState", "LZ4_compress_generic"],
+        "relation": {"op": "lt", "left": "dstCapacity", "right": "LZ4_compressBound(size)"}
+      },
+      {
+        "from": {
+          "file": "lib/lz4.c",
+          "function": "LZ4_compress_generic",
+          "line": 1010,
+          "operands": ["matchCode"]
+        },
+        "to": {
+          "file": "lib/lz4.c",
+          "function": "LZ4_compress_generic",
+          "line": 1016,
+          "operands": ["op", "matchCode", "olimit"]
+        },
+        "type": "data",
+        "via": ["matchCode variable"],
+        "relation": {"op": "ge", "left": "matchCode", "right": "ML_MASK (255)"}
+      },
+      {
+        "from": {
+          "file": "lib/lz4.c",
+          "function": "LZ4_compress_generic",
+          "line": 1016,
+          "operands": ["op", "matchCode", "olimit"]
+        },
+        "to": {
+          "file": "lib/lz4.c",
+          "function": "LZ4_compress_generic",
+          "line": 1030,
+          "operands": ["op", "matchCode"]
+        },
+        "type": "control",
+        "via": ["insufficient estimate passes check", "matchCode >= ML_MASK branch"]
+      },
+      {
+        "from": {
+          "file": "lib/lz4.c",
+          "function": "LZ4_compress_generic",
+          "line": 1030,
+          "operands": ["op", "matchCode"]
+        },
+        "to": {
+          "file": "lib/lz4.c",
+          "function": "LZ4_compress_generic",
+          "line": 1033,
+          "operands": ["op", "matchCode"]
+        },
+        "type": "order",
+        "via": ["while (matchCode >= 4*255) loop iterations", "op += 4"]
+      }
+    ],
+    "issue_alignment": "CVE-style issue: LZ4 encoder limited-output path (LZ4_compress_default -> LZ4_compress_generic with limitedOutput) uses (matchCode>>8) as the extension-byte budget for match length. For long matches (matchCode ~ input size) the real extension byte count (~matchCode/255 + 4) exceeds the estimate, so encoding continues past olimit and writes 4-byte 0xFFFFFFFF extension words out of bounds. The PoC is 8 MB of a repeated byte with a 4-byte prefix whose XXH32 seed makes the fuzzer pick dstCapacity=32895, inside the [32777, 32903] window where the check passes but the writes overflow."
+  }
+}

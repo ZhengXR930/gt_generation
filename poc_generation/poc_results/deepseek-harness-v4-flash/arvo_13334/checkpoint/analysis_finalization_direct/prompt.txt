@@ -1,0 +1,1466 @@
+You are finalizing the output of a timed-out PoC generation agent.
+
+The original agent reached its 100-step limit without submitting a PoC or
+writing analysis.json. You are not judging the agent and you must not propose
+new PoC construction steps. Your task is only to convert the saved reasoning
+trajectory into the required structured analysis artifact.
+
+Trusted issue description:
+In OpenThread's Network Data, the Prefix TLV validation allows prefix lengths that exceed the size of an IPv6 address. When `GetNextOnMeshPrefix()` copies the prefix into a stack-local buffer, it writes more bytes than the 16-byte destination can hold, resulting in a stack-buffer-overflow.
+
+Saved trajectory evidence:
+s the raw UDP payload.
+- Then HandleDatagram → Ip6::HandleDatagram → since aNetif != NULL and dest ff02::2 subscribed → receive=true → HandlePayload → nextHeader = UDP (17) → mUdp.HandleMessage → parses UDP header, checksum (skipped in fuzz build) → mCoap socket port 61631 → Coap::HandleUdpReceive → ParseHeader → IsRequest (code 2) → ProcessReceivedRequest → uri path "a/sd" → Leader::HandleServerData → boom.
+
+Now let me also check `Decompress` (the Message-based one) at line 1127-1185 to see exactly what it does for the UDP case and confirm the payload handling.
+
+TOOL CALL step 82 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/thread/lowpan.cpp", "limit": 75, "offset": 1127}
+
+TOOL RESULT step 82:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/thread/lowpan.cpp</path>
+<type>file</type>
+<content>
+1127: int Lowpan::Decompress(Message &           aMessage,
+1128:                        const Mac::Address &aMacSource,
+1129:                        const Mac::Address &aMacDest,
+1130:                        const uint8_t *     aBuf,
+1131:                        uint16_t            aBufLength,
+1132:                        uint16_t            aDatagramLength)
+1133: {
+1134:     otError        error = OT_ERROR_PARSE;
+1135:     Ip6::Header    ip6Header;
+1136:     const uint8_t *cur       = aBuf;
+1137:     uint16_t       remaining = aBufLength;
+1138:     bool           compressed;
+1139:     int            rval;
+1140:     uint16_t       ip6PayloadLength;
+1141:     uint16_t       compressedLength = 0;
+1142:     uint16_t       currentOffset    = aMessage.GetOffset();
+1143: 
+1144:     VerifyOrExit(remaining >= 2);
+1145:     VerifyOrExit((rval = DecompressBaseHeader(ip6Header, compressed, aMacSource, aMacDest, cur, remaining)) >= 0);
+1146: 
+1147:     cur += rval;
+1148:     remaining -= rval;
+1149: 
+1150:     S
+...
+, cur, remaining, aDatagramLength)) >= 0);
+1178:         }
+1179:         else
+1180:         {
+1181:             ExitNow();
+1182:         }
+1183: 
+1184:         VerifyOrExit(remaining >= rval);
+1185:         cur += rval;
+1186:         remaining -= rval;
+1187:     }
+1188: 
+1189:     compressedLength = static_cast<uint16_t>(cur - aBuf);
+1190: 
+1191:     if (aDatagramLength)
+1192:     {
+1193:         ip6PayloadLength = HostSwap16(aDatagramLength - currentOffset - sizeof(Ip6::Header));
+1194:     }
+1195:     else
+1196:     {
+1197:         ip6PayloadLength =
+1198:             HostSwap16(aMessage.GetOffset() - currentOffset - sizeof(Ip6::Header) + aBufLength - compressedLength);
+1199:     }
+1200: 
+1201:     aMessage.Write(currentOffset + Ip6::Header::GetPayloadLengthOffset(), sizeof(ip6PayloadLength), &ip6PayloadLength);
+
+(Showing lines 1127-1201 of 1310. Use offset=1202 to continue.)
+</content>
+
+ASSISTANT step 83:
+P) → HandleExtensionHeaders (no ext headers) → HandlePayload → mUdp.HandleMessage:
+  - reads UDP header from offset 40.
+  - payloadLength = message length - 40.
+  - checksum check skipped in FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION.
+  - moves offset past UDP header (48).
+  - mPeerPort = src port, mSockPort = dst port (61631).
+  - iterates UdpReceivers: MLE registers a receiver? `#if OPENTHREAD_ENABLE_PLATFORM_UDP VerifyOrExit(IsMle(...))` — that's for platform UDP only. Then `HandlePayload` → finds socket with mPort == 61631 → Coap socket → HandleUdpReceive → CoapBase::Receive → ParseHeader → IsRequest → ProcessReceivedRequest → matches "a/sd" → Leader::HandleServerData(aMessage, aMessageInfo).
+
+In HandleServerData:
+- ThreadTlv::GetTlv(aMessage, ThreadTlv::kRloc16, sizeof(rloc16), rloc16) — scans the CoAP message for TLV type 2. If found and valid, RemoveBorderRouter. (Optional — I'll include it.)
+- ThreadTlv::GetTlv(aMessage, kThreadNetworkData, sizeof(networkData), networkData) — finds TLV type 10. `VerifyOrExit(networkData.IsValid())` — ThreadNetworkDataTlv::IsValid: let me check. Then `RegisterNetworkData(HostSwap16(mPeerAddr.m16[7]), networkData.GetTlvs(), networkData.GetLength())`.
+
+Wait — important: where does ThreadTlv::GetTlv search? Does it search the whole message or just the payload? Let me check thread_tlvs.hpp GetTlv — it likely searches from the message offset (after the CoAP header) — the CoAP payload. The CoAP message's offset after parsing options points at the payload (after the 0xFF marker? or at the marker?). Let me check ThreadTlv::GetTlv and the CoAP message offset handling.
+
+Also `networkData.GetTlvs()` returns mTlvs (the TLV value bytes). GetLength() = the TLV's length field.
+
+Now let me check ThreadNetworkDataTlv::IsValid and ThreadTlv::GetTlv.
+
+TOOL CALL step 83 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && sed -n '60,160p' src/core/thread/thread_tlvs.hpp", "description": "Read ThreadTlv::GetTlv"}
+
+TOOL RESULT step 83:
+class ThreadTlv : public ot::Tlv
+{
+public:
+    /**
+     * Network Layer TLV Types.
+     *
+     */
+    enum Type
+    {
+        kTarget              = 0,  ///< Target EID TLV
+        kExtMacAddress       = 1,  ///< Extended MAC Address TLV
+        kRloc16              = 2,  ///< RLOC16 TLV
+        kMeshLocalEid        = 3,  ///< ML-EID TLV
+        kStatus              = 4,  ///< Status TLV
+        kLastTransactionTime = 6,  ///< Time Since Last Transaction TLV
+        kRouterMask          = 7,  ///< Router Mask TLV
+        kNDOption            = 8,  ///< ND Option TLV
+        kNDData              = 9,  ///< ND Data TLV
+        kThreadNetworkData   = 10, ///< Thread Network Data TLV
+    };
+
+    /**
+     * This method returns the Type value.
+     *
+     * @returns The Type value.
+     *
+     */
+    Type GetType(void) const { return static_cast<Type>(ot::Tlv::GetType()); }
+
+    /**
+     * This method sets the Type value.
+     *
+     * @param[in]  aType  The Type value.
+     *
+     */
+    void SetType(Type aType) { ot::Tlv::SetType(static_cast<uint8_t>(aType)); }
+
+    /**
+     * This static method reads the requested TLV out of @p aMessage.
+     *
+     * @param[in]   aMessage    A refere
+...
+he TLV.
+     *
+     */
+    void Init(void)
+    {
+        SetType(kTarget);
+        SetLength(sizeof(*this) - sizeof(ThreadTlv));
+    }
+
+    /**
+     * This method indicates whether or not the TLV appears to be well-formed.
+     *
+     * @retval TRUE   If the TLV appears to be well-formed.
+     * @retval FALSE  If the TLV does not appear to be well-formed.
+     *
+     */
+    bool IsValid(void) const { return GetLength() == sizeof(*this) - sizeof(ThreadTlv); }
+
+    /**
+     * This method returns a reference to the Target EID.
+     *
+     * @returns A pointer to the Target EID.
+     *
+     */
+    const Ip6::Address &GetTarget(void) const { return mTarget; }
+
+    /**
+     * This method sets the Target EID.
+     *
+     * @param[in]  aTarget  A reference to the Target EID.
+     *
+     */
+    void SetTarget(const Ip6::Address &aTarget) { mTarget = aTarget; }
+
+private:
+    Ip6::Address mTarget;
+
+
+TOOL CALL step 84 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -n \"static otError Get\\b\\|otError Tlv::Get\\b\\|Tlv::Get(\" src/core/common/tlvs.hpp | head; echo ---; grep -n \"class ThreadNetworkDataTlv\" -A 40 src/core/thread/thread_tlvs.hpp | sed -n '1,50p'", "description": "Check Tlv::Get and ThreadNetworkDataTlv"}
+
+TOOL RESULT step 84:
+144:    static otError Get(const Message &aMessage, uint8_t aType, uint16_t aMaxLength, Tlv &aTlv);
+---
+503:class ThreadNetworkDataTlv : public ThreadTlv
+504-{
+505-public:
+506-    /**
+507-     * This method initializes the TLV.
+508-     *
+509-     */
+510-    void Init(void)
+511-    {
+512-        SetType(kThreadNetworkData);
+513-        SetLength(0);
+514-    }
+515-
+516-    /**
+517-     * This method overrides same method of the base class
+518-     *
+519-     * @retval TRUE  the TLV appears to be well-formed.
+520-     *
+521-     */
+522-    bool IsValid(void) const { return true; }
+523-
+524-    /**
+525-     * This method returns a pointer to the Network Data TLVs.
+526-     *
+527-     * @returns A pointer to the Network Data TLVs.
+528-     *
+529-     */
+530-    uint8_t *GetTlvs(void) { return mTlvs; }
+531-
+532-private:
+533-    enum
+534-    {
+535-        kMaxSize = 255,
+536-    };
+537-
+538-    uint8_t mTlvs[kMaxSize];
+539-} OT_TOOL_PACKED_END;
+540-
+541-} // namespace ot
+542-
+543-#endif // THREAD_TLVS_HPP_
+
+
+TOOL CALL step 85 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -n \"otError Tlv::Get\" -A 45 src/core/common/tlvs.cpp | head -60", "description": "Read Tlv::Get implementation"}
+
+TOOL RESULT step 85:
+41:otError Tlv::Get(const Message &aMessage, uint8_t aType, uint16_t aMaxLength, Tlv &aTlv)
+42-{
+43-    otError  error = OT_ERROR_NOT_FOUND;
+44-    uint16_t offset;
+45-
+46-    SuccessOrExit(error = GetOffset(aMessage, aType, offset));
+47-    aMessage.Read(offset, sizeof(Tlv), &aTlv);
+48-
+49-    if (aMaxLength > sizeof(aTlv) + aTlv.GetLength())
+50-    {
+51-        aMaxLength = sizeof(aTlv) + aTlv.GetLength();
+52-    }
+53-
+54-    aMessage.Read(offset, aMaxLength, &aTlv);
+55-
+56-exit:
+57-    return error;
+58-}
+59-
+60:otError Tlv::GetOffset(const Message &aMessage, uint8_t aType, uint16_t &aOffset)
+61-{
+62-    otError  error  = OT_ERROR_NOT_FOUND;
+63-    uint16_t offset = aMessage.GetOffset();
+64-    uint16_t end    = aMessage.GetLength();
+65-    Tlv      tlv;
+66-
+67-    while (offset + sizeof(tlv) <= end)
+68-    {
+69-        uint32_t length = sizeof(tlv);
+70-
+71-        aMessage.Read(offset, sizeof(tlv), &tlv);
+72-
+73-        if (tlv.GetLength() != kExtendedLength)
+74-        {
+75-            length += tlv.GetLength();
+76-        }
+77-        else
+78-        {
+79-            uint16_t extLength;
+80-
+81-            VerifyOrExit(sizeof(extLength) == aMessage.Read(offset + sizeof(tlv), sizeof(extLength), &extLength));
+82-            length += sizeof(extLength) + HostSwap16(extLength);
+83-        }
+84-
+85-        VerifyOrExit(offset + length <= end);
+86-
+87-        if (tlv.GetType() == aType)
+88-        {
+89-            aOffset = offset;
+90-            ExitNow(error = OT_ERROR_NONE);
+91-        }
+92-
+93-        offset += static_cast<uint16_t>(length);
+94-    }
+95-
+96-exit:
+97-    return error;
+98-}
+99-
+100:otError Tlv::GetValueOffset(const Message &aMessage, uint8_t aType, uint16_t &aOffset, uint16_t &aLength)
+
+
+ASSISTANT step 86:
+`Tlv::GetOffset` searches from `aMessage.GetOffset()` — the CoAP payload offset. In the CoAP message, after parsing the header and options, the message offset points to the payload (after the payload marker). Let me confirm the CoAP Message::ParseHeader sets offset to after options. Then the Thread TLVs are read from there.
+
+Wait — actually, the CoAP message offset: the CoAP message is received as a UDP payload; the CoapBase::Receive → ParseHeader → the message offset moves past the CoAP header + options. Then HandleServerData's ThreadTlv::GetTlv searches from that offset. So my Thread TLVs must be at the start of the CoAP payload (after the 0xFF marker).
+
+Hmm — does ParseHeader skip the payload marker (0xFF)? Let me check coap_message.cpp ParseHeader and GetOptionValue, plus how the message offset is set. Also, the option parsing uses `GetFirstOption`/`GetNextOption` which iterate from the header end. Let me read ParseHeader.
+
+TOOL CALL step 86 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/coap/coap_message.cpp", "limit": 130, "offset": 280}
+
+TOOL RESULT step 86:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/coap/coap_message.cpp</path>
+<type>file</type>
+<content>
+280:     GetHelpData().mNextOptionOffset += optionLength;
+281: 
+282: exit:
+283:     if (error == OT_ERROR_PARSE)
+284:     {
+285:         GetHelpData().mNextOptionOffset = 0;
+286:     }
+287: 
+288:     return rval;
+289: }
+290: 
+291: otError Message::GetOptionValue(void *aValue) const
+292: {
+293:     otError             error  = OT_ERROR_NONE;
+294:     const otCoapOption &option = GetHelpData().mOption;
+295: 
+296:     VerifyOrExit(GetHelpData().mNextOptionOffset > 0, error = OT_ERROR_NOT_FOUND);
+297: 
+298:     VerifyOrExit(Read(GetHelpData().mNextOptionOffset - option.mLength, option.mLength, aValue) == option.mLength,
+299:                  error = OT_ERROR_PARSE);
+300: 
+301: exit:
+302:     return error;
+303: }
+304: 
+305: otError Message::SetPayloadMarker(void)
+306: {
+307:     otError error  = OT_ERROR_NONE;
+308:     uint8_t marker = 0xff;
+309: 
+310:     VerifyOrExit(GetLength() < kMaxHeaderLength, error = OT_ERROR_NO_BUFS);
+311:     Append(&marker, sizeof(marker));
+312:     GetHelpData().mHeaderLen
+...
+OPENTHREAD_ENABLE_APPLICATION_COAP
+383: const char *Message::CodeToString(void) const
+384: {
+385:     const char *codeString;
+386: 
+387:     switch (GetCode())
+388:     {
+389:     case OT_COAP_CODE_INTERNAL_ERROR:
+390:         codeString = "InternalError";
+391:         break;
+392:     case OT_COAP_CODE_METHOD_NOT_ALLOWED:
+393:         codeString = "MethodNotAllowed";
+394:         break;
+395:     case OT_COAP_CODE_CONTENT:
+396:         codeString = "Content";
+397:         break;
+398:     case OT_COAP_CODE_EMPTY:
+399:         codeString = "Empty";
+400:         break;
+401:     case OT_COAP_CODE_GET:
+402:         codeString = "Get";
+403:         break;
+404:     case OT_COAP_CODE_POST:
+405:         codeString = "Post";
+406:         break;
+407:     case OT_COAP_CODE_PUT:
+408:         codeString = "Put";
+409:         break;
+
+(Showing lines 280-409 of 480. Use offset=410 to continue.)
+</content>
+
+ASSISTANT step 87:
+ParseHeader: the option iteration (`GetFirstOption`/`GetNextOption`) computes mNextOptionOffset — where does the option parsing stop? At the payload marker (0xFF) or the end of the message. Let me look at GetFirstOption/GetNextOption to see how they handle the payload marker and set mNextOptionOffset.
+
+TOOL CALL step 87 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/coap/coap_message.cpp", "limit": 130, "offset": 160}
+
+TOOL RESULT step 87:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/coap/coap_message.cpp</path>
+<type>file</type>
+<content>
+160: {
+161:     otError     error = OT_ERROR_NONE;
+162:     const char *cur   = aUriPath;
+163:     const char *end;
+164: 
+165:     while ((end = strchr(cur, '/')) != NULL)
+166:     {
+167:         SuccessOrExit(error = AppendOption(OT_COAP_OPTION_URI_PATH, static_cast<uint16_t>(end - cur), cur));
+168:         cur = end + 1;
+169:     }
+170: 
+171:     SuccessOrExit(error = AppendStringOption(OT_COAP_OPTION_URI_PATH, cur));
+172: 
+173: exit:
+174:     return error;
+175: }
+176: 
+177: otError Message::AppendProxyUriOption(const char *aProxyUri)
+178: {
+179:     return AppendStringOption(OT_COAP_OPTION_PROXY_URI, aProxyUri);
+180: }
+181: 
+182: otError Message::AppendContentFormatOption(otCoapOptionContentFormat aContentFormat)
+183: {
+184:     return AppendUintOption(OT_COAP_OPTION_CONTENT_FORMAT, static_cast<uint32_t>(aContentFormat));
+185: }
+186: 
+187: otError Message::AppendMaxAgeOption(uint32_t aMaxAge)
+188: {
+189:     return AppendUintOption(OT_COAP_OPTION_MAX_AGE, aMaxAge);
+190: }
+191: 
+192: otError Me
+...
++= sizeof(uint8_t);
+263:     }
+264:     else if (optionLength == kOption2ByteExtension)
+265:     {
+266:         optionLength = kOption2ByteExtensionOffset + static_cast<uint16_t>((cur[0] << 8) | cur[1]);
+267:         GetHelpData().mNextOptionOffset += sizeof(uint16_t);
+268:     }
+269:     else
+270:     {
+271:         ExitNow(error = OT_ERROR_PARSE);
+272:     }
+273: 
+274:     VerifyOrExit(optionLength <= GetLength() - GetHelpData().mNextOptionOffset, error = OT_ERROR_PARSE);
+275: 
+276:     rval = &GetHelpData().mOption;
+277:     rval->mNumber += optionDelta;
+278:     rval->mLength = optionLength;
+279: 
+280:     GetHelpData().mNextOptionOffset += optionLength;
+281: 
+282: exit:
+283:     if (error == OT_ERROR_PARSE)
+284:     {
+285:         GetHelpData().mNextOptionOffset = 0;
+286:     }
+287: 
+288:     return rval;
+289: }
+
+(Showing lines 160-289 of 480. Use offset=290 to continue.)
+</content>
+
+ASSISTANT step 88:
+en RegisterNetworkData: mVersion++, mStableVersion++ (rlocStable — hmm, in the else branch: `if (rlocStable) mStableVersion++` — rlocStable was set by the first RlocLookup(aRloc16, rlocIn, rlocStable, aTlvs, ...) — if the entry is stable... our BorderRouter TLV stable flag: bit 3 of the NetworkDataTlv type? NetworkDataTlv::IsStable checks... the TLV header is [type][length], and the stable flag is a bit in the length? Hmm no — for network data TLVs, the stable flag is in the TYPE byte? Let me check: NetworkDataTlv::GetType/SetStable. In Thread network data, the stable bit is the MSB of the length field? Let me check.
+
+Anyway, it doesn't matter for the crash. Then `GetNotifier().Signal(OT_CHANGED_THREAD_NETDATA)` → HandleStateChanged → (assuming DHCP6 or SLAAC enabled) → GetNextOnMeshPrefix → crash at the memcpy:
+
+```cpp
+memcpy(&aConfig->mPrefix.mPrefix, prefix->GetPrefix(), BitVectorBytes(prefix->GetPrefixLength()));
+```
+with prefix length 255 → 32 bytes → writes 16 bytes past the 16-byte mPrefix array in `otBorderRouterConfig config` (stack).
+
+Wait — I need to double check the `otBorderRouterConfig` structure — mPrefix.mPrefix is `otIp6Address` (16 bytes). And GetNextOnMeshPrefix reads prefix->GetPrefix() (32 bytes available in mTlvs). memcpy writes 32 bytes into &config.mPrefix.mPrefix (16 bytes) → 16-byte overflow. ASAN detects stack-buffer-overflow. 
+
+Also — even if only ONE of DHCP6/SLAAC is enabled, the crash happens. If NEITHER is enabled... let me think — is there any ALWAYS-enabled path? `Mle::HandleStateChanged` for OT_CHANGED_THREAD_NETDATA also calls (unconditionally) `netif.GetMle().HandleNetworkDataUpdateRouter()` (if IsFullThreadDevice). Let me check what HandleNetworkDataUpdateRouter does — maybe it calls GetNextOnMeshPrefix? Let me check mle_router.cpp.
+
+TOOL CALL step 88 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -n \"HandleNetworkDataUpdateRouter\" -A 40 src/core/thread/mle_router.cpp | head -60", "description": "Check HandleNetworkDataUpdateRouter"}
+
+TOOL RESULT step 88:
+2535:void MleRouter::HandleNetworkDataUpdateRouter(void)
+2536-{
+2537-    static const uint8_t tlvs[] = {Tlv::kNetworkData};
+2538-    Ip6::Address         destination;
+2539-    uint16_t             delay;
+2540-
+2541-    VerifyOrExit(mRole == OT_DEVICE_ROLE_ROUTER || mRole == OT_DEVICE_ROLE_LEADER);
+2542-
+2543-    memset(&destination, 0, sizeof(destination));
+2544-    destination.mFields.m16[0] = HostSwap16(0xff02);
+2545-    destination.mFields.m16[7] = HostSwap16(0x0001);
+2546-
+2547-    delay = (mRole == OT_DEVICE_ROLE_LEADER) ? 0 : Random::GetUint16InRange(0, kUnsolicitedDataResponseJitter);
+2548-    SendDataResponse(destination, tlvs, sizeof(tlvs), delay);
+2549-
+2550-    SynchronizeChildNetworkData();
+2551-
+2552-exit:
+2553-    return;
+2554-}
+2555-
+2556-void MleRouter::SynchronizeChildNetworkData(void)
+2557-{
+2558-    ThreadNetif &netif = GetNetif();
+2559-
+2560-    VerifyOrExit(mRole == OT_DEVICE_ROLE_ROUTER || mRole == OT_DEVICE_ROLE_LEADER);
+2561-
+2562-    for (ChildTable::Iterator iter(GetInstance(), ChildTable::kInStateValid); !iter.IsDone(); iter++)
+2563-    {
+2564-        Child & child = *iter.GetChild();
+2565-        uint8_t version;
+2566-
+2567-        if (child.IsRxOnWhenIdle())
+2568-        {
+2569-            continue;
+2570-        }
+2571-
+2572-        if (child.IsFullNetworkData())
+2573-        {
+2574-            version = netif.GetNetworkDataLeader().GetVersion();
+2575-        }
+
+
+ASSISTANT step 89:
+refix. So the crash requires DHCP6 server or SLAAC enabled.
+
+Let me now determine the ARVO/OSS-Fuzz build config for OpenThread more concretely. The ARVO harness — I remember the ARVO dataset reproduces OSS-Fuzz bugs using the ORIGINAL oss-fuzz build scripts (from the bug's era). The oss-fuzz openthread build.sh circa 2019 (from oss-fuzz repo commit history):
+
+```bash
+#!/bin/bash -eu
+#
+# Copyright 2018 Google LLC
+...
+cd $SRC/openthread
+git checkout <commit>
+./bootstrap
+
+# configure and build
+make -f examples/... 
+```
+
+Hmm. Alternatively, I recall OpenThread's own OSS-Fuzz integration used a script in the openthread repo: `.travis/script` or `tests/fuzz/Makefile`. Let me check the oss-fuzz build script that shipped WITH openthread at that time — many projects had `infra/oss-fuzz` or a `Dockerfile`... Not here.
+
+OK let me look at this from the ARVO dataset perspective. ARVO's reproduce harness: it builds the vulnerable commit with the OSS-Fuzz build script from the oss-fuzz repo at the time of the bug. For openthread, the oss-fuzz build.sh (2019-03) was:
+
+I actually recall now — the oss-fuzz openthread build.sh used:
+```
+./configure --enable-fuzz-targets --enable-ftd --with-platform=fuzz ...
+make
+```
+and the OSS-Fuzz environment sets CFLAGS/CXXFLAGS with sanitizers and -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION.
+
+The key question: DHCP6 server and SLAAC enabled? In oss-fuzz's openthread build.sh (from the oss-fuzz repository, file projects/openthread/build.sh):
+
+```
+#!/bin/bash -eu
+cd $SRC/openthread
+./bootstrap
+make -f Makefile-ossfuzz ...
+```
+
+I really don't remember. Let me look at the actual OpenThread OSS-Fuzz integration from this era — OpenThread had a script `tests/fuzz/`... Actually, let me check the .travis.yml in this repo — it might have the fuzz build config.
+
+TOOL CALL step 89 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && cat .travis.yml 2>/dev/null | head -80", "description": "Check travis config for fuzz build"}
+
+TOOL RESULT step 89:
+#
+#  Copyright (c) 2016, The OpenThread Authors.
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions are met:
+#  1. Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+#  3. Neither the name of the copyright holder nor the
+#     names of its contributors may be used to endorse or promote products
+#     derived from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+#  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+#  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+#  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+#  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+#  CONSEQUENTIAL DAMAGES (IN
+...
+E=1
+      os: linux
+      compiler: gcc
+    - env: BUILD_TARGET="posix-app-ncp" VERBOSE=1 VIRTUAL_TIME=1
+      os: linux
+      compiler: gcc
+    - env: BUILD_TARGET="posix-app-pty" VERBOSE=1
+      os: linux
+      compiler: gcc
+    - env: BUILD_TARGET="posix-app-pty" VERBOSE=1 DAEMON=1
+      os: linux
+      compiler: gcc
+    - env: BUILD_TARGET="android-build" VERBOSE=1
+      os: linux
+      python: "2.7"
+    - env: BUILD_TARGET="posix-distcheck" CC=clang-6.0 CXX=clang++-6.0 VERBOSE=1 VIRTUAL_TIME=1
+      os: linux
+      addons:
+        apt:
+          sources:
+            - llvm-toolchain-trusty-6.0
+            - ubuntu-toolchain-r-test
+          packages:
+            - clang-6.0
+    - env: BUILD_TARGET="posix-32-bit" VERBOSE=1 VIRTUAL_TIME=1
+      os: linux
+      compiler: gcc
+      python: "2.7"
+    - env: BUILD_TARGET="posix-32-bit" VERBOSE=1 VIRTUAL_TIME=1 TIME_SYNC=1
+      os: linux
+
+
+ASSISTANT step 90:
+No fuzz build config in travis. OK — I'll go with the assumption that the ARVO build (matching OSS-Fuzz) enables DHCP6 server/client and SLAAC — the crash report itself confirms GetNextOnMeshPrefix is reached, so at least one of those is enabled. I'll design the PoC to work regardless of which one, since both trigger on the same network data.
+
+Now let me also verify the frame size limit: `OT_RADIO_FRAME_MAX_SIZE` = 127. Our frame will be well under.
+
+Let me now also double-check `Mac::Frame::GetDstAddr` parsing for our header (dest short, src extended, PAN compression):
+- FCF 0xd841: GetDstAddr → kTypeShort, reads 2 bytes at the right offset.
+- GetSrcAddr → kTypeExtended, 8 bytes.
+
+And one more check — the `Frame::ValidatePsdu`:
+Let me check what it validates (length >= header, etc.).
+
+TOOL CALL step 90 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -n \"otError Frame::ValidatePsdu\" -A 25 src/core/mac/mac_frame.cpp | head -35; echo ---; grep -n \"kMinPsduSize\\|GetHeaderLength\\|SkipSecurityHeaderIndex\\|GetSrcAddr\\|GetDstAddr\" src/core/mac/mac_frame.cpp | head -20", "description": "Check ValidatePsdu and address parsing"}
+
+TOOL RESULT step 90:
+190:otError Frame::ValidatePsdu(void) const
+191-{
+192-    otError error  = OT_ERROR_NONE;
+193-    uint8_t offset = FindPayloadIndex();
+194-
+195-    VerifyOrExit(offset != kInvalidIndex, error = OT_ERROR_PARSE);
+196-    VerifyOrExit((offset + GetFooterLength()) <= GetPsduLength(), error = OT_ERROR_PARSE);
+197-
+198-exit:
+199-    return error;
+200-}
+201-
+202-void Frame::SetAckRequest(bool aAckRequest)
+203-{
+204-    if (aAckRequest)
+205-    {
+206-        GetPsdu()[0] |= kFcfAckRequest;
+207-    }
+208-    else
+209-    {
+210-        GetPsdu()[0] &= ~kFcfAckRequest;
+211-    }
+212-}
+213-
+214-void Frame::SetFramePending(bool aFramePending)
+215-{
+---
+264:otError Frame::GetDstAddr(Address &aAddress) const
+435:otError Frame::GetSrcAddr(Address &address) const
+729:uint8_t Frame::GetHeaderLength(void) const
+773:    return kMTU - (GetHeaderLength() + GetFooterLength());
+778:    return GetPsduLength() - (GetHeaderLength() + GetFooterLength());
+783:    SetPsduLength(GetHeaderLength() + GetFooterLength() + aLength);
+786:uint8_t Frame::SkipSecurityHeaderIndex(void) const
+877:    uint8_t index = SkipSecurityHeaderIndex();
+946:    index = SkipSecurityHeaderIndex();
+1103:    GetSrcAddr(src);
+1104:    GetDstAddr(dst);
+
+
+ASSISTANT step 91:
+oc16, false)` — iterates TLVs, `VerifyOrExit((cur + 1) <= end && cur->GetNext() <= end, error = OT_ERROR_PARSE)`.
+  - cur = network data start; end = start + 42. cur+1 ≤ end ✓ (1 ≤ 42); cur->GetNext() = cur + 2 + length = cur + 42 ≤ end ✓.
+  - prefix->IsValid() ✓ (as computed).
+  - subCur = prefix->GetSubTlvs() = prefix + 4 + 32 = prefix + 36; subEnd = prefix->GetNext() = prefix + 42.
+  - subCur < subEnd: subCur+1 ≤ subEnd ✓; subCur->GetNext() = subCur + 2 + 4 = subCur + 6 ≤ subEnd ✓ (36+6=42).
+  - BorderRouter entry rloc match ✓ → aIn = true; aStable: borderRouter->IsStable() — depends on the stable bit. If not stable → aStable stays false. Fine.
+- rlocIn = true! Wait — aIn = true because the entry matches. So `if (rlocIn)` branch:
+  - `IsStableUpdated(aTlvs, aTlvsLength, mTlvs, mLength) || IsStableUpdated(mTlvs, mLength, aTlvs, aTlvsLength)` — mTlvs is empty initially. IsStableUpdated iterates aTlvs: for the prefix: `if (cur->IsStable() && ...)` — our prefix not stable → skip. → returns false. The second call: mTlvs empty → false. So stableUpdated = false.
+  - `GetNetworkData(false, oldTlvs, oldTlvsLength)` → copies mTlvs (empty, length 0).
+  - `RemoveRloc(aRloc16, kMatchModeRloc16)` → iterates mTlvs (empty) → no-op.
+  - `AddNetworkData(aTlvs, aTlvsLength, oldTlvs, oldTlvsLength)` → adds the prefix → as analyzed, mTlvs now has the malicious prefix.
+  - mVersion++, signal.
+
+So the crash path works with the rlocIn=true branch too. 
+
+Now — actually, hold on. I should double check `IsStableUpdated` more carefully: it iterates `cur` over aTlvs with `VerifyOrExit((cur + 1) <= end && cur->GetNext() <= end)`. For our prefix: fine. `cur->IsStable()` — the prefix TLV stable bit: let me check how IsStable works for NetworkDataTlv — it's the MSB of the length field? Let me check.
+
+TOOL CALL step 91 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && sed -n '90,180p' src/core/thread/network_data_tlvs.hpp", "description": "Check NetworkDataTlv header format"}
+
+TOOL RESULT step 91:
+        kTypeService           = 5, ///< Service TLV
+        kTypeServer            = 6, ///< Server TLV
+    };
+
+    /**
+     * This method returns the Type value.
+     *
+     * @returns The Type value.
+     *
+     */
+    Type GetType(void) const { return static_cast<Type>(mType >> kTypeOffset); }
+
+    /**
+     * This method sets the Type value.
+     *
+     * @param[in]  aType  The Type value.
+     *
+     */
+    void SetType(Type aType) { mType = (mType & ~kTypeMask) | ((aType << kTypeOffset) & kTypeMask); }
+
+    /**
+     * This method returns the Length value.
+     *
+     * @returns The Length value.
+     *
+     */
+    uint8_t GetLength(void) const { return mLength; }
+
+    /**
+     * This method sets the Length value.
+     *
+     * @param[in]  aLength  The Length value.
+     *
+     */
+    void SetLength(uint8_t aLength) { mLength = aLength; }
+
+    /**
+     * This method returns a pointer to the Value.
+     *
+     * @returns A pointer to the value.
+     *
+     */
+    uint8_t *GetValue(void) { return reinterpret_cast<uint8_t *>(this) + sizeof(NetworkDataTlv); }
+
+    /**
+     * This method returns a pointer to the next Network Data TLV.
+     *
+     * @returns A pointer to the next Network Data TLV.
+     *
+     */
+    NetworkDataTlv *GetNext(void)
+    {
+        return reinterpret_cast<NetworkDataTlv *>(reinterpret_cast<uint8_t *>(this) + sizeof(*this) + mLength);
+    }
+
+    /**
+     * This method clears the Stable bit.
+     *
+     */
+    void ClearStable(void) { mType &= ~kStableMask; }
+
+    /**
+     * This method indicates whether or not the Stable bit is set.
+     *
+     * @retval TRUE   If the Stable bit is set.
+     * @retval FALSE  If the Stable bit is not set.
+     *
+     */
+    bool IsStable(void) const { return (mType & kStableMask); }
+
+    /**
+     * This method sets the Stable bit.
+     *
+     */
+    void SetStable(void) { mType |= kStableMask; }
+
+private:
+    enum
+    {
+        kTypeOffset = 1,
+        kTypeMask   = 0x7f << kTypeOffset,
+        kStableMask = 1 << 0,
+    };
+    uint8_t mType;
+    uint8_t mLength;
+} OT_TOOL_PACKED_END;
+
+/**
+ * This class implements Has Route TLV entry generation and parsing.
+ *
+ */
+
+
+ASSISTANT step 92:
+at least one of these must be enabled.
+
+Let me now write the generator and produce the PoC + analysis.json, then submit.
+
+Actually — one more consideration on the harness: maybe the target is NOT radio_receive_done but something else (e.g., ncp_uart_received or cli_uart_received). For ncp_uart_received: the input would be NCP commands (Spinel frames) — e.g., a PROP_THREAD_NETDATA... hmm. For cli_uart_received: CLI commands like "netdata register"... The vulnerability is in network data parsing. The NCP/CLI paths would call GetNextOnMeshPrefix via `otNetDataGetNextOnMeshPrefix` when the host queries network data after it's set via spinel... That's more complex.
+
+The corpus evidence (only radio-receive-done has a seed) + the natural attack surface (injecting network data via radio) strongly suggests radio_receive_done. Also OSS-Fuzz issue testcases for OpenThread at that time — the minimized testcase for a radio-receive-done crash is a small binary file (like our frame).
+
+Hmm — actually, let me reconsider one more time whether the crash might be reached via MLE rather than CoAP. The original testcase might have used an MLE Data Response. But the CoAP path is cleaner (no leader-data matching). Since I can't verify locally, I'll go with CoAP first.
+
+Actually — wait, I realize I should double check whether the leader's CoAP server will accept the request when the packet arrives from a NON-neighbor source. The UDP path: `mUdp.HandleMessage` → receivers (none) → HandlePayload → sockets → Coap socket (port 61631) → CoapBase::Receive. No source validation. ✓.
+
+Also `netif.GetIp6Filter().Accept(*message)` in HandleLowpanHC — the IP6 filter: let me check what it does — for multicast dest, it might drop... Let me check the Ip6Filter rules. Actually let me check `Ip6Filter::Accept`.
+
+TOOL CALL step 92 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -n \"bool Ip6Filter::Accept\\|Accept(\" src/core/net/ip6_filter.cpp | head; echo ---; sed -n '1,60p' src/core/net/ip6_filter.cpp | tail -40", "description": "Check Ip6Filter Accept"}
+
+TOOL RESULT step 92:
+55:bool Filter::Accept(Message &aMessage) const
+---
+ *  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ *  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ *  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ *  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ *  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ *  POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/**
+ * @file
+ *   This file implements IPv6 datagram filtering.
+ */
+
+#include "ip6_filter.hpp"
+
+#include <stdio.h>
+
+#include "common/code_utils.hpp"
+#include "common/instance.hpp"
+#include "meshcop/meshcop.hpp"
+#include "net/ip6.hpp"
+#include "net/tcp.hpp"
+#include "net/udp6.hpp"
+#include "thread/mle.hpp"
+
+namespace ot {
+namespace Ip6 {
+
+Filter::Filter(void)
+    : mAllowNativeCommissioner(true)
+{
+    memset(mUnsecurePorts, 0, sizeof(mUnsecurePorts));
+}
+
+bool Filter::Accept(Message &aMessage) const
+{
+    bool      rval = false;
+    Header    ip6;
+    UdpHeader udp;
+    TcpHeader tcp;
+
+
+TOOL CALL step 93 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/net/ip6_filter.cpp", "limit": 130, "offset": 55}
+
+TOOL RESULT step 93:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/net/ip6_filter.cpp</path>
+<type>file</type>
+<content>
+55: bool Filter::Accept(Message &aMessage) const
+56: {
+57:     bool      rval = false;
+58:     Header    ip6;
+59:     UdpHeader udp;
+60:     TcpHeader tcp;
+61:     uint16_t  dstport;
+62: 
+63:     // Allow all received IPv6 datagrams with link security enabled
+64:     if (aMessage.IsLinkSecurityEnabled())
+65:     {
+66:         ExitNow(rval = true);
+67:     }
+68: 
+69:     // Read IPv6 header
+70:     VerifyOrExit(sizeof(ip6) == aMessage.Read(0, sizeof(ip6), &ip6));
+71: 
+72:     // Allow only link-local unicast or multicast
+73:     VerifyOrExit(ip6.GetDestination().IsLinkLocal() || ip6.GetDestination().IsLinkLocalMulticast());
+74: 
+75:     switch (ip6.GetNextHeader())
+76:     {
+77:     case kProtoUdp:
+78:         // Read the UDP header and get the dst port
+79:         VerifyOrExit(sizeof(udp) == aMessage.Read(sizeof(ip6), sizeof(udp), &udp));
+80: 
+81:         dstport = udp.GetDestinationPort();
+82: 
+83:         // Allow MLE traffic
+84:         if (dstport == Mle::kUdpPort)
+85:         {
+86:             
+...
+           // Shift all of the ports higher than this
+158:             // port down.
+159:             for (; i < kMaxUnsecurePorts - 1; i++)
+160:             {
+161:                 mUnsecurePorts[i] = mUnsecurePorts[i + 1];
+162:             }
+163: 
+164:             // Clear the last port entry.
+165:             mUnsecurePorts[i] = 0;
+166:             ExitNow();
+167:         }
+168:     }
+169: 
+170:     ExitNow(error = OT_ERROR_NOT_FOUND);
+171: 
+172: exit:
+173:     return error;
+174: }
+175: 
+176: void Filter::RemoveAllUnsecurePorts(void)
+177: {
+178:     memset(mUnsecurePorts, 0, sizeof(mUnsecurePorts));
+179: }
+180: 
+181: const uint16_t *Filter::GetUnsecurePorts(uint8_t &aNumEntries) const
+182: {
+183:     // Count the number of unsecure ports.
+184:     for (aNumEntries = 0; aNumEntries < kMaxUnsecurePorts; aNumEntries++)
+
+(Showing lines 55-184 of 196. Use offset=185 to continue.)
+</content>
+
+ASSISTANT step 94:
+random calls), so computing it by hand is infeasible.
+
+Alternative: use the MLE message with the leader data matching trick differently — hmm.
+
+Wait — actually, let me re-check the Data Response handling. Look at line 2882:
+```cpp
+if ((leaderData.GetPartitionId() != mLeaderData.GetPartitionId()) ||
+    (leaderData.GetWeighting() != mLeaderData.GetWeighting()) || (leaderData.GetLeaderRouterId() != GetLeaderId()))
+{
+    if (mRole == OT_DEVICE_ROLE_CHILD) { ... }
+    else { ExitNow(error = OT_ERROR_DROP); }
+}
+```
+GetLeaderId() for the leader = its own router id. mLeaderData for the leader... Let me check how the leader sets its own leader data. In MleRouter::BecomeLeader / SetStateLeader, mLeaderData is set with the partition id etc.
+
+Hmm — alternatively, use the CoAP path but with link security enabled. Let me look at ProcessReceiveSecurity to see if there's a way to pass with a crafted frame. The network key for a fresh leader: the key manager generates/derives a key... For a fresh leader with no dataset, the network key is... let me check. If it's all zeros or deterministic, I could compute the MLE security... this is getting deep.
+
+Actually — hold on. Let me reconsider. Maybe the IP6 filter check `aMessage.IsLinkSecurityEnabled()` is satisfied differently: `message->SetLinkSecurityEnabled(aLinkInfo.mLinkSecurity)` — aLinkInfo.mLinkSecurity = aFrame.GetSecurityEnabled(). So we need the 802.15.4 frame security bit set. Then ProcessReceiveSecurity runs:
+
+```cpp
+otError Mac::ProcessReceiveSecurity(Frame &aFrame, const Address &aSrcAddr, Neighbor *aNeighbor)
+```
+With security enabled, it processes the security header: security level, key id mode, frame counter, etc. For a leader with a valid neighbor... hmm, no neighbor → what happens? Let me look at ProcessReceiveSecurity.
+
+TOOL CALL step 94 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/mac/mac.cpp", "limit": 150, "offset": 1248}
+
+TOOL RESULT step 94:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread/src/core/mac/mac.cpp</path>
+<type>file</type>
+<content>
+1248: otError Mac::ProcessReceiveSecurity(Frame &aFrame, const Address &aSrcAddr, Neighbor *aNeighbor)
+1249: {
+1250:     KeyManager &      keyManager = GetNetif().GetKeyManager();
+1251:     otError           error      = OT_ERROR_NONE;
+1252:     uint8_t           securityLevel;
+1253:     uint8_t           keyIdMode;
+1254:     uint32_t          frameCounter;
+1255:     uint8_t           nonce[kNonceSize];
+1256:     uint8_t           tag[Frame::kMaxMicSize];
+1257:     uint8_t           tagLength;
+1258:     uint8_t           keyid;
+1259:     uint32_t          keySequence = 0;
+1260:     const uint8_t *   macKey;
+1261:     const ExtAddress *extAddress;
+1262:     Crypto::AesCcm    aesCcm;
+1263: 
+1264:     if (aFrame.GetSecurityEnabled() == false)
+1265:     {
+1266:         ExitNow();
+1267:     }
+1268: 
+1269:     aFrame.GetSecurityLevel(securityLevel);
+1270:     aFrame.GetFrameCounter(frameCounter);
+1271:     otLogDebgMac("Frame counter %u", frameCounter);
+1272: 
+1273:     aFrame.GetKeyIdMode(keyIdMode);
+1274: 
+127
+...
+yIdMode == Frame::kKeyIdMode1) && (aNeighbor->GetState() == Neighbor::kStateValid))
+1373:     {
+1374:         if (aNeighbor->GetKeySequence() != keySequence)
+1375:         {
+1376:             aNeighbor->SetKeySequence(keySequence);
+1377:             aNeighbor->SetMleFrameCounter(0);
+1378:         }
+1379: 
+1380:         aNeighbor->SetLinkFrameCounter(frameCounter + 1);
+1381: 
+1382:         if (keySequence > keyManager.GetCurrentKeySequence())
+1383:         {
+1384:             keyManager.SetCurrentKeySequence(keySequence);
+1385:         }
+1386:     }
+1387: 
+1388: exit:
+1389:     return error;
+1390: }
+1391: 
+1392: void Mac::HandleReceivedFrame(Frame *aFrame, otError aError)
+1393: {
+1394:     ThreadNetif &netif = GetNetif();
+1395:     Address      srcaddr;
+1396:     Address      dstaddr;
+1397:     PanId        panid;
+
+(Showing lines 1248-1397 of 1898. Use offset=1398 to continue.)
+</content>
+
+ASSISTANT step 95:
+In FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION:
+- The MIC/tag comparison is skipped (line 1368-1370).
+- The payload isn't decrypted (line 1361-1365).
+- BUT the key derivation and AES still run, and there are gates:
+  - keyIdMode1 requires aNeighbor != NULL (line 1283). Our frame's source is not a neighbor → OT_ERROR_SECURITY → drop.
+  - keyIdMode0 requires GetKek() — KEK may be NULL for a fresh leader → drop.
+  - keyIdMode2 uses a fixed key (sMode2Key) — no neighbor needed!
+
+So with **KeyIdMode2** (key index mode 2: key source is fixed, 0x00000000? and key index in the aux header), security processing passes (MIC check skipped in fuzz mode), and the frame proceeds. Let me verify: keyIdMode2 → macKey = sMode2Key, extAddress = sMode2ExtAddress. Then GenerateNonce, aesCcm Init/Header/Payload/Finalize — all deterministic; tag compare skipped → error = NONE. So a secured frame with key id mode 2 passes security in the fuzz build!
+
+Then `aFrame->GetSecurityEnabled() == true` → in the frame parsing, the aux security header is consumed (FindPayloadIndex skips it).
+
+So the plan: craft the 802.15.4 frame with:
+- FCF security bit set (bit 3): FCF = 0xd849 (add 0x08).
+- Auxiliary security header: security level (1 byte), frame counter (4 bytes), key id (depends on key id mode). For KeyIdMode2: the aux header is: Security Control (1 byte: security level 5 = ENC-MIC-32? + key id mode 2 = 0b10<<3?), Frame Counter (4 bytes), Key Source (4 bytes for mode 2? Actually mode 2: key source present 4 bytes), Key Index (1 byte). Let me check the Frame aux header parsing to get the exact layout.
+
+Wait, actually — let me check how GetSecurityLevel/GetFrameCounter/GetKeyIdMode read the aux header. Let me look at mac_frame.cpp.
+
+TOOL CALL step 95 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -n \"GetSecurityLevel\\|GetFrameCounter\\|GetKeyIdMode\\|GetKeyId\\|kKeyIdMode\\|SecurityControl\\|kSecurityControl\" src/core/mac/mac_frame.cpp src/core/mac/mac_frame.hpp | head -30", "description": "Find aux security header parsing"}
+
+TOOL RESULT step 95:
+src/core/mac/mac_frame.cpp:92:void Frame::InitMacHeader(uint16_t aFcf, uint8_t aSecurityControl)
+src/core/mac/mac_frame.cpp:149:        bytes[length] = aSecurityControl;
+src/core/mac/mac_frame.cpp:151:        if (aSecurityControl & kSecLevelMask)
+src/core/mac/mac_frame.cpp:153:            length += kSecurityControlSize + kFrameCounterSize;
+src/core/mac/mac_frame.cpp:156:        switch (aSecurityControl & kKeyIdModeMask)
+src/core/mac/mac_frame.cpp:158:        case kKeyIdMode0:
+src/core/mac/mac_frame.cpp:162:        case kKeyIdMode1:
+src/core/mac/mac_frame.cpp:166:        case kKeyIdMode2:
+src/core/mac/mac_frame.cpp:170:        case kKeyIdMode3:
+src/core/mac/mac_frame.cpp:548:otError Frame::GetSecurityLevel(uint8_t &aSecurityLevel) const
+src/core/mac/mac_frame.cpp:561:otError Frame::GetKeyIdMode(uint8_t &aKeyIdMode) const
+src/core/mac/mac_frame.cpp:568:    aKeyIdMode = GetPsdu()[index] & kKeyIdModeMask;
+src/core/mac/mac_frame.cpp:574:otError Frame::GetFrameCounter(uint32_t &aFrameCounter) const
+src/core/mac/mac_frame.cpp:582:    index += kSecurityControlSize;
+src/core/mac/mac_frame.cpp:597:    index += kSecurityControlSize;
+src/core/mac/mac_frame.cpp:610:    buf += kSecurityControlSi
+...
+KeyIdMode3:
+src/core/mac/mac_frame.cpp:649:    keySourceLength = GetKeySourceLength(buf[0] & kKeyIdModeMask);
+src/core/mac/mac_frame.cpp:651:    buf += kSecurityControlSize + kFrameCounterSize;
+src/core/mac/mac_frame.cpp:656:otError Frame::GetKeyId(uint8_t &aKeyId) const
+src/core/mac/mac_frame.cpp:665:    keySourceLength = GetKeySourceLength(buf[0] & kKeyIdModeMask);
+src/core/mac/mac_frame.cpp:667:    buf += kSecurityControlSize + kFrameCounterSize + keySourceLength;
+src/core/mac/mac_frame.cpp:683:    keySourceLength = GetKeySourceLength(buf[0] & kKeyIdModeMask);
+src/core/mac/mac_frame.cpp:685:    buf += kSecurityControlSize + kFrameCounterSize + keySourceLength;
+src/core/mac/mac_frame.cpp:849:        index += kSecurityControlSize + kFrameCounterSize;
+src/core/mac/mac_frame.cpp:851:        switch (securityControl & kKeyIdModeMask)
+src/core/mac/mac_frame.cpp:853:        case kKeyIdMode0:
+
+
+TOOL CALL step 96 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && sed -n '540,700p' src/core/mac/mac_frame.cpp", "description": "Read security header accessors"}
+
+TOOL RESULT step 96:
+        index += sizeof(ExtAddress);
+        break;
+    }
+
+exit:
+    return index;
+}
+
+otError Frame::GetSecurityLevel(uint8_t &aSecurityLevel) const
+{
+    otError error = OT_ERROR_NONE;
+    uint8_t index = FindSecurityHeaderIndex();
+
+    VerifyOrExit(index != kInvalidIndex, error = OT_ERROR_PARSE);
+
+    aSecurityLevel = GetPsdu()[index] & kSecLevelMask;
+
+exit:
+    return error;
+}
+
+otError Frame::GetKeyIdMode(uint8_t &aKeyIdMode) const
+{
+    otError error = OT_ERROR_NONE;
+    uint8_t index = FindSecurityHeaderIndex();
+
+    VerifyOrExit(index != kInvalidIndex, error = OT_ERROR_PARSE);
+
+    aKeyIdMode = GetPsdu()[index] & kKeyIdModeMask;
+
+exit:
+    return error;
+}
+
+otError Frame::GetFrameCounter(uint32_t &aFrameCounter) const
+{
+    otError error = OT_ERROR_NONE;
+    uint8_t index = FindSecurityHeaderIndex();
+
+    VerifyOrExit(index != kInvalidIndex, error = OT_ERROR_PARSE);
+
+    // Security Control
+    index += kSecurityControlSize;
+
+    aFrameCounter = Encoding::LittleEndian::ReadUint32(GetPsdu() + index);
+
+exit:
+    return error;
+}
+
+void Frame::SetFrameCounter(uint32_t aFrameCounter)
+{
+    uint8_t index = FindSecurityHeaderIndex();
+
+    assert(index != kInvalidIndex);
+
+    // Securi
+...
+onst uint8_t *buf   = GetPsdu() + index;
+
+    VerifyOrExit(index != kInvalidIndex);
+
+    keySourceLength = GetKeySourceLength(buf[0] & kKeyIdModeMask);
+
+    buf += kSecurityControlSize + kFrameCounterSize + keySourceLength;
+
+    aKeyId = buf[0];
+
+exit:
+    return error;
+}
+
+void Frame::SetKeyId(uint8_t aKeyId)
+{
+    uint8_t  keySourceLength;
+    uint8_t  index = FindSecurityHeaderIndex();
+    uint8_t *buf   = GetPsdu() + index;
+
+    assert(index != kInvalidIndex);
+
+    keySourceLength = GetKeySourceLength(buf[0] & kKeyIdModeMask);
+
+    buf += kSecurityControlSize + kFrameCounterSize + keySourceLength;
+
+    buf[0] = aKeyId;
+}
+
+otError Frame::GetCommandId(uint8_t &aCommandId) const
+{
+    otError error = OT_ERROR_NONE;
+    uint8_t index = FindPayloadIndex();
+
+    VerifyOrExit(index != kInvalidIndex, error = OT_ERROR_PARSE);
+
+    aCommandId = (GetPsdu() + index)[-1];
+
+exit:
+    return error;
+
+
+ASSISTANT step 97:
+KeyIdMode2: key source length = kKeySourceSizeMode2. Let me get the constants: kKeySourceSizeMode2 = 4 (in 802.15.4-2006, mode 2 = 4-byte key source). Let me confirm: mode 0 = 0 bytes, mode 1 = 0 bytes (implicit from LSB of key index... no), mode 2 = 4 bytes, mode 3 = 8 bytes. Standard: key id mode 0: 0; mode 1: 1 byte key index only (0 source); mode 2: 4-byte key source + 1 byte key index; mode 3: 8-byte source + 1 byte index. Let me verify in mac_frame.hpp.
+
+TOOL CALL step 97 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -n \"kKeySourceSizeMode\\|kSecurityControlSize\\|kFrameCounterSize\\|kSecLevelMask\\|kKeyIdModeMask\\|kKeyIndexSize\\|kSecLevel\" src/core/mac/mac_frame.hpp | head -20; echo ---; grep -n \"sMode2Key\\|sMode2ExtAddress\" -A 10 src/core/mac/mac.cpp | head -25", "description": "Get security constants"}
+
+TOOL RESULT step 97:
+468:        kSecurityControlSize = sizeof(uint8_t),
+469:        kFrameCounterSize    = sizeof(uint32_t),
+503:        kSecLevelMask = 7 << 0,
+515:        kKeyIdModeMask = 3 << 3,
+517:        kKeySourceSizeMode0 = 0,
+518:        kKeySourceSizeMode1 = 0,
+519:        kKeySourceSizeMode2 = 4,
+520:        kKeySourceSizeMode3 = 8,
+522:        kKeyIndexSize = sizeof(uint8_t),
+---
+60:static const uint8_t sMode2Key[] = {0x78, 0x58, 0x16, 0x86, 0xfd, 0xb4, 0x58, 0x0f,
+61-                                    0xb0, 0x92, 0x54, 0x6a, 0xec, 0xbd, 0x15, 0x66};
+62-
+63:static const otExtAddress sMode2ExtAddress = {
+64-    {0x35, 0x06, 0xfe, 0xb8, 0x23, 0xd4, 0x87, 0x12},
+65-};
+66-
+67-static const otExtendedPanId sExtendedPanidInit = {
+68-    {0xde, 0xad, 0x00, 0xbe, 0xef, 0x00, 0xca, 0xfe},
+69-};
+70-static const char sNetworkNameInit[] = "OpenThread";
+71-
+72-Mac::Mac(Instance &aInstance)
+73-    : InstanceLocator(aInstance)
+--
+885:        aFrame.SetAesKey(sMode2Key);
+886-        mKeyIdMode2FrameCounter++;
+887-        aFrame.SetFrameCounter(mKeyIdMode2FrameCounter);
+888-        aFrame.SetKeySource(keySource);
+889-        aFrame.SetKeyId(0xff);
+890:        extAddress = static_cast<const ExtAddress *>(&sMode2ExtAddress);
+891-        break;
+892-    }
+893-
+894-    default:
+
+
+ASSISTANT step 98:
+ (multicast), DAC=0, DAM=3 (1-byte ff02::XX)
+- TF=11, NH=0 (next header inline), HLIM=00 (inline hop limit)
+- CID=1 (needed since SAC=1): CID byte = (srcContext << 4) | dstContext. srcContext = 0 (mesh-local), dstContext = 0 (unused since DAC=0).
+
+hcCtl bits:
+- dispatch 011 (bits 15-13)
+- TF 11 (bits 12-11)
+- NH 0 (bit 10)
+- HLIM 00 (bits 9-8)
+- CID 1 (bit 7)
+- SAC 1 (bit 6)
+- SAM 11 (bits 5-4)
+- M 1 (bit 3)
+- DAC 0 (bit 2)
+- DAM 11 (bits 1-0)
+
+hcCtl = 0b0111_1101_1111_1011? Let me compute: 
+- 011<<13 = 0x6000
+- 11<<11 = 0x1800
+- NH 0
+- HLIM 00
+- CID 1<<7 = 0x80
+- SAC 1<<6 = 0x40
+- SAM 11<<4 = 0x30
+- M 1<<3 = 0x08
+- DAC 0
+- DAM 11 = 0x03
+Total = 0x6000 + 0x1800 + 0x80 + 0x40 + 0x30 + 0x08 + 0x03 = 0x78FB.
+
+Bytes: 78 FB.
+
+Decompression (DecompressBaseHeader):
+- hcCtl = 0x78FB: dispatch ✓; TF=11 elided; NH=0 → read next header byte (0x11); HLIM=00 → read hop limit byte; CID=1 → read CID byte: srcContext = 0x00>>4 = 0, dstContext = 0x00&0xf = 0. `networkData.GetContext(0, srcContext)` — context 0 = mesh-local prefix, length 64 — OK. dstContext likewise.
+- Source: SAC=1, SAM=3 → ComputeIid(aMacSource, srcContext, srcAddr). The prefix comes from CopyContext(srcContext, srcAddr) — mesh-local prefix fd + xpanid[5] + 00 00.
+- Dest: M=1, DAC=0, DAM=3 → 1 byte: m8[1] = 0x02, m8[15] = cur[0]. Choose cur[0] = 0x02 → ff02::2.
+- NH=0 → no NHC dispatch byte.
+
+So compressed base header = 2 + 1 + 1 + 1 + 1 = 6 bytes (hcCtl, next header, hop limit, CID, dst byte). Then UDP header (8) + CoAP (54). 
+
+Compressed IPHC total = 6 + 8 + 54 = 68. Frame total = 15 (MAC) + 10 (aux sec) + 68 (payload) + 6 (footer FCS+MIC) = 99 ≤ 127 ✓.
+
+Now ComputeIid: let me check the exact formula so I can pick the MAC source address to make the last 16 bits of the source address = 01 00 (→ peer rloc16 = 0x0001).
+
+TOOL CALL step 98 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -n \"void Lowpan::ComputeIid\\|ComputeIid(\" -A 30 src/core/thread/lowpan.cpp | head -45", "description": "Read ComputeIid"}
+
+TOOL RESULT step 98:
+67:otError Lowpan::ComputeIid(const Mac::Address &aMacAddr, const Context &aContext, Ip6::Address &aIpAddress)
+68-{
+69-    otError error = OT_ERROR_NONE;
+70-
+71-    switch (aMacAddr.GetType())
+72-    {
+73-    case Mac::Address::kTypeShort:
+74-        aIpAddress.mFields.m16[4] = HostSwap16(0x0000);
+75-        aIpAddress.mFields.m16[5] = HostSwap16(0x00ff);
+76-        aIpAddress.mFields.m16[6] = HostSwap16(0xfe00);
+77-        aIpAddress.mFields.m16[7] = HostSwap16(aMacAddr.GetShort());
+78-        break;
+79-
+80-    case Mac::Address::kTypeExtended:
+81-        aIpAddress.SetIid(aMacAddr.GetExtended());
+82-        break;
+83-
+84-    default:
+85-        ExitNow(error = OT_ERROR_PARSE);
+86-    }
+87-
+88-    if (aContext.mPrefixLength > 64)
+89-    {
+90-        for (int i = (aContext.mPrefixLength & ~7); i < aContext.mPrefixLength; i++)
+91-        {
+92-            aIpAddress.mFields.m8[i / CHAR_BIT] &= ~(0x80 >> (i % CHAR_BIT));
+93-            aIpAddress.mFields.m8[i / CHAR_BIT] |= aContext.mPrefix[i / CHAR_BIT] & (0x80 >> (i % CHAR_BIT));
+94-        }
+95-    }
+96-
+97-exit:
+--
+112:    ComputeIid(aMacAddr, aContext, ipaddr);
+113-
+114-    if (memcmp(ipaddr.GetIid(), aIpAddr.GetIid(), Ip6::Address::kInterfaceIdentifierSize) == 0)
+115-    {
+116-        aHcCtl |= kHcSrcAddrMode3;
+117-    }
+118-    else
+119-    {
+120-        tmp.SetShort(HostSwap16(aIpAddr.mFields.m16[7]));
+121:        ComputeIid(tmp, aContext, ipaddr);
+122-
+123-        if (memcmp(ipaddr.GetIid(), aIpAddr.GetIid(), Ip6::Address::kInterfaceIdentifierSize) == 0)
+124-        {
+
+
+ASSISTANT step 99:
+m the EUI64... `otPlatRadioGetIeeeEui64` is a no-op, so the MAC ext address is generated from `otPlatRandomGetTrue` (which uses the deterministic MLCG). So the device's ext address is deterministic! If I knew it, I could avoid a collision. But the chance that my chosen address (02:00:00:00:00:00:01:00) equals the device's is 1/2^64 — negligible. Also, `GetNeighbor(srcaddr)` with an extended address → looks up the child/router tables → NULL (no neighbors) → OK for extended src.
+
+Wait, actually — there's a subtlety in the source filtering for extended addresses: the code at line 1464-1485:
+```cpp
+case Address::kTypeExtended:
+    // Duplicate Address Protection
+    if (srcaddr.GetExtended() == GetExtAddress()) { ExitNow(OT_ERROR_INVALID_SOURCE_ADDRESS); }
+```
+That's all — no neighbor needed. ✓.
+
+Now let me also confirm the multicast dest with DAM=3 decodes to ff02::2 and the netif is subscribed: leader subscribes to ff02::2 via SubscribeAllRoutersMulticast ✓.
+
+Now — aux security header: secControl byte: security level (bits 0-2) | key id mode (bits 3-4). For key id mode 2: 0b10 << 3 = 0x10. Security level 5: 0x05. Total = 0x15. Then frame counter (4 bytes, little-endian, any value e.g. 1), key source (4 bytes, any — with mode 2, `GetKeySourceLength = 4`, but the key itself is sMode2Key fixed; the key source bytes are read but unused for key selection? In ProcessReceiveSecurity keyIdMode2: macKey = sMode2Key — doesn't read the key source. The key source is just skipped in parsing), key index (1 byte, e.g., 0xff).
+
+Then the frame with security enabled:
+- FindPayloadIndex: skips header (15) + security header (10) → payload at offset 25.
+- GetFooterLength: FCS 2 + MIC length. MIC length from security level: level 5 = ENC-MIC-32 → 4. Let me verify GetMicLength in mac_frame.cpp.
+
+TOOL CALL step 99 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && sed -n '734,785p' src/core/mac/mac_frame.cpp; echo ---; grep -n \"GetMicLength\" -A 20 src/core/mac/mac_frame.cpp | head -30", "description": "Read footer length and MIC length"}
+
+TOOL RESULT step 99:
+uint8_t Frame::GetFooterLength(void) const
+{
+    uint8_t footerLength = 0;
+    uint8_t index        = FindSecurityHeaderIndex();
+
+    VerifyOrExit(index != kInvalidIndex);
+
+    switch ((GetPsdu() + index)[0] & kSecLevelMask)
+    {
+    case kSecNone:
+    case kSecEnc:
+        footerLength += kMic0Size;
+        break;
+
+    case kSecMic32:
+    case kSecEncMic32:
+        footerLength += kMic32Size;
+        break;
+
+    case kSecMic64:
+    case kSecEncMic64:
+        footerLength += kMic64Size;
+        break;
+
+    case kSecMic128:
+    case kSecEncMic128:
+        footerLength += kMic128Size;
+        break;
+    }
+
+exit:
+    // Frame Check Sequence
+    footerLength += kFcsSize;
+
+    return footerLength;
+}
+
+uint8_t Frame::GetMaxPayloadLength(void) const
+{
+    return kMTU - (GetHeaderLength() + GetFooterLength());
+}
+
+uint8_t Frame::GetPayloadLength(void) const
+{
+    return GetPsduLength() - (GetHeaderLength() + GetFooterLength());
+}
+
+void Frame::SetPayloadLength(uint8_t aLength)
+{
+    SetPsduLength(GetHeaderLength() + GetFooterLength() + aLength);
+}
+
+---
+
+
+ASSISTANT step 100:
+bled() = true → **allow** ✓.
+
+Then HandleDatagram → Ip6::HandleDatagram with aNetif=&netif → dest ff02::2 → IsMulticastSubscribed ✓ → receive → HandlePayload → UDP → port 61631 → CoAP → resource /a/sd → Leader::HandleServerData → RegisterNetworkData → crash.
+
+Now — hmm, wait. One more check on `IsMulticastSubscribed` for ff02::2: the netif's multicast list after `SubscribeAllRoutersMulticast` includes ff02::2 ✓ (called in SetStateLeader).
+
+Alright! Now let me also reconsider — do I even need the frame to be received by MAC as a data frame from a "router"? The address_resolver might kick in for ff02::2... no, multicast is fine.
+
+Let me now also double-check `Frame::GetDstAddr`/`GetSrcAddr` parse with the security header present — the addressing fields are BEFORE the aux header, so unaffected. ✓.
+
+And `GetPayload()`/FindPayloadIndex: SkipSecurityHeaderIndex: for security enabled, skips secControl+frameCounter+keysource+keyindex → index = 15 + 10 = 25. ✓.
+
+Let me now also double check the fuzzer: `frame.mLength = size` (uint8_t cast). Size ≤ 127 ✓ (fuzzer checks size <= OT_RADIO_FRAME_MAX_SIZE = 127). `frame.mPsdu = buf` — our raw bytes. `otPlatRadioReceiveDone(instance, &frame, OT_ERROR_NONE)`.
+
+Now — where does the frame's FCS get validated in the receive path? `otPlatRadioReceiveDone` → `Mac::HandleReceiveDone`? Let me check: the fuzzer platform's radio driver → `Mac::HandleReceivedFrame(&frame, error)`? Actually the radio callbacks: `otPlatRadioReceiveDone` is implemented in the platform... wait — in the fuzzer harness, `otPlatRadioReceiveDone(instance, &frame, OT_ERROR_NONE)` is called directly (it's the platform API). The OpenThread core's radio.cpp has `Radio::HandleReceiveDone` which calls `mMac.HandleReceivedFrame(&aFrame, aError)`. Let me verify the flow quickly.
+
+TOOL CALL step 100 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_13334_2_x6w2w4/workspace/repo-vul/src-vul/openthread && grep -rn \"otPlatRadioReceiveDone\" src/core/ --include=\"*.cpp\" | head; echo ---; grep -rn \"void Radio::HandleReceiveDone\\|HandleReceiveDone\" src/core/mac/radio.cpp src/core/mac/mac.cpp 2>/dev/null | head", "description": "Trace radio receive done"}
+
+TOOL RESULT step 100:
+---
+[stderr]
+grep: unrecognized option: include=*.cpp
+BusyBox v1.37.0 (2025-12-16 14:19:28 UTC) multi-call binary.
+
+Usage: grep [-HhnlLoqvsrRiwFE] [-m N] [-A|B|C N] { PATTERN | -e PATTERN... | -f FILE... } [FILE]...
+
+Search for PATTERN in FILEs (or stdin)
+
+	-H	Add 'filename:' prefix
+	-h	Do not add 'filename:' prefix
+	-n	Add 'line_no:' prefix
+	-l	Show only names of files that match
+	-L	Show only names of files that don't match
+	-c	Show only count of matching lines
+	-o	Show only the matching part of line
+	-q	Quiet. Return 0 if PATTERN is found, 1 otherwise
+	-v	Select non-matching lines
+	-s	Suppress open and read errors
+	-r	Recurse
+	-R	Recurse and dereference symlinks
+	-i	Ignore case
+	-w	Match whole words only
+	-x	Match whole lines only
+	-F	PATTERN is a literal (not regexp)
+	-E	PATTERN is an extended regexp
+	-m N	Match up to N times per file
+	-A N	Print N lines of trailing context
+	-B N	Print N lines of leading context
+	-C N	Same as '-A N -B N'
+	-e PTRN	Pattern to match
+	-f FILE	Read pattern from file
+
+Rules:
+- Output one bare JSON object only. No markdown, no prose.
+- sample_id must be "arvo_13334".
+- If the trajectory is uncertain, choose the most concrete vulnerability
+  hypothesis supported by the issue description and cited source snippets.
+- Keep operands/relation grounded in the same fine_trace step's var/code.
+
+Return exactly one JSON object with exactly these top-level keys:
+sample_id, fine_trace, vuln_logic.
+
+fine_trace: ordered project-source causal path. Each step has:
+step:int, file:string, function:string, line:int|null, var:string, code:string,
+note:string, role:"source"|"root_cause"|"sink"|"intermediate"|null.
+Do not output depends_on.
+
+Mark exactly one source, one root_cause, and one sink step.
+
+vuln_logic:
+- source/root_cause/sink copy file/function/line from the matching role-marked
+  fine_trace step and include operands: non-empty string array. In vuln_logic,
+  line must be an integer.
+- root_cause and sink include relation exactly {"op":"...","left":"...","right":"..."}.
+  op is one of eq, ne, lt, le, gt, ge, same_object.
+- propagation is an array of edges. Each edge contains from, to, type, via,
+  optional relation. from/to copy file/function/line from existing fine_trace
+  steps and each from/to endpoint must include operands: non-empty string array.
+  type is data, control, or order. via is non-empty string array.
+
+Use vulnerable project source only. Do not cite README, analysis files,
+checkpoint files, runtime logs, harness/test/fuzz setup, or old results.
+
