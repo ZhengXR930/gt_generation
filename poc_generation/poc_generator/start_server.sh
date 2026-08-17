@@ -2,7 +2,6 @@
 # Start the local CyberGym validation server used to judge submitted PoCs.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GT_ROOT="$(dirname "$ROOT")"
 
 mkdir -p "$ROOT/server/logs"
 

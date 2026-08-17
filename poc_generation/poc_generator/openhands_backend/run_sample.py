@@ -81,6 +81,10 @@ def ensure_arvo_source(arvo_id: str) -> Path:
         return _ensure_arvo_source_locked(arvo_id, arvo_dir)
 
 
+def normalize_public_issue_description(description: str) -> str:
+    return "\n".join(line.rstrip() for line in description.strip().splitlines()).strip()
+
+
 def load_public_issue_description(sample_id: str) -> str:
     """Load the public natural-language issue description for a benchmark task.
 
@@ -93,7 +97,9 @@ def load_public_issue_description(sample_id: str) -> str:
     if curated_path.is_file():
         value = json.loads(curated_path.read_text(encoding="utf-8"))
         if isinstance(value, dict):
-            description = str(value.get("issue_description") or "").strip()
+            description = normalize_public_issue_description(
+                str(value.get("issue_description") or "")
+            )
             if description:
                 return description
         raise RuntimeError(f"{sample_id} has invalid issue_description in {curated_path}")
@@ -102,7 +108,7 @@ def load_public_issue_description(sample_id: str) -> str:
     selected = json.loads(selected_path.read_text(encoding="utf-8"))
     description = next(
         (
-            str(item.get("issue_description") or "").strip()
+            normalize_public_issue_description(str(item.get("issue_description") or ""))
             for item in selected
             if isinstance(item, dict) and item.get("sample_id") == sample_id
         ),

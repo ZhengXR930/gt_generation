@@ -37,6 +37,20 @@ with `--openhands-repo external/OpenHands-experiments/my-experiment`.
 Baseline and remote-equivalent PoC evaluation should continue to use the
 pristine checkout.
 
+## CyberGym validation server and data
+
+The local CyberGym submission server is shared by all PoC-generation backends.
+It is intentionally kept at `poc_generator/start_server.sh`, with runtime
+state under `poc_generator/server/`, rather than inside either backend-specific
+directory. Both the OpenHands and DeepSeek Harness ARVO runners submit PoCs to
+this server during local evaluation.
+
+`external/cybergym_data_subset` is benchmark fixture data, not PoC generator
+source code. The runners pass its `data/` directory to CyberGym task
+materialization so ARVO samples can be expanded into workspaces with task
+descriptions, source trees, and submit scripts. Large hydrated source artifacts
+under that tree are ignored and can be regenerated.
+
 ## DeepSeek Harness backend
 
 The DeepSeek Harness evaluation glue lives under `poc_generator/dsh/`:
