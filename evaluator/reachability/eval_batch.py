@@ -10,7 +10,7 @@ from typing import Any
 
 from reachability.arvo_gdb import prepare_arvo_target, run_arvo_gdb
 from reachability.core import evaluate_r1_r5
-from reachability.engine import extract_reachability_checkpoints
+from reachability.engine import extract_reachability_checkpoints, parse_sanitizer_trace
 from reachability.local_gdb import run_local_gdb
 from reachability.runtime_spec import (
     RuntimeSpecError,
@@ -239,7 +239,10 @@ def evaluate_model_sample(
                     current_runtime_trace = "\n".join(
                         value for value in (gdb_result.stdout, gdb_result.stderr) if value
                     )
-                    sanitizer_trace = current_runtime_trace or saved_runtime_trace
+                    sanitizer_trace, sanitizer_trace_source = _select_sanitizer_trace(
+                        current_runtime_trace=current_runtime_trace,
+                        saved_runtime_trace=saved_runtime_trace,
+                    )
                     report = evaluate_r1_r5(
                         gt=scoring_gt,
                         hits=hits if checked else None,
@@ -256,6 +259,7 @@ def evaluate_model_sample(
                             )
                             is True,
                             "gdb_returncode": gdb_result.returncode,
+                            "sanitizer_trace_source": sanitizer_trace_source,
                         }
                     )
                     (output_dir / "reachability_report.json").write_text(
@@ -325,6 +329,50 @@ def evaluate_model_sample(
         encoding="utf-8",
     )
     return summary
+
+
+def _select_sanitizer_trace(
+    *,
+    current_runtime_trace: str | None,
+    saved_runtime_trace: str | None,
+) -> tuple[str | None, str]:
+    """Choose sanitizer evidence without letting GDB signal output mask it.
+
+    Under GDB, sanitizer-instrumented binaries often stop at SIGSEGV before the
+    sanitizer runtime prints its usual `ERROR: ...` / `SUMMARY: ...` report.
+    The submit-time runtime output is persisted separately and is the correct
+    target-trigger oracle for that exact candidate.  Use current GDB output when
+    it already contains sanitizer evidence; otherwise fall back to saved runtime
+    output.  If both carry sanitizer evidence, concatenate them so source frames
+    from either run remain available to the parser.
+    """
+    current = current_runtime_trace or ""
+    saved = saved_runtime_trace or ""
+    current_observed = parse_sanitizer_trace(current)
+    saved_observed = parse_sanitizer_trace(saved)
+    current_has_sanitizer = bool(
+        current_observed.get("sanitizer")
+        or current_observed.get("crash_type")
+        or current_observed.get("crash_stack")
+        or current_observed.get("crash_location")
+    )
+    saved_has_sanitizer = bool(
+        saved_observed.get("sanitizer")
+        or saved_observed.get("crash_type")
+        or saved_observed.get("crash_stack")
+        or saved_observed.get("crash_location")
+    )
+    if current_has_sanitizer and saved_has_sanitizer:
+        return current + "\n" + saved, "gdb_and_saved_runtime"
+    if current_has_sanitizer:
+        return current, "gdb_runtime"
+    if saved_has_sanitizer:
+        return saved, "saved_runtime_output"
+    if current:
+        return current, "gdb_runtime_no_sanitizer"
+    if saved:
+        return saved, "saved_runtime_output_no_sanitizer"
+    return None, "missing"
 
 
 def main(argv: list[str] | None = None) -> int:
