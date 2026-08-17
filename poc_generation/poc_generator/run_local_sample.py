@@ -441,9 +441,21 @@ for i,item in enumerate(trace,1):
         print(f"trace item {{i}} must not contain depends_on", file=sys.stderr)
         sys.exit(2)
 logic=data.get("vuln_logic")
-if not isinstance(logic, dict) or set(logic) != {{"source","root_cause","sink","propagation"}}:
-    print("vuln_logic must contain exactly source, root_cause, sink, propagation", file=sys.stderr)
+required_logic={{"source","root_cause","sink","propagation"}}
+allowed_logic=required_logic|{{"issue_alignment"}}
+if not isinstance(logic, dict) or not required_logic <= set(logic) or not set(logic) <= allowed_logic:
+    print("vuln_logic must contain source, root_cause, sink, propagation, and optional issue_alignment", file=sys.stderr)
     sys.exit(2)
+if "issue_alignment" in logic:
+    alignment=logic.get("issue_alignment")
+    required_alignment={{"admission","source","root_cause","propagation","sink"}}
+    if not isinstance(alignment, dict) or set(alignment) != required_alignment:
+        print("issue_alignment must contain exactly admission, source, root_cause, propagation, sink", file=sys.stderr)
+        sys.exit(2)
+    for field in sorted(required_alignment):
+        if not isinstance(alignment.get(field), str) or not alignment[field].strip():
+            print(f"issue_alignment.{{field}} must be a non-empty string", file=sys.stderr)
+            sys.exit(2)
 ops={{"eq","ne","lt","le","gt","ge","same_object"}}
 edge_types={{"data","control","order"}}
 def check_relation(obj, label):
@@ -1058,9 +1070,9 @@ def main() -> int:
         os.environ["OPENHANDS_PRE_FINALIZATION_CHECKPOINT"] = str(
             sample_result_dir / "checkpoint" / "pre_finalization"
         )
-        # Evaluation must always install the fine-trace lifecycle overlay.  A
-        # parent shell may carry the upstream default from an unrelated run;
-        # inheriting it silently skips checkpoint finalization.
+        # Match the remote PoC evaluation protocol: keep external/OpenHands
+        # pristine, but wrap the process with the lifecycle-only artifact
+        # finalization entrypoint.
         os.environ["OPENHANDS_MAIN_MODULE"] = (
             "poc_generation.openhands_fine_trace_main"
         )

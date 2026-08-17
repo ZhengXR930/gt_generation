@@ -1,8 +1,9 @@
-"""Drop-in OpenHands main module for the unified reward framework.
+"""OpenHands main module owned by the reward framework.
 
-The CyberGym launcher selects this module with
-``OPENHANDS_REWARD_FRAMEWORK=1``.  Subject-model prompt and task inputs remain
-unchanged except that ``submit_candidate`` is exposed as a first-class tool.
+This module is not selected by the normal ``poc_generation`` evaluator.  A
+reward-only launcher must opt in with ``OPENHANDS_REWARD_FRAMEWORK=1`` and the
+reward harness profile. Subject-model prompt and task inputs remain unchanged
+except that ``submit_candidate`` is exposed as a first-class tool.
 """
 
 from __future__ import annotations
@@ -26,10 +27,6 @@ from .adapters.openhands import (
     install_openhands_reward_framework,
 )
 from .backend import CodexBackend
-from .cross_sample import CrossSampleHarnessPatcher, CrossSampleTrainer
-from .episode_analyzer import EpisodeAnalyzer
-from .experience_pool import ExperiencePool
-from .harness_repository import HarnessRepository
 from .instrumentation.arvo import ArvoGDBInstrumentationBackend
 from .orchestrator import RewardFramework
 from .state_store import atomic_json
@@ -107,6 +104,14 @@ def _codex_auth_file(executable: str) -> Path:
 
 
 def main() -> None:
+    if (
+        os.getenv("OPENHANDS_HARNESS_PROFILE") != "reward"
+        or os.getenv("OPENHANDS_REWARD_FRAMEWORK") != "1"
+    ):
+        raise RuntimeError(
+            "reward_framework.openhands_entrypoint may only run under "
+            "--harness-profile reward"
+        )
     # The reward entrypoint replaces the ordinary evaluation entrypoint, so it
     # must install the same lifecycle-only finalization overlay itself.  This
     # preserves the pre-finalization checkpoint and yields the required
@@ -145,49 +150,14 @@ def main() -> None:
         isolation_image=codex_isolation_image or None,
         isolation_auth_file=codex_auth_file,
     )
-    training_root_value = os.getenv("REWARD_FRAMEWORK_TRAINING_ROOT", "").strip()
+    spec_cache_value = os.getenv("REWARD_FRAMEWORK_SPEC_CACHE_ROOT", "").strip()
     spec_cache_root = (
-        Path(training_root_value).resolve() / "spec_cache"
-        if training_root_value else None
+        Path(spec_cache_value).resolve()
+        if spec_cache_value else None
     )
-    trainer = None
     harness_version = int(os.getenv(
         "REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION", "1"
     ))
-    episode_analyzer = EpisodeAnalyzer(backend)
-    if os.getenv("REWARD_FRAMEWORK_CROSS_SAMPLE_TRAINING", "0") == "1":
-        if not training_root_value:
-            raise RuntimeError("adaptive harness training requires REWARD_FRAMEWORK_TRAINING_ROOT")
-        training_root = Path(training_root_value).resolve()
-        pristine = Path(os.getenv(
-            "REWARD_FRAMEWORK_PRISTINE_OPENHANDS",
-            str(repo_root / "external" / "OpenHands"),
-        )).resolve()
-        repository = HarnessRepository(training_root / "harness", pristine)
-        repository.initialize()
-        harness_version = int(os.getenv(
-            "REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION",
-            str(repository.active_version),
-        ))
-        patcher_backend = CodexBackend(
-            model=os.getenv(
-                "REWARD_FRAMEWORK_PATCHER_MODEL",
-                os.getenv("REWARD_FRAMEWORK_MODEL", "gpt-5.5"),
-            ),
-            timeout=int(os.getenv("REWARD_FRAMEWORK_MODEL_TIMEOUT", "600")),
-            executable=codex_executable,
-            session_file=training_root / "codex_sessions/harness_patcher.session",
-            sandbox="workspace-write",
-            fresh_each_run=True,
-            isolation_image=codex_isolation_image or None,
-            isolation_auth_file=codex_auth_file,
-        )
-        trainer = CrossSampleTrainer(
-            analyzer=episode_analyzer,
-            pool=ExperiencePool(training_root / "experience_pool"),
-            patcher=CrossSampleHarnessPatcher(patcher_backend),
-            repository=repository,
-        )
     baseline_profile = os.getenv(
         "REWARD_FRAMEWORK_BASELINE_PROFILE", "openhands_0.33.0_pristine"
     )
@@ -250,9 +220,6 @@ def main() -> None:
         )
         iteration_limit = _is_iteration_limit_error(final_state)
         if error_state and not iteration_limit:
-            # Exhausted provider retries are infrastructure evidence, not
-            # Subject/harness-quality evidence. Preserve diagnosis but never
-            # train the cross-sample Patcher on the partial episode.
             for framework in frameworks:
                 framework.record_event(
                     source="controller",
@@ -267,15 +234,14 @@ def main() -> None:
                     {
                         "reason": "openhands_error",
                         "last_error": str(final_state.last_error or "")[:1000],
-                        "experience_pool_updated": False,
+                        "gt_used": False,
                     },
                 )
         else:
             if iteration_limit:
                 # OpenHands 0.33 represents ordinary iteration-budget
-                # exhaustion as AgentState.ERROR.  It is still a completed
-                # benchmark episode and must contribute experience to the
-                # cross-sample Patcher.
+                # exhaustion as AgentState.ERROR. It is still a completed
+                # reward episode.
                 for framework in frameworks:
                     framework.reach_iteration_limit(
                         iteration=max_iterations, maximum=max_iterations
@@ -286,43 +252,16 @@ def main() -> None:
             if completed:
                 for framework in frameworks:
                     try:
-                        if trainer is None:
-                            # Frozen held-out episodes still need deterministic
-                            # stage-control analysis. Freezing disables pool
-                            # writes and harness patches, not measurement.
-                            episode_analyzer.analyze(
-                                store=framework.store,
-                                harness_version=harness_version,
-                            )
-                            continue
-                        trainer.finish_episode(
-                            framework.store, harness_version=harness_version
-                        )
+                        framework.finalize_episode()
                     except Exception as exc:
-                        # Post-episode training must never erase a valid Subject
-                        # result. Persist the optimizer failure for the pool
-                        # maintainer and leave the active fork unchanged.
-                        if trainer is None:
-                            atomic_json(
-                                framework.store.root / "episode_analysis_error.json",
-                                {
-                                    "episode_harness_version": harness_version,
-                                    "analysis_error": f"{type(exc).__name__}: {exc}",
-                                    "experience_pool_updated": False,
-                                    "gt_used": False,
-                                },
-                            )
-                        else:
-                            atomic_json(
-                                framework.store.root / "cross_sample_update.json",
-                                {
-                                    "episode_harness_version": harness_version,
-                                    "next_harness_version": harness_version,
-                                    "patch": None,
-                                    "patch_error": f"{type(exc).__name__}: {exc}",
-                                    "gt_used": False,
-                                },
-                            )
+                        atomic_json(
+                            framework.store.root / "episode_summary_error.json",
+                            {
+                                "episode_harness_version": harness_version,
+                                "summary_error": f"{type(exc).__name__}: {exc}",
+                                "gt_used": False,
+                            },
+                        )
         finally:
             for transport in installed:
                 transport.close()

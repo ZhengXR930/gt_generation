@@ -1,9 +1,14 @@
-"""Task-conditioned, GT-free assertion reward protocol.
+"""GT-free stage Reward Spec and deterministic claim assessment.
 
-The protocol deliberately has one admission channel and three semantic claim
-kinds.  It reuses the meaning of the dataset assertions without importing any
-GT artifact: required claims encode safety obligations, observed claims encode
-unsafe runtime states, and transition claims encode ordered value/object flow.
+The Reward Spec is intentionally aligned with the offline evaluation axes but
+is generated only from the public issue description and the vulnerable source
+tree:
+
+``admission -> source -> root -> propagation -> sink``.
+
+It does not import GT invariants, sanitizer traces, known PoCs, or historical
+crash states.  Runtime feedback is based on passive observations of the
+submitted candidate and on the claim polarity defined here.
 """
 
 from __future__ import annotations
@@ -11,10 +16,10 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
-CLAIM_KINDS = {"required", "observed", "transition"}
+STAGES = ("admission", "source", "root", "propagation", "sink")
 OPS = {"eq", "ne", "lt", "le", "gt", "ge", "same_object"}
 IDENTIFIER = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 LITERALS = {"true", "false", "null", "nullptr"}
@@ -45,7 +50,9 @@ class ClaimCheck:
     right: Any
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "ClaimCheck":
+    def from_dict(cls, value: dict[str, Any] | None) -> "ClaimCheck | None":
+        if value is None:
+            return None
         if not isinstance(value, dict) or set(value) != {"op", "left", "right"}:
             raise ValueError("claim check must contain only op, left, and right")
         op = str(value["op"])
@@ -58,98 +65,190 @@ class ClaimCheck:
 
 
 @dataclass(frozen=True)
-class AdmissionAssertion:
-    assertion_id: str
+class RewardClaim:
+    claim_id: str
+    stage: str
     at: ClaimLocation
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"id": self.assertion_id, "at": asdict(self.at)}
-
-
-@dataclass(frozen=True)
-class SemanticAssertion:
-    assertion_id: str
-    kind: str
-    at: ClaimLocation
-    check: ClaimCheck
+    claim: str
+    check: ClaimCheck | None = None
     source: ClaimLocation | None = None
+    operands: tuple[str, ...] = ()
+    required: bool = True
+
+    def __post_init__(self) -> None:
+        if self.stage not in STAGES:
+            raise ValueError(f"invalid claim stage: {self.stage}")
+        if not self.claim_id.strip() or not self.claim.strip():
+            raise ValueError("claim id and claim text are required")
+        if self.stage == "propagation" and self.source is None:
+            raise ValueError("propagation claim requires a source endpoint")
+        if self.stage != "propagation" and self.source is not None:
+            raise ValueError("source endpoint is only valid for propagation")
+        if self.stage in {"root", "sink"} and self.check is None:
+            raise ValueError(f"{self.stage} claim requires a vulnerable-state check")
 
     def to_dict(self) -> dict[str, Any]:
-        value = {
-            "id": self.assertion_id,
-            "kind": self.kind,
+        value: dict[str, Any] = {
+            "id": self.claim_id,
             "at": asdict(self.at),
-            "check": asdict(self.check),
+            "claim": self.claim,
         }
-        if self.source is not None:
+        if self.check is not None:
+            value["check"] = asdict(self.check)
+        if self.operands and self.stage != "propagation":
+            value["operands"] = list(self.operands)
+        if self.stage == "propagation":
             value["from"] = asdict(self.source)
+            value["to"] = value.pop("at")
+            value["via"] = list(self.operands)
         return value
 
 
 @dataclass(frozen=True)
-class AssertionRewardSpec:
-    admission: tuple[AdmissionAssertion, ...]
-    assertions: tuple[SemanticAssertion, ...]
-    protocol: str = "assertion-reward-v1"
+class RewardSpec:
+    admission: tuple[RewardClaim, ...]
+    source: tuple[RewardClaim, ...]
+    root: tuple[RewardClaim, ...]
+    propagation_required: tuple[RewardClaim, ...]
+    propagation_optional: tuple[RewardClaim, ...]
+    sink: tuple[RewardClaim, ...]
 
     @property
     def constructable(self) -> bool:
-        return bool(self.admission or self.assertions)
+        return bool(self.admission and (self.source or self.root or self.sink))
+
+    @property
+    def all_claims(self) -> tuple[RewardClaim, ...]:
+        return (
+            self.admission + self.source + self.root
+            + self.propagation_required + self.propagation_optional + self.sink
+        )
+
+    def stage_claims(self, stage: str) -> tuple[RewardClaim, ...]:
+        if stage == "admission":
+            return self.admission
+        if stage == "source":
+            return self.source
+        if stage == "root":
+            return self.root
+        if stage == "propagation":
+            return self.propagation_required
+        if stage == "sink":
+            return self.sink
+        raise ValueError(f"invalid stage: {stage}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "protocol": self.protocol,
             "admission": [item.to_dict() for item in self.admission],
-            "claims": [item.to_dict() for item in self.assertions],
+            "source": [item.to_dict() for item in self.source],
+            "root": [item.to_dict() for item in self.root],
+            "propagation": {
+                "required": [item.to_dict() for item in self.propagation_required],
+                "optional": [item.to_dict() for item in self.propagation_optional],
+            },
+            "sink": [item.to_dict() for item in self.sink],
         }
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "AssertionRewardSpec":
-        if not isinstance(value, dict):
-            raise ValueError("assertion Reward Spec must be an object")
-        if value.get("protocol", "assertion-reward-v1") != "assertion-reward-v1":
-            raise ValueError("unsupported assertion Reward protocol")
-        admission = []
-        for index, raw in enumerate(value.get("admission") or [], 1):
-            item = dict(raw)
-            assertion_id = str(item.get("id") or f"admission_{index:02d}")
-            admission.append(AdmissionAssertion(
-                assertion_id, ClaimLocation.from_dict(item.get("at"))
-            ))
-        assertions = []
-        for index, raw in enumerate(value.get("claims") or [], 1):
-            item = dict(raw)
-            kind = str(item.get("kind") or "")
-            if kind not in CLAIM_KINDS:
-                raise ValueError(f"invalid semantic claim kind: {kind}")
-            source_raw = item.get("from")
-            if kind == "transition" and source_raw is None:
-                raise ValueError("transition claim requires from")
-            if kind != "transition" and source_raw is not None:
-                raise ValueError("from is allowed only for transition claims")
-            assertions.append(SemanticAssertion(
-                assertion_id=str(item.get("id") or f"{kind}_{index:02d}"),
-                kind=kind,
-                at=ClaimLocation.from_dict(item.get("at")),
-                check=ClaimCheck.from_dict(item.get("check")),
-                source=(ClaimLocation.from_dict(source_raw) if source_raw else None),
-            ))
+    def from_dict(cls, value: dict[str, Any]) -> "RewardSpec":
+        if not isinstance(value, dict) or set(value) != {
+            "admission", "source", "root", "propagation", "sink",
+        }:
+            raise ValueError(
+                "Reward Spec must contain exactly admission/source/root/"
+                "propagation/sink"
+            )
+        propagation = value["propagation"]
+        if not isinstance(propagation, dict) or set(propagation) != {
+            "required", "optional",
+        }:
+            raise ValueError("propagation must contain required and optional arrays")
+        admission = tuple(
+            _claim_from_dict(stage="admission", raw=raw, index=index)
+            for index, raw in enumerate(_items(value["admission"], "admission"), 1)
+        )
+        source = tuple(
+            _claim_from_dict(stage="source", raw=raw, index=index)
+            for index, raw in enumerate(_items(value["source"], "source"), 1)
+        )
+        root = tuple(
+            _claim_from_dict(stage="root", raw=raw, index=index)
+            for index, raw in enumerate(_items(value["root"], "root"), 1)
+        )
+        prop_required = tuple(
+            _claim_from_dict(
+                stage="propagation", raw=raw, index=index, required=True
+            )
+            for index, raw in enumerate(
+                _items(propagation["required"], "propagation.required"), 1
+            )
+        )
+        prop_optional = tuple(
+            _claim_from_dict(
+                stage="propagation", raw=raw, index=index, required=False
+            )
+            for index, raw in enumerate(
+                _items(propagation["optional"], "propagation.optional"), 1
+            )
+        )
+        sink = tuple(
+            _claim_from_dict(stage="sink", raw=raw, index=index)
+            for index, raw in enumerate(_items(value["sink"], "sink"), 1)
+        )
+        spec = cls(admission, source, root, prop_required, prop_optional, sink)
         if not admission:
-            raise ValueError("Reward Spec requires at least one admission assertion")
-        if not assertions:
+            raise ValueError("Reward Spec requires at least one admission claim")
+        if not (source or root or sink):
             raise ValueError("Reward Spec requires at least one semantic claim")
-        return cls(tuple(admission), tuple(assertions))
+        return spec
+
+
+def _items(value: Any, field: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be an array")
+    if len(value) > 6:
+        raise ValueError(f"{field} contains too many claims")
+    if any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"{field} items must be objects")
+    return list(value)
+
+
+def _claim_from_dict(
+    *, stage: str, raw: dict[str, Any], index: int, required: bool = True,
+) -> RewardClaim:
+    claim_id = str(raw.get("id") or f"{stage}_{index:02d}").strip()
+    claim = str(raw.get("claim") or raw.get("description") or "").strip()
+    if stage == "propagation":
+        source = ClaimLocation.from_dict(raw.get("from"))
+        at = ClaimLocation.from_dict(raw.get("to") or raw.get("at"))
+        operands = tuple(str(x).strip() for x in raw.get("via") or raw.get("operands") or [])
+    else:
+        source = None
+        at = ClaimLocation.from_dict(raw.get("at"))
+        operands = tuple(str(x).strip() for x in raw.get("operands") or [])
+    operands = tuple(x for x in operands if x)
+    return RewardClaim(
+        claim_id=claim_id,
+        stage=stage,
+        at=at,
+        claim=claim,
+        check=ClaimCheck.from_dict(raw.get("check")),
+        source=source,
+        operands=operands,
+        required=required,
+    )
 
 
 @dataclass(frozen=True)
-class AssertionResult:
-    assertion_id: str
-    kind: str
+class ClaimResult:
+    claim_id: str
+    stage: str
     status: str
     reached: bool
     evaluated: bool
     check_satisfied: bool | None
     matched_vulnerable_state: bool | None
+    required: bool = True
     left: Any = None
     right: Any = None
 
@@ -157,46 +256,11 @@ class AssertionResult:
         return asdict(self)
 
 
-@dataclass(frozen=True)
-class AssertionAssessment:
-    admission: str
-    claims: tuple[AssertionResult, ...]
-    information_gain: int
-    consistency: str = "consistent"
-
-    # Compatibility properties for the existing crash-safe state store.  New
-    # consumers use claim_results and information_gain, never this projection.
-    @property
-    def first_unresolved(self) -> str | None:
-        if self.admission != "confirmed":
-            return "admission"
-        item = next((x for x in self.claims if not x.evaluated), None)
-        return item.assertion_id if item else None
-
-    @property
-    def longest_confirmed_prefix(self) -> tuple[str, ...]:
-        return tuple(
-            item.assertion_id for item in self.claims
-            if item.matched_vulnerable_state is True
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "protocol": "assertion-reward-v1",
-            "admission": self.admission,
-            "claims": [item.to_dict() for item in self.claims],
-            "information_gain": self.information_gain,
-            "consistency": self.consistency,
-            "matched_claims": list(self.longest_confirmed_prefix),
-            "first_unresolved": self.first_unresolved,
-        }
-
-
-def validate_spec_sources(spec: AssertionRewardSpec, source_root: Path) -> None:
+def validate_spec_sources(spec: RewardSpec, source_root: Path) -> None:
     root = source_root.resolve()
     file_text: dict[str, str] = {}
-    locations = [item.at for item in spec.admission]
-    for claim in spec.assertions:
+    locations: list[ClaimLocation] = []
+    for claim in spec.all_claims:
         locations.append(claim.at)
         if claim.source:
             locations.append(claim.source)
@@ -212,33 +276,47 @@ def validate_spec_sources(spec: AssertionRewardSpec, source_root: Path) -> None:
         function = location.function.rsplit("::", 1)[-1]
         if location.function not in text and function not in text:
             raise ValueError(f"claim function absent from source: {location.function}")
-    for claim in spec.assertions:
-        operand_locations = (
-            (claim.check.left, claim.source or claim.at),
-            (claim.check.right, claim.at),
+    for claim in spec.all_claims:
+        _validate_expressions(
+            [claim.check.left, claim.check.right] if claim.check else claim.operands,
+            claim.at,
+            file_text,
         )
-        for operand, location in operand_locations:
-            if not isinstance(operand, str):
-                continue
-            expression = operand.strip()
-            assignment = bool(re.search(r"(?<![!<>=])=(?!=)", expression))
-            function_call = bool(re.search(r"\b[A-Za-z_]\w*\s*\(", expression))
-            if not expression or ";" in expression or assignment or function_call:
-                raise ValueError(f"unsafe claim operand: {operand!r}")
-            lowered = expression.lower()
-            if lowered in LITERALS or re.fullmatch(r"[-+]?(0x[0-9a-fA-F]+|\d+)", expression):
-                continue
-            identifiers = {
-                token for token in IDENTIFIER.findall(expression)
-                if token not in {"sizeof"}
-            }
-            text = file_text.get(location.file, "")
-            missing = [token for token in sorted(identifiers) if token not in text]
-            if missing:
-                raise ValueError(
-                    f"claim operand is not source-visible at {location.file}: "
-                    f"{operand!r}; missing={missing[:3]}"
-                )
+        if claim.stage == "propagation" and claim.source and claim.check:
+            _validate_expressions([claim.check.left], claim.source, file_text)
+
+
+def _validate_expressions(
+    expressions: Iterable[Any], location: ClaimLocation, file_text: dict[str, str],
+) -> None:
+    for operand in expressions:
+        if not isinstance(operand, str):
+            continue
+        expression = operand.strip()
+        assignment = bool(re.search(r"(?<![!<>=])=(?!=)", expression))
+        function_call = bool(re.search(r"\b[A-Za-z_]\w*\s*\(", expression))
+        if not expression or ";" in expression or assignment or function_call:
+            raise ValueError(f"unsafe claim operand: {operand!r}")
+        lowered = expression.lower()
+        if lowered in LITERALS or re.fullmatch(r"[-+]?(0x[0-9a-fA-F]+|\d+)", expression):
+            continue
+        member_identifiers = {
+            match.group(1)
+            for match in re.finditer(
+                r"(?:->|\.)\s*([A-Za-z_][A-Za-z0-9_]*)", expression
+            )
+        }
+        identifiers = {
+            token for token in IDENTIFIER.findall(expression)
+            if token not in {"sizeof"} and token not in member_identifiers
+        }
+        text = file_text.get(location.file, "")
+        missing = [token for token in sorted(identifiers) if token not in text]
+        if missing:
+            raise ValueError(
+                f"claim operand is not source-visible at {location.file}: "
+                f"{operand!r}; missing={missing[:3]}"
+            )
 
 
 def check_value(op: str, left: Any, right: Any) -> bool:
@@ -255,38 +333,3 @@ def check_value(op: str, left: Any, right: Any) -> bool:
     if op == "ge":
         return left >= right
     raise ValueError(f"unsupported claim operator: {op}")
-
-
-def assess_assertions(
-    *, admission: str, results: tuple[AssertionResult, ...],
-    previous: dict[str, Any] | None, trigger_observed: bool,
-) -> AssertionAssessment:
-    old = {
-        str(item.get("assertion_id")): item
-        for item in ((previous or {}).get("assessment") or {}).get("claims", [])
-        if isinstance(item, dict)
-    }
-    previous_assessment = (previous or {}).get("assessment") or {}
-    gain = int(
-        admission == "confirmed"
-        and previous_assessment.get("admission") != "confirmed"
-    )
-    for item in results:
-        before = old.get(item.assertion_id)
-        if item.evaluated and (
-            before is None
-            or not before.get("evaluated")
-            or before.get("matched_vulnerable_state") != item.matched_vulnerable_state
-        ):
-            gain += 1
-    conflict = (
-        trigger_observed
-        and admission == "confirmed"
-        and bool(results)
-        and all(item.evaluated for item in results)
-        and all(item.matched_vulnerable_state is False for item in results)
-    )
-    return AssertionAssessment(
-        admission, results, gain,
-        "spec_or_mapping_conflict" if conflict else "consistent",
-    )

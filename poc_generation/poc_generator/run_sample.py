@@ -9,7 +9,6 @@ poc_generation/<sample_id>/checkpoint/, and writes poc_generation/<sample_id>/ma
 The subject's final analysis artifact is captured as part of the same task.
 """
 import argparse
-import atexit
 import fcntl
 import json
 import logging
@@ -39,7 +38,6 @@ from run_openhands_cybergym import (  # noqa: E402
 from cybergym.task.types import TaskDifficulty  # noqa: E402
 from check_success import check as check_success  # noqa: E402
 from poc_dedup import deduplicate_submission_attempts  # noqa: E402
-from reward_framework.harness_repository import HarnessRepository  # noqa: E402
 from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
 
 
@@ -82,24 +80,49 @@ def ensure_arvo_source(arvo_id: str) -> Path:
         return _ensure_arvo_source_locked(arvo_id, arvo_dir)
 
 
+def load_public_issue_description(sample_id: str) -> str:
+    """Load the public natural-language issue description for a benchmark task.
+
+    The curated per-sample package is the authoritative public task input.  It
+    is safe for PoC generation because it contains only the issue description,
+    not GT traces, sanitizer output, assertions, known PoCs, or crash state.
+    ``selected_1000.json`` is kept only as a compatibility fallback.
+    """
+    curated_path = GT_ROOT / "gt_results" / sample_id / "issue_description.json"
+    if curated_path.is_file():
+        value = json.loads(curated_path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            description = str(value.get("issue_description") or "").strip()
+            if description:
+                return description
+        raise RuntimeError(f"{sample_id} has invalid issue_description in {curated_path}")
+
+    selected_path = GT_ROOT / "dataset" / "selected_1000.json"
+    selected = json.loads(selected_path.read_text(encoding="utf-8"))
+    description = next(
+        (
+            str(item.get("issue_description") or "").strip()
+            for item in selected
+            if isinstance(item, dict) and item.get("sample_id") == sample_id
+        ),
+        "",
+    )
+    if not description:
+        raise RuntimeError(
+            f"{sample_id} has no issue_description in {curated_path} or {selected_path}"
+        )
+    return description
+
+
 def _ensure_arvo_source_locked(arvo_id: str, arvo_dir: Path) -> Path:
     description_path = arvo_dir / "description.txt"
-    if not description_path.is_file():
-        selected_path = GT_ROOT / "dataset" / "selected_1000.json"
-        selected = json.loads(selected_path.read_text(encoding="utf-8"))
-        sample_id = f"arvo_{arvo_id}"
-        description = next(
-            (
-                str(item.get("issue_description") or "").strip()
-                for item in selected
-                if isinstance(item, dict) and item.get("sample_id") == sample_id
-            ),
-            "",
-        )
-        if not description:
-            raise RuntimeError(
-                f"{sample_id} has no issue_description in {selected_path}"
-            )
+    sample_id = f"arvo_{arvo_id}"
+    description = load_public_issue_description(sample_id)
+    if (
+        not description_path.is_file()
+        or description_path.read_text(encoding="utf-8", errors="replace").strip()
+        != description
+    ):
         description_path.write_text(description + "\n", encoding="utf-8")
 
     repo_dir = arvo_dir / "repo-vul"
@@ -293,101 +316,6 @@ def persist_submission_attempts(
     return persisted
 
 
-def persist_reward_framework_state(
-    run_dir: Path, sample_dir: Path
-) -> tuple[dict, list[dict]] | None:
-    """Persist and normalize the native Reward Framework submission ledger.
-
-    Native ``submit_candidate`` calls intentionally bypass the legacy CyberGym
-    HTTP submission database.  Treat the framework's crash-safe state directory
-    as the authoritative ledger whenever it exists, and expose its attempts in
-    the same manifest-level view used by ordinary evaluation runs.
-    """
-    source = run_dir / "reward_framework"
-    if not (source / "task_context.json").is_file():
-        return None
-
-    destination = sample_dir / "reward_framework"
-    if destination.exists():
-        shutil.rmtree(destination)
-    shutil.copytree(source, destination)
-    persisted_index = destination / "candidates" / "index.json"
-    index = (
-        json.loads(persisted_index.read_text(encoding="utf-8"))
-        if persisted_index.is_file()
-        else {"attempts": []}
-    )
-    normalized = []
-    for sequence, metadata in enumerate(index.get("attempts") or [], 1):
-        attempt_number = int(metadata["attempt_number"])
-        candidate_id = str(metadata["candidate_id"])
-        attempt_rel = Path("reward_framework/candidates") / candidate_id / "attempts" / f"attempt_{attempt_number:04d}"
-        evidence_rel = Path("reward_framework/evidence") / f"attempt_{attempt_number:04d}.json"
-        evidence_path = sample_dir / evidence_rel
-        evidence = (
-            json.loads(evidence_path.read_text(encoding="utf-8"))
-            if evidence_path.is_file() else {}
-        )
-        runtime = evidence.get("runtime") or {}
-        analysis_rel = attempt_rel / "analysis.json"
-        poc_rel = Path("reward_framework/candidates") / candidate_id / "poc"
-        runtime_rel = attempt_rel / "current_runtime.json"
-        analysis_path = sample_dir / analysis_rel
-        materialize_attempt_analysis_files(analysis_path.parent)
-        analysis_valid = False
-        try:
-            analysis_value = json.loads(analysis_path.read_text(encoding="utf-8"))
-            analysis_valid = (
-                isinstance(analysis_value, dict)
-                and set(analysis_value) == {"sample_id", "fine_trace", "vuln_logic"}
-            )
-        except (OSError, TypeError, json.JSONDecodeError):
-            pass
-        normalized.append({
-            "attempt_id": f"reward_attempt_{attempt_number:04d}",
-            "attempt_number": attempt_number,
-            "sequence_in_run": sequence,
-            "source": "reward_framework",
-            "candidate_id": candidate_id,
-            "duplicate_of": metadata.get("duplicate_of"),
-            "poc_hash": metadata.get("sha256"),
-            "analysis_valid": analysis_valid,
-            "vul_exit_code": runtime.get("exit_code"),
-            "crashed": runtime.get("trigger_observed") is True,
-            "trigger_observed": runtime.get("trigger_observed") is True,
-            "assessment": evidence.get("assessment"),
-            "feedback": evidence.get("feedback"),
-            "result_path": f"{attempt_rel.as_posix()}/",
-            "analysis_path": analysis_rel.as_posix(),
-            "poc_path": poc_rel.as_posix(),
-            "runtime_output_path": (
-                runtime_rel.as_posix()
-                if (sample_dir / runtime_rel).is_file() else evidence_rel.as_posix()
-            ),
-            "evidence_path": evidence_rel.as_posix() if evidence_path.is_file() else None,
-        })
-
-    observation_path = destination / "observation_state.json"
-    observation = (
-        json.loads(observation_path.read_text(encoding="utf-8"))
-        if observation_path.is_file() else {}
-    )
-    crashed = [attempt for attempt in normalized if attempt["trigger_observed"]]
-    result = {
-        "ok": True,
-        "source": "reward_framework",
-        "submissions": normalized,
-        "num_submissions": len(normalized),
-        "submission_attempts": normalized,
-        "num_submission_attempts": len(normalized),
-        "num_crashed": len(crashed),
-        "success": bool(crashed),
-        "terminal_reason": observation.get("terminal_reason"),
-        "state_path": "reward_framework/observation_state.json",
-    }
-    return result, normalized
-
-
 def clear_previous_result(sample_dir: Path) -> None:
     """Remove the previous result for this exact model/sample before rerunning.
 
@@ -502,24 +430,14 @@ def run_attempt(
         configure_harness_profile(
             harness_profile,
             max_iterations=args.max_iter,
-            update_harness=not getattr(args, "freeze_harness_updates", False),
         )
-        # configure_harness_profile("baseline") intentionally selects the
-        # pristine upstream entrypoint.  This evaluator still needs the
-        # lifecycle-only fine-trace overlay around that pristine controller so
-        # iteration/error endpoints freeze the checkpoint and get a bounded,
-        # tool-free finalization turn.
-        if (
-            harness_profile == "baseline"
-            and os.getenv("OPENHANDS_CAPTURE_FINE_TRACE") == "1"
-        ):
+        # configure_harness_profile intentionally selects the pristine upstream
+        # entrypoint. The remote PoC evaluation still wraps that controller with
+        # the lifecycle-only artifact overlay so clean endpoints and iteration
+        # caps produce the required analysis.json.
+        if os.getenv("OPENHANDS_CAPTURE_FINE_TRACE") == "1":
             os.environ["OPENHANDS_MAIN_MODULE"] = (
                 "poc_generation.openhands_fine_trace_main"
-            )
-        if harness_profile == "reward":
-            version = os.getenv("REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION", "1")
-            os.environ["REWARD_FRAMEWORK_BASELINE_PROFILE"] = (
-                f"openhands_evolved_v{version}"
             )
     else:
         # Historical experiment drivers install their own isolated entrypoints
@@ -545,9 +463,7 @@ def run_attempt(
             native_tool_calling=native_tool_calling_for_model(args.model),
         ),
         max_iter=args.max_iter,
-        repo=Path(
-            os.getenv("REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT", args.openhands_repo)
-        ).expanduser().resolve(),
+        repo=args.openhands_repo.expanduser().resolve(),
         remove_tmp=False,  # need config.toml still present to copy it out below
         timeout=args.timeout,
     )
@@ -578,25 +494,21 @@ def run_attempt(
         cybergym_agent_id = args_json["task"]["agent_id"]
 
         sample_dir = results_dir / sample_id
-        reward_result = persist_reward_framework_state(run_dir, sample_dir)
-        if reward_result is not None:
-            success_info, persisted_attempts = reward_result
-        else:
-            db_path = ROOT / "server" / "poc.db"
-            success_info = (
-                check_success(db_path, cybergym_agent_id)
-                if db_path.exists() else {"ok": False, "error": "db not found"}
-            )
-            task_workspace = Path(os.environ.get("OPENHANDS_TASK_WORKSPACE") or "")
-            fallback_analysis = task_workspace / ".latest_analysis.json"
-            if not fallback_analysis.is_file():
-                fallback_analysis = sample_dir / "analysis.json"
-            persisted_attempts = persist_submission_attempts(
-                sample_dir,
-                cybergym_agent_id,
-                success_info.get("submission_attempts") or [],
-                fallback_analysis if fallback_analysis.is_file() else None,
-            )
+        db_path = ROOT / "server" / "poc.db"
+        success_info = (
+            check_success(db_path, cybergym_agent_id)
+            if db_path.exists() else {"ok": False, "error": "db not found"}
+        )
+        task_workspace = Path(os.environ.get("OPENHANDS_TASK_WORKSPACE") or "")
+        fallback_analysis = task_workspace / ".latest_analysis.json"
+        if not fallback_analysis.is_file():
+            fallback_analysis = sample_dir / "analysis.json"
+        persisted_attempts = persist_submission_attempts(
+            sample_dir,
+            cybergym_agent_id,
+            success_info.get("submission_attempts") or [],
+            fallback_analysis if fallback_analysis.is_file() else None,
+        )
         poc_deduplication, deduplicated_pocs = (
             deduplicate_submission_attempts(persisted_attempts)
         )
@@ -613,10 +525,7 @@ def run_attempt(
             )
             if candidate_path.is_file():
                 if persist_analysis_artifact(candidate_path, sample_dir):
-                    analysis_source = (
-                        "reward_framework_last_valid_submission"
-                        if reward_result is not None else "last_valid_poc_submission"
-                    )
+                    analysis_source = "last_valid_poc_submission"
 
         # A final analysis artifact is written ONLY when the episode reaches a clean
         # endpoint (iteration limit / agent finished). Its
@@ -763,31 +672,6 @@ def run_attempt(
                     "tool-using continuation is needed later."
                 ),
             },
-            "reward_framework": (
-                {
-                    "enabled": True,
-                    "dir": "reward_framework/",
-                    "state_path": "reward_framework/observation_state.json",
-                    "trajectory_state_path": "reward_framework/trajectory_state.json",
-                    "evidence_state_path": "reward_framework/evidence_state.json",
-                    "harness_state_path": "reward_framework/harness_state.json",
-                    "task_context_path": "reward_framework/task_context.json",
-                    "candidate_index_path": "reward_framework/candidates/index.json",
-                    "evidence_dir": "reward_framework/evidence/",
-                    "episode_experience_path": (
-                        "reward_framework/episode_experience.json"
-                        if (sample_dir / "reward_framework/episode_experience.json").is_file()
-                        else None
-                    ),
-                    "cross_sample_update_path": (
-                        "reward_framework/cross_sample_update.json"
-                        if (sample_dir / "reward_framework/cross_sample_update.json").is_file()
-                        else None
-                    ),
-                    "terminal_reason": success_info.get("terminal_reason"),
-                }
-                if reward_result is not None else {"enabled": False}
-            ),
         }
         manifest_path = sample_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest_entry, indent=2, default=str))
@@ -809,35 +693,15 @@ def main():
     ap.add_argument("--model", default="deepseek/deepseek-chat")
     ap.add_argument(
         "--harness-profile",
-        choices=("baseline", "reward"),
+        choices=("baseline",),
         default="baseline",
-        help=(
-            "baseline uses pristine OpenHands; reward enables the complete "
-            "Reward Framework and cross-sample harness optimization."
-        ),
+        help="Normal PoC generation uses pristine OpenHands; reward runs are separate.",
     )
     ap.add_argument(
         "--openhands-repo",
         type=Path,
         default=GT_ROOT / "external" / "OpenHands",
         help="Complete OpenHands checkout containing pyproject.toml.",
-    )
-    ap.add_argument(
-        "--harness-training-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Shared GT-free Experience Pool and versioned OpenHands fork for "
-            "the reward profile; defaults beside results-dir."
-        ),
-    )
-    ap.add_argument(
-        "--freeze-harness-updates",
-        action="store_true",
-        help=(
-            "Use the current learned reward harness without updating its "
-            "Experience Pool or source; intended for validation/test."
-        ),
     )
     ap.add_argument(
         "--base-url",
@@ -871,71 +735,9 @@ def main():
     results_dir = args.results_dir.expanduser().resolve()
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    adaptive_python_root = None
-    harness_training_lock = None
-    if args.harness_profile == "reward":
-        training_root = (
-            args.harness_training_dir.expanduser().resolve()
-            if args.harness_training_dir is not None
-            else results_dir.parent / "harness_training"
-        )
-        training_root.mkdir(parents=True, exist_ok=True)
-        if not args.freeze_harness_updates:
-            harness_training_lock = (training_root / ".sample_update.lock").open("a+")
-            fcntl.flock(harness_training_lock.fileno(), fcntl.LOCK_EX)
-            atexit.register(harness_training_lock.close)
-        repository = HarnessRepository(
-            training_root / "harness", args.openhands_repo.expanduser().resolve()
-        )
-        version = repository.initialize()
-        # Freeze one source snapshot for every retry of this sample. The global
-        # worktree may advance after an episode, but never underneath a sample.
-        adaptive_python_root = training_root / "launches" / f"{args.arvo_id}_{os.getpid()}"
-        if adaptive_python_root.exists():
-            shutil.rmtree(adaptive_python_root)
-        adaptive_python_root.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(
-            repository.worktree, adaptive_python_root,
-            ignore=shutil.ignore_patterns(".harness_optimizer", "__pycache__", "*.pyc"),
-        )
-        active_record = json.loads(repository.active_path.read_text())
-        expected_sha256 = str(active_record["source_sha256"])
-        launch_sha256 = HarnessRepository.tree_sha256(adaptive_python_root)
-        if launch_sha256 != expected_sha256:
-            shutil.rmtree(adaptive_python_root, ignore_errors=True)
-            raise RuntimeError(
-                "isolated OpenHands launch does not match the active harness: "
-                f"version={version}, expected={expected_sha256}, actual={launch_sha256}"
-            )
-        (adaptive_python_root / ".reward_harness_launch.json").write_text(
-            json.dumps(
-                {
-                    "version": version,
-                    "source_sha256": launch_sha256,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
-        )
-        atexit.register(shutil.rmtree, adaptive_python_root, True)
-        if not args.freeze_harness_updates:
-            os.environ["REWARD_FRAMEWORK_TRAINING_ROOT"] = str(training_root)
-        os.environ["REWARD_FRAMEWORK_PRISTINE_OPENHANDS"] = str(
-            args.openhands_repo.expanduser().resolve()
-        )
-        os.environ["REWARD_FRAMEWORK_EPISODE_HARNESS_VERSION"] = str(version)
-        os.environ["REWARD_FRAMEWORK_EPISODE_HARNESS_SHA256"] = launch_sha256
-        os.environ["REWARD_FRAMEWORK_EPISODE_OPENHANDS_ROOT"] = str(
-            adaptive_python_root
-        )
-
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-    python_paths = []
-    if adaptive_python_root is not None:
-        python_paths.append(str(adaptive_python_root))
-    python_paths.extend([str(GT_ROOT), str(GT_ROOT / "external" / "cybergym" / "src")])
+    python_paths = [str(GT_ROOT), str(GT_ROOT / "external" / "cybergym" / "src")]
     if os.environ.get("PYTHONPATH"):
         python_paths.append(os.environ["PYTHONPATH"])
     os.environ["PYTHONPATH"] = os.pathsep.join(python_paths)
@@ -954,9 +756,9 @@ def main():
     sample_id = f"arvo_{args.arvo_id}"
     ensure_arvo_source(args.arvo_id)
 
-    # The initial task prompt declares the analysis artifact as a required final
-    # deliverable. The harness only supplies a bounded format-only final turn at
-    # the iteration limit; it does not start a probe or reveal GT.
+    # The remote PoC evaluation protocol requires the lifecycle-only artifact
+    # overlay. It wraps the pinned checkout at process entry without editing
+    # external/OpenHands.
     analysis_output = results_dir / sample_id / "analysis.json"
     sample_output_dir = results_dir / sample_id
     analysis_output = sample_output_dir / "analysis.json"
@@ -968,8 +770,7 @@ def main():
     os.environ.pop("OPENHANDS_FINE_TRACE_OUTPUT", None)
     os.environ.pop("OPENHANDS_VULN_LOGIC_OUTPUT", None)
     os.environ["OPENHANDS_EXPECTED_SAMPLE_ID"] = sample_id
-    # Do not inherit the upstream entrypoint from a parent experiment: the
-    # evaluation protocol requires the checkpoint/fine-trace overlay.
+    # Do not inherit an entrypoint from a parent experiment.
     os.environ["OPENHANDS_MAIN_MODULE"] = "poc_generation.openhands_fine_trace_main"
 
     last_status = None

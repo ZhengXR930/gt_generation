@@ -15,6 +15,7 @@ class PlatformAdapter(Protocol):
     def checkpoint(self, label: str) -> Path | None: ...
     def submission_ready(self) -> bool: ...
     def submission_fingerprint(self) -> str | None: ...
+    def submission_bundle_fingerprint(self) -> str | None: ...
 
 
 class CallbackAdapter:
@@ -44,3 +45,21 @@ class CallbackAdapter:
         if not candidate.is_file():
             return None
         return hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+    def submission_bundle_fingerprint(self) -> str | None:
+        """Identify the current PoC+analysis bundle.
+
+        Candidate uniqueness is still keyed by PoC bytes, but the harness must
+        distinguish a repaired analysis.json for the same PoC from a repeated
+        no-op. This fingerprint is only used by submission control policy.
+        """
+        candidate = self.workspace_root / "poc.bin"
+        analysis = self.workspace_root / "analysis.json"
+        if not candidate.is_file() or not analysis.is_file():
+            return None
+        digest = hashlib.sha256()
+        for path in (candidate, analysis):
+            content = path.read_bytes()
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        return digest.hexdigest()

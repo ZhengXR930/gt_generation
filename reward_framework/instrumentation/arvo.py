@@ -21,7 +21,7 @@ from evaluator.reachability.arvo_gdb import (
     target_arguments,
 )
 
-from ..assertion_reward import AssertionResult, check_value
+from ..assertion_reward import ClaimResult, check_value
 from ..models import Probe, ProbePlan, RawRuntimeReport, RuntimeFact, StageStatus
 from ..runtime import default_trigger_oracle
 from ..state_store import atomic_json
@@ -73,14 +73,19 @@ def compile_checkpoints(source_root: Path, plan: ProbePlan) -> list[dict[str, An
         captures = {}
         if probe.claim_id:
             operands = []
-            if probe.claim_kind == "transition":
+            if probe.claim_kind == "propagation":
                 operands = [
                     ("left", probe.left_operand)
                     if probe.endpoint == "from" else
                     ("right", probe.right_operand)
                 ]
-            elif probe.claim_kind in {"required", "observed"}:
+            elif probe.claim_kind in {"root", "sink"}:
                 operands = [("left", probe.left_operand), ("right", probe.right_operand)]
+            elif probe.claim_kind in {"source", "admission"}:
+                operands = [
+                    (f"operand_{i}", expression)
+                    for i, expression in enumerate(probe.captures, 1)
+                ]
             for name, expression in operands:
                 if _operand_literal(expression)[0]:
                     continue
@@ -113,6 +118,7 @@ def compile_checkpoints(source_root: Path, plan: ProbePlan) -> list[dict[str, An
                 "check_op": probe.check_op,
                 "left_operand": probe.left_operand,
                 "right_operand": probe.right_operand,
+                "required": probe.required,
             },
         })
     return checkpoints
@@ -144,7 +150,7 @@ def _operand_value(raw: Any, fields: dict[str, Any], name: str) -> Any:
 
 def evaluate_claim_hits(
     checkpoints: list[dict[str, Any]], hits: list[dict[str, Any]], checked: bool,
-) -> tuple[str, tuple[AssertionResult, ...]]:
+) -> tuple[str, tuple[ClaimResult, ...]]:
     ordered_hits = []
     for order, hit in enumerate(hits):
         if hit.get("line") is not None:
@@ -188,13 +194,12 @@ def evaluate_claim_hits(
 
     results = []
     for claim_id, meta in declared.items():
-        kind = str(meta["claim_kind"])
+        stage = str(meta["claim_kind"])
         entries = groups.get(claim_id, [])
         values: list[tuple[bool, Any, Any]] = []
-        errors = False
-        if kind == "transition":
+        if stage == "propagation":
             sources = [item for item in entries if item[0] == "from"]
-            targets = [item for item in entries if item[0] == "at"]
+            targets = [item for item in entries if item[0] == "to"]
             for _, source_order, source_hit, _ in sources:
                 for _, target_order, target_hit, _ in targets:
                     if source_order >= target_order:
@@ -208,34 +213,36 @@ def evaluate_claim_hits(
                         )
                         values.append((check_value(str(meta["check_op"]), left, right), left, right))
                     except (KeyError, TypeError, ValueError):
-                        errors = True
+                        pass
             reached = bool(sources and targets)
         else:
             reached = bool(entries)
-            for _, _, hit, _ in entries:
-                try:
-                    fields = hit.get("fields") or {}
-                    left = _operand_value(meta.get("left_operand"), fields, "left")
-                    right = _operand_value(meta.get("right_operand"), fields, "right")
-                    values.append((check_value(str(meta["check_op"]), left, right), left, right))
-                except (KeyError, TypeError, ValueError):
-                    errors = True
+            if meta.get("check_op") is None:
+                values = [(True, None, None)] if reached else []
+            else:
+                for _, _, hit, _ in entries:
+                    try:
+                        fields = hit.get("fields") or {}
+                        left = _operand_value(meta.get("left_operand"), fields, "left")
+                        right = _operand_value(meta.get("right_operand"), fields, "right")
+                        values.append((check_value(str(meta["check_op"]), left, right), left, right))
+                    except (KeyError, TypeError, ValueError):
+                        pass
         evaluated = bool(values)
-        expected = False if kind == "required" else True
+        expected = True
         matched = any(item[0] is expected for item in values) if evaluated else None
         if not reached:
             status = "not_reached"
         elif not evaluated:
             status = "unresolved"
-        elif kind == "required":
-            status = "violated" if matched else "safety_satisfied"
         else:
             status = "confirmed" if matched else "not_observed"
         representative = next((item for item in values if item[0] is expected), values[-1] if values else None)
-        results.append(AssertionResult(
-            claim_id, kind, status, reached, evaluated,
+        results.append(ClaimResult(
+            claim_id, stage, status, reached, evaluated,
             representative[0] if representative else None,
             matched,
+            bool(meta.get("required", True)),
             representative[1] if representative else None,
             representative[2] if representative else None,
         ))
@@ -379,7 +386,7 @@ class ArvoGDBInstrumentationBackend:
                 observations[stage] = StageStatus.NOT_REACHED
         return observations, tuple(facts)
 
-    def verify(self, *, poc_path: Path, trace_path: Path, plan: ProbePlan,
+    def verify(self, *, poc_path: Path, analysis_path: Path, plan: ProbePlan,
                output_dir: Path) -> RawRuntimeReport:
         output_dir.mkdir(parents=True, exist_ok=True)
         prepared = self._target()
@@ -393,7 +400,7 @@ class ArvoGDBInstrumentationBackend:
             staging = Path(raw_staging)
             staged_poc = staging / "poc"
             shutil.copy2(poc_path, staged_poc)
-            shutil.copy2(trace_path, staging / "trace.json")
+            shutil.copy2(analysis_path, staging / "analysis.json")
             work = staging / "runtime"
             report = self._verify_visible(
                 prepared=prepared, poc_path=staged_poc,

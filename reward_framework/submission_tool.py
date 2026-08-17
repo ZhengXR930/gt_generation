@@ -13,22 +13,28 @@ SUBMIT_CANDIDATE_TOOL = {
     "type": "function",
     "function": {
         "name": TOOL_NAME,
-        "description": (
-            "Submit the current runnable vulnerability-reproduction candidate "
-            "and the fine trace describing this exact candidate. Submission does "
-            "not imply success; runtime evidence will be returned and unsuccessful "
-            "candidates must be revised until the task succeeds or reaches its budget."
-        ),
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["poc_path", "trace_path"],
-            "properties": {
-                "poc_path": {"type": "string"},
-                "trace_path": {"type": "string"}
+            "description": (
+                "Submit the current runnable vulnerability-reproduction candidate "
+                "and the analysis.json describing this exact candidate. Use this "
+                "as soon as you have a candidate-level conclusion: a concrete input "
+                "carrier, a task execution interface, and issue-relevant causal "
+                "claims that are compared with the public issue description in "
+                "vuln_logic.issue_alignment. Do not wait for complete proof or "
+                "a guaranteed crash. Submission does not imply success; runtime "
+                "evidence and issue-alignment status will be returned, and "
+                "unsuccessful candidates must be revised until the task succeeds "
+                "or reaches its budget."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["poc_path", "analysis_path"],
+                "properties": {
+                    "poc_path": {"type": "string"},
+                    "analysis_path": {"type": "string"}
+                }
             }
         }
-    }
 }
 
 
@@ -49,9 +55,9 @@ def resolve_workspace_path(workspace: Path, value: Any, field: str) -> Path:
 
 def parse_submission(workspace: Path, arguments: str | dict[str, Any]) -> tuple[Path, Path]:
     value = json.loads(arguments) if isinstance(arguments, str) else arguments
-    if not isinstance(value, dict) or set(value) != {"poc_path", "trace_path"}:
-        raise ValueError("submit_candidate requires exactly poc_path and trace_path")
+    if not isinstance(value, dict) or set(value) != {"poc_path", "analysis_path"}:
+        raise ValueError("submit_candidate requires exactly poc_path and analysis_path")
     return (
         resolve_workspace_path(workspace, value["poc_path"], "poc_path"),
-        resolve_workspace_path(workspace, value["trace_path"], "trace_path"),
+        resolve_workspace_path(workspace, value["analysis_path"], "analysis_path"),
     )

@@ -27,11 +27,6 @@ from typing import Any
 FINE_TRACE_FINAL_MARKER = "[Analysis Artifact Finalization]"
 _MAX_FORMAT_RETRIES = 3
 _SUBMIT_COMMAND_TIMEOUT_SECONDS = 120
-_REWARD_SUBMIT_COMMAND = re.compile(
-    r"(?:^|(?:&&|\|\||;|\n)\s*)"
-    r"(?:python3\s+)?/workspace/\.reward_framework/submit_candidate\.py"
-    r"(?:\s|$)"
-)
 _MODELHUB_DEFAULTS_ONLY_KEYS = ("temperature", "top_p", "stop")
 
 
@@ -180,10 +175,7 @@ def _is_submit_command(action: Any) -> bool:
     return (
         isinstance(command, str)
         and not bool(getattr(action, "is_input", False))
-        and (
-            "submit.sh" in command
-            or bool(_REWARD_SUBMIT_COMMAND.search(command.strip()))
-        )
+        and "submit.sh" in command
     )
 
 

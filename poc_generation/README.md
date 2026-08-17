@@ -21,3 +21,16 @@ export OPENHANDS_PYTHON=/path/to/openhands-venv/bin/python
 Both `run_sample.py` and `run_local_sample.py` accept
 `--openhands-repo /path/to/OpenHands`. No runner depends on a machine-local
 `/tmp/openhands-poc-smoke` directory.
+
+Do not edit `external/OpenHands` directly. It is the pinned pristine baseline
+used by PoC-generation evaluation. For experiments that require OpenHands source
+changes, first create a separate editable copy:
+
+```bash
+./scripts/create_openhands_copy.sh my-experiment
+```
+
+Then pass that copy to an independent experiment or reward-framework launcher
+with `--openhands-repo external/OpenHands-experiments/my-experiment`.
+Baseline and remote-equivalent PoC evaluation should continue to use the
+pristine checkout.

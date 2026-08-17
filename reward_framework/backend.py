@@ -28,12 +28,7 @@ class CodexRun:
 
 
 class CodexBackend:
-    """One durable Codex CLI role.
-
-    A backend instance represents one agent identity.  All calls made through
-    it resume the same Codex thread; Reward Agent and Harness Patcher therefore
-    use two instances and never accidentally share conversational memory.
-    """
+    """Filesystem-isolated Codex CLI backend for Reward Agent roles."""
 
     _FORBIDDEN_COMMAND = re.compile(
         r"(^|[;&|]\s*)(cd\s+\.\.|find\s+\.\.|ls\s+\.\.|"
@@ -47,8 +42,8 @@ class CodexBackend:
                  sandbox: str = "read-only", fresh_each_run: bool = False,
                  isolation_image: str | None = None,
                  isolation_auth_file: Path | None = None):
-        if sandbox not in {"read-only", "workspace-write"}:
-            raise ValueError("CodexBackend only permits read-only or workspace-write")
+        if sandbox != "read-only":
+            raise ValueError("Reward CodexBackend permits only read-only sandbox")
         self.model = model
         self.executable = executable
         self.timeout = timeout
@@ -120,12 +115,12 @@ class CodexBackend:
             # to create a second bubblewrap namespace inside the container is
             # both redundant and unreliable (the standalone helper is not
             # present in the minimal controller image). The role view mount is
-            # read-only for Reward and writable only for the Patcher.
+            # read-only.
             "--sandbox", "danger-full-access",
             "--cd", "/work",
             "--skip-git-repo-check",
             "--ignore-user-config", "--ignore-rules", "--ephemeral",
-            # The Reward/Patcher roles must not inherit account-level apps,
+            # The Reward Agent roles must not inherit account-level apps,
             # plugins, memories, goals, or auxiliary agents. Those channels
             # can carry information outside the explicit role view even when
             # the filesystem mount itself is isolated.
@@ -200,7 +195,6 @@ class CodexBackend:
                     "--model", self.model,
                     # `codex exec resume` does not expose `--sandbox`; without
                     # this override it silently falls back to read-only even
-                    # for the workspace-write Harness Patcher session.
                     "-c", f'sandbox_mode="{self.sandbox}"',
                     "--skip-git-repo-check",
                     "--ignore-user-config", "--ignore-rules",
@@ -230,7 +224,7 @@ class CodexBackend:
                 text=True,
                 capture_output=True,
                 # `codex exec resume` has no --cd option. Without an explicit
-                # process cwd, resumed Reward/Patcher turns silently inherit
+                # process cwd, resumed Reward Agent turns silently inherit
                 # the controller's directory and can no longer see their
                 # materialized state view.
                 cwd=cwd,

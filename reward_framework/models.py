@@ -6,10 +6,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
-from .assertion_reward import AssertionRewardSpec
-
-
-STAGES = ("admission", "source", "root", "propagation", "target")
+from .assertion_reward import ClaimResult, RewardSpec, STAGES
 
 
 class StageStatus(str, Enum):
@@ -19,73 +16,7 @@ class StageStatus(str, Enum):
     NOT_REACHED = "not_reached"
     NOT_DECLARED = "not_declared"
     OBSERVED_BUT_BLOCKED = "observed_but_blocked"
-
-
-@dataclass(frozen=True)
-class SourceAnchor:
-    file: str
-    function: str
-    fact: str
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "SourceAnchor":
-        if set(value) != {"file", "function", "fact"}:
-            raise ValueError("source anchor must contain file, function, and fact")
-        fields = {key: str(value[key]).strip() for key in value}
-        if not all(fields.values()):
-            raise ValueError("source anchor fields cannot be empty")
-        return cls(**fields)
-
-
-@dataclass(frozen=True)
-class RewardSpec:
-    claims: dict[str, str | None]
-    evidence: dict[str, tuple[SourceAnchor, ...]]
-
-    def __post_init__(self) -> None:
-        if tuple(self.claims) != STAGES or set(self.evidence) != set(STAGES):
-            raise ValueError(f"reward spec stages must be {STAGES}")
-        for stage in STAGES:
-            claim = self.claims[stage]
-            if claim is not None and not str(claim).strip():
-                raise ValueError(f"{stage} claim cannot be blank")
-            anchors = self.evidence[stage]
-            if len(anchors) > 2:
-                raise ValueError(f"{stage} has more than two source anchors")
-            if bool(claim) != bool(anchors):
-                raise ValueError(f"{stage} claim and evidence must co-occur")
-
-    @property
-    def constructable(self) -> bool:
-        return any(self.claims.values())
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "claims": dict(self.claims),
-            "evidence": {
-                stage: [asdict(anchor) for anchor in self.evidence[stage]]
-                for stage in STAGES
-            },
-        }
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "RewardSpec":
-        if set(value) != {"claims", "evidence"}:
-            raise ValueError("reward spec must contain claims and evidence")
-        claims = value["claims"]
-        evidence = value["evidence"]
-        if not isinstance(claims, dict) or not isinstance(evidence, dict):
-            raise ValueError("claims and evidence must be objects")
-        normalized_claims: dict[str, str | None] = {}
-        normalized_evidence: dict[str, tuple[SourceAnchor, ...]] = {}
-        for stage in STAGES:
-            claim = claims.get(stage)
-            normalized_claims[stage] = None if claim is None else str(claim).strip()
-            items = evidence.get(stage)
-            if not isinstance(items, list):
-                raise ValueError(f"{stage} evidence must be a list")
-            normalized_evidence[stage] = tuple(SourceAnchor.from_dict(x) for x in items)
-        return cls(normalized_claims, normalized_evidence)
+    SPEC_OR_MAPPING_CONFLICT = "spec_or_mapping_conflict"
 
 
 @dataclass(frozen=True)
@@ -94,7 +25,7 @@ class TaskContext:
     issue_description: str
     codebase_root: str
     source_manifest_sha256: str
-    reward_spec: RewardSpec | AssertionRewardSpec
+    reward_spec: RewardSpec
     spec_model: str
     created_at: str
 
@@ -106,12 +37,7 @@ class TaskContext:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "TaskContext":
         copied = dict(value)
-        raw_spec = copied["reward_spec"]
-        copied["reward_spec"] = (
-            AssertionRewardSpec.from_dict(raw_spec)
-            if raw_spec.get("protocol") == "assertion-reward-v1"
-            else RewardSpec.from_dict(raw_spec)
-        )
+        copied["reward_spec"] = RewardSpec.from_dict(copied["reward_spec"])
         return cls(**copied)
 
 
@@ -131,6 +57,10 @@ class TrajectoryState:
     last_submission_sequence: int = 0
     submission_requested: bool = False
     materialization_outstanding: bool = False
+    materialization_reminder_count: int = 0
+    last_materialization_reminder_sequence: int = 0
+    auto_submission_count: int = 0
+    last_auto_submission_fingerprint: str | None = None
     awaiting_verification: bool = False
     terminal_reason: str | None = None
 
@@ -153,6 +83,14 @@ class TrajectoryState:
             "last_submission_sequence": self.last_submission_sequence,
             "submission_requested": self.submission_requested,
             "materialization_outstanding": self.materialization_outstanding,
+            "materialization_reminder_count": self.materialization_reminder_count,
+            "last_materialization_reminder_sequence": (
+                self.last_materialization_reminder_sequence
+            ),
+            "auto_submission_count": self.auto_submission_count,
+            "last_auto_submission_fingerprint": (
+                self.last_auto_submission_fingerprint
+            ),
             "awaiting_verification": self.awaiting_verification,
             "terminal_reason": self.terminal_reason,
         }
@@ -161,12 +99,13 @@ class TrajectoryState:
     def from_dict(cls, value: dict[str, Any]) -> "TrajectoryState":
         copied = dict(value)
         copied["events"] = [TrajectoryEvent(**item) for item in copied.get("events", [])]
+        copied.setdefault("materialization_reminder_count", 0)
+        copied.setdefault("last_materialization_reminder_sequence", 0)
+        copied.setdefault("auto_submission_count", 0)
+        copied.setdefault("last_auto_submission_fingerprint", None)
         return cls(**copied)
 
 
-# Backward-compatible public name used by the first Reward Framework version.
-# New code and persisted files call this the trajectory state because it is the
-# platform-neutral, complete action/observation history rather than a summary.
 ObservationState = TrajectoryState
 
 
@@ -189,7 +128,9 @@ class EvidenceState:
             errors.append("instrumentation_unavailable")
         if record.runtime.error:
             errors.append("runtime_or_probe_error")
-        if boundary:
+        if record.assessment.consistency == "spec_or_mapping_conflict":
+            errors.append("spec_or_mapping_conflict")
+        elif boundary:
             errors.append(f"causal_boundary:{boundary}")
         if record.feedback.contradiction:
             errors.append("candidate_claim_refuted")
@@ -275,12 +216,6 @@ class HarnessState:
         copied["current_policy"] = HarnessPolicy.from_dict(
             copied["current_policy"]
         )
-        for legacy in (
-            "revisions", "last_optimizer_sequence", "pending_reward_sequence",
-            "pending_reward_attempt", "last_patcher_reward_sequence",
-            "optimizer_errors",
-        ):
-            copied.pop(legacy, None)
         return cls(**copied)
 
 
@@ -301,6 +236,7 @@ class Probe:
     check_op: str | None = None
     left_operand: Any = None
     right_operand: Any = None
+    required: bool = True
 
     def __post_init__(self) -> None:
         if self.stage not in STAGES:
@@ -361,7 +297,7 @@ class RawRuntimeReport:
     facts: tuple[RuntimeFact, ...]
     instrumentation_available: bool
     error: str | None = None
-    claim_results: tuple[Any, ...] = ()
+    claim_results: tuple[ClaimResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -369,12 +305,16 @@ class StageAssessment:
     stages: dict[str, StageStatus]
     longest_confirmed_prefix: tuple[str, ...]
     first_unresolved: str | None
+    consistency: str = "consistent"
+    conflict_stages: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "stages": {stage: self.stages[stage].value for stage in STAGES},
             "longest_confirmed_prefix": list(self.longest_confirmed_prefix),
             "first_unresolved": self.first_unresolved,
+            "consistency": self.consistency,
+            "conflict_stages": list(self.conflict_stages),
         }
 
 
@@ -385,6 +325,7 @@ class Feedback:
     delta: str
     evidence_ids: tuple[str, ...]
     assessment: Any
+    issue_alignment_review: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -393,6 +334,7 @@ class Feedback:
             "delta": self.delta,
             "evidence_ids": list(self.evidence_ids),
             "assessment": self.assessment.to_dict(),
+            "issue_alignment_review": self.issue_alignment_review,
         }
 
 

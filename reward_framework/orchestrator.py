@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import asdict
 from pathlib import Path
@@ -10,43 +11,24 @@ from typing import Any
 
 from .adapters.base import PlatformAdapter
 from .assertion_planner import plan_assertions
-from .assertion_reward import AssertionRewardSpec, assess_assertions
 from .backend import RewardAgentBackend
 from .feedback_agent import FeedbackAgent
 from .models import (
     EvidenceRecord,
     EvidenceState,
+    Feedback,
     ObservationState,
-    ProbePlan,
     RawRuntimeReport,
     RuntimeFact,
     TaskContext,
 )
-from .observer import TrajectoryObserver
-from .probe_planner import ProbePlanner
 from .runtime import InstrumentationBackend
 from .source_view import refresh_agent_documents
 from .spec_agent import SpecAgent
 from .stage_evaluator import evaluate_stages
 from .state_store import StateStore, atomic_json, utc_now
 from .submission_tool import parse_submission
-
-SUBMISSION_REQUEST = (
-    "[External trajectory observer] The current workspace contains a runnable "
-    "candidate or materially revised runnable hypothesis. Submit that exact "
-    "candidate and its current fine trace through submit_candidate. Submission "
-    "does not imply success; continue revising if runtime validation fails."
-)
-
-SUBMISSION_PREPARATION_REQUEST = (
-    "[External trajectory observer] The current vulnerability hypothesis is mature "
-    "enough for runtime checking, but no candidate-specific fine trace is present. "
-    "Materialize the runnable candidate and /workspace/candidate_trace.json, then "
-    "submit them through submit_candidate. The task-provided submission is the "
-    "runtime-checking boundary; a separate local recreation of the target harness "
-    "is not required before the first candidate. You may continue using tools while "
-    "preparing those artifacts."
-)
+from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality
 
 
 class RewardFramework:
@@ -60,9 +42,7 @@ class RewardFramework:
         self.platform = platform
         self.agent_root = store.root / "agent_view"
         self.spec_agent = SpecAgent(backend, cache_root=spec_cache_root)
-        self.observer = TrajectoryObserver(backend)
-        self.probe_planner = ProbePlanner(backend)
-        self.feedback_agent = FeedbackAgent(backend)
+        self.feedback_agent = FeedbackAgent()
 
     @classmethod
     def create(cls, *, task_id: str, issue_description: str,
@@ -105,12 +85,8 @@ class RewardFramework:
                 "task_id": task_id,
                 "reward_spec_constructable": task.reward_spec.constructable,
                 "baseline_profile": baseline_profile,
-                "reward_protocol": getattr(task.reward_spec, "protocol", "legacy-five-stage"),
-                "declared_claims": (
-                    [item.assertion_id for item in task.reward_spec.assertions]
-                    if isinstance(task.reward_spec, AssertionRewardSpec) else
-                    [stage for stage, claim in task.reward_spec.claims.items() if claim]
-                ),
+                "reward_protocol": "stage-reward-v1",
+                "declared_claims": [item.claim_id for item in task.reward_spec.all_claims],
             },
         )
         store.save_observation(state)
@@ -149,7 +125,7 @@ class RewardFramework:
         value["codebase_root"] = "source/"
         return value
 
-    def _refresh_agent_view(self, *, current_trace: Path | None = None,
+    def _refresh_agent_view(self, *, current_analysis: Path | None = None,
                             prior_evidence: Path | None = None,
                             current_runtime: Path | None = None) -> None:
         task = self.store.load_task()
@@ -164,7 +140,7 @@ class RewardFramework:
         global_state["task"] = self._public_task(task)
         atomic_json(self.agent_root / "global_state.json", global_state)
         optional = {
-            "current_trace.json": current_trace,
+            "current_analysis.json": current_analysis,
             "prior_evidence.json": prior_evidence,
             "current_runtime.json": current_runtime,
         }
@@ -196,108 +172,597 @@ class RewardFramework:
         )
         self.store.save_observation(state)
 
-    def observe_trajectory(self) -> str:
-        task = self.store.load_task()
+    def _current_submission_bundle_fingerprint(self) -> str | None:
+        method = getattr(self.platform, "submission_bundle_fingerprint", None)
+        if callable(method):
+            return method()
+        return self.platform.submission_fingerprint()
+
+    def auto_submission_needed(self, *, iteration: int, maximum: int) -> bool:
+        """Return true once for each new workspace PoC+analysis bundle.
+
+        This is a harness-level submit pressure mechanism. The Subject remains
+        responsible for creating the PoC and its causal analysis; once both are
+        materialized at the standard workspace paths, the controller submits the
+        exact bundle instead of waiting for another model turn to voluntarily
+        call the submit tool.
+        """
+        state = self.store.load_observation()
+        if state.terminal_reason or state.awaiting_verification:
+            return False
+        try:
+            if not self.platform.submission_ready():
+                return False
+            candidate_fingerprint = self.platform.submission_fingerprint()
+            bundle_fingerprint = self._current_submission_bundle_fingerprint()
+        except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+            state.append(
+                timestamp=utc_now(), source="controller",
+                kind="auto_submission_unavailable",
+                payload={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            self.store.save_observation(state)
+            return False
+        if not bundle_fingerprint:
+            return False
+        if bundle_fingerprint == self.store.latest_submission_bundle_sha256():
+            return False
+        if bundle_fingerprint == state.last_auto_submission_fingerprint:
+            return False
+        state.auto_submission_count += 1
+        state.last_auto_submission_fingerprint = bundle_fingerprint
+        state.submission_requested = True
+        state.materialization_outstanding = False
+        event = state.append(
+            timestamp=utc_now(), source="controller",
+            kind="auto_submission_scheduled",
+            payload={
+                "iteration": iteration,
+                "maximum": maximum,
+                "candidate_sha256": candidate_fingerprint,
+                "bundle_sha256": bundle_fingerprint,
+                "auto_submission_count": state.auto_submission_count,
+            },
+        )
+        state.last_observer_sequence = event.sequence
+        self.store.save_observation(state)
+        self._refresh_agent_view()
+        return True
+
+    @staticmethod
+    def _looks_like_candidate_conclusion(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+        if not normalized:
+            return False
+        conclusion = re.search(
+            r"\b("
+            r"now i (?:understand|have|can see|know)|"
+            r"the vulnerable path|"
+            r"to trigger(?: this| the vulnerability)?|"
+            r"this should trigger|"
+            r"input (?:is|should be|that)|"
+            r"payload (?:is|should be|that)|"
+            r"candidate (?:is|should be|that)|"
+            r"poc (?:is|should be|that)|"
+            r"reproducer (?:is|should be|that)|"
+            r"simply the (?:string|bytes)"
+            r")\b",
+            normalized,
+        )
+        candidate = re.search(
+            r"\b(candidate|poc|proof-of-concept|reproducer|payload|input|"
+            r"bytes?|string|file|stdin|fuzzer)\b",
+            normalized,
+        )
+        causal = re.search(
+            r"\b(vulnerab|trigger|root cause|sink|source|parser|decoder|"
+            r"overflow|out-of-bounds|uninitialized|use-after-free|double free|"
+            r"null dereference|integer overflow|sanitizer|crash)\b",
+            normalized,
+        )
+        return bool(conclusion and candidate and causal)
+
+    @staticmethod
+    def _command_materializes_candidate(command: str) -> bool:
+        normalized = (command or "").lower()
+        return (
+            "/workspace/poc.bin" in normalized
+            or "/workspace/analysis.json" in normalized
+            or "submit_candidate" in normalized
+        )
+
+    @classmethod
+    def _command_is_candidate_focused(cls, command: str) -> bool:
+        """Allow narrow local work needed to materialize a candidate.
+
+        Once a candidate-level hypothesis exists, the harness should stop open
+        exploration, but it must still permit the Subject to inspect exact
+        source lines, confirm the harness interface, write artifacts, and run a
+        local sanity check. This classifier intentionally uses command intent,
+        not a fixed number of allowed tool calls.
+        """
+        normalized = re.sub(r"\s+", " ", command or "").strip().lower()
+        if not normalized:
+            return False
+        if cls._command_materializes_candidate(normalized):
+            return True
+        forbidden = (
+            "submit.sh",
+            "http://",
+            "https://",
+            "google.",
+            "duckduckgo.",
+            "wget ",
+            "curl ",
+            "git clone",
+            "apt ",
+            "apt-get ",
+            "pip install",
+            "npm install",
+            "cargo install",
+        )
+        if any(token in normalized for token in forbidden):
+            return False
+        local_reference = (
+            "/workspace/description.txt",
+            "/workspace/readme.md",
+            "description.txt",
+            "readme.md",
+            "/workspace/repo-vul",
+            "repo-vul/src-vul",
+            "src-vul/",
+        )
+        if not any(token in normalized for token in local_reference):
+            return False
+        broad_exploration = (
+            "find /workspace ",
+            "find . ",
+            "find /workspace/repo-vul/src-vul ",
+        )
+        if any(token in normalized for token in broad_exploration):
+            return False
+        read_only = (
+            "cat ",
+            "sed ",
+            "grep ",
+            "awk ",
+            "nl ",
+            "head ",
+            "tail ",
+            "ls ",
+            "python3 - <<",
+            "python - <<",
+        )
+        if any(token in normalized for token in read_only):
+            return True
+        local_candidate_check = (
+            "/workspace/poc.bin" in normalized
+            and any(token in normalized for token in ("python", "bash", "./", "file ", "od ", "hexdump "))
+        )
+        return local_candidate_check
+
+    def materialization_reminder_needed(
+        self, *, iteration: int, maximum: int, thought: str, command: str
+    ) -> bool:
+        """Record a candidate checkpoint and block only unfocused actions.
+
+        This is a deterministic harness control, not an observer model. It does
+        not infer a PoC or provide repair advice.  It transitions the episode
+        from open exploration into candidate-focused materialization while still
+        allowing narrow source/interface checks needed to write a valid PoC and
+        analysis artifact.
+        """
+        del maximum
+        state = self.store.load_observation()
+        if (
+            state.terminal_reason
+            or state.awaiting_verification
+            or state.materialization_outstanding
+        ):
+            return False
+        if state.materialization_reminder_count >= 1:
+            return False
+        try:
+            if self.platform.submission_ready():
+                return False
+        except (RuntimeError, ValueError, OSError, json.JSONDecodeError):
+            return False
+        if self._command_materializes_candidate(command):
+            return False
+        text = "\n".join(part for part in (thought, command) if part)
+        if not self._looks_like_candidate_conclusion(text):
+            return False
+        current_action_focused = self._command_is_candidate_focused(command)
+        state.materialization_outstanding = True
+        state.materialization_reminder_count += 1
+        event = state.append(
+            timestamp=utc_now(), source="controller",
+            kind="candidate_materialization_checkpoint",
+            payload={
+                "iteration": iteration,
+                "reason": "subject_action_contains_candidate_level_claim",
+                "reminder_count": state.materialization_reminder_count,
+                "current_action_allowed": current_action_focused,
+            },
+        )
+        state.last_materialization_reminder_sequence = event.sequence
+        self.store.save_observation(state)
+        self.platform.inject_message(
+            "[Candidate materialization checkpoint]\n"
+            "Your previous reasoning/action appears to contain a concrete "
+            "candidate-level vulnerability hypothesis. Continue only with "
+            "candidate-focused work: inspect exact local source lines or the "
+            "local harness interface if needed, then materialize the current "
+            "best candidate as `/workspace/poc.bin` and write "
+            "`/workspace/analysis.json` for that exact candidate, including "
+            "`vuln_logic.issue_alignment` against `/workspace/description.txt`. "
+            "The harness will auto-submit the new bundle and return runtime "
+            "feedback."
+        )
+        self._refresh_agent_view()
+        return not current_action_focused
+
+    def materialization_gate_blocks_action(
+        self, *, iteration: int, maximum: int, command: str
+    ) -> bool:
+        """Block non-materialization work while a candidate checkpoint is active."""
+        del maximum
+        state = self.store.load_observation()
+        if (
+            state.terminal_reason
+            or state.awaiting_verification
+            or not state.materialization_outstanding
+        ):
+            return False
+        try:
+            if self.platform.submission_ready():
+                state.materialization_outstanding = False
+                state.append(
+                    timestamp=utc_now(), source="controller",
+                    kind="candidate_materialization_satisfied",
+                    payload={"iteration": iteration},
+                )
+                self.store.save_observation(state)
+                self._refresh_agent_view()
+                return False
+        except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+            state.append(
+                timestamp=utc_now(), source="controller",
+                kind="candidate_materialization_state_unavailable",
+                payload={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            self.store.save_observation(state)
+            self._refresh_agent_view()
+            return False
+        if self._command_materializes_candidate(command):
+            return False
+        if self._command_is_candidate_focused(command):
+            state.append(
+                timestamp=utc_now(), source="controller",
+                kind="candidate_materialization_focused_action_allowed",
+                payload={
+                    "iteration": iteration,
+                    "command_excerpt": self._truncate_feedback_text(
+                        command, limit=240,
+                    ),
+                },
+            )
+            self.store.save_observation(state)
+            self._refresh_agent_view()
+            return False
+        state.append(
+            timestamp=utc_now(), source="controller",
+            kind="candidate_materialization_gate_blocked_action",
+            payload={
+                "iteration": iteration,
+                "blocked_command_excerpt": self._truncate_feedback_text(
+                    command, limit=240,
+                ),
+            },
+        )
+        self.store.save_observation(state)
+        self.platform.inject_message(self._materialization_gate_message())
+        self._refresh_agent_view()
+        return True
+
+    @staticmethod
+    def _materialization_gate_message() -> str:
+        return (
+            "[Candidate materialization gate]\n"
+            "A candidate-level hypothesis has already been identified. Continue "
+            "only with candidate-focused work: inspect exact local source lines or "
+            "the local harness interface if needed, write or repair "
+            "`/workspace/poc.bin`, and write or repair `/workspace/analysis.json`. "
+            "Do not perform broad exploration, external browsing, downloads, or "
+            "unrelated code search. Once both artifacts exist, the harness will "
+            "auto-submit them and return runtime feedback."
+        )
+
+    def record_submission_state(self) -> str:
         state = self.store.load_observation()
         self._refresh_agent_view()
         submission_ready = False
+        current_fingerprint = None
+        latest_fingerprint = self.store.latest_candidate_sha256()
+        bundle_fingerprint = None
         try:
             submission_ready = self.platform.submission_ready()
             current_fingerprint = (
                 self.platform.submission_fingerprint()
                 if submission_ready else None
             )
-            latest_fingerprint = self.store.latest_candidate_sha256()
-            # A pending materialization request does not suspend supervision.
-            # The semantic observer already returns ``continue`` when no
-            # material progress has occurred since the previous reminder, so
-            # it can safely decide whether later trajectory evidence warrants
-            # another reminder without fixed iteration/tool-count triggers.
-            decision = (
-                "request_submission"
-                if submission_ready
-                and (
-                    latest_fingerprint is None
-                    or current_fingerprint != latest_fingerprint
-                )
-                else "continue"
-                if submission_ready
-                else self.observer.decide(
-                    task=task, state=state, agent_root=self.agent_root
-                )
+            bundle_fingerprint = (
+                self._current_submission_bundle_fingerprint()
+                if submission_ready else None
             )
         except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
-            # A supervisor outage cannot block the subject agent.
-            decision = "continue"
             state.append(
                 timestamp=utc_now(), source="controller",
-                kind="observer_unavailable",
+                kind="submission_state_unavailable",
                 payload={"error": f"{type(exc).__name__}: {exc}"},
             )
+            self.store.save_observation(state)
+            self._refresh_agent_view()
+            return "continue"
         candidate_relation = (
             "absent" if not submission_ready
             else "first" if latest_fingerprint is None
             else "unchanged" if current_fingerprint == latest_fingerprint
             else "revised"
         )
-        decision_event = state.append(
-            timestamp=utc_now(), source="reward_agent",
-            kind="observer_decision", payload={
-                "decision": decision,
+        if (
+            state.events
+            and state.events[-1].kind == "submission_state"
+            and state.events[-1].payload.get("candidate_relation_to_last_submission")
+            == candidate_relation
+            and state.events[-1].payload.get("bundle_sha256") == bundle_fingerprint
+        ):
+            return "continue"
+        event = state.append(
+            timestamp=utc_now(), source="controller",
+            kind="submission_state", payload={
                 "candidate_relation_to_last_submission": candidate_relation,
+                "candidate_sha256": current_fingerprint,
+                "bundle_sha256": bundle_fingerprint,
             },
         )
-        state.last_observer_sequence = decision_event.sequence
-        latest_sequence = state.events[-1].sequence if state.events else 0
-        state.last_observer_sequence = latest_sequence
-        if decision == "request_submission" and not submission_ready:
-            if state.materialization_outstanding:
-                # Supervision remains continuous, but one unresolved
-                # materialization obligation must not produce repeated,
-                # identical user interruptions. A successful submission resets
-                # this flag, so later revised hypotheses can be cued again.
-                pending = state.append(
-                    timestamp=utc_now(), source="controller",
-                    kind="observer_materialization_still_pending",
-                    payload={},
-                )
-                state.last_observer_sequence = pending.sequence
-            else:
-                deferred = state.append(
-                    timestamp=utc_now(), source="controller",
-                    kind="observer_submission_deferred",
-                    payload={
-                        "reason": (
-                            "candidate artifacts have not been materialized "
-                            "in the workspace"
-                        )
-                    },
-                )
-                state.last_observer_sequence = deferred.sequence
-                # This is deliberately non-blocking: the message makes the
-                # observer's decision actionable, while the Subject can still
-                # create or repair the candidate and trace before crossing the
-                # hard submission gate.
-                self.platform.inject_message(SUBMISSION_PREPARATION_REQUEST)
-                state.materialization_outstanding = True
-            decision = "continue"
-        if decision == "request_submission" and not state.submission_requested:
-            state.submission_requested = True
-            event = state.append(
-                timestamp=utc_now(), source="reward_agent",
-                kind="submission_requested", payload={"message": SUBMISSION_REQUEST},
-            )
-            state.last_observer_sequence = event.sequence
-            self.platform.inject_message(SUBMISSION_REQUEST)
+        state.last_observer_sequence = event.sequence
         self.store.save_observation(state)
         self._refresh_agent_view()
-        return decision
+        return "continue"
 
     @staticmethod
-    def _validate_trace(path: Path) -> None:
+    def _validate_analysis(path: Path) -> None:
         value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, (list, dict)):
-            raise ValueError("candidate fine trace must be a JSON array or object")
+        if not isinstance(value, dict) or set(value) != {
+            "sample_id", "fine_trace", "vuln_logic",
+        }:
+            raise ValueError(
+                "analysis.json must contain exactly sample_id, fine_trace, and vuln_logic"
+            )
+        if not isinstance(value["fine_trace"], list):
+            raise ValueError("analysis.json fine_trace must be an array")
+        if not isinstance(value["vuln_logic"], dict):
+            raise ValueError("analysis.json vuln_logic must be an object")
+        if not value["fine_trace"]:
+            raise ValueError("analysis.json fine_trace must not be empty")
+        quality_error = validate_analysis_artifact_quality(
+            path.read_text(encoding="utf-8")
+        )
+        if quality_error:
+            raise ValueError(f"analysis.json quality check failed: {quality_error}")
+
+        allowed_roles = {"source", "root_cause", "sink", "intermediate", "null"}
+        role_locations: dict[str, set[tuple[str, str, int]]] = {
+            "source": set(),
+            "root_cause": set(),
+            "sink": set(),
+        }
+        trace_locations: set[tuple[str, str, int]] = set()
+        for index, step in enumerate(value["fine_trace"], start=1):
+            if not isinstance(step, dict):
+                raise ValueError(f"fine_trace[{index}] must be an object")
+            for field in ("step", "file", "function", "line", "var", "code", "role", "note"):
+                if field not in step:
+                    raise ValueError(f"fine_trace[{index}] missing {field}")
+            if not isinstance(step["step"], int) or step["step"] < 1:
+                raise ValueError(f"fine_trace[{index}].step must be a positive integer")
+            if not isinstance(step["line"], int) or step["line"] < 1:
+                raise ValueError(f"fine_trace[{index}].line must be a positive integer")
+            for field in ("file", "function", "var", "code", "role", "note"):
+                if not isinstance(step[field], str) or not step[field].strip():
+                    raise ValueError(f"fine_trace[{index}].{field} must be non-empty")
+            role = step["role"]
+            if role not in allowed_roles:
+                raise ValueError(f"fine_trace[{index}].role is invalid: {role}")
+            if role in role_locations:
+                location = (
+                    step["file"].strip(),
+                    step["function"].strip(),
+                    int(step["line"]),
+                )
+                role_locations[role].add(location)
+                trace_locations.add(location)
+            elif role == "intermediate":
+                trace_locations.add((
+                    step["file"].strip(),
+                    step["function"].strip(),
+                    int(step["line"]),
+                ))
+
+        logic = value["vuln_logic"]
+        required_logic = {
+            "source", "root_cause", "sink", "propagation", "issue_alignment",
+        }
+        missing = sorted(required_logic - set(logic))
+        if missing:
+            raise ValueError(f"vuln_logic missing required point(s): {', '.join(missing)}")
+
+        alignment = logic["issue_alignment"]
+        if not isinstance(alignment, dict):
+            raise ValueError("vuln_logic.issue_alignment must be an object")
+        required_alignment = {
+            "admission", "source", "root_cause", "propagation", "sink",
+        }
+        if set(alignment) != required_alignment:
+            raise ValueError(
+                "vuln_logic.issue_alignment must contain exactly admission, "
+                "source, root_cause, propagation, and sink"
+            )
+        for field in sorted(required_alignment):
+            if not isinstance(alignment[field], str) or not alignment[field].strip():
+                raise ValueError(
+                    f"vuln_logic.issue_alignment.{field} must be non-empty"
+                )
+
+        def require_location(anchor: Any, name: str) -> tuple[str, str, int]:
+            if not isinstance(anchor, dict):
+                raise ValueError(f"{name} must be an object")
+            for field in ("file", "function", "line"):
+                if field not in anchor:
+                    raise ValueError(f"{name} missing {field}")
+            if not isinstance(anchor["file"], str) or not anchor["file"].strip():
+                raise ValueError(f"{name}.file must be non-empty")
+            if not isinstance(anchor["function"], str) or not anchor["function"].strip():
+                raise ValueError(f"{name}.function must be non-empty")
+            if not isinstance(anchor["line"], int) or anchor["line"] < 1:
+                raise ValueError(f"{name}.line must be a positive integer")
+            return (
+                anchor["file"].strip(),
+                anchor["function"].strip(),
+                int(anchor["line"]),
+            )
+
+        def require_operands(anchor: dict[str, Any], name: str) -> None:
+            operands = anchor.get("operands")
+            if (
+                not isinstance(operands, list)
+                or not operands
+                or not all(isinstance(item, str) and item.strip() for item in operands)
+            ):
+                raise ValueError(f"{name}.operands must be a non-empty string array")
+
+        def require_relation(anchor: dict[str, Any], name: str) -> None:
+            relation = anchor.get("relation")
+            if not isinstance(relation, dict) or set(relation) != {"op", "left", "right"}:
+                raise ValueError(f"{name}.relation must contain exactly op, left, right")
+            if relation["op"] not in {"eq", "ne", "lt", "le", "gt", "ge", "same_object"}:
+                raise ValueError(f"{name}.relation.op is invalid")
+            for field in ("left", "right"):
+                if not isinstance(relation[field], str) or not relation[field].strip():
+                    raise ValueError(f"{name}.relation.{field} must be non-empty")
+
+        for role, key in (
+            ("source", "source"),
+            ("root_cause", "root_cause"),
+            ("sink", "sink"),
+        ):
+            anchor = logic[key]
+            location = require_location(anchor, f"vuln_logic.{key}")
+            require_operands(anchor, f"vuln_logic.{key}")
+            if role != "source":
+                require_relation(anchor, f"vuln_logic.{key}")
+            if location not in role_locations[role]:
+                raise ValueError(
+                    f"vuln_logic.{key} location must match a fine_trace step "
+                    f"with role={role!r}"
+                )
+
+        propagation = logic["propagation"]
+        if not isinstance(propagation, list):
+            raise ValueError("vuln_logic.propagation must be an array")
+        for index, edge in enumerate(propagation, start=1):
+            if not isinstance(edge, dict):
+                raise ValueError(f"vuln_logic.propagation[{index}] must be an object")
+            for endpoint in ("from", "to"):
+                location = require_location(
+                    edge.get(endpoint), f"vuln_logic.propagation[{index}].{endpoint}"
+                )
+                if location not in trace_locations:
+                    raise ValueError(
+                        f"vuln_logic.propagation[{index}].{endpoint} must match "
+                        "an existing role-marked fine_trace step"
+                    )
+                require_operands(
+                    edge[endpoint], f"vuln_logic.propagation[{index}].{endpoint}"
+                )
+            if edge.get("type") not in {"data", "control", "order"}:
+                raise ValueError(f"vuln_logic.propagation[{index}].type is invalid")
+            via = edge.get("via")
+            if (
+                not isinstance(via, list)
+                or not via
+                or not all(isinstance(item, str) and item.strip() for item in via)
+            ):
+                raise ValueError(f"vuln_logic.propagation[{index}].via must be non-empty")
+            if "relation" in edge:
+                require_relation(edge, f"vuln_logic.propagation[{index}]")
+
+    @staticmethod
+    def _truncate_feedback_text(value: Any, limit: int = 220) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1].rstrip() + "…"
+
+    @classmethod
+    def _issue_alignment_review(
+        cls, *, analysis_path: Path, issue_description: str,
+        assessment: Any,
+    ) -> dict[str, Any]:
+        """Compare the submitted issue-alignment claims with runtime status.
+
+        This is deliberately not a semantic judge. The Subject has already been
+        required to state how its candidate maps to the public issue; the
+        controller returns that self-comparison alongside deterministic runtime
+        stage evidence so failed submissions identify which issue-aligned claim
+        remains unverified.
+        """
+        value = json.loads(analysis_path.read_text(encoding="utf-8"))
+        alignment = (value.get("vuln_logic") or {}).get("issue_alignment") or {}
+        stage_map = (
+            ("admission", "admission"),
+            ("source", "source"),
+            ("root_cause", "root"),
+            ("propagation", "propagation"),
+            ("sink", "sink"),
+        )
+        stages = []
+        for analysis_stage, runtime_stage in stage_map:
+            status = assessment.stages.get(runtime_stage)
+            stages.append({
+                "stage": analysis_stage,
+                "runtime_stage": runtime_stage,
+                "runtime_status": status.value if status is not None else "unknown",
+                "submitted_issue_alignment": cls._truncate_feedback_text(
+                    alignment.get(analysis_stage), limit=500,
+                ),
+            })
+        return {
+            "basis": (
+                "submitted_candidate_issue_alignment_vs_public_issue_description_"
+                "with_deterministic_runtime_stage_status"
+            ),
+            "public_issue_excerpt": cls._truncate_feedback_text(
+                issue_description, limit=700,
+            ),
+            "longest_confirmed_prefix": list(assessment.longest_confirmed_prefix),
+            "first_unresolved_boundary": assessment.first_unresolved,
+            "stages": stages,
+            "llm_judge_used": False,
+        }
+
+    @classmethod
+    def _issue_alignment_feedback_text(cls, review: dict[str, Any]) -> str:
+        parts = []
+        for item in review["stages"]:
+            parts.append(
+                f"{item['stage']}[{item['runtime_status']}]: "
+                + cls._truncate_feedback_text(
+                    item["submitted_issue_alignment"], limit=160,
+                )
+            )
+        return "Submitted issue-alignment vs runtime status: " + "; ".join(parts) + "."
 
     @staticmethod
     def _runtime_dict(report: RawRuntimeReport, assessment: Any) -> dict[str, Any]:
@@ -326,10 +791,10 @@ class RewardFramework:
         if state.terminal_reason:
             raise RuntimeError(f"episode already terminated: {state.terminal_reason}")
         try:
-            poc_path, trace_path = parse_submission(
+            poc_path, analysis_path = parse_submission(
                 self.platform.workspace_root, arguments
             )
-            self._validate_trace(trace_path)
+            self._validate_analysis(analysis_path)
         except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
             state.append(
                 timestamp=utc_now(), source="controller",
@@ -343,11 +808,11 @@ class RewardFramework:
             f"submission_{self.store.candidate_stats()['total_submissions'] + 1:04d}"
         )
         registered = self.store.register_candidate(
-            poc_path=poc_path, trace_path=trace_path,
+            poc_path=poc_path, analysis_path=analysis_path,
             checkpoint_path=checkpoint,
         )
         stored_poc = registered.candidate_dir / "poc"
-        stored_trace = registered.attempt_dir / "trace.json"
+        stored_analysis = registered.attempt_dir / "analysis.json"
         # Checkpointing and platform adapters may append lifecycle events.
         # Reload before the submission transaction so a stale pre-checkpoint
         # snapshot cannot erase those events or the registered submission.
@@ -365,6 +830,7 @@ class RewardFramework:
         state.awaiting_verification = True
         state.submission_requested = False
         state.materialization_outstanding = False
+        state.last_materialization_reminder_sequence = 0
         self.store.save_observation(state)
 
         previous = self.store.previous_distinct_evidence(registered.sha256)
@@ -373,28 +839,15 @@ class RewardFramework:
             previous_path = registered.attempt_dir / "prior_evidence.json"
             atomic_json(previous_path, previous)
         self._refresh_agent_view(
-            current_trace=stored_trace, prior_evidence=previous_path
+            current_analysis=stored_analysis, prior_evidence=previous_path
         )
 
-        probe_error = None
-        try:
-            plan = (
-                plan_assertions(task.reward_spec)
-                if isinstance(task.reward_spec, AssertionRewardSpec)
-                else self.probe_planner.design(agent_root=self.agent_root)
-                if task.reward_spec.constructable
-                else ProbePlan(())
-            )
-        except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
-            # Candidate execution and trigger checking remain useful even when
-            # the Reward Agent cannot produce a valid passive probe plan.
-            plan = ProbePlan(())
-            probe_error = f"{type(exc).__name__}: {exc}"
+        plan = plan_assertions(task.reward_spec)
         runtime_dir = registered.attempt_dir / "runtime"
         try:
             report = self.instrumentation.verify(
                 poc_path=stored_poc,
-                trace_path=stored_trace,
+                analysis_path=stored_analysis,
                 plan=plan,
                 output_dir=runtime_dir,
             )
@@ -414,40 +867,11 @@ class RewardFramework:
                 instrumentation_available=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
-        if probe_error:
-            report = RawRuntimeReport(
-                exit_code=report.exit_code,
-                stdout=report.stdout,
-                stderr=report.stderr,
-                trigger_observed=report.trigger_observed,
-                stage_observations=report.stage_observations,
-                facts=report.facts + (RuntimeFact(
-                    fact_id="PROBE-PLAN-UNAVAILABLE", stage="trigger",
-                    kind="probe_plan_unavailable",
-                    statement="No source-valid passive probe plan was available for this submission.",
-                    data={"error": probe_error},
-                ),),
-                instrumentation_available=report.instrumentation_available,
-                error="; ".join(x for x in (report.error, probe_error) if x),
-                claim_results=report.claim_results,
-            )
-        assessment = (
-            assess_assertions(
-                admission=(
-                    report.stage_observations.get("admission").value
-                    if report.stage_observations.get("admission") else "unresolved"
-                ),
-                results=report.claim_results,
-                previous=previous,
-                trigger_observed=report.trigger_observed,
-            )
-            if isinstance(task.reward_spec, AssertionRewardSpec)
-            else evaluate_stages(task.reward_spec, report)
-        )
+        assessment = evaluate_stages(task.reward_spec, report)
         runtime_path = registered.attempt_dir / "current_runtime.json"
         atomic_json(runtime_path, self._runtime_dict(report, assessment))
         self._refresh_agent_view(
-            current_trace=stored_trace,
+            current_analysis=stored_analysis,
             prior_evidence=previous_path,
             current_runtime=runtime_path,
         )
@@ -455,7 +879,20 @@ class RewardFramework:
             report=report,
             assessment=assessment,
             previous=previous,
-            agent_root=self.agent_root,
+        )
+        issue_alignment_review = self._issue_alignment_review(
+            analysis_path=stored_analysis,
+            issue_description=task.issue_description,
+            assessment=assessment,
+        )
+        feedback = Feedback(
+            summary=feedback.summary + " "
+            + self._issue_alignment_feedback_text(issue_alignment_review),
+            contradiction=feedback.contradiction,
+            delta=feedback.delta,
+            evidence_ids=feedback.evidence_ids,
+            assessment=feedback.assessment,
+            issue_alignment_review=issue_alignment_review,
         )
         record = EvidenceRecord(
             candidate_id=registered.candidate_id,
@@ -490,19 +927,25 @@ class RewardFramework:
             state.terminal_reason = "trigger_success"
         self.store.save_observation(state)
         self._refresh_agent_view(
-            current_trace=stored_trace,
+            current_analysis=stored_analysis,
             prior_evidence=previous_path,
             current_runtime=runtime_path,
         )
         if not report.trigger_observed:
             self._refresh_agent_view(
-                current_trace=stored_trace,
+                current_analysis=stored_analysis,
                 prior_evidence=previous_path,
                 current_runtime=runtime_path,
             )
             factual = feedback.summary
             if feedback.contradiction:
                 factual += " " + feedback.contradiction
+            factual += (
+                " Before preparing the next candidate, compare the submitted "
+                "/workspace/analysis.json against /workspace/description.txt "
+                "across admission, source, root_cause, propagation, and sink; "
+                "revise issue_alignment together with any changed causal claims."
+            )
             self.platform.inject_message("[Runtime reward evidence] " + factual)
         response = {
             "candidate_id": registered.candidate_id,
@@ -544,8 +987,11 @@ class RewardFramework:
             return True
         self.platform.inject_message(
             "The task has not triggered the vulnerability and has not reached "
-            "its iteration limit. Continue investigating and submit runnable "
-            "candidates through submit_candidate."
+            "its iteration limit. If you have a candidate-level conclusion, "
+            "do not finish: materialize the candidate as /workspace/poc.bin, "
+            "write /workspace/analysis.json with issue_alignment against "
+            "/workspace/description.txt, and submit it through submit_candidate. "
+            "If no candidate-level conclusion exists yet, continue investigating."
         )
         state.append(
             timestamp=utc_now(), source="controller", kind="early_finish_rejected",
@@ -562,7 +1008,23 @@ class RewardFramework:
             "awaiting_verification": state.awaiting_verification,
             "submission_requested": state.submission_requested,
             "materialization_outstanding": state.materialization_outstanding,
+            "materialization_reminder_count": state.materialization_reminder_count,
+            "auto_submission_count": state.auto_submission_count,
             "trajectory_events": len(state.events),
             "candidate_stats": self.store.candidate_stats(),
             "harness": self.store.load_harness_state().to_dict(),
         }
+
+    def finalize_episode(self) -> Path:
+        """Persist a GT-free episode-local summary for inspection."""
+        state = self.store.load_observation()
+        summary = {
+            "task_id": self.store.load_task().task_id,
+            "terminal_reason": state.terminal_reason,
+            "candidate_stats": self.store.candidate_stats(),
+            "latest_evidence": self.store.load_evidence_state().to_dict(),
+            "gt_used": False,
+        }
+        path = self.store.root / "episode_summary.json"
+        atomic_json(path, summary)
+        return path

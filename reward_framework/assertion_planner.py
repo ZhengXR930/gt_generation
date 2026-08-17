@@ -1,11 +1,11 @@
-"""Deterministically compile an assertion Reward Spec into passive probes."""
+"""Compile a stage Reward Spec into passive runtime probes."""
 
 from __future__ import annotations
 
 import re
 from typing import Any
 
-from .assertion_reward import AssertionRewardSpec
+from .assertion_reward import RewardClaim, RewardSpec
 from .models import Probe, ProbePlan
 
 
@@ -24,55 +24,51 @@ def _literal(value: Any) -> tuple[bool, Any]:
     return False, None
 
 
-def plan_assertions(spec: AssertionRewardSpec) -> ProbePlan:
-    probes: list[Probe] = []
-    for item in spec.admission:
-        probes.append(Probe(
-            stage="admission", anchor_kind="issue",
-            file=item.at.file, function=item.at.function, line=item.at.line,
-            statement=None, purpose="Observe candidate input admission.",
-            claim_id=item.assertion_id, claim_kind="admission",
-        ))
-    for claim in spec.assertions:
-        left_literal, _ = _literal(claim.check.left)
-        right_literal, _ = _literal(claim.check.right)
-        if claim.kind == "transition":
-            assert claim.source is not None
-            probes.append(Probe(
-                stage="propagation", anchor_kind="issue",
-                file=claim.source.file, function=claim.source.function,
-                line=claim.source.line, statement=None,
-                captures=(() if left_literal else (str(claim.check.left),)),
-                purpose="Capture the transition producer operand.",
-                claim_id=claim.assertion_id, claim_kind=claim.kind,
-                endpoint="from", check_op=claim.check.op,
-                left_operand=claim.check.left, right_operand=claim.check.right,
-            ))
-            captures = () if right_literal else (str(claim.check.right),)
-            probes.append(Probe(
-                stage="propagation", anchor_kind="issue",
-                file=claim.at.file, function=claim.at.function,
-                line=claim.at.line, statement=None, captures=captures,
-                purpose="Capture the transition consumer operand.",
-                claim_id=claim.assertion_id, claim_kind=claim.kind,
-                endpoint="at", check_op=claim.check.op,
-                left_operand=claim.check.left, right_operand=claim.check.right,
-            ))
-            continue
-        captures = tuple(
-            str(value) for value, literal in (
-                (claim.check.left, left_literal),
-                (claim.check.right, right_literal),
-            ) if not literal
+def _captures_for_claim(claim: RewardClaim, *, endpoint: str = "at") -> tuple[str, ...]:
+    if claim.check is not None:
+        operands = (
+            (claim.check.left,) if endpoint == "from"
+            else (claim.check.right,) if endpoint == "to"
+            else (claim.check.left, claim.check.right)
         )
-        probes.append(Probe(
-            stage="root" if claim.kind == "required" else "target",
-            anchor_kind="issue", file=claim.at.file,
-            function=claim.at.function, line=claim.at.line,
-            statement=None, captures=captures,
-            purpose=f"Evaluate the {claim.kind} semantic assertion.",
-            claim_id=claim.assertion_id, claim_kind=claim.kind,
-            endpoint="at", check_op=claim.check.op,
-            left_operand=claim.check.left, right_operand=claim.check.right,
+        return tuple(str(value) for value in operands if not _literal(value)[0])
+    return tuple(claim.operands)
+
+
+def _probe(
+    claim: RewardClaim, *, endpoint: str = "at", file: str | None = None,
+    function: str | None = None, line: int | None = None,
+) -> Probe:
+    return Probe(
+        stage=claim.stage,
+        anchor_kind="issue",
+        file=file or claim.at.file,
+        function=function or claim.at.function,
+        line=line or claim.at.line,
+        statement=None,
+        captures=_captures_for_claim(claim, endpoint=endpoint),
+        purpose=f"Observe Reward Spec {claim.stage} claim {claim.claim_id}.",
+        claim_id=claim.claim_id,
+        claim_kind=claim.stage,
+        endpoint=endpoint,
+        check_op=claim.check.op if claim.check else None,
+        left_operand=claim.check.left if claim.check else None,
+        right_operand=claim.check.right if claim.check else None,
+        required=claim.required,
+    )
+
+
+def plan_assertions(spec: RewardSpec) -> ProbePlan:
+    probes: list[Probe] = []
+    for claim in spec.admission + spec.source + spec.root:
+        probes.append(_probe(claim))
+    for claim in spec.propagation_required + spec.propagation_optional:
+        assert claim.source is not None
+        probes.append(_probe(
+            claim, endpoint="from", file=claim.source.file,
+            function=claim.source.function, line=claim.source.line,
         ))
+        probes.append(_probe(claim, endpoint="to"))
+    for claim in spec.sink:
+        probes.append(_probe(claim))
     return ProbePlan(tuple(probes), ())

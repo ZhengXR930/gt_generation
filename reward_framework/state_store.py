@@ -22,6 +22,15 @@ from .models import (
 )
 
 
+def submission_bundle_sha256(poc_content: bytes, analysis_content: bytes) -> str:
+    """Stable identity for the exact candidate+analysis submission bundle."""
+    digest = hashlib.sha256()
+    for content in (poc_content, analysis_content):
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -204,14 +213,16 @@ class StateStore:
                     "by_sha256": {}, "attempts": []}
         return json.loads(path.read_text())
 
-    def register_candidate(self, *, poc_path: Path, trace_path: Path,
+    def register_candidate(self, *, poc_path: Path, analysis_path: Path,
                            checkpoint_path: Path | None = None) -> RegisteredCandidate:
         poc = poc_path.resolve()
-        trace = trace_path.resolve()
-        if not poc.is_file() or not trace.is_file():
-            raise FileNotFoundError("candidate PoC and trace must both exist")
+        analysis = analysis_path.resolve()
+        if not poc.is_file() or not analysis.is_file():
+            raise FileNotFoundError("candidate PoC and analysis.json must both exist")
         content = poc.read_bytes()
+        analysis_content = analysis.read_bytes()
         digest = hashlib.sha256(content).hexdigest()
+        bundle_digest = submission_bundle_sha256(content, analysis_content)
         index = self._index()
         attempt_number = int(index["total_submissions"]) + 1
         duplicate_of = index["by_sha256"].get(digest)
@@ -229,8 +240,8 @@ class StateStore:
 
         attempt_dir = candidate_dir / "attempts" / f"attempt_{attempt_number:04d}"
         attempt_dir.mkdir(parents=True, exist_ok=False)
-        shutil.copy2(trace, attempt_dir / "trace.json")
-        shutil.copy2(trace, candidate_dir / "latest_trace.json")
+        shutil.copy2(analysis, attempt_dir / "analysis.json")
+        shutil.copy2(analysis, candidate_dir / "latest_analysis.json")
         checkpoint_reference = None
         if checkpoint_path is not None:
             checkpoint_reference = str(checkpoint_path.resolve())
@@ -238,9 +249,10 @@ class StateStore:
             "attempt_number": attempt_number,
             "candidate_id": candidate_id,
             "sha256": digest,
+            "bundle_sha256": bundle_digest,
             "duplicate_of": duplicate_of,
             "source_poc": str(poc),
-            "source_trace": str(trace),
+            "source_analysis": str(analysis),
             "checkpoint": checkpoint_reference,
             "created_at": utc_now(),
         }
@@ -291,4 +303,12 @@ class StateStore:
         if not attempts:
             return None
         value = str(attempts[-1].get("sha256") or "").strip()
+        return value or None
+
+    def latest_submission_bundle_sha256(self) -> str | None:
+        """Return the last exact PoC+analysis bundle recorded at submission."""
+        attempts = self._index().get("attempts") or []
+        if not attempts:
+            return None
+        value = str(attempts[-1].get("bundle_sha256") or "").strip()
         return value or None

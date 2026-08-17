@@ -13,7 +13,7 @@ from .state_store import atomic_json
 
 
 class InstrumentationBackend(Protocol):
-    def verify(self, *, poc_path: Path, trace_path: Path, plan: ProbePlan,
+    def verify(self, *, poc_path: Path, analysis_path: Path, plan: ProbePlan,
                output_dir: Path) -> RawRuntimeReport: ...
 
 
@@ -47,7 +47,7 @@ def _load_stage_report(path: Path) -> tuple[dict[str, StageStatus], tuple[Runtim
         value = json.loads(path.read_text(encoding="utf-8"))
         raw_observations = value.get("stage_observations") or {}
         unknown = set(raw_observations) - {
-            "admission", "source", "root", "propagation", "target"
+            "admission", "source", "root", "propagation", "sink"
         }
         if unknown:
             raise ValueError(f"unknown stage observations: {sorted(unknown)}")
@@ -56,6 +56,7 @@ def _load_stage_report(path: Path) -> tuple[dict[str, StageStatus], tuple[Runtim
             for stage, status in raw_observations.items()
         }
         if any(status in {StageStatus.NOT_DECLARED, StageStatus.OBSERVED_BUT_BLOCKED}
+               or status == StageStatus.SPEC_OR_MAPPING_CONFLICT
                for status in observations.values()):
             raise ValueError("instrumentation cannot assign controller-owned statuses")
         facts = tuple(RuntimeFact(**item) for item in value.get("facts", []))
@@ -68,7 +69,7 @@ class CommandInstrumentationBackend:
     """Execute a candidate and optionally an external probe compiler/runner.
 
     The optional instrumentation command receives these literal placeholders:
-    ``{poc}``, ``{trace}``, ``{probe_plan}``, ``{stage_report}``, and
+    ``{poc}``, ``{analysis}``, ``{probe_plan}``, ``{stage_report}``, and
     ``{output_dir}``.  It must write a JSON stage report with controller-owned
     stage observations and runtime facts.  This keeps ARVO GDB, local harnesses,
     and future platform-specific instrumentation behind one protocol.
@@ -87,7 +88,7 @@ class CommandInstrumentationBackend:
         self.timeout = timeout
         self.trigger_oracle = trigger_oracle
 
-    def verify(self, *, poc_path: Path, trace_path: Path, plan: ProbePlan,
+    def verify(self, *, poc_path: Path, analysis_path: Path, plan: ProbePlan,
                output_dir: Path) -> RawRuntimeReport:
         output_dir.mkdir(parents=True, exist_ok=True)
         probe_path = output_dir / "probe_plan.json"
@@ -95,7 +96,7 @@ class CommandInstrumentationBackend:
         atomic_json(probe_path, plan.to_dict())
         values = {
             "poc": str(poc_path.resolve()),
-            "trace": str(trace_path.resolve()),
+            "analysis": str(analysis_path.resolve()),
             "probe_plan": str(probe_path.resolve()),
             "stage_report": str(stage_path.resolve()),
             "output_dir": str(output_dir.resolve()),
@@ -181,11 +182,11 @@ class StaticInstrumentationBackend:
         self.report = report
         self.calls: list[dict[str, Any]] = []
 
-    def verify(self, *, poc_path: Path, trace_path: Path, plan: ProbePlan,
+    def verify(self, *, poc_path: Path, analysis_path: Path, plan: ProbePlan,
                output_dir: Path) -> RawRuntimeReport:
         output_dir.mkdir(parents=True, exist_ok=True)
         self.calls.append({
-            "poc_path": str(poc_path), "trace_path": str(trace_path),
+            "poc_path": str(poc_path), "analysis_path": str(analysis_path),
             "plan": plan.to_dict(), "output_dir": str(output_dir),
         })
         atomic_json(output_dir / "static_runtime.json", {

@@ -1,15 +1,14 @@
-"""One-time public issue + source -> assertion Reward Spec initialization."""
+"""One-time public issue + source -> stage Reward Spec initialization."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .assertion_reward import RewardSpec, validate_spec_sources
 from .backend import RewardAgentBackend
-from .assertion_reward import AssertionRewardSpec, validate_spec_sources
 from .models import TaskContext
 from .source_view import (
     materialize_source_view,
@@ -33,30 +32,29 @@ an automatically generated index from the same public issue and source tree;
 read it first and inspect the relevant source files before deciding claims. Do
 not construct a PoC and do not provide repair advice.
 
-Compile a compact executable Reward Spec with:
+Return a compact executable Reward Spec with exactly these top-level fields:
+`admission`, `source`, `root`, `propagation`, and `sink`.
 
 1. `admission`: one to three alternative source locations where a real public
    API, parser, decoder, dispatcher, or in-tree fuzz driver accepts candidate
    input and dispatches/constructs the issue-relevant internal object. These
    locations are OR alternatives.
-2. `claims`: only source-defensible semantic assertions:
-   - required: a safety obligation that correct execution must satisfy. A
-     vulnerable candidate makes this check false;
-   - observed: an unsafe state that vulnerable execution makes true;
-   - transition: an ordered relation from a producer location to a later
-     consumer location. The check compares the left expression captured at
-     `from` with the right expression captured at `at`.
+2. `source`: source/input-derivation locations where issue-relevant
+   attacker-controlled fields enter internal state.
+3. `root`: vulnerable-state predicates that must hold for the issue-described
+   bug to exist at runtime.
+4. `propagation.required`: ordered producer -> consumer transitions that are
+   necessary to connect source/root to sink. Keep this sparse.
+5. `propagation.optional`: useful but non-essential propagation checkpoints.
+6. `sink`: dangerous consumption predicates where the vulnerable state is used.
 
-Use only eq, ne, lt, le, gt, ge, or same_object. Operands are strings containing
-short side-effect-free source expressions visible at the cited location, or
-literal spellings such as `0`, `true`, or `nullptr`. Do not use function calls
-or assignments. Prefer one decisive Required claim and only
-add Observed/Transition claims that the public issue and source actually
-support. Transition is optional. Do not encode Source/Root/Propagation/Target
-labels and do not predict sanitizer output. Every location must use a real
-source-relative file, function, and current line number.
-The structured `from` field is required by the output contract: set it to null
-for Required and Observed claims, and to the producer location for Transition.
+Use only eq, ne, lt, le, gt, ge, or same_object for `check`. Operands and `via`
+items are short side-effect-free source expressions visible at the cited
+location, or literal spellings such as `0`, `true`, or `nullptr`. Do not use
+function calls or assignments. Prefer one decisive root claim and one decisive
+sink claim. Leave uncertain propagation under `optional` or empty. Do not
+predict sanitizer output. Every location must use a real source-relative file,
+function, and current line number.
 
 The vulnerable source view is the source/ directory. Inspect it, but write
 citation paths relative to source/ (do not include the source/ prefix).
@@ -66,102 +64,42 @@ PUBLIC ISSUE (verbatim):
 """
 
 
-def _function_is_source_verifiable(function: str, text: str) -> bool:
-    if function == "<file>":
-        return True
-    if function in text:
-        return True
-    unqualified = function.rsplit("::", 1)[-1]
-    if unqualified in text:
-        return True
-    generated = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)_hash", function)
-    return bool(
-        generated
-        and "funcname##_hash" in text
-        and re.search(
-            rf"\bSTART\s*\(\s*{re.escape(generated.group(1))}\s*,", text
+def require_minimum_reward_spec(spec: RewardSpec) -> None:
+    """Reject structurally valid but operationally useless Reward Specs."""
+    missing = []
+    if not spec.admission:
+        missing.append("admission")
+    if not spec.source:
+        missing.append("source")
+    if not spec.root:
+        missing.append("root")
+    if not spec.sink:
+        missing.append("sink")
+    if missing:
+        raise ValueError(
+            "Reward Spec is missing required stage claims: " + ", ".join(missing)
         )
-    )
 
 
-def _canonicalize_anchor_function(function: str, text: str) -> str:
-    if _function_is_source_verifiable(function, text):
-        return function
-    cited = function.rsplit("::", 1)[-1]
-    identifiers = set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text))
-    suffixes = sorted(
-        (name for name in identifiers if cited.endswith(name) and len(name) >= 4),
-        key=len, reverse=True,
-    )
-    if suffixes and (len(suffixes) == 1 or len(suffixes[0]) > len(suffixes[1])):
-        return suffixes[0]
-    # Reward Spec is a soft task hypothesis.  Preserve source-verifiable file
-    # evidence when the model's function spelling cannot be repaired; exact
-    # executable locations remain mandatory in the later Probe Plan.
-    return "<file>"
-
-
-def validate_legacy_spec_sources(spec, source_root: Path) -> None:
-    source_root = source_root.resolve()
-    for stage, anchors in spec.evidence.items():
-        for anchor in anchors:
-            path = (source_root / anchor.file).resolve()
-            if source_root not in path.parents or not path.is_file():
-                raise ValueError(f"{stage} evidence escapes source view: {anchor.file}")
-            text = path.read_text(encoding="utf-8", errors="replace")
-            if not _function_is_source_verifiable(anchor.function, text):
-                raise ValueError(
-                    f"{stage} function {anchor.function!r} absent from {anchor.file}"
-                )
-
-
-def canonicalize_spec_sources(spec, source_root: Path):
-    evidence = {}
-    for stage, anchors in spec.evidence.items():
-        normalized = []
-        for anchor in anchors:
-            file = resolve_public_source_path(
-                source_root, anchor.file, anchor.function
-            )
-            text = (source_root / file).read_text(
-                encoding="utf-8", errors="replace"
-            )
-            normalized.append(type(anchor)(
-                file=file,
-                function=_canonicalize_anchor_function(anchor.function, text),
-                fact=anchor.fact,
-            ))
-        evidence[stage] = tuple(normalized)
-    return type(spec)(dict(spec.claims), evidence)
-
-
-def canonicalize_assertion_sources(
-    spec: AssertionRewardSpec, source_root: Path,
-) -> AssertionRewardSpec:
+def canonicalize_spec_sources(spec: RewardSpec, source_root: Path) -> RewardSpec:
     """Repair only unambiguous wrapper/path spellings in model citations."""
     value = spec.to_dict()
-    value["admission"] = [
-        {
-            **item,
-            "at": {
-                **item["at"],
+    for stage in ("admission", "source", "root", "sink"):
+        normalized = []
+        for item in value[stage]:
+            copied = dict(item)
+            copied["at"] = {
+                **copied["at"],
                 "file": resolve_public_source_path(
-                    source_root, item["at"]["file"], item["at"]["function"]
+                    source_root, copied["at"]["file"], copied["at"]["function"]
                 ),
-            },
-        }
-        for item in value["admission"]
-    ]
-    normalized_claims = []
-    for item in value["claims"]:
-        copied = dict(item)
-        copied["at"] = {
-            **copied["at"],
-            "file": resolve_public_source_path(
-                source_root, copied["at"]["file"], copied["at"]["function"]
-            ),
-        }
-        if copied.get("from"):
+            }
+            normalized.append(copied)
+        value[stage] = normalized
+    for group in ("required", "optional"):
+        normalized = []
+        for item in value["propagation"][group]:
+            copied = dict(item)
             copied["from"] = {
                 **copied["from"],
                 "file": resolve_public_source_path(
@@ -170,9 +108,17 @@ def canonicalize_assertion_sources(
                     copied["from"]["function"],
                 ),
             }
-        normalized_claims.append(copied)
-    value["claims"] = normalized_claims
-    return AssertionRewardSpec.from_dict(value)
+            copied["to"] = {
+                **copied["to"],
+                "file": resolve_public_source_path(
+                    source_root,
+                    copied["to"]["file"],
+                    copied["to"]["function"],
+                ),
+            }
+            normalized.append(copied)
+        value["propagation"][group] = normalized
+    return RewardSpec.from_dict(value)
 
 
 class SpecAgent:
@@ -185,7 +131,7 @@ class SpecAgent:
         if self.cache_root is None:
             return None
         material = json.dumps({
-            "schema_version": 3,
+            "schema_version": 4,
             "issue": issue,
             "source_manifest_sha256": manifest,
             "spec_prompt_sha256": hashlib.sha256(
@@ -210,7 +156,8 @@ class SpecAgent:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             if set(cached) != {"reward_spec"}:
                 raise ValueError(f"invalid Reward Spec cache entry: {cache_path}")
-            spec = AssertionRewardSpec.from_dict(cached["reward_spec"])
+            spec = RewardSpec.from_dict(cached["reward_spec"])
+            require_minimum_reward_spec(spec)
             validate_spec_sources(spec, source_view)
             return TaskContext(
                 task_id=task_id,
@@ -236,19 +183,11 @@ class SpecAgent:
                 role="initialize_spec" if attempt == 0 else "repair_spec",
                 prompt=base_prompt + correction,
                 schema=SCHEMA,
-                # Every Reward-Agent role shares one durable Codex session, so
-                # its working root is stable for the entire episode.
                 cwd=agent_root,
             )
             try:
-                spec = canonicalize_assertion_sources(
-                    AssertionRewardSpec.from_dict(raw), source_view
-                )
-                if not spec.constructable:
-                    raise ValueError(
-                        "the assertion Spec is empty despite a non-empty public issue; "
-                        "inspect the public source and express defensible assertions"
-                    )
+                spec = canonicalize_spec_sources(RewardSpec.from_dict(raw), source_view)
+                require_minimum_reward_spec(spec)
                 validate_spec_sources(spec, source_view)
                 break
             except (ValueError, TypeError) as exc:

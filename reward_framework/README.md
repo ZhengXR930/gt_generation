@@ -1,191 +1,147 @@
 # GT-Free Reward Framework
 
-This package separates task-local runtime reward from cross-sample OpenHands
-harness evolution. Ground truth is never materialized in an Agent view and is
-not an optimization signal.
+This package implements an episode-local reward loop for vulnerability
+reproduction. It does not optimize or patch OpenHands. The controller
+intervention is a platform-neutral supervisor that observes the trajectory,
+requests submission when a runnable candidate appears ready, and gates
+unfocused actions while that candidate is being materialized.
 
-The method has a task-local assertion protocol and a platform-neutral ordered
-control graph. The assertion protocol consists of alternative Admission
-locations plus Required safety obligations, Observed unsafe-state predicates,
-and optional ordered Transition predicates. The control graph (`Activation ->
-Availability -> Consumption -> Progress -> Success`) identifies the first
-broken feedback boundary. Episode analysis persists that result as
-`stage_control`; the cross-sample Patcher may act only on the earliest
-harness-owned blocked stage, never on a downstream symptom or on Subject causal
-stagnation by itself.
-
-## Two time scales
-
-```text
-one episode (frozen harness_vN)
-issue + vulnerable source -> Reward Spec
-Subject trajectory -> submit_candidate -> checkpoint
-PoC + trace -> assertion probes -> deterministic assessment -> factual Reward
-trigger success or iteration limit
-                         |
-                         v
-episode-end deterministic metrics + Codex Experience Analyzer
-                         |
-                         v
-append-only cross-sample Experience Pool
-                         |
-                         v
-Codex Harness Patcher -> isolated OpenHands fork -> validate/rollback
-                         |
-                         v
-next process loads harness_vN+1
-```
-
-The harness is immutable for every retry belonging to one sample. There is no
-in-episode source patch, process restart, or policy hot swap.
-
-## Subject-model recovery
-
-Reward-harness runs bound every Subject-model request and use OpenHands' native
-in-place retry loop. Defaults are 90 seconds and three total attempts with
-bounded exponential backoff. A transient failure and its later recovery are
-persisted as `subject_llm_retryable_error` and `subject_llm_recovered` events.
-If every attempt fails, the episode is marked `episode_aborted` and is excluded
-from the cross-sample experience pool.
-
-The defaults can be overridden with
-`REWARD_FRAMEWORK_SUBJECT_LLM_TIMEOUT`,
-`REWARD_FRAMEWORK_SUBJECT_LLM_ATTEMPTS`,
-`REWARD_FRAMEWORK_SUBJECT_LLM_RETRY_MIN_WAIT`, and
-`REWARD_FRAMEWORK_SUBJECT_LLM_RETRY_MAX_WAIT`. Baseline evaluation does not use
-these reward-harness settings.
+Ground truth is never materialized in the Reward Agent view and is not used by
+the reward loop.
 
 ## Information boundary
 
-The task-local Reward Agent sees only:
+The Reward Agent sees only:
 
-- public issue description;
-- vulnerable codebase;
-- Subject trajectory and submitted fine trace;
+- the public issue description;
+- the vulnerable source codebase;
+- the Subject trajectory recorded during this episode;
+- the submitted `analysis.json` for the exact candidate;
 - candidate execution and passive runtime facts;
 - earlier evidence from the same episode.
 
 It does not see GT fine traces, invariant graphs, known PoCs, historical crash
-states, held-out results, patches, or sanitizer traces supplied by the dataset.
+states, held-out results, dataset sanitizer traces, or evaluation reports.
 
-The cross-sample Harness Patcher consumes the same canonical training
-trajectory after an episode completes. Its isolated view contains:
+## Reward Spec
 
-- a complete isolated OpenHands source fork;
-- the frozen full Subject trajectory, including factual Reward interactions;
-- a value-free control-plane index into important lifecycle boundaries;
-- generalized episode metrics and prior error history;
-- prior harness version and Patch effectiveness.
+The Reward Spec is generated once per sample from public issue + codebase and
+has this fixed shape:
 
-Training trajectories can contain the public task semantics and source/tool
-output already observed by the Subject. The Patcher does not receive GT,
-known-success PoCs, hidden dataset sanitizer ground truth, or held-out episode
-results. It cannot modify its trajectory/experience inputs, and source
-validation rejects dataset-specific literals in a proposed OpenHands Patch.
-
-## Task-local state
-
-Each episode state directory contains:
-
-- `task_context.json`: immutable issue, source manifest, and Reward Spec;
-- `trajectory_state.json`: complete platform-neutral trajectory;
-- `evidence_state.json`: attempts, runtime facts, causal progress, and errors;
-- `harness_state.json`: the frozen OpenHands fork version used by the episode;
-- `candidates/`: content-deduplicated PoCs and every submission/checkpoint;
-- `evidence/`: immutable runtime/assessment/feedback record per attempt;
-- `episode_experience.json`: GT-free end-of-episode experience card;
-- `cross_sample_update.json`: pool append and next harness version result.
-
-## Reward Agent
-
-A single logical read-only Reward Agent serves four task-local roles, but its
-memory is the controller-owned files above rather than an unbounded model
-conversation. Each model turn is fresh and ephemeral, reads the current
-observation/evidence state, and therefore cannot fail because an old Codex
-thread needs pre-sampling compaction:
-
-1. compile Admission and Required/Observed/Transition assertions from public
-   issue plus source;
-2. observe the full trajectory and request submission at semantic readiness;
-3. compile the frozen task assertions into source-valid passive probes;
-4. turn trusted runtime evidence into factual, non-prescriptive feedback.
-
-Assertion truth and polarity remain deterministic and controller-owned. A
-Required assertion describes a safety obligation, so violation is vulnerable
-progress; Observed and Transition assertions describe vulnerable facts, so
-satisfaction is vulnerable progress. Admission alternatives use OR. Absence of
-runtime evidence is `unresolved`, never silently treated as refutation.
-
-## Experience Pool and multi-objective optimization
-
-Every completed episode contributes exact metrics for:
-
-- trigger success;
-- no-submission behavior and first-submission sequence;
-- semantic supervisor reminders, artifact-preparation reminders, and formal
-  submission reminders;
-- valid submissions occurring after a reminder and episodes where reminders
-  never produce a candidate;
-- total, unique, duplicate, and invalid submissions;
-- Reward events followed by Subject action;
-- distinct retries after Reward;
-- ordered causal progress;
-- instrumentation unavailability and premature finish attempts.
-
-The Experience Analyzer may classify only enumerated, evidence-bound categories
-such as `missing_submission`, `candidate_materialization_failure`,
-`duplicate_candidate_loop`,
-`reward_context_loss`, `productive_retry`, or `causal_stagnation`. The pool
-stores successes as controls as well as failures. Harness optimization targets
-submission conversion only after the semantic observer reports readiness; raw
-reminder or submission count is never an objective, and duplicate/invalid
-submission rates act as counter-objectives against over-eager submission.
-The compact pool index references a frozen canonical trajectory for every
-training episode. Control-plane records are navigation indexes, not substitutes
-for the full trajectory and not additional model-generated traces.
-
-## Cross-sample Harness Patcher
-
-A separate workspace-write Codex role runs only after an episode ends. Every
-patch deliberation starts in a fresh ephemeral model context and receives the
-GT-free Experience Pool, referenced full training trajectories, previous error
-history, and the current isolated OpenHands worktree; these controller-owned
-files, not hidden conversation history, are its cross-sample memory. It may change real files
-under OpenHands controller, CodeAct, memory, core loop, and prompt source. A
-bounded proposal/contract-error/redeliberation loop rejects silent `keep`
-decisions for high-confidence controller-owned failures. The controller checks:
-
-- changed files exactly match the structured declaration;
-- the Patch stays inside the allowed OpenHands harness surface;
-- Python files parse and files are not deleted;
-- no dataset/result/GT literals appear;
-- controller-owned Experience Pool and trajectory inputs remain unchanged.
-
-Rejected changes restore the complete pre-Patch worktree. Accepted changes are
-stored as a unified diff, changed-file snapshot, metadata, and a monotonically
-increasing harness version. The next sample receives a frozen copy through
-`PYTHONPATH`; pristine baseline evaluation still imports the untouched upstream
-checkout.
-
-## Experimental variants
-
-```bash
-# untouched formal baseline
-python poc_generation/poc_generator/run_sample.py ... --harness-profile baseline
-
-# complete method: Reward plus GT-free cross-sample harness evolution
-python poc_generation/poc_generator/run_sample.py ... \
-  --harness-profile reward \
-  --harness-training-dir /path/to/shared_training_state
-
-# the same complete method in held-out validation/test mode
-python poc_generation/poc_generator/run_sample.py ... \
-  --harness-profile reward \
-  --freeze-harness-updates \
-  --harness-training-dir /path/to/frozen_training_state
+```json
+{
+  "admission": [],
+  "source": [],
+  "root": [],
+  "propagation": {
+    "required": [],
+    "optional": []
+  },
+  "sink": []
+}
 ```
 
-There are only two experimental variants: `baseline` and `reward`. Use
-sequential training samples for `reward`: the next sample is the unit that
-consumes an accepted harness update. `--freeze-harness-updates` is a lifecycle
-control for validation/test, not a third method variant.
+The dimensions are aligned with the deterministic evaluator:
+
+- `admission`: the input is accepted by the real parser/API/driver and
+  converted into the issue-relevant internal object.
+- `source`: attacker-controlled issue-relevant data enters internal state.
+- `root`: the vulnerable state predicate is established.
+- `propagation.required`: sparse necessary transitions connecting the state to
+  consumption.
+- `propagation.optional`: diagnostic transitions that must not gate feedback.
+- `sink`: the vulnerable state is consumed by an issue-relevant dangerous
+  operation.
+
+Every claim cites source-relative file/function/line. Root and sink claims use
+a side-effect-free `check` over source-visible operands. Propagation claims use
+`from`, `to`, and `via`, with an optional `check`.
+
+## Candidate submission
+
+The Subject Agent should materialize every runnable candidate at the standard
+workspace paths:
+
+- `/workspace/poc.bin`
+- `/workspace/analysis.json`
+
+The controller automatically submits each new PoC+analysis bundle exactly once.
+The Subject may also submit explicitly through the first-class tool:
+
+```json
+{"poc_path": "/workspace/poc.bin", "analysis_path": "/workspace/analysis.json"}
+```
+
+`analysis.json` must be the same artifact used by formal evaluation:
+
+```json
+{
+  "sample_id": "...",
+  "fine_trace": [],
+  "vuln_logic": {}
+}
+```
+
+The framework rejects incomplete causal analyses at submission time. A valid
+analysis must bind the source, root-cause, sink, and propagation claims to
+role-marked `fine_trace` steps, including operands and required relations for
+root and sink. It must also include `vuln_logic.issue_alignment` comparing the
+candidate's admission, source, root-cause, propagation, and sink claims against
+the public issue description. The framework checkpoints every valid submission,
+content-deduplicates PoCs, runs the candidate, records runtime facts, and
+returns factual feedback if the trigger oracle did not fire.
+
+## Supervisor
+
+The supervisor is not a harness optimizer and does not modify OpenHands. Its
+high-level decisions are:
+
+- `continue`
+- `request_submission`
+
+If the workspace already contains a new `poc.bin` plus `analysis.json`, the
+harness submits it directly before spending another Subject model turn. If the
+trajectory indicates a concrete runnable hypothesis but artifacts are absent,
+the request becomes a candidate-materialization checkpoint. The Subject may
+still inspect exact local source lines, confirm the local harness interface,
+write artifacts, and run local sanity checks. Broad exploration, external
+browsing/downloads, legacy `submit.sh` use, and unrelated searches are blocked
+until the current candidate is materialized or submitted. The reminder and gate
+do not include vulnerability advice.
+
+## Feedback
+
+Feedback reports:
+
+- the longest confirmed stage prefix;
+- the first unresolved boundary;
+- trusted contradictions, if any;
+- stage-status change from the previous distinct candidate;
+- whether the independent runtime trigger oracle fired.
+
+Feedback is non-prescriptive. It must not suggest bytes, field values, commands,
+patches, next steps, or a complete PoC.
+
+## OpenHands usage
+
+The normal evaluation runner remains under `poc_generation/` and only launches
+the baseline OpenHands evaluator. Reward mode is selected only by a
+reward-framework-owned launcher or environment that points OpenHands at
+`reward_framework.openhands_entrypoint`.
+
+Isolation rules:
+
+- `external/OpenHands` remains the pinned pristine checkout for normal
+  OpenHands evaluation.
+- `poc_generation` does not select the reward entrypoint, create
+  `.reward_framework`, rewrite `README.md`/`submit.sh`, or persist reward
+  framework state in normal results.
+- The reward entrypoint refuses to run unless a reward-owned launcher selects
+  the reward profile and sets `OPENHANDS_REWARD_FRAMEWORK=1`.
+- Reward workspace changes, native submit tooling, feedback, and supervisor
+  gates must stay inside `reward_framework`.
+
+The current OpenHands evaluation flow writes one top-level
+`poc_generation/poc_results/<model>/<sample>/analysis.json`. When a PoC is
+submitted, the matching per-submission `analysis.json` is also saved and
+reachability can be executed immediately, avoiding a second Docker pull.
