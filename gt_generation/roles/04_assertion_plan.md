@@ -41,6 +41,12 @@ are immutable inputs.
    fixed execution or in the single fixed perturbation after a guard. Do not use
    a predicate that the vulnerable runtime already satisfies, even if it names
    the right function or operands.
+   Before writing the spec, make a two-column mental matrix for the proposed
+   required predicate:
+   `vulnerable original -> refuted` and `fixed original/one guarded
+   perturbation -> satisfied`. If the vulnerable trace already satisfies the
+   predicate, or if both sides are expected to have the same truth value, the
+   assertion is not a root obligation and must be redesigned.
 4. Record every assertion operand in `field_bindings.json` as an exact
    vulnerable-source expression. Record every synthetic event in
    `event_locations.json` with its real vulnerable-source function, file, and
@@ -65,6 +71,59 @@ the vulnerable execution using the accepted fine trace, sanitizer trace, and
 vulnerable source.
 For a guarded fix, `protects` names the dangerous operation whose absence will
 be distinguished during execution.
+
+## Assertion semantics hard rules
+
+These rules are structural, not stylistic. Violating one of them produces an
+unusable GT package.
+
+1. `required` is the only vulnerable/fixed differential assertion. It must be a
+   source-level safety obligation that the vulnerable original violates and the
+   fixed side satisfies or guards. It is not an observed bad-state fact and not
+   a restatement that execution reached the right function.
+2. If the accepted vulnerable trace shows the proposed required predicate is
+   already true, reject it. Example: if runtime events show `throw_flag=0`,
+   then `eq($sink.throw_flag, $sink.false_literal)` cannot be the missing root
+   obligation for that witness.
+3. `observed` assertions describe facts that hold in the real vulnerable
+   execution. Both operands after the operator must be `$event.field` strings.
+   Do not compare an observed assertion to an inline literal such as `1000000`,
+   `0`, `NULL`, or a heap address. If the semantic fact is "huge remaining
+   length", express it as a source-derived relation such as
+   `gt($sink.str_size, $root.off)` and bind both fields.
+4. `transition` assertions verify propagation between two events. They must
+   have `from`, `at`, and a check that directly relates one `$from_event.field`
+   to one `$at_event.field`. Do not use constants, PoC byte counts, allocator
+   addresses, or unrelated fields.
+5. Required assertions may use literals only when the literal is a source-level
+   safety value: a real source literal, macro, enum, sentinel, NULL/0 boolean,
+   or a consciously chosen wrap/bounds threshold justified in the node
+   description and field bindings. Never invent a numeric threshold merely to
+   make an observed assertion pass.
+6. If no source-derived field-to-field observed/transition relation can be
+   written for a candidate node or edge, omit that node/edge from the candidate
+   graph. Keep the root required differential correct instead of forcing
+   propagation coverage.
+7. If the trace review selected the wrong root/sink relation, rewrite the GT
+   semantics in `candidate_invariants.json` to the relation actually proven by
+   source and runtime. Do not preserve a wrong `op/left/right` just because it
+   appeared in an earlier draft.
+
+Use the verifier's operand grammar literally:
+
+```json
+{"kind": "observed", "check": ["gt", "$sink.str_size", "$root.off"]}
+{"kind": "transition", "from": "source", "at": "sink",
+ "check": ["eq", "$source.ptr", "$sink.ptr"]}
+```
+
+The following shapes are invalid:
+
+```json
+{"kind": "observed", "check": ["gt", "$sink.str_size", 1000000]}
+{"kind": "transition", "from": "source", "at": "sink",
+ "check": ["eq", "$source.ptr", 0]}
+```
 
 ## GT Contract Outputs
 
