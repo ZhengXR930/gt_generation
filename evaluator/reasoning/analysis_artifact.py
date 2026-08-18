@@ -528,8 +528,13 @@ def validate_vuln_logic(response: str) -> str | None:
     if logic is None:
         return "vuln_logic must be one bare JSON object"
     expected = {"source", "root_cause", "sink", "propagation"}
-    if set(logic) != expected:
-        return "vuln_logic must contain exactly source, root_cause, sink, and propagation"
+    allowed = expected | {"issue_alignment"}
+    keys = set(logic)
+    if not expected <= keys or not keys <= allowed:
+        return (
+            "vuln_logic must contain source, root_cause, sink, propagation, "
+            "and optional issue_alignment"
+        )
     error = _location_error(logic.get("source"), "source", require_relation=False)
     if error:
         return error
@@ -566,6 +571,19 @@ def validate_vuln_logic(response: str) -> str | None:
             error = _relation_error(edge.get("relation"), f"{prefix}.relation")
             if error:
                 return error
+    if "issue_alignment" in logic:
+        alignment = logic.get("issue_alignment")
+        expected_alignment = {"admission", "source", "root_cause", "propagation", "sink"}
+        if not isinstance(alignment, dict):
+            return "issue_alignment must be an object"
+        if set(alignment) != expected_alignment:
+            return (
+                "issue_alignment must contain exactly admission, source, "
+                "root_cause, propagation, and sink"
+            )
+        for field in sorted(expected_alignment):
+            if not isinstance(alignment.get(field), str) or not alignment[field].strip():
+                return f"issue_alignment.{field} must be a non-empty string"
     return None
 
 

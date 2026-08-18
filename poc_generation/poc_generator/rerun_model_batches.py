@@ -25,12 +25,20 @@ for import_root in (GT_ROOT, GT_ROOT / "evaluator"):
 RESULTS_ROOT = HERE.parent / "poc_results"
 LOG_ROOT = RESULTS_ROOT / "_batch_logs"
 LOCK_ROOT = RESULTS_ROOT / "_sample_locks"
-RUN_SAMPLE = HERE / "run_sample.py"
-RUN_LOCAL_SAMPLE = HERE / "run_local_sample.py"
+OPENHANDS_BACKEND = HERE / "openhands_backend"
+DSH_BACKEND = HERE / "dsh"
+RUN_SAMPLE = OPENHANDS_BACKEND / "run_sample.py"
+RUN_LOCAL_SAMPLE = OPENHANDS_BACKEND / "run_local_sample.py"
+RUN_DEEPSEEK_HARNESS_LOCAL_SAMPLE = DSH_BACKEND / "run_deepseek_harness_local_sample.py"
+RUN_DEEPSEEK_HARNESS_ARVO_SAMPLE = DSH_BACKEND / "run_deepseek_harness_arvo_sample.py"
 
 
 def sample_environment(config: dict) -> dict[str, str]:
     env = os.environ.copy()
+    tmp_root = str(config.get("tmp_root") or "").strip()
+    if tmp_root:
+        Path(tmp_root).mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = tmp_root
     runtime_network = str(config.get("openhands_runtime_docker_network") or "").strip()
     if runtime_network:
         env["OPENHANDS_RUNTIME_DOCKER_NETWORK"] = runtime_network
@@ -176,6 +184,21 @@ def has_valid_analysis(result_dir: Path) -> bool:
     )
 
 
+def analysis_requirement_satisfied(result_dir: Path, manifest: dict) -> bool:
+    if has_valid_analysis(result_dir):
+        return True
+    if manifest.get("evaluation_protocol") == "poc_analysis_artifact_per_submission_v3_dsh_arvo":
+        attempts = manifest.get("submission_attempts") or []
+        if not attempts:
+            return False
+        return all(
+            bool(attempt.get("analysis_path"))
+            and (result_dir / str(attempt["analysis_path"])).is_file()
+            for attempt in attempts
+        )
+    return False
+
+
 def submission_files_complete(result_dir: Path, manifest: dict, *, local: bool) -> bool:
     # Historical v2 result packages often preserved only poc.bin plus the
     # per-submission analysis artifact; reachability replays PoCs later and
@@ -193,10 +216,10 @@ def submission_files_complete(result_dir: Path, manifest: dict, *, local: bool) 
             return False
         required = {
             "poc.bin",
-            "analysis.json",
             "result.json",
             "runtime_output.txt",
         }
+        required.add("analysis.json")
         if not local:
             required.add("request.json")
         if not all((attempt_dir / name).is_file() for name in required):
@@ -219,6 +242,8 @@ def submission_files_complete(result_dir: Path, manifest: dict, *, local: bool) 
             "representative_runtime_output_path",
         ):
             relative_path = poc.get(key)
+            if relative_path and (result_dir / relative_path).is_file():
+                continue
             if not relative_path or not (result_dir / relative_path).is_file():
                 return False
     return True
@@ -236,7 +261,7 @@ def result_is_complete(result_dir: Path) -> bool:
         return False
     if manifest.get("status") not in COMPLETE_STATUSES:
         return False
-    if not has_valid_analysis(result_dir):
+    if not analysis_requirement_satisfied(result_dir, manifest):
         return False
     if not (result_dir / "checkpoint").is_dir():
         return False
@@ -255,7 +280,7 @@ def local_result_is_complete(result_dir: Path) -> bool:
         return False
     if manifest.get("status") not in COMPLETE_STATUSES:
         return False
-    if not has_valid_analysis(result_dir):
+    if not analysis_requirement_satisfied(result_dir, manifest):
         return False
     if not (result_dir / "checkpoint").is_dir():
         return False
@@ -264,6 +289,7 @@ def local_result_is_complete(result_dir: Path) -> bool:
 
 def run_one(config: dict, sample_id: str) -> dict:
     namespace = config["results_namespace"]
+    backend = str(config.get("backend") or "openhands")
     LOCK_ROOT.mkdir(parents=True, exist_ok=True)
     lock_path = LOCK_ROOT / f"{sample_id}.lock"
     with lock_path.open("w", encoding="utf-8") as lock_file:
@@ -287,7 +313,66 @@ def run_one(config: dict, sample_id: str) -> dict:
         log_dir = LOG_ROOT / namespace
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{sample_id}.log"
-        if is_arvo:
+        if backend == "deepseek_harness":
+            if is_arvo:
+                command = [
+                    sys.executable,
+                    str(RUN_DEEPSEEK_HARNESS_ARVO_SAMPLE),
+                    "--arvo-id",
+                    remove_prefix(sample_id, "arvo_"),
+                    "--max-iter",
+                    str(config["max_iter"]),
+                    "--server",
+                    config["server"],
+                    "--difficulty",
+                    config["difficulty"],
+                    "--timeout",
+                    str(config.get("timeout", 7200)),
+                    "--model",
+                    config["model"],
+                    "--base-url",
+                    config.get("base_url", ""),
+                    "--api-key-env",
+                    config["api_key_env"],
+                    "--results-dir",
+                    str(RESULTS_ROOT / namespace),
+                    "--max-attempts",
+                    str(config.get("max_attempts", 1)),
+                ]
+            else:
+                command = [
+                    sys.executable,
+                    str(RUN_DEEPSEEK_HARNESS_LOCAL_SAMPLE),
+                    "--sample-id",
+                    sample_id,
+                    "--max-iter",
+                    str(config["max_iter"]),
+                    "--timeout",
+                    str(config.get("timeout", 7200)),
+                    "--model",
+                    config["model"],
+                    "--base-url",
+                    config.get("base_url", ""),
+                    "--api-key-env",
+                    config["api_key_env"],
+                    "--results-dir",
+                    str(RESULTS_ROOT / namespace),
+                ]
+            if config.get("dsh_src"):
+                command.extend(["--dsh-src", str(config["dsh_src"])])
+            if config.get("dsh_node_root"):
+                command.extend(["--node-root", str(config["dsh_node_root"])])
+            if config.get("dsh_home"):
+                command.extend(["--dsh-home", str(config["dsh_home"])])
+            if config.get("dsh_scratch_root"):
+                command.extend(["--scratch-root", str(config["dsh_scratch_root"])])
+            if config.get("reasoning_effort"):
+                command.extend(
+                    ["--reasoning-effort", str(config["reasoning_effort"])]
+                )
+            if config.get("allow_tool_network"):
+                command.append("--allow-tool-network")
+        elif is_arvo:
             command = [
                 sys.executable, str(RUN_SAMPLE), "--arvo-id",
                 remove_prefix(sample_id, "arvo_"), "--max-iter",
@@ -298,9 +383,13 @@ def run_one(config: dict, sample_id: str) -> dict:
                 "--results-dir", str(RESULTS_ROOT / namespace), "--max-attempts",
                 str(config.get("max_attempts", 1)),
             ]
-            command.extend(
-                ["--harness-profile", str(config.get("harness_profile") or "baseline")]
-            )
+            harness_profile = str(config.get("harness_profile") or "baseline")
+            if harness_profile != "baseline":
+                raise RuntimeError(
+                    "poc_generation no longer launches reward harness profiles; "
+                    "use reward_framework independently"
+                )
+            command.extend(["--harness-profile", "baseline"])
         else:
             command = [
                 sys.executable, str(RUN_LOCAL_SAMPLE), "--sample-id", sample_id,

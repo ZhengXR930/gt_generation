@@ -1,0 +1,1 @@
+"""BrowserGym core compatibility namespace."""

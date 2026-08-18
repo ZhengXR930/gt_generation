@@ -50,7 +50,10 @@ def select_samples(config: dict) -> list[str]:
         return selected
     if selector != "strict_non_arvo_runtime_recoverable":
         raise ValueError(f"unknown sample_selector: {selector}")
-    from run_local_sample import GT_ROOT as LOCAL_GT_ROOT, load_runtime_spec
+    from openhands_backend.run_local_sample import (
+        GT_ROOT as LOCAL_GT_ROOT,
+        load_runtime_spec,
+    )
 
     selected = []
     for result_dir in sorted(LOCAL_GT_ROOT.joinpath("gt_results").iterdir()):
