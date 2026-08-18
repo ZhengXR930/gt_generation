@@ -39,7 +39,10 @@ _REL_OPS = {"eq", "ne", "lt", "le", "gt", "ge", "same_object"}
 SCHEMA = """Return exactly one JSON object with exactly these top-level keys:
 sample_id, fine_trace, vuln_logic.
 
-fine_trace: ordered project-source causal path. Use 3 to 8 steps only:
+fine_trace: ordered vulnerable-implementation-source causal path. Use 3 to 8
+steps only. Harness/test/fuzz frames may appear only as unscored intermediate
+context when needed; they must not be source, root_cause, sink, or vuln_logic
+propagation endpoints:
 source, root_cause, sink, plus only indispensable intermediate steps. Do not
 expand loops, repeated call chains, or every observed action. Each step has:
 step:int, file:string, function:string, line:int|null, var:string, code:string,
@@ -59,8 +62,12 @@ vuln_logic:
   steps and each from/to endpoint must include operands: non-empty string array.
   type is data, control, or order. via is non-empty string array.
 
-Use vulnerable project source only. Do not cite README, analysis files,
-checkpoint files, runtime logs, harness/test/fuzz setup, or old results.
+Use vulnerable implementation source only for source/root_cause/sink and
+vuln_logic propagation endpoints. Do not cite README, description.txt, analysis
+files, checkpoint files, runtime logs, harness/test/fuzz setup, build/setup
+wrappers, or old results as scored anchors. If input first appears only in a
+harness, keep that step intermediate and choose the first downstream vulnerable
+implementation statement as source.
 """
 
 

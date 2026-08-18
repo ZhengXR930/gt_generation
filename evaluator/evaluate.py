@@ -10,6 +10,7 @@ from typing import Any
 from evaluator.compiled_graph import compile_invariant_graph
 from evaluator.reasoning.analysis_artifact import (
     parse_analysis_artifact,
+    validate_analysis_artifact,
     validate_analysis_artifact_quality,
 )
 from evaluator.reasoning.vuln_logic_scoring import score_vuln_logic
@@ -66,11 +67,19 @@ def audit_gt() -> dict[str, Any]:
     }
 
 
-def evaluate_sample(model: str, sample_dir: Path) -> dict[str, Any]:
+def evaluate_sample(
+    model: str,
+    sample_dir: Path,
+    *,
+    require_analysis_quality: bool = True,
+) -> dict[str, Any]:
     sample_id = sample_dir.name
     gt_dir = GT_RESULTS / sample_id
     result: dict[str, Any] = {"model": model, "sample_id": sample_id}
-    logic = _load_vuln_logic(sample_dir)
+    logic, quality_error = _load_vuln_logic(
+        sample_dir,
+        require_quality=require_analysis_quality,
+    )
     if logic is not None:
         try:
             result["reasoning"] = score_vuln_logic(
@@ -78,6 +87,8 @@ def evaluate_sample(model: str, sample_dir: Path) -> dict[str, Any]:
                 logic,
                 gt_dir=gt_dir,
             )
+            if quality_error:
+                result["reasoning"]["analysis_quality_error"] = quality_error
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             result["reasoning"] = {
                 "unavailable": f"vuln_logic scoring failed: {type(exc).__name__}: {exc}"
@@ -197,16 +208,25 @@ def evaluate_sample(model: str, sample_dir: Path) -> dict[str, Any]:
     return result
 
 
-def _load_vuln_logic(sample_dir: Path) -> dict[str, Any] | None:
+def _load_vuln_logic(
+    sample_dir: Path,
+    *,
+    require_quality: bool = True,
+) -> tuple[dict[str, Any] | None, str | None]:
     analysis_path = sample_dir / "analysis.json"
     if analysis_path.is_file():
         text = analysis_path.read_text(encoding="utf-8")
-        if validate_analysis_artifact_quality(text) is not None:
-            return None
+        quality_error = validate_analysis_artifact_quality(text)
+        if require_quality and quality_error is not None:
+            return None, quality_error
+        if quality_error is not None:
+            structure_error = validate_analysis_artifact(text)
+            if structure_error is not None:
+                return None, structure_error
         value = parse_analysis_artifact(text)
         logic = value.get("vuln_logic") if value is not None else None
-        return logic if isinstance(logic, dict) else None
-    return None
+        return (logic, quality_error) if isinstance(logic, dict) else (None, quality_error)
+    return None, None
 
 
 def _saved_gdb_ledger_error(output_dir: Path) -> str | None:
@@ -230,7 +250,12 @@ def _saved_gdb_ledger_error(output_dir: Path) -> str | None:
     return None
 
 
-def evaluate_batch(models: list[str], samples: set[str]) -> dict[str, Any]:
+def evaluate_batch(
+    models: list[str],
+    samples: set[str],
+    *,
+    require_analysis_quality: bool = True,
+) -> dict[str, Any]:
     rows = []
     for model in models:
         model_dir = POC_RESULTS / model
@@ -239,7 +264,13 @@ def evaluate_batch(models: list[str], samples: set[str]) -> dict[str, Any]:
                 continue
             if not (GT_RESULTS / sample_dir.name / "verified_assertions.json").is_file():
                 continue
-            rows.append(evaluate_sample(model, sample_dir))
+            rows.append(
+                evaluate_sample(
+                    model,
+                    sample_dir,
+                    require_analysis_quality=require_analysis_quality,
+                )
+            )
     return {
         "evaluation_protocol": "unified-invariant-location-evaluation-v3",
         "models": models,
@@ -472,6 +503,14 @@ def _propagation_chain_names(rows: list[dict[str, Any]]) -> dict[str, int]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audit-gt", action="store_true")
+    parser.add_argument(
+        "--relaxed-analysis-quality",
+        action="store_true",
+        help=(
+            "Score structurally valid analysis.json artifacts even when the "
+            "quality lint rejects anchors such as harness or README paths."
+        ),
+    )
     parser.add_argument("--model", action="append")
     parser.add_argument("--sample-id", action="append")
     parser.add_argument(
@@ -491,7 +530,11 @@ def main(argv: list[str] | None = None) -> int:
     report = (
         audit_gt()
         if args.audit_gt
-        else evaluate_batch(args.model or [], sample_ids)
+        else evaluate_batch(
+            args.model or [],
+            sample_ids,
+            require_analysis_quality=not args.relaxed_analysis_quality,
+        )
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(

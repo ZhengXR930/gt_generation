@@ -122,7 +122,7 @@ Required JSON shape:
 
 Field meanings:
 - sample_id: the exact sample id provided in the final user prompt. Do not convert between arvo_123 and arvo:123.
-- fine_trace: the shortest sufficient causal path through vulnerable project source code. Omit harness boilerplate, setup, generic parser admission, README/workspace artifacts, runtime logs, and incidental exploration.
+- fine_trace: the shortest sufficient causal path through vulnerable implementation source code. Omit harness boilerplate, setup, generic parser admission, README/workspace artifacts, runtime logs, and incidental exploration. A fuzz/test harness frame may appear only as an unscored intermediate when it is necessary to explain how bytes enter the target; it must not be the source, root_cause, sink, or a vuln_logic propagation endpoint.
 - fine_trace.step: integer steps starting at 1 in causal/execution order.
 - fine_trace.file/function/line: vulnerable project source location. line may be null only when the checkpoint evidence truly has no line, but any step used by vuln_logic must have an integer line.
 - fine_trace.var: one concrete source expression, variable, field, macro, literal, or language-native variable token at that step.
@@ -131,7 +131,7 @@ Field meanings:
 - fine_trace.note: concise reason this step is on the causal path.
 
 Role meanings:
-- source: first vulnerable project source statement where attacker-controlled data or vulnerability-relevant state becomes a program value used by the real implementation. It is not a fuzz harness entrypoint, test driver, README, workspace setup, or generic parser admission unless that code is the vulnerable project implementation itself.
+- source: first vulnerable implementation source statement where attacker-controlled data or vulnerability-relevant state becomes a program value used by the real implementation. It is not a fuzz harness entrypoint, test driver, README, workspace setup, generic parser admission, or build/setup wrapper unless that code is itself the vulnerable implementation being scored. If the first observed input is only in a harness, keep that harness step unrole-marked or role=intermediate and choose the first downstream vulnerable implementation statement as source.
 - root_cause: project source statement that represents the missing or violated safety obligation: pointer must be NULL after transfer, index < capacity, remaining bytes >= read size, object alive before use, buffer initialized before read, etc. It is not a symptom, crash line, generic error check, or harness line.
 - sink: project source statement where the unsafe operation or vulnerability manifestation happens: out-of-bounds read/write, use-after-free, double free, invalid free, uninitialized read, null dereference, or overflow-triggering operation. It is not merely the final sanitizer stack frame if the actual unsafe project operation is visible elsewhere.
 - intermediate: project source statement needed to carry data, control, object identity, lifetime, size, or ordering from source/root_cause to sink. Use null or omit role for ordinary nearby statements.
@@ -149,7 +149,7 @@ Expression rules:
 - root_cause.relation and sink.relation must be the real safety condition or violated predicate. Do not use tautologies such as {"op":"eq","left":"x","right":"x"} or {"op":"same_object","left":"x","right":"x"} to fill the field.
 - operands, via, relation.left, and relation.right must be concrete verbatim source expressions or literals from the cited source evidence: variables, fields, macros, constants, string/integer literals, calls, or language-native variables such as PHP $name tokens.
 - Never put English explanations, conceptual phrases, unresolved instrumentation placeholders such as $event.field, or invented property names in operands, via, relation.left, or relation.right.
-- README.md, workspace, checkpoint files, candidate_trace.json, analysis.json, prompts, runtime logs, harness, test, and fuzz setup code are not valid anchors for source, root_cause, sink, or propagation endpoints."""
+- README.md, description.txt, workspace, checkpoint files, candidate_trace.json, analysis.json, prompts, runtime logs, harness, test, fuzz setup, and build/setup code are not valid anchors for source, root_cause, sink, or vuln_logic propagation endpoints."""
 
 USER_PROMPT = """[Analysis Artifact Finalization] Exploration is frozen and tools are unavailable. Based only on the checkpoint evidence, now return the fine_trace and vuln_logic together in the exact JSON object specified by the system message."""
 

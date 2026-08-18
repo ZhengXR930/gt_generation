@@ -52,7 +52,11 @@ from openhands_backend.run_sample import load_env_key  # noqa: E402
 
 SCHEMA = """Required analysis.json schema:
 - Return/write one bare JSON object with exactly: sample_id, fine_trace, vuln_logic.
-- fine_trace is an ordered project-source causal path. Each step must contain:
+- fine_trace is an ordered vulnerable-implementation-source causal path. A
+  harness/test/fuzz frame may appear only as an unscored intermediate when
+  needed to show how bytes enter the target; it must not be role="source",
+  role="root_cause", role="sink", or a vuln_logic propagation endpoint. Each
+  step must contain:
   step:int, file:string, function:string, line:int|null, var:string, code:string,
   note:string, and role:"source"|"root_cause"|"sink"|"intermediate"|null.
   Do not output depends_on.
@@ -69,8 +73,12 @@ SCHEMA = """Required analysis.json schema:
   optional relation. from/to copy file/function/line from existing fine_trace
   steps and each from/to endpoint must include operands: non-empty string array.
   type is data, control, or order. via is a non-empty string array.
-- Use vulnerable project source locations only. Do not cite README, analysis
-  files, checkpoint files, runtime logs, harness/test/fuzz setup, or old results.
+- Use vulnerable implementation source locations only for source/root_cause/sink
+  and vuln_logic propagation endpoints. Do not cite README, description.txt,
+  analysis files, checkpoint files, runtime logs, harness/test/fuzz setup,
+  build/setup wrappers, or old results as scored anchors. If input first appears
+  only in a harness, keep that step intermediate and choose the first downstream
+  vulnerable implementation statement as source.
 """
 
 

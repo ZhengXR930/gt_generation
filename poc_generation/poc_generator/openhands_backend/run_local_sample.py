@@ -327,9 +327,12 @@ Each candidate artifact must be ONLY one JSON object, with no Markdown fences or
 surrounding prose, and exactly three top-level keys: `sample_id`, `fine_trace`,
 and `vuln_logic`.
 `fine_trace` describes the ordered path from attacker-controlled input through
-propagation and root cause to the memory-safety sink. Every element must have
-this core shape, with optional `line_end` and required `role` for the causal
-steps that will be projected into `vuln_logic`:
+vulnerable implementation source, propagation, and root cause to the
+memory-safety sink. A harness/test/fuzz frame may appear only as an unscored
+`intermediate` when needed to show how bytes enter the target; it must not be
+the `source`, `root_cause`, `sink`, or a `vuln_logic` propagation endpoint.
+Every element must have this core shape, with optional `line_end` and required
+`role` for the causal steps that will be projected into `vuln_logic`:
 
 {{"step": 1, "file": "<source-relative path>", "function": "<function name>",
  "line": <integer or null>, "var": "<variable/field/expression>",
@@ -367,8 +370,12 @@ and use their concrete operands/carriers.
   ]
 }}
 
-Use project source locations for source/root_cause/sink/propagation, not
-harness, test, fuzz setup, parser admission, or build code. `op` must be one of
+Use vulnerable implementation source locations for source/root_cause/sink and
+for `vuln_logic.propagation` endpoints, not harness, test, fuzz setup, parser
+admission, README/description/workspace placeholders, runtime logs, or build
+code. If the first observed input appears only in harness code, keep that step
+as unrole-marked or `intermediate` and choose the first downstream vulnerable
+implementation statement as `source`. `op` must be one of
 `eq`, `ne`, `lt`, `le`, `gt`, `ge`, or `same_object`. `source` has no
 `relation` or `op`; score it by location and operand. `root_cause` and `sink`
 must include `relation:{{op,left,right}}`. `root_cause.relation` states the
