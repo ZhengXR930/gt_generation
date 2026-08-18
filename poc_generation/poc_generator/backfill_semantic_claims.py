@@ -39,6 +39,11 @@ from evaluator.reasoning.fine_trace import (  # noqa: E402
     parse_fine_trace,
     validate_fine_trace,
 )
+from poc_generation.analysis_artifact_prompt import (  # noqa: E402
+    analysis_artifact_finalization_system_prompt,
+    analysis_artifact_finalization_user_prompt,
+    analysis_artifact_repair_prompt,
+)
 try:  # noqa: E402
     from openhands.agenthub.codeact_agent.codeact_agent import CodeActAgent
     from openhands.core.config import AgentConfig, LLMConfig
@@ -70,88 +75,8 @@ OBSOLETE_TOP_LEVEL_OUTPUTS = (
     "vuln_logic.json",
 )
 
-SYSTEM_PROMPT = """You are an evaluation artifact finalizer. Tool use is disabled. Use only evidence already present in the conversation. Return exactly one bare JSON object with exactly three top-level keys: sample_id, fine_trace, and vuln_logic. Do not emit Markdown, prose, XML, DSML, tool calls, confidence fields, GT identifiers, or trace_step references.
-
-Required JSON shape:
-{
-  "sample_id": "exact_sample_id",
-  "fine_trace": [
-    {
-      "step": 1,
-      "file": "project/source/file.c",
-      "function": "function_name",
-      "line": 123,
-      "var": "source_expr",
-      "code": "source statement",
-      "role": "source",
-      "note": "why this step matters"
-    }
-  ],
-  "vuln_logic": {
-    "source": {
-      "file": "same file as the fine_trace source step",
-      "function": "same function",
-      "line": 123,
-      "operands": ["attacker_controlled_expr"]
-    },
-    "root_cause": {
-      "file": "same file as the fine_trace root_cause step",
-      "function": "same function",
-      "line": 130,
-      "operands": ["left_expr", "right_expr"],
-      "relation": {"op": "lt", "left": "left_expr", "right": "right_expr"}
-    },
-    "sink": {
-      "file": "same file as the fine_trace sink step",
-      "function": "same function",
-      "line": 140,
-      "operands": ["left_expr", "right_expr"],
-      "relation": {"op": "gt", "left": "left_expr", "right": "right_expr"}
-    },
-    "propagation": [
-      {
-        "from": {"file": "file.c", "function": "f", "line": 123, "operands": ["expr"]},
-        "to": {"file": "file.c", "function": "f", "line": 140, "operands": ["expr"]},
-        "type": "data",
-        "via": ["expr"],
-        "relation": {"op": "eq", "left": "expr", "right": "expr"}
-      }
-    ]
-  }
-}
-
-Field meanings:
-- sample_id: the exact sample id provided in the final user prompt. Do not convert between arvo_123 and arvo:123.
-- fine_trace: the shortest sufficient causal path through vulnerable implementation source code. Omit harness boilerplate, setup, generic parser admission, README/workspace artifacts, runtime logs, and incidental exploration. A fuzz/test harness frame may appear only as an unscored intermediate when it is necessary to explain how bytes enter the target; it must not be the source, root_cause, sink, or a vuln_logic propagation endpoint.
-- fine_trace.step: integer steps starting at 1 in causal/execution order.
-- fine_trace.file/function/line: vulnerable project source location. line may be null only when the checkpoint evidence truly has no line, but any step used by vuln_logic must have an integer line.
-- fine_trace.var: one concrete source expression, variable, field, macro, literal, or language-native variable token at that step.
-- fine_trace.code: the source statement or a concise source-level description from the evidence.
-- fine_trace.role: one of source, root_cause, sink, intermediate, or null. There must be exactly one source step, one root_cause step, and one sink step. Do not output depends_on.
-- fine_trace.note: concise reason this step is on the causal path.
-
-Role meanings:
-- source: first vulnerable implementation source statement where attacker-controlled data or vulnerability-relevant state becomes a program value used by the real implementation. It is not a fuzz harness entrypoint, test driver, README, workspace setup, generic parser admission, or build/setup wrapper unless that code is itself the vulnerable implementation being scored. If the first observed input is only in a harness, keep that harness step unrole-marked or role=intermediate and choose the first downstream vulnerable implementation statement as source.
-- root_cause: project source statement that represents the missing or violated safety obligation: pointer must be NULL after transfer, index < capacity, remaining bytes >= read size, object alive before use, buffer initialized before read, etc. It is not a symptom, crash line, generic error check, or harness line.
-- sink: project source statement where the unsafe operation or vulnerability manifestation happens: out-of-bounds read/write, use-after-free, double free, invalid free, uninitialized read, null dereference, or overflow-triggering operation. It is not merely the final sanitizer stack frame if the actual unsafe project operation is visible elsewhere.
-- intermediate: project source statement needed to carry data, control, object identity, lifetime, size, or ordering from source/root_cause to sink. Use null or omit role for ordinary nearby statements.
-
-vuln_logic field meanings:
-- vuln_logic is a projection from role-marked fine_trace steps, not a second independent story. If an anchor is wrong, fix the fine_trace role step first, then copy it into vuln_logic.
-- source: copy file/function/line from the single fine_trace step with role=source. operands names the attacker-controlled value/object/size expression at that source. source has no relation or op.
-- root_cause: copy file/function/line from the single fine_trace step with role=root_cause. operands are the concrete expressions involved in the violated safety obligation. relation is required and must be exactly {"op": "...", "left": "...", "right": "..."}.
-- sink: copy file/function/line from the single fine_trace step with role=sink. operands are the concrete expressions involved in the unsafe operation or violated sink predicate. relation is required and must be exactly {"op": "...", "left": "...", "right": "..."}.
-- propagation: each edge connects two existing fine_trace steps. from and to must copy file/function/line from existing fine_trace steps, usually source/root_cause/sink or intermediate. type is data, control, or order. via is the carrier expression, guard expression, or order keyword. relation is optional and, when present, must be exactly {"op": "...", "left": "...", "right": "..."}.
-- Consistency: source/root_cause/sink operands and relation terms must be grounded in the same fine_trace step marked with that role. If vuln_logic.sink talks about glyph_props, the fine_trace sink step must also be the source statement involving glyph_props; do not put glyph_props under sink when the sink role step is a different call or variable.
-
-Expression rules:
-- relation.op must be one of eq, ne, lt, le, gt, ge, or same_object. Keep left/right direction meaningful for lt, le, gt, and ge.
-- root_cause.relation and sink.relation must be the real safety condition or violated predicate. Do not use tautologies such as {"op":"eq","left":"x","right":"x"} or {"op":"same_object","left":"x","right":"x"} to fill the field.
-- operands, via, relation.left, and relation.right must be concrete verbatim source expressions or literals from the cited source evidence: variables, fields, macros, constants, string/integer literals, calls, or language-native variables such as PHP $name tokens.
-- Never put English explanations, conceptual phrases, unresolved instrumentation placeholders such as $event.field, or invented property names in operands, via, relation.left, or relation.right.
-- README.md, description.txt, workspace, checkpoint files, candidate_trace.json, analysis.json, prompts, runtime logs, harness, test, fuzz setup, and build/setup code are not valid anchors for source, root_cause, sink, or vuln_logic propagation endpoints."""
-
-USER_PROMPT = """[Analysis Artifact Finalization] Exploration is frozen and tools are unavailable. Based only on the checkpoint evidence, now return the fine_trace and vuln_logic together in the exact JSON object specified by the system message."""
+SYSTEM_PROMPT = analysis_artifact_finalization_system_prompt()
+USER_PROMPT = analysis_artifact_finalization_user_prompt()
 
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*\n(?P<body>.*?)(?:\n```\s*)?$", re.DOTALL)
 _LINE_NUMBER_RE = re.compile(r"(\d+)")
@@ -162,13 +87,7 @@ _SOURCE_LINE_RE = re.compile(
 
 
 def _user_prompt_for_sample(sample_id: str) -> str:
-    return (
-        USER_PROMPT
-        + "\nExpected sample_id: "
-        + sample_id
-        + "\nThe returned JSON object's sample_id field must exactly equal this "
-        "value, byte-for-byte."
-    )
+    return analysis_artifact_finalization_user_prompt(sample_id)
 
 
 def _parse_toml_value(value: str) -> Any:
@@ -375,40 +294,7 @@ def _lightweight_artifact_backfill(
                     {"role": "assistant", "content": raw},
                     {
                         "role": "user",
-                        "content": (
-                            "The artifact was rejected because "
-                            f"{error}. Return only the corrected bare JSON object "
-                            "with exactly sample_id, fine_trace, and vuln_logic. "
-                            "If the error names operands, via, relation.left, or "
-                            "relation.right, replace that field with a concrete "
-                            "source expression, literal, macro, or function-call "
-                            "expression from the cited source evidence. Do not use "
-                            "English explanatory phrases or placeholders such as "
-                            "$attr. If the error says a line must be an integer, "
-                            "replace null, unknown, or a range with the nearest "
-                            "integer line number from the same vulnerable source "
-                            "file/function in the checkpoint evidence. If the "
-                            "error says relation is tautological or must describe "
-                            "the violated safety condition, replace eq(x,x) or "
-                            "same_object(x,x) with the actual required predicate "
-                            "from the vulnerable source, such as index < capacity "
-                            "or object != NULL before use. If the "
-                            "error says operands/relation must be grounded in "
-                            "the same fine_trace step, either move that role to "
-                            "the trace step that actually contains those "
-                            "expressions or change vuln_logic to use expressions "
-                            "from the current role step. If the "
-                            "error says vuln_logic must be projected from "
-                            "fine_trace, update the corresponding role-marked "
-                            "or intermediate fine_trace step and copy its "
-                            "file/function/line into vuln_logic. If the error "
-                            "mentions harness, test, fuzz, README, or workspace, "
-                            "remove that key role and choose the first real "
-                            "vulnerable project source statement for source, "
-                            "the violated safety-obligation statement for "
-                            "root_cause, and the unsafe operation statement for "
-                            "sink."
-                        ),
+                        "content": analysis_artifact_repair_prompt(error),
                     },
                 ]
             )
@@ -872,38 +758,7 @@ def generate_one(
                         role="user",
                         content=[
                             TextContent(
-                                text=(
-                                    "The previous response was rejected because "
-                                    f"{error}. Return only a corrected bare JSON object "
-                                    "with exactly sample_id, fine_trace, and vuln_logic. "
-                                    "If the error names operands, via, relation.left, or "
-                                    "relation.right, replace that field with a concrete "
-                                    "source expression, literal, macro, or function-call "
-                                    "expression from the cited source evidence. "
-                                    "If the error says relation is tautological or "
-                                    "must describe the violated safety condition, "
-                                    "replace eq(x,x) or same_object(x,x) with the "
-                                    "actual required predicate from the vulnerable "
-                                    "source, such as index < capacity or object != "
-                                    "NULL before use. "
-                                    "If the error says operands/relation must be "
-                                    "grounded in the same fine_trace step, either "
-                                    "move that role to the trace step that actually "
-                                    "contains those expressions or change vuln_logic "
-                                    "to use expressions from the current role step. "
-                                    "If the error says vuln_logic must be projected "
-                                    "from fine_trace, update the corresponding "
-                                    "role-marked or intermediate fine_trace step "
-                                    "and copy its file/function/line into "
-                                    "vuln_logic. If the error mentions harness, "
-                                    "test, fuzz, README, or workspace, remove "
-                                    "that key role and choose the first real "
-                                    "vulnerable project source statement for "
-                                    "source, the violated safety-obligation "
-                                    "statement for root_cause, and the unsafe "
-                                    "operation statement for sink. Do not surround it with "
-                                    "backticks or a code fence."
-                                )
+                                text=analysis_artifact_repair_prompt(error)
                             )
                         ],
                         force_string_serializer=True,

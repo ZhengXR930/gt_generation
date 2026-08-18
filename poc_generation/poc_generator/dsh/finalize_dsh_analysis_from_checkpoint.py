@@ -30,6 +30,9 @@ RESULTS_ROOT = GENERATOR_ROOT.parent / "poc_results"
 sys.path.insert(0, str(GENERATOR_ROOT))
 sys.path.insert(0, str(GT_ROOT))
 
+from poc_generation.analysis_artifact_prompt import (  # noqa: E402
+    analysis_artifact_schema_instructions,
+)
 from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
 from dsh.run_deepseek_harness_local_sample import (  # noqa: E402
     DEFAULT_DSH_SCRATCH_ROOT,
@@ -48,38 +51,6 @@ from dsh.run_deepseek_harness_local_sample import (  # noqa: E402
     write_dsh_settings,
 )
 from openhands_backend.run_sample import load_env_key  # noqa: E402
-
-
-SCHEMA = """Required analysis.json schema:
-- Return/write one bare JSON object with exactly: sample_id, fine_trace, vuln_logic.
-- fine_trace is an ordered vulnerable-implementation-source causal path. A
-  harness/test/fuzz frame may appear only as an unscored intermediate when
-  needed to show how bytes enter the target; it must not be role="source",
-  role="root_cause", role="sink", or a vuln_logic propagation endpoint. Each
-  step must contain:
-  step:int, file:string, function:string, line:int|null, var:string, code:string,
-  note:string, and role:"source"|"root_cause"|"sink"|"intermediate"|null.
-  Do not output depends_on.
-- Mark exactly one fine_trace step role="source", exactly one role="root_cause",
-  and exactly one role="sink".
-- vuln_logic must be an object with source, root_cause, sink, propagation, and
-  optional issue_alignment.
-- vuln_logic.source/root_cause/sink copy file/function/line from the matching
-  role-marked fine_trace step and include operands: non-empty string array.
-  In vuln_logic, line must be an integer.
-- root_cause and sink must include relation exactly {"op": "...", "left": "...",
-  "right": "..."}. op must be one of eq, ne, lt, le, gt, ge, same_object.
-- propagation is an array of edges. Each edge contains from, to, type, via, and
-  optional relation. from/to copy file/function/line from existing fine_trace
-  steps and each from/to endpoint must include operands: non-empty string array.
-  type is data, control, or order. via is a non-empty string array.
-- Use vulnerable implementation source locations only for source/root_cause/sink
-  and vuln_logic propagation endpoints. Do not cite README, description.txt,
-  analysis files, checkpoint files, runtime logs, harness/test/fuzz setup,
-  build/setup wrappers, or old results as scored anchors. If input first appears
-  only in a harness, keep that step intermediate and choose the first downstream
-  vulnerable implementation statement as source.
-"""
 
 
 def failed_samples_from_summary(summary_path: Path) -> list[str]:
@@ -145,7 +116,7 @@ def write_workspace(sample_id: str, scratch: Path, sample_dir: Path) -> tuple[Pa
         f"{description.strip()}\n\n"
         "## Saved checkpoint trajectory excerpt\n\n"
         f"{excerpt.strip()}\n\n"
-        f"{SCHEMA}\n",
+        f"{analysis_artifact_schema_instructions(sample_id=sample_id, max_trace_steps=8)}\n",
         encoding="utf-8",
     )
     scrub = scrub_agent_visible_public_testcases(workspace)
@@ -172,7 +143,7 @@ issue and source code.
 Finish within {max_steps} DSH steps. Your final answer must be one bare JSON
 object and nothing else.
 
-{SCHEMA}
+{analysis_artifact_schema_instructions(sample_id=sample_id, max_trace_steps=8)}
 """
 
 

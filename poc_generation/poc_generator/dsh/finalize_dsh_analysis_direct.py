@@ -22,6 +22,9 @@ RESULTS_ROOT = GENERATOR_ROOT.parent / "poc_results"
 sys.path.insert(0, str(GENERATOR_ROOT))
 sys.path.insert(0, str(GT_ROOT))
 
+from poc_generation.analysis_artifact_prompt import (  # noqa: E402
+    analysis_artifact_schema_instructions,
+)
 from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
 from openhands_backend.run_sample import load_env_key  # noqa: E402
 
@@ -34,41 +37,6 @@ _SOURCE_EXPR_RE = re.compile(
 )
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _REL_OPS = {"eq", "ne", "lt", "le", "gt", "ge", "same_object"}
-
-
-SCHEMA = """Return exactly one JSON object with exactly these top-level keys:
-sample_id, fine_trace, vuln_logic.
-
-fine_trace: ordered vulnerable-implementation-source causal path. Use 3 to 8
-steps only. Harness/test/fuzz frames may appear only as unscored intermediate
-context when needed; they must not be source, root_cause, sink, or vuln_logic
-propagation endpoints:
-source, root_cause, sink, plus only indispensable intermediate steps. Do not
-expand loops, repeated call chains, or every observed action. Each step has:
-step:int, file:string, function:string, line:int|null, var:string, code:string,
-note:string, role:"source"|"root_cause"|"sink"|"intermediate"|null.
-Do not output depends_on.
-
-Mark exactly one source, one root_cause, and one sink step.
-
-vuln_logic:
-- source/root_cause/sink copy file/function/line from the matching role-marked
-  fine_trace step and include operands: non-empty string array. In vuln_logic,
-  line must be an integer.
-- root_cause and sink include relation exactly {"op":"...","left":"...","right":"..."}.
-  op is one of eq, ne, lt, le, gt, ge, same_object.
-- propagation is an array of edges. Each edge contains from, to, type, via,
-  optional relation. from/to copy file/function/line from existing fine_trace
-  steps and each from/to endpoint must include operands: non-empty string array.
-  type is data, control, or order. via is non-empty string array.
-
-Use vulnerable implementation source only for source/root_cause/sink and
-vuln_logic propagation endpoints. Do not cite README, description.txt, analysis
-files, checkpoint files, runtime logs, harness/test/fuzz setup, build/setup
-wrappers, or old results as scored anchors. If input first appears only in a
-harness, keep that step intermediate and choose the first downstream vulnerable
-implementation statement as source.
-"""
 
 
 def failed_samples_from_summary(summary_path: Path) -> list[str]:
@@ -183,7 +151,7 @@ Rules:
 - Keep operands/relation grounded in the same fine_trace step's var/code.
 - Keep fine_trace compact: 3 to 8 steps total. Never output more than 8 steps.
 
-{SCHEMA}
+{analysis_artifact_schema_instructions(sample_id=sample, max_trace_steps=8)}
 """
 
 

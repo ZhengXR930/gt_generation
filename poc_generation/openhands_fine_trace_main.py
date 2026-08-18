@@ -23,6 +23,19 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+try:
+    from poc_generation.analysis_artifact_prompt import (
+        analysis_artifact_finalization_instruction,
+        analysis_artifact_finalization_system_prompt,
+        analysis_artifact_repair_prompt,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+    from analysis_artifact_prompt import (  # type: ignore
+        analysis_artifact_finalization_instruction,
+        analysis_artifact_finalization_system_prompt,
+        analysis_artifact_repair_prompt,
+    )
+
 
 FINE_TRACE_FINAL_MARKER = "[Analysis Artifact Finalization]"
 _MAX_FORMAT_RETRIES = 3
@@ -58,86 +71,8 @@ def _force_started_key() -> str:
 
 def _final_deliverable_instruction() -> str:
     expected_sample_id = os.environ.get("OPENHANDS_EXPECTED_SAMPLE_ID", "").strip()
-    sample_id_instruction = (
-        f"sample_id must be exactly {expected_sample_id!r}; do not rewrite "
-        "separators or dataset prefixes. "
-        if expected_sample_id
-        else "sample_id is the current benchmark sample id from the task metadata "
-        "or workspace prompt, and must not be empty. "
-    )
-    return (
-        "Return ONLY one bare JSON object with exactly three top-level keys: "
-        "sample_id, fine_trace and vuln_logic. Do not emit Markdown, prose, XML, "
-        "DSML, tool calls, confidence fields, GT identifiers, or trace_step references. "
-        + sample_id_instruction
-        +
-        "Use this JSON shape: "
-        '{"sample_id":"exact_sample_id","fine_trace":[{"step":1,"file":"project/source/file.c",'
-        '"function":"function_name","line":123,"var":"source_expr","code":"source statement",'
-        '"role":"source","note":"why this step matters"}],"vuln_logic":{"source":'
-        '{"file":"same as source trace step","function":"same function","line":123,'
-        '"operands":["input_controlled_expr"]},"root_cause":{"file":"same as '
-        'root_cause trace step","function":"same function","line":130,"operands":'
-        '["left_expr","right_expr"],"relation":{"op":"lt","left":"left_expr",'
-        '"right":"right_expr"}},"sink":{"file":"same as sink trace step","function":'
-        '"same function","line":140,"operands":["left_expr","right_expr"],"relation":'
-        '{"op":"gt","left":"left_expr","right":"right_expr"}},"propagation":[{"from":'
-        '{"file":"file.c","function":"f","line":123,"operands":["expr"]},"to":'
-        '{"file":"file.c","function":"f","line":140,"operands":["expr"]},"type":"data",'
-        '"via":["expr"],"relation":{"op":"eq","left":"expr","right":"expr"}}]}}. '
-        "Field meanings: fine_trace is the shortest sufficient causal path through "
-        "vulnerable implementation source code under the local benchmark input. "
-        "Omit harness boilerplate, setup, generic parser admission, README/workspace "
-        "artifacts, runtime logs, and incidental exploration. A harness/test/fuzz "
-        "frame may appear only as an unscored intermediate when needed to show how "
-        "bytes enter the target; it must not be source, root_cause, sink, or a "
-        "vuln_logic propagation endpoint. fine_trace.step is an integer starting "
-        "at 1 in causal/execution "
-        "order. fine_trace.file/function/line is a project source location; "
-        "any step used by vuln_logic must have an integer line. fine_trace.var is one "
-        "concrete source expression, variable, field, macro, literal, or language-native "
-        "variable token at that step. fine_trace.role is one of source, root_cause, "
-        "sink, intermediate, or null. There must be exactly one source step, one "
-        "root_cause step, and one sink step. Do not output depends_on. Role meanings: "
-        "source is the first vulnerable implementation source statement where input-controlled "
-        "data or bug-relevant state becomes a program value used by the real "
-        "implementation, not harness/test/fuzz/README/description/workspace setup. "
-        "If the first observed input is only in harness code, keep that step "
-        "unrole-marked or role=intermediate and choose the first downstream "
-        "vulnerable implementation statement as source. root_cause is the "
-        "project source statement that represents the missing or violated safety "
-        "obligation: pointer must be NULL after transfer, index < capacity, remaining "
-        "bytes >= read size, object alive before use, buffer initialized before read, "
-        "etc. It is not a symptom, crash line, generic error check, or harness line. "
-        "sink is the project source statement where the target invalid operation or "
-        "bug manifestation happens. intermediate is a project source statement needed to "
-        "carry data, control, object identity, lifetime, size, or ordering. vuln_logic "
-        "is a projection from role-marked fine_trace steps, not a second independent "
-        "story. source, root_cause, and sink must copy file/function/line from the "
-        "single fine_trace step with that role. source has operands only and no "
-        "relation or op. root_cause and sink require relation exactly {op,left,right}. "
-        "root_cause.relation states the safety condition that should have held to "
-        "avoid the bug, not the vulnerable-path negation; for example, if the bug "
-        "happens because i >= capacity, write root_cause.relation as lt(i,capacity). "
-        "source/root_cause/sink operands and relation terms must be grounded in the "
-        "same fine_trace step marked with that role; if vuln_logic.sink talks about "
-        "glyph_props, the fine_trace sink step must also involve glyph_props. "
-        "propagation edges connect existing fine_trace steps; from and to must copy "
-        "file/function/line from existing trace steps. propagation.type is data, "
-        "control, or order. propagation.via is the carrier expression, guard expression, "
-        "or order keyword. propagation.relation is optional and, when present, is "
-        "exactly {op,left,right}. relation.op is eq, ne, lt, le, gt, ge, or same_object. "
-        "Keep left/right direction meaningful for ordered relations. root_cause.relation "
-        "must be the real safety condition, while sink.relation must be the target "
-        "operation's required or violated sink predicate; "
-        "do not use tautologies such as eq(x,x) or same_object(x,x) to fill the field. "
-        "operands, via, "
-        "relation.left, and relation.right must be concrete verbatim source expressions "
-        "or literals from the cited source evidence, not prose labels, English explanatory "
-        "phrases, invented property names, or placeholders such as $event.field. README.md, "
-        "description.txt, workspace, checkpoint files, analysis.json, prompts, runtime logs, "
-        "harness, test, fuzz setup, and build/setup code are not valid anchors for "
-        "source, root_cause, sink, or vuln_logic propagation endpoints."
+    return analysis_artifact_finalization_instruction(
+        sample_id=expected_sample_id or None
     )
 
 
@@ -398,26 +333,15 @@ async def _complete_trace(controller: Any, response: str) -> None:
             MessageAction(
                 content=(
                     f"{FINE_TRACE_FINAL_MARKER} The final deliverable was not "
-                    f"accepted: {error}. Return only a corrected bare JSON object "
-                    "with exactly sample_id, fine_trace, and vuln_logic. If the "
-                    "error names operands, via, relation.left, or relation.right, "
-                    "replace that field with a concrete source expression, literal, "
-                    "macro, or function-call expression from the cited source evidence. "
-                    "Do not use English explanatory phrases. If the error mentions "
-                    "harness, test, fuzz, README, description, or workspace, remove "
-                    "that key role and choose the first downstream vulnerable "
-                    "implementation source statement for source, the violated "
-                    "safety-obligation statement for root_cause, and the target "
-                    "invalid operation statement for sink. If "
-                    "the error says relation is tautological or must describe the "
-                    "violated safety condition, replace eq(x,x) or same_object(x,x) "
-                    "with the actual required predicate from the project source, "
-                    "such as index < capacity or object != NULL before use. If "
-                    "the error says operands/relation must be grounded in the same "
-                    "fine_trace step, either move that role to the trace step that "
-                    "actually contains those expressions or change vuln_logic to "
-                    "use expressions from the current role step. "
-                    f"{_final_deliverable_instruction()}"
+                    "accepted. "
+                    + analysis_artifact_repair_prompt(
+                        error,
+                        include_finalization_instruction=True,
+                        sample_id=os.environ.get(
+                            "OPENHANDS_EXPECTED_SAMPLE_ID", ""
+                        ).strip()
+                        or None,
+                    )
                 ),
                 wait_for_response=False,
             ),
@@ -600,9 +524,12 @@ def install_fine_trace_overlay() -> None:
             content=[
                 TextContent(
                     text=(
-                        "You are an evaluation artifact finalizer. Tool use is "
-                        "disabled and must never be requested or described. "
-                        + _final_deliverable_instruction()
+                        analysis_artifact_finalization_system_prompt(
+                            sample_id=os.environ.get(
+                                "OPENHANDS_EXPECTED_SAMPLE_ID", ""
+                            ).strip()
+                            or None
+                        )
                         + " Do not emit XML, DSML, or tool_calls."
                     )
                 )
