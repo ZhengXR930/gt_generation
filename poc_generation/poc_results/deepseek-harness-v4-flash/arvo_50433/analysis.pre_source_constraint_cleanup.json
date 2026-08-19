@@ -1,0 +1,230 @@
+{
+  "sample_id": "arvo_50433",
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "tests/fuzz/fuzz_compress_frame.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 34,
+      "var": "cparams.clevel",
+      "code": "cparams.clevel = data[0] % (9 + 1);",
+      "note": "The first input byte 0x5b (91) selects clevel = 91 % 10 = 1, so the chunk produced for the tiny source buffer will not take the clevel==0 memcpy-only path.",
+      "role": "source"
+    },
+    {
+      "step": 2,
+      "file": "tests/fuzz/fuzz_compress_frame.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 60,
+      "var": "chunksize",
+      "code": "nchunks = blosc2_schunk_append_buffer(schunk, (uint8_t *)data + i, chunksize);",
+      "note": "With a 2-byte input, max_chunksize (512*91) exceeds the buffer, so the only loop iteration shrinks chunksize to size-i = 2 and appends a 2-byte source buffer.",
+      "role": "intermediate"
+    },
+    {
+      "step": 3,
+      "file": "blosc/schunk.c",
+      "function": "blosc2_schunk_append_buffer",
+      "line": 1024,
+      "var": "chunk",
+      "code": "uint8_t* chunk = malloc(nbytes + BLOSC2_MAX_OVERHEAD);",
+      "note": "The compressed-chunk destination is only nbytes + BLOSC2_MAX_OVERHEAD = 2 + 32 = 34 bytes for the 2-byte source buffer.",
+      "role": "intermediate"
+    },
+    {
+      "step": 4,
+      "file": "blosc/blosc2.c",
+      "function": "blosc2_compress_ctx",
+      "line": 2388,
+      "var": "error",
+      "code": "error = write_compression_header(context, true);",
+      "note": "The extended header (32 bytes) is built for the 2-byte source; the header builder decides whether the chunk is memcpy-only or a regular compressed chunk with a bstarts block-start table.",
+      "role": "intermediate"
+    },
+    {
+      "step": 5,
+      "file": "blosc/blosc2.c",
+      "function": "write_compression_header",
+      "line": 2218,
+      "var": "context->header_flags",
+      "code": "if (context->clevel == 0) {\n    /* Compression level 0 means buffer to be memcpy'ed */\n    context->header_flags |= (uint8_t)BLOSC_MEMCPYED;\n  }",
+      "note": "Root cause: the header builder only marks the chunk memcpy-only when clevel==0. It fails to do so for a source size (2 bytes) below the minimum threshold, so the small buffer is mishandled as a normal compressed chunk.",
+      "role": "root_cause"
+    },
+    {
+      "step": 6,
+      "file": "blosc/blosc2.c",
+      "function": "write_compression_header",
+      "line": 2233,
+      "var": "context->bstarts",
+      "code": "context->bstarts = (int32_t*)(context->dest + context->header_overhead);\n      context->output_bytes = context->header_overhead + (int32_t)sizeof(int32_t) * context->nblocks;",
+      "note": "Because the chunk was not marked memcpy-only, a block-start table of 4*nblocks = 4 bytes is placed right after the 32-byte header, making output_bytes = 36, which exceeds the 34-byte allocation.",
+      "role": "intermediate"
+    },
+    {
+      "step": 7,
+      "file": "blosc/blosc2.c",
+      "function": "blosc_compress_context",
+      "line": 2294,
+      "var": "ntbytes",
+      "code": "ntbytes = do_job(context);",
+      "note": "With the memcpy bit unset, the real compression job runs, entering serial_blosc which writes the block-start table into dest before compressing each block.",
+      "role": "intermediate"
+    },
+    {
+      "step": 8,
+      "file": "blosc/blosc2.c",
+      "function": "serial_blosc",
+      "line": 1826,
+      "var": "bstarts",
+      "code": "_sw32(bstarts + j, ntbytes);",
+      "note": "Sink: for nblocks=1, this writes 4 bytes at dest+32..35, i.e. 2 bytes beyond the 34-byte malloc, producing the ASAN heap-buffer-overflow WRITE of size 4.",
+      "role": "sink"
+    }
+  ],
+  "vuln_logic": {
+    "source": {
+      "file": "tests/fuzz/fuzz_compress_frame.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 34,
+      "operands": ["data[0]", "cparams.clevel"]
+    },
+    "root_cause": {
+      "file": "blosc/blosc2.c",
+      "function": "write_compression_header",
+      "line": 2218,
+      "operands": ["context->clevel", "BLOSC_MEMCPYED"],
+      "relation": {
+        "op": "eq",
+        "left": "context->clevel",
+        "right": "0"
+      }
+    },
+    "sink": {
+      "file": "blosc/blosc2.c",
+      "function": "serial_blosc",
+      "line": 1826,
+      "operands": ["bstarts", "ntbytes"],
+      "relation": {
+        "op": "gt",
+        "left": "header_overhead + 4 * nblocks (36)",
+        "right": "nbytes + BLOSC2_MAX_OVERHEAD (34)"
+      }
+    },
+    "propagation": [
+      {
+        "from": {
+          "file": "tests/fuzz/fuzz_compress_frame.c",
+          "function": "LLVMFuzzerTestOneInput",
+          "line": 34,
+          "operands": ["data[0]", "cparams.clevel"]
+        },
+        "to": {
+          "file": "tests/fuzz/fuzz_compress_frame.c",
+          "function": "LLVMFuzzerTestOneInput",
+          "line": 60,
+          "operands": ["chunksize", "size"]
+        },
+        "type": "data",
+        "via": ["cparams.clevel", "chunksize", "nbytes"]
+      },
+      {
+        "from": {
+          "file": "tests/fuzz/fuzz_compress_frame.c",
+          "function": "LLVMFuzzerTestOneInput",
+          "line": 60,
+          "operands": ["chunksize", "size"]
+        },
+        "to": {
+          "file": "blosc/schunk.c",
+          "function": "blosc2_schunk_append_buffer",
+          "line": 1024,
+          "operands": ["nbytes", "chunk"]
+        },
+        "type": "data",
+        "via": ["src", "nbytes"]
+      },
+      {
+        "from": {
+          "file": "blosc/schunk.c",
+          "function": "blosc2_schunk_append_buffer",
+          "line": 1024,
+          "operands": ["nbytes", "chunk"]
+        },
+        "to": {
+          "file": "blosc/blosc2.c",
+          "function": "blosc2_compress_ctx",
+          "line": 2388,
+          "operands": ["srcsize", "destsize"]
+        },
+        "type": "data",
+        "via": ["chunk", "destsize"]
+      },
+      {
+        "from": {
+          "file": "blosc/blosc2.c",
+          "function": "blosc2_compress_ctx",
+          "line": 2388,
+          "operands": ["srcsize", "destsize"]
+        },
+        "to": {
+          "file": "blosc/blosc2.c",
+          "function": "write_compression_header",
+          "line": 2218,
+          "operands": ["context->clevel", "context->header_flags"]
+        },
+        "type": "control",
+        "via": ["write_compression_header", "BLOSC_MEMCPYED"]
+      },
+      {
+        "from": {
+          "file": "blosc/blosc2.c",
+          "function": "write_compression_header",
+          "line": 2218,
+          "operands": ["context->clevel", "context->header_flags"]
+        },
+        "to": {
+          "file": "blosc/blosc2.c",
+          "function": "write_compression_header",
+          "line": 2233,
+          "operands": ["context->bstarts", "context->output_bytes"]
+        },
+        "type": "data",
+        "via": ["context->bstarts", "context->output_bytes", "context->nblocks"]
+      },
+      {
+        "from": {
+          "file": "blosc/blosc2.c",
+          "function": "write_compression_header",
+          "line": 2233,
+          "operands": ["context->bstarts", "context->output_bytes"]
+        },
+        "to": {
+          "file": "blosc/blosc2.c",
+          "function": "blosc_compress_context",
+          "line": 2294,
+          "operands": ["context->header_flags", "ntbytes"]
+        },
+        "type": "data",
+        "via": ["context->header_flags", "do_job"]
+      },
+      {
+        "from": {
+          "file": "blosc/blosc2.c",
+          "function": "blosc_compress_context",
+          "line": 2294,
+          "operands": ["context->header_flags", "ntbytes"]
+        },
+        "to": {
+          "file": "blosc/blosc2.c",
+          "function": "serial_blosc",
+          "line": 1826,
+          "operands": ["bstarts", "ntbytes"]
+        },
+        "type": "control",
+        "via": ["do_job", "serial_blosc", "context->nblocks"]
+      }
+    ],
+    "issue_alignment": "A 2-byte source buffer is compressed as a regular chunk because write_compression_header only sets BLOSC_MEMCPYED for clevel==0, not for source sizes below the minimum threshold; the resulting block-start table (4 bytes at dest+32) is written beyond the 34-byte chunk allocation, an ASAN heap-buffer-overflow WRITE of size 4."
+  }
+}

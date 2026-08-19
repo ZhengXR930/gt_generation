@@ -1,0 +1,1125 @@
+You are finalizing the output of a timed-out PoC generation agent.
+
+The original PoC generation run ended with status: iteration_cap. Its saved
+analysis is missing or does not satisfy the current required schema. You are
+not judging the agent and you must not propose new PoC construction steps.
+Your task is only to convert the saved reasoning trajectory into the required
+structured analysis artifact.
+
+Trusted issue description:
+A global-buffer-overflow READ occurs in xmlDictHashName (dict.c), triggered during NCName/QName parsing (xmlParseNCName/xmlParseQNameHashed in parser.c). The hash/name lookup reads one byte out-of-bounds before the global table xmlIsPubidChar_tab (chvalid.c), which can lead to crashes or potential information disclosure when processing specially crafted XML names (e.g., element or attribute names).
+
+Saved trajectory evidence:
+TOOL RESULT step 67:
+357: * xmlBufGrowInternal:
+368:xmlBufGrowInternal(xmlBufPtr buf, size_t len) {
+435:xmlBufGrow(xmlBufPtr buf, int len) {
+441:    ret = xmlBufGrowInternal(buf, len);
+357: * xmlBufGrowInternal:
+368:xmlBufGrowInternal(xmlBufPtr buf, size_t len) {
+
+
+TOOL CALL step 68 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/_work/src/buf.c", "limit": 90, "offset": 357}
+
+TOOL RESULT step 68:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/_work/src/buf.c</path>
+<type>file</type>
+<content>
+357:  * xmlBufGrowInternal:
+358:  * @buf:  the buffer
+359:  * @len:  the minimum free size to allocate
+360:  *
+361:  * Grow the available space of an XML buffer, @len is the target value
+362:  * Error checking should be done on buf->error since using the return
+363:  * value doesn't work that well
+364:  *
+365:  * Returns 0 in case of error or the length made available otherwise
+366:  */
+367: static size_t
+368: xmlBufGrowInternal(xmlBufPtr buf, size_t len) {
+369:     size_t size;
+370:     xmlChar *newbuf;
+371: 
+372:     if ((buf == NULL) || (buf->error != 0)) return(0);
+373:     CHECK_COMPAT(buf)
+374: 
+375:     if (len < buf->size - buf->use)
+376:         return(buf->size - buf->use - 1);
+377:     if (len >= SIZE_MAX - buf->use) {
+378:         xmlBufMemoryError(buf);
+379:         return(0);
+380:     }
+381: 
+382:     if (buf->size > (size_t) len) {
+383:         size = buf->size > SIZE_MAX / 2 ? SIZE_MAX : buf->size * 2;
+384:     } else {
+385:         size = buf->use + len;
+386:         size = size > SIZE_MAX - 10
+...
+ newbuf;
+418:     }
+419:     buf->size = size;
+420:     UPDATE_COMPAT(buf)
+421:     return(buf->size - buf->use - 1);
+422: }
+423: 
+424: /**
+425:  * xmlBufGrow:
+426:  * @buf:  the buffer
+427:  * @len:  the minimum free size to allocate
+428:  *
+429:  * Grow the available space of an XML buffer, @len is the target value
+430:  * This is been kept compatible with xmlBufferGrow() as much as possible
+431:  *
+432:  * Returns -1 in case of error or the length made available otherwise
+433:  */
+434: int
+435: xmlBufGrow(xmlBufPtr buf, int len) {
+436:     size_t ret;
+437: 
+438:     if ((buf == NULL) || (len < 0)) return(-1);
+439:     if (len == 0)
+440:         return(0);
+441:     ret = xmlBufGrowInternal(buf, len);
+442:     if (buf->error != 0)
+443:         return(-1);
+444:     return(ret > INT_MAX ? INT_MAX : ret);
+445: }
+446: 
+
+(Showing lines 357-446 of 1052. Use offset=447 to continue.)
+</content>
+
+ASSISTANT step 69:
+r xmlDictHashName to read OOB, the `data` pointer must point to "" + offset. This happens when the truncation occurred BEFORE the xmlDictLookupHashed call, and startPosition (or cur) is a stale large offset.
+
+Scenario A: truncation during the name loop (as I described) — data = "" + startPosition.
+Scenario B: truncation happened EARLIER (during some other parse step, e.g., SKIP_BLANKS or attribute value parsing), then the parser advances cur past "" (e.g., NEXTL: cur += l where l>0, or NEXT1: cur++), so cur points past "". Then xmlParseNCName fast path: `in = ctxt->input->cur` (points past "") — `*in` reads OOB immediately (in xmlParseNCName itself), not in xmlDictHashName.
+
+So Scenario A is the most consistent with the summary: the OOB read happens in xmlDictHashName itself, meaning data (BASE_PTR + startPosition) points into the global region while startPosition is stale. 
+
+Hmm, wait, actually in Scenario A — after truncation, does the parser even reach xmlDictLookupHashed? Let me trace xmlParseNCNameComplex with truncation inside the loop:
+
+```c
+startPosition = CUR_PTR - BASE_PTR;   // e.g., 1000 (old buffer)
+c = CUR_CHAR(l);                       // 'a', l=1
+while ((c != ' ') && ...) {
+    len += l;
+    NEXTL(l);                          // cur += 1
+    c = CUR_CHAR(l);                   // GROW triggered here (end - cur < 250) → truncate → cur = "" ; c = *cur = 0
+}
+// loop ends (c == 0)
+if (len > maxLength) ...               // no
+ret = xmlDictLookupHashed(ctxt->dict, (BASE_PTR + startPosition), len);
+// BASE_PTR = "" ; startPosition = 1000 → data = "" + 1000 → OOB read in xmlDictHashName
+```
+
+Yes! This reaches xmlDictLookupHashed with data = "" + 1000. 
+
+But wait — is CUR_CHAR (xmlCurrentChar) guaranteed to call GROW when near the end? Let me check xmlCurrentChar.
+
+TOOL CALL step 69 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && grep -n \"xmlCurrentChar\" parserInternals.c | head -3; sed -n \"$(grep -n \"^xmlCurrentChar\" parserInternals.c | head -1 | cut -d: -f1),+60p\" parserInternals.c'", "description": "Show xmlCurrentChar implementation"}
+
+TOOL RESULT step 69:
+861: * xmlCurrentChar:
+881:xmlCurrentChar(xmlParserCtxtPtr ctxt, int *len) {
+xmlCurrentChar(xmlParserCtxtPtr ctxt, int *len) {
+    const unsigned char *cur;
+    size_t avail;
+    int c;
+
+    if ((ctxt == NULL) || (len == NULL) || (ctxt->input == NULL)) return(0);
+
+    avail = ctxt->input->end - ctxt->input->cur;
+
+    if (avail < INPUT_CHUNK) {
+        xmlParserGrow(ctxt);
+        avail = ctxt->input->end - ctxt->input->cur;
+    }
+
+    cur = ctxt->input->cur;
+    c = *cur;
+
+    if (c < 0x80) {
+	/* 1-byte code */
+        if (c < 0x20) {
+            /*
+             *   2.11 End-of-Line Handling
+             *   the literal two-character sequence "#xD#xA" or a standalone
+             *   literal #xD, an XML processor must pass to the application
+             *   the single character #xA.
+             */
+            if (c == '\r') {
+                /*
+                 * TODO: This function shouldn't change the 'cur' pointer
+                 * as side effect, but the NEXTL macro in parser.c relies
+                 * on this behavior when incrementing line numbers.
+                 */
+                if (cur[1] == '\n')
+                    ctxt->input->cur++;
+                *len = 1;
+                c = '\n';
+            } else if (c == 0) {
+                if (ctxt->input->cur >= ctxt->input->end) {
+                    *len = 0;
+                } else {
+                    *len = 1;
+                    /*
+                     * TODO: Null bytes should be handled by callers,
+                     * but this can be tricky.
+                     */
+                    xmlErrEncodingInt(ctxt, XML_ERR_INVALID_CHAR,
+                            "Char 0x0 out of allowed range\n", c);
+                }
+            } else {
+                *len = 1;
+            }
+        } else {
+            *len = 1;
+        }
+
+        return(c);
+    } else {
+        int val;
+
+        if (avail < 2)
+            goto incomplete_sequence;
+
+
+ASSISTANT step 70:
+failure? No — without a malloc failure, GROW succeeds and reads the remaining bytes (or returns 0 at EOF without error). buf->error stays 0 → no truncation. So we NEED the malloc failure at the right time.
+
+Alternatively, maybe the truncation can also be triggered with the "BOUNDED" alloc type (XML_MAX_TEXT_LENGTH exceeded)? If the buffer is XML_BUFFER_ALLOC_BOUNDED and the size exceeds XML_MAX_TEXT_LENGTH, xmlBufMemoryError is called → buf->error set → truncation! That happens when the document is huge (with XML_PARSE_HUGE off, XML_MAX_TEXT_LENGTH = 10MB? let me check). That's another trigger: a document with a name > 10MB → buffer exceeds XML_MAX_TEXT_LENGTH → error → truncation → OOB. But the fuzzer input size limits... the testcase might be small. The malloc-fail trigger seems more likely given the fuzzer harness has the maxAlloc mechanism.
+
+Hmm wait, actually — let me reconsider. Since the benchmark names the issue as a specific oss-fuzz testcase with a specific crash, the testcase must be a small file that triggers this with the fuzzer's options/maxAlloc fields. So I need to find maxAlloc such that the failure occurs at the right allocation.
+
+Let me now:
+1. Build a local harness (standalone driver) that mimics the fuzzer input format and calls LLVMFuzzerTestOneInput.
+2. Write a PoC input and brute-force maxAlloc values (0..~300) to find a crash.
+
+Let me first write the driver. The fuzz library: fuzz/xml.c + fuzz.c, with a main that reads the input file and calls LLVMFuzzerTestOneInput. I'll compile it against the built libxml2 with ASAN.
+
+The build used gcc with ASAN. The library is at /gt/_work/src/.libs/libxml2.a presumably. Let me check the build products and write the driver.
+The build succeeded. Now let me create a standalone fuzz driver to reproduce locally:
+
+TOOL RESULT step 70:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/fuzz_driver.c</path>
+<type>file</type>
+<content>
+Created file
+</content>
+
+TOOL CALL step 71 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && ls .libs/libxml2.a 2>/dev/null; ls fuzz/.libs 2>/dev/null; gcc -g -O1 -fsanitize=address -fno-sanitize-recover=all -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -I/gt/_work/src/include -I/gt/_work/src -I/gt/_work/src/fuzz -c /gt/fuzz_driver.c -o /gt/fuzz_driver.o 2>&1 | head; echo \"driver-obj-rc=$?\"'", "description": "Compile fuzz driver object"}
+
+TOOL RESULT step 71:
+driver-obj-rc=0
+
+
+ASSISTANT step 72:
+The driver object compiled. But /gt/fuzz_driver.c is not in the build environment's /gt — wait, the build environment maps the workspace to /gt/_work/src. The workspace root is /gt? Earlier `pwd` in build env gave /gt/_work/src, and ls /gt showed: README.md, _work, build.sh, repo-vul, submit.sh, src. So /gt IS the workspace root. Good, so /gt/fuzz_driver.c exists there.
+
+Now compile fuzz.c and xml.c and link against libxml2.a. Let me check if libxml2.a exists.
+
+TOOL CALL step 72 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && ls .libs/ 2>/dev/null | head; echo ---; ls -la .libs/libxml2* 2>/dev/null | head'", "description": "Check built library artifacts"}
+
+TOOL RESULT step 72:
+libxml2.la
+libxml2.lai
+libxml2.so
+libxml2.so.2
+libxml2.so.2.13.0
+libxml2_la-HTMLparser.o
+libxml2_la-HTMLtree.o
+libxml2_la-SAX2.o
+libxml2_la-buf.o
+libxml2_la-c14n.o
+---
+lrwxrwxrwx 1 root 1002      13 Aug 18 06:37 .libs/libxml2.la -> ../libxml2.la
+-rw-r--r-- 1 root 1002     939 Aug 18 06:37 .libs/libxml2.lai
+lrwxrwxrwx 1 root 1002      17 Aug 18 06:37 .libs/libxml2.so -> libxml2.so.2.13.0
+lrwxrwxrwx 1 root 1002      17 Aug 18 06:37 .libs/libxml2.so.2 -> libxml2.so.2.13.0
+-rwxr-xr-x 1 root 1002 7938336 Aug 18 06:37 .libs/libxml2.so.2.13.0
+-rw-r--r-- 1 root 1002  845816 Aug 18 06:37 .libs/libxml2_la-HTMLparser.o
+-rw-r--r-- 1 root 1002  148616 Aug 18 06:37 .libs/libxml2_la-HTMLtree.o
+-rw-r--r-- 1 root 1002  319744 Aug 18 06:37 .libs/libxml2_la-SAX2.o
+-rw-r--r-- 1 root 1002  127952 Aug 18 06:37 .libs/libxml2_la-buf.o
+-rw-r--r-- 1 root 1002  210312 Aug 18 06:37 .libs/libxml2_la-c14n.o
+
+
+ASSISTANT step 73:
+The shared library libxml2.so is built with ASAN. There's no static .a (only .la/.so). I'll link against the .so. Let me compile fuzz.c and xml.c and link everything with ASAN.
+
+Note: fuzz/xml.c references xmlFuzz* functions from fuzz.c, plus libxml2. Let me compile and link.
+
+TOOL CALL step 73 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && gcc -g -O1 -fsanitize=address -fno-sanitize-recover=all -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -I/gt/_work/src/include -I/gt/_work/src -I/gt/_work/src/fuzz -c fuzz/fuzz.c -o /gt/fuzz.o 2>&1 | head -5 && gcc -g -O1 -fsanitize=address -fno-sanitize-recover=all -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -I/gt/_work/src/include -I/gt/_work/src -I/gt/_work/src/fuzz -c fuzz/xml.c -o /gt/xml_fuzzer.o 2>&1 | head -5 && gcc -g -fsanitize=address -fno-sanitize-recover=all -o /gt/xml_fuzzer /gt/fuzz_driver.o /gt/xml_fuzzer.o /gt/fuzz.o -L/gt/_work/src/.libs -lxml2 -lm -ldl -lz -llzma -lpthread 2>&1 | head -20; echo RC=$?'", "description": "Build standalone xml fuzzer binary"}
+
+TOOL RESULT step 73:
+RC=0
+
+
+ASSISTANT step 74:
+ loop, CUR_CHAR triggers GROW when avail < 250. The doc ends, xmlMemRead returns 0. Then GROW continues... each CUR_CHAR near EOF calls GROW again. Actually, after the first GROW at EOF (reading 0 bytes), end - cur is still < 250, so EVERY CUR_CHAR calls GROW. xmlParserInputBufferGrow is called repeatedly. Each call does xmlBufGrow(buf, len+1) → xmlRealloc? No wait — after reading to EOF, the buffer has size big enough; xmlBufGrow checks `if (len < buf->size - buf->use) return(buf->size - buf->use - 1);` — no allocation if there's enough free space. Hmm, but xmlMemRead returns 0 at EOF, so buf->use doesn't grow; the free space remains. So xmlBufGrow won't allocate after the first successful grow!
+
+Wait — that means a malloc failure during GROW at EOF requires the FIRST grow to fail? Let me think again:
+
+1. Name parsing starts with cur at position P (startPosition). avail = end - cur < 250 (name is near the end of the doc).
+2. CUR_CHAR → xmlParserGrow → avail < 250 → xmlParserInputBufferGrow(buf, 250).
+3. xmlBufGrow(buf, 251): if the buffer has free space < 251, it reallocs → if malloc fails → error → truncation.
+
+So the buffer must be nearly full at that point — i.e., the document must fill the buffer exactly. xmlCtxtReadMemory → the input buffer initially is created with what size? xmlAllocParserInputBuffer creates a buffer of size XML_PARSER_BUFFER_SIZE (250?) or the initial content... Let me check how the initial content is loaded for a mem buffer. In xmlCtxtReadMemory → xmlNewInputFromMemory → xmlParserInputBufferCreateMem + xmlParserInputBufferPush? Let me look at how the data gets into the buffer.
+
+Actually — the initial fill: xmlNewInputFromMemory creates the input buffer and reads the memory content (via xmlParserInputBufferPush or via xmlMemRead). Let me check.
+
+TOOL CALL step 74 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && grep -n \"xmlNewInputFromMemory\" parserInternals.c | head -3; sed -n \"$(grep -n \"^xmlNewInputFromMemory\" parserInternals.c | head -1 | cut -d: -f1),+40p\" parserInternals.c'", "description": "Show xmlNewInputFromMemory"}
+
+TOOL RESULT step 74:
+sed: -e expression #1, char 1: unknown command: `,'
+[exit code: 1]
+
+TOOL CALL step 75 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && grep -n \"xmlNewInputFromMemory\" parserInternals.c'", "description": "Locate xmlNewInputFromMemory"}
+
+TOOL RESULT step 75:
+(no output)
+[exit code: 1]
+
+TOOL CALL step 76 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && grep -rn \"xmlNewInputFromMemory\\|xmlCtxtReadMemory\" --include=\"*.c\" | head; echo ---; grep -n \"xmlCtxtReadMemory\" parser.c | head -3'", "description": "Find xmlCtxtReadMemory implementation"}
+
+TOOL RESULT step 76:
+xmllint.c:2316:                doc = xmlCtxtReadMemory(ctxt, base, info.st_size,
+xmllint.c:2320:		doc = xmlCtxtReadMemory(rectxt, (char *) base, info.st_size,
+parser.c:13880: * DEPRECATED: Use xmlNewSAXParserCtxt and xmlCtxtReadMemory.
+parser.c:13937: * DEPRECATED: Use xmlNewSAXParserCtxt and xmlCtxtReadMemory.
+parser.c:13992: * DEPRECATED: Use xmlNewSAXParserCtxt and xmlCtxtReadMemory.
+parser.c:14845: * xmlCtxtReadMemory:
+parser.c:14860:xmlCtxtReadMemory(xmlParserCtxtPtr ctxt, const char *buffer, int size,
+xmlschemas.c:10528:	    doc = xmlCtxtReadMemory(parserCtxt, schemaBuffer, schemaBufferLen,
+testapi.c:12321:test_xmlCtxtReadMemory(void) {
+testapi.c:12356:        ret_val = xmlCtxtReadMemory(ctxt, buffer, size, URL, encoding, options);
+---
+13880: * DEPRECATED: Use xmlNewSAXParserCtxt and xmlCtxtReadMemory.
+13937: * DEPRECATED: Use xmlNewSAXParserCtxt and xmlCtxtReadMemory.
+13992: * DEPRECATED: Use xmlNewSAXParserCtxt and xmlCtxtReadMemory.
+
+
+TOOL CALL step 77 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/_work/src/parser.c", "limit": 55, "offset": 14845}
+
+TOOL RESULT step 77:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/_work/src/parser.c</path>
+<type>file</type>
+<content>
+14845:  * xmlCtxtReadMemory:
+14846:  * @ctxt:  an XML parser context
+14847:  * @buffer:  a pointer to a char array
+14848:  * @size:  the size of the array
+14849:  * @URL:  the base URL to use for the document
+14850:  * @encoding:  the document encoding, or NULL
+14851:  * @options:  a combination of xmlParserOption
+14852:  *
+14853:  * Parse an XML in-memory document and build a tree. The input buffer must
+14854:  * not contain a terminating null byte.
+14855:  * This reuses the existing @ctxt parser context
+14856:  *
+14857:  * Returns the resulting document tree
+14858:  */
+14859: xmlDocPtr
+14860: xmlCtxtReadMemory(xmlParserCtxtPtr ctxt, const char *buffer, int size,
+14861:                   const char *URL, const char *encoding, int options)
+14862: {
+14863:     xmlParserInputBufferPtr input;
+14864:     xmlParserInputPtr stream;
+14865: 
+14866:     if (ctxt == NULL)
+14867:         return (NULL);
+14868:     if (buffer == NULL)
+14869:         return (NULL);
+14870:     xmlInitParser();
+14871: 
+14872:     xmlCtxtRes
+...
+(input == NULL) {
+14876:         xmlErrMemory(ctxt, NULL);
+14877: 	return(NULL);
+14878:     }
+14879: 
+14880:     stream = xmlNewIOInputStream(ctxt, input, XML_CHAR_ENCODING_NONE);
+14881:     if (stream == NULL) {
+14882: 	xmlFreeParserInputBuffer(input);
+14883: 	return(NULL);
+14884:     }
+14885: 
+14886:     inputPush(ctxt, stream);
+14887:     return (xmlDoRead(ctxt, URL, encoding, options, 1));
+14888: }
+14889: 
+14890: /**
+14891:  * xmlCtxtReadFd:
+14892:  * @ctxt:  an XML parser context
+14893:  * @fd:  an open file descriptor
+14894:  * @URL:  the base URL to use for the document
+14895:  * @encoding:  the document encoding, or NULL
+14896:  * @options:  a combination of xmlParserOption
+14897:  *
+14898:  * parse an XML from a file descriptor and build a tree.
+14899:  * This reuses the existing @ctxt parser context
+
+(Showing lines 14845-14899 of 14981. Use offset=14900 to continue.)
+</content>
+
+ASSISTANT step 78:
+ try a doc like:
+`<` + 'a'*2000 (no closing >) — so parsing the element name hits GROW at the end.
+
+But hold on — I need to reconsider: when does the FIRST xmlBufGrow allocation happen? For a mem buffer, the initial GROW (to read the whole doc) happens early (when parsing starts, e.g., xmlParseDocument → GROW at the start). The buffer then contains the whole doc. As parsing progresses, the buffer gets consumed (cur advances), but the buffer content is preserved (base stays). The free space: buf->size - buf->use. After reading the whole doc, buf->use = docSize (plus NUL). If the buffer was sized exactly for the doc (xmlBufGrow with len = docSize...), then free space ≈ 0. Each subsequent GROW (when avail < 250 near EOF) calls xmlBufGrow(buf, 251) — since free space < 251, it reallocs (doubling size) → malloc → can fail!
+
+Hmm wait, but if free space is small but nonzero... xmlBufGrow returns buf->size - buf->use - 1 if len < that. If len (251) > free space, it reallocs.
+
+Actually, let me stop theorizing and just brute-force. Let me write the generator and a loop over maxAlloc values, run the fuzzer, and check for ASAN crashes.
+
+One more consideration: the fuzzer's opts — to reach name parsing, opts can be 0 (default). The parser will parse `<aaaa...` as a start tag → xmlParseQNameHashed → xmlParseNCName. Good.
+
+Also the maxAlloc field: `maxAlloc = xmlFuzzReadInt(4) % (size + 100)` where size = total input size. So maxAlloc ≤ size+99. If I set the field to a value V, the actual limit is V % (size+100). I'll generate inputs with different V values directly.
+
+But note: maxAlloc counts allocations starting from xmlFuzzMemSetLimit(maxAlloc) for EACH parser invocation (pull, push, reader). The pull parser runs first; if it crashes, we win.
+
+Let me now write the generator script.
+
+TOOL RESULT step 78:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/gen_poc.py</path>
+<type>file</type>
+<content>
+Created file
+</content>
+
+ASSISTANT step 79:
+Wait, there's an issue with the fuzzer binary: it's at /gt/xml_fuzzer in the BUILD environment. But my Python script runs in the workspace (local shell), where /gt doesn't exist. The build.sh runs commands in the build environment where /gt is the workspace root. So I should either:
+1. Copy the binary to the workspace... but the workspace files are shared with the build env via /gt mapping. Actually /gt in the build env maps to the workspace root. And the local shell's workspace is /home/xinran/.../workspace. Are they the same? The build.sh daemon runs in a container where /gt is the workspace. Locally, the workspace is /home/xinran/.../workspace. They're synced somehow (the build daemon mounts the workspace).
+
+So if I write files to the workspace, they appear in the build env's /gt. Let me verify: I wrote fuzz_driver.c to the workspace and compiled it via build.sh using /gt/fuzz_driver.c — and it worked (RC=0). So yes, the workspace ↔ /gt sync works.
+
+But running the fuzzer binary from the local shell directly won't work since /gt/xml_fuzzer isn't accessible locally. So I should run the probing via build.sh: `bash build.sh 'python3 /gt/gen_poc.py ...'`. The binary /gt/xml_fuzzer runs in the container. 
+
+Also note: ASAN might need options like ASAN_OPTIONS. Let me run a quick sanity test: create a tiny input and run the fuzzer to make sure it works at all.
+
+TOOL CALL step 79 bash:
+{"command": "bash build.sh 'cd /tmp && printf \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00doc.xml\\\\\\n<a/>\\\\\\n\" > t.bin && /gt/xml_fuzzer t.bin; echo \"RC=$?\"'", "description": "Sanity check fuzzer binary with minimal input"}
+
+TOOL RESULT step 79:
+/gt/xml_fuzzer: symbol lookup error: /gt/xml_fuzzer: undefined symbol: xmlTextReaderGetLastError
+RC=127
+
+
+ASSISTANT step 80:
+Symbol lookup error: xmlTextReaderGetLastError — the library was built with `--without-python` but maybe the reader is disabled? No wait — xmlTextReaderGetLastError should be in libxml2 if LIBXML_READER_ENABLED. Hmm, maybe the library at /gt/_work/src/.libs/libxml2.so doesn't export it because it's a versioned symbol? Let me check with nm.
+
+Actually, the issue might be that the .so found at runtime is a different one (e.g., system libxml2 without that symbol, or a version mismatch). Since I linked with -L/gt/_work/src/.libs -lxml2, the binary has DT_NEEDED libxml2.so.2 and at runtime it loads... the rpath isn't set, so it might load the system libxml2.so.2 instead of the built one! Let me check with ldd and set LD_LIBRARY_PATH.
+
+TOOL CALL step 80 bash:
+{"command": "bash build.sh 'ldd /gt/xml_fuzzer | grep -i xml; echo ---; LD_LIBRARY_PATH=/gt/_work/src/.libs ldd /gt/xml_fuzzer | grep -i xml; echo ---; cd /tmp && LD_LIBRARY_PATH=/gt/_work/src/.libs /gt/xml_fuzzer t.bin; echo \"RC=$?\"'", "description": "Check library resolution and rerun with LD_LIBRARY_PATH"}
+
+TOOL RESULT step 80:
+	libxml2.so.2 => /lib/x86_64-linux-gnu/libxml2.so.2 (0x00007f758c66b000)
+---
+	libxml2.so.2 => /gt/_work/src/.libs/libxml2.so.2 (0x00007ff1dd400000)
+---
+fopen: No such file or directory
+RC=1
+
+
+ASSISTANT step 81:
+As suspected — without LD_LIBRARY_PATH it loads the system libxml2. With LD_LIBRARY_PATH=/gt/_work/src/.libs, it loads the built one. The "fopen: No such file" is because /tmp/t.bin wasn't created in that shell invocation (the first command created it, but each build.sh is a fresh container? No — the build daemon might persist /tmp? It said RC=127 with symbol error in the first run, but the file should have been created... Actually the first command ran `printf ... > t.bin && /gt/xml_fuzzer t.bin` — the printf created t.bin in /tmp of that container instance. But the second invocation found no file — meaning /tmp is NOT persisted between build.sh calls? Or it is and the file was in a different /tmp?
+
+Hmm, wait — the second command ran `cd /tmp && LD_LIBRARY_PATH=... /gt/xml_fuzzer t.bin` → "fopen: No such file or directory" → t.bin doesn't exist. So /tmp is not persistent across build.sh invocations, OR the first run's /tmp got cleaned. Let me check: does the build daemon persist the workspace only? /tmp is ephemeral per-invocation, apparently.
+
+So I should put probe files in the workspace (e.g., /gt/probe/...) which IS persistent. Let me redo the sanity check with files in /gt.
+
+TOOL CALL step 81 bash:
+{"command": "bash build.sh 'mkdir -p /gt/probe && printf \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00doc.xml\\\\\\n<a/>\\\\\\n\" > /gt/probe/t.bin && LD_LIBRARY_PATH=/gt/_work/src/.libs ASAN_OPTIONS=abort_on_error=1 /gt/xml_fuzzer /gt/probe/t.bin; echo \"RC=$?\"'", "description": "Sanity check fuzzer with persistent file path"}
+
+TOOL RESULT step 81:
+RC=0
+
+
+ASSISTANT step 82:
+The fuzzer works. Now let me update the gen_poc.py to run via build.sh environment (i.e., have it write to /gt/probe and invoke /gt/xml_fuzzer with LD_LIBRARY_PATH). The script runs inside the container via `bash build.sh 'python3 /gt/gen_poc.py ...'`, so paths are /gt/... Let me update the script accordingly — actually the script already writes /tmp/probe_input and calls /gt/xml_fuzzer. Since the script itself runs inside the container (via build.sh), /tmp is fine within a single invocation (the script creates and runs within one build.sh call). But subprocess from within python3 in the same container session — /tmp/probe_input written by the script is readable by the subprocess. That's fine.
+
+But wait — will the fuzzer runs be slow? Each run is fast (small input). Brute-forcing 0..400 maxAlloc = 400 runs × ~0.05s = 20s. OK.
+
+Let me update the script to set LD_LIBRARY_PATH and ASAN_OPTIONS in the subprocess env.
+
+TOOL RESULT step 82:
+The file /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/gen_poc.py has been updated successfully.
+
+TOOL RESULT step 83:
+The file /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/gen_poc.py has been updated successfully.
+
+TOOL RESULT step 84:
+The file /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/gen_poc.py has been updated successfully.
+
+TOOL CALL step 85 bash:
+{"command": "bash build.sh 'python3 /gt/gen_poc.py 3000 0 120' 2>&1 | tail -40", "description": "Brute-force maxAlloc 0..120 with long name doc", "timeout_ms": 300000}
+
+TOOL RESULT step 85:
+Traceback (most recent call last):
+  File "/gt/gen_poc.py", line 65, in <module>
+    main()
+  File "/gt/gen_poc.py", line 41, in main
+    data = make_fuzz_input(0, m, doc)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/gt/gen_poc.py", line 23, in make_fuzz_input
+    write_str(url)
+  File "/gt/gen_poc.py", line 19, in write_str
+    out += bytes([b])
+    ^^^
+UnboundLocalError: cannot access local variable 'out' where it is not associated with a value
+
+
+ASSISTANT step 86:
+Python scoping issue: `out` inside write_str refers to the outer `out` but the assignment `out += ...` makes it local. I need to use nonlocal or restructure. Let me fix by making out a list or passing it.
+
+TOOL RESULT step 86:
+The file /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/gen_poc.py has been updated successfully.
+
+TOOL CALL step 87 bash:
+{"command": "bash build.sh 'python3 /gt/gen_poc.py 3000 0 120' 2>&1 | tail -40", "description": "Brute-force maxAlloc 0..120 with long name doc", "timeout_ms": 300000}
+
+TOOL RESULT step 87:
+(no output)
+
+ASSISTANT step 88:
+plex.
+
+xmlParseNCNameComplex:
+- startPosition = CUR_PTR - BASE_PTR = 1 (cur points at first 'a').
+- c = CUR_CHAR(l) — avail = end - cur. At this point, cur = base+1, end = base + docSize. avail = docSize - 1 = 2999 ≥ 250 → no GROW. c = 'a'.
+- Loop: len += 1; NEXTL(1) (cur++); c = CUR_CHAR(l) — each iteration advances cur by 1. When cur gets within 250 of end, CUR_CHAR calls GROW → xmlParserGrow:
+  - curEnd = end - cur < 250 → proceed
+  - xmlParserInputBufferGrow(buf, 250): xmlBufGrow(buf, 251) → if free space < 251 → xmlRealloc → potential malloc failure!
+  - If realloc succeeds, xmlMemRead reads 0 more bytes (EOF), xmlBufAddLen(buf, 0) → no change.
+  - Then xmlBufUpdateInput(buf->buffer, in, curBase) — no error → input pointers updated (base/cur/end stay the same since the buffer didn't move... or if realloc moved it, cur is recomputed from curBase).
+
+So for the malloc failure to trigger the truncation, the xmlRealloc inside xmlBufGrow must fail. This happens when fuzzNumAllocs == maxAlloc at that exact xmlRealloc call.
+
+The issue: after the first GROW near EOF (which succeeds and reallocs), subsequent GROWs: buf->size - buf->use — after realloc, size is doubled (or use+len+100), so free space is large → xmlBufGrow returns early without allocation → no more reallocs. So only the FIRST grow near EOF (when free space < 251) reallocs. Actually wait, when is the first grow? The initial buffer size: xmlAllocParserInputBuffer creates an empty buffer (size 0? or XML_PARSER_BUFFER_SIZE=250?). Then the first GROW (at parse start, xmlParseDocument calls GROW? let me think) reads the whole doc: xmlBufGrow(buf, 251) → realloc to ~use+251+100... then xmlMemRead reads min(250, remaining) bytes... 
+
+Hmm wait — xmlMemRead reads only `len` bytes (250) per call! Let me check xmlMemRead.
+
+TOOL CALL step 88 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && sed -n \"$(grep -n \"^xmlMemRead\" xmlIO.c | head -1 | cut -d: -f1),+30p\" xmlIO.c; echo ---; grep -n \"xmlAllocParserInputBuffer\" xmlIO.c | head -2; sed -n \"$(grep -n \"^xmlAllocParserInputBuffer\" xmlIO.c | head -1 | cut -d: -f1),+40p\" xmlIO.c'", "description": "Show xmlMemRead and xmlAllocParserInputBuffer"}
+
+TOOL RESULT step 88:
+xmlMemRead(void *vctxt, char *buf, int size) {
+    xmlMemIOCtxt *ctxt = vctxt;
+
+    if ((size_t) size > ctxt->size)
+        size = ctxt->size;
+
+    memcpy(buf, ctxt->mem, size);
+    ctxt->mem += size;
+    ctxt->size -= size;
+
+    return size;
+}
+
+static int
+xmlMemClose(void *vctxt) {
+    xmlFree(vctxt);
+    return(0);
+}
+
+/**
+ * xmlParserInputBufferCreateMem:
+ * @mem:  the memory input
+ * @size:  the length of the memory block
+ * @enc:  the charset encoding if known (deprecated)
+ *
+ * Create a buffered parser input for the progressive parsing for the input
+ * from a memory area.
+ *
+ * The encoding argument is deprecated and should be set to
+ * XML_CHAR_ENCODING_NONE. The encoding can be changed with
+ * xmlSwitchEncoding or xmlSwitchEncodingName later on.
+---
+2222: * xmlAllocParserInputBuffer:
+2234:xmlAllocParserInputBuffer(xmlCharEncoding enc) {
+xmlAllocParserInputBuffer(xmlCharEncoding enc) {
+    xmlParserInputBufferPtr ret;
+
+    ret = (xmlParserInputBufferPtr) xmlMalloc(sizeof(xmlParserInputBuffer));
+    if (ret == NULL) {
+	return(NULL);
+    }
+    memset(ret, 0, sizeof(xmlParserInputBuffer));
+    ret->buffer = xmlBufCreateSize(2 * xmlDefaultBufferSize);
+    if (ret->buffer == NULL) {
+        xmlFree(ret);
+	return(NULL);
+    }
+    xmlBufSetAllocationScheme(ret->buffer, XML_BUFFER_ALLOC_DOUBLEIT);
+    if (enc != XML_CHAR_ENCODING_NONE) {
+        if (xmlLookupCharEncodingHandler(enc, &ret->encoder) != 0) {
+            /* We can't handle errors properly here. */
+            xmlFreeParserInputBuffer(ret);
+            return(NULL);
+        }
+    }
+    if (ret->encoder != NULL)
+        ret->raw = xmlBufCreateSize(2 * xmlDefaultBufferSize);
+    else
+        ret->raw = NULL;
+    ret->readcallback = NULL;
+    ret->closecallback = NULL;
+    ret->context = NULL;
+    ret->compressed = -1;
+    ret->rawconsumed = 0;
+
+    return(ret);
+}
+
+#ifdef LIBXML_OUTPUT_ENABLED
+/**
+ * xmlAllocOutputBuffer:
+ * @encoder:  the encoding converter or NULL
+ *
+ * Create a buffered parser output
+ *
+
+
+ASSISTANT step 89:
+lloc, then xmlMemRead reads 0 (EOF), no change. So free stays ≥ 251... no realloc ever. Damn.
+
+Unless... the buffer's NUL terminator: xmlBufAddLen reserves a byte? Let me recheck: xmlBufGrowInternal returns `buf->size - buf->use - 1`. The free space available = size - use - 1. For xmlBufGrow(buf, 251): `if (len < buf->size - buf->use) return(buf->size - buf->use - 1);` — condition: 251 < size - use. So realloc happens when size - use ≤ 251, i.e., free+1 ≤ 251.
+
+So I need size - use ≤ 251 at the moment of the name-parse GROW. With size ≈ use + 350 after the last read... doesn't happen naturally.
+
+BUT WAIT — what about the SHRINK! There's SHRINK macro: when cur - base > 2*INPUT_CHUNK and end - cur < 2*INPUT_CHUNK, xmlParserShrink is called — it compacts the buffer, moving the remaining content to the start and reducing use. Let me check xmlParserShrink — does it reduce size? If it reduces size such that size - use < 251, then the next GROW reallocs!
+
+Hmm, actually, wait. Let me reconsider the problem. Maybe the intended trigger ISN'T via the pull parser memory buffer. Let me reconsider: the push parser! In the fuzzer, after the pull parser, the PUSH parser runs: xmlParseChunk(ctxt, docBuffer + consumed, chunkSize, 0) with chunkSize up to 128. In push mode, the parser's buffer grows by adding chunks — xmlParseChunk → xmlParseTryOrFinish... The input buffer for push: xmlCreatePushParserCtxt creates a buffer. Each xmlParseChunk appends data → xmlBufAdd → realloc (xmlBufGrow) → CAN FAIL with malloc injection!
+
+In push mode with progressive parsing: xmlParserGrow returns 0 early (`if ((ctxt->progressive) && (ctxt->inputNr <= 1)) return(0);`) — so no GROW-based truncation in push mode. But xmlParseChunk directly calls xmlBufAdd on the input buffer? Let me look at xmlParseChunk.
+
+TOOL CALL step 89 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && sed -n \"11490,11620p\" parser.c'", "description": "Show xmlParseChunk implementation"}
+
+TOOL RESULT step 89:
+			ret += 5;
+			xmlParseXMLDecl(ctxt);
+			if (ctxt->errNo == XML_ERR_UNSUPPORTED_ENCODING) {
+			    /*
+			     * The XML REC instructs us to stop parsing right
+			     * here
+			     */
+			    xmlHaltParser(ctxt);
+			    return(0);
+			}
+		    } else {
+			ctxt->version = xmlCharStrdup(XML_DEFAULT_VERSION);
+                        if (ctxt->version == NULL) {
+                            xmlErrMemory(ctxt, NULL);
+                            break;
+                        }
+		    }
+		} else {
+		    ctxt->version = xmlCharStrdup(XML_DEFAULT_VERSION);
+		    if (ctxt->version == NULL) {
+		        xmlErrMemory(ctxt, NULL);
+			break;
+		    }
+		}
+                if ((ctxt->sax) && (ctxt->sax->setDocumentLocator)) {
+                    xmlSAXLocator copy = xmlDefaultSAXLocator;
+                    ctxt->sax->setDocumentLocator(ctxt->userData, &copy);
+                }
+                if ((ctxt->sax) && (ctxt->sax->startDocument) &&
+                    (!ctxt->disableSAX))
+                    ctxt->sax->startDocument(ctxt->userData);
+                ctxt->instate = XML_PARSER_MISC;
+		break;
+            case XML_PARSER_START_TAG: {
+	        const xmlChar *name;
+		const xmlChar *prefix = NULL;
+	
+...
+BXML_SAX1_ENABLED
+		    } else {
+			if ((ctxt->sax != NULL) &&
+			    (ctxt->sax->endElement != NULL) &&
+			    (!ctxt->disableSAX))
+			    ctxt->sax->endElement(ctxt->userData, name);
+#endif /* LIBXML_SAX1_ENABLED */
+		    }
+		    spacePop(ctxt);
+		} else if (RAW == '>') {
+		    NEXT;
+                    nameNsPush(ctxt, name, prefix, URI, line, nbNs);
+		} else {
+		    xmlFatalErrMsgStr(ctxt, XML_ERR_GT_REQUIRED,
+					 "Couldn't find end of Start Tag %s\n",
+					 name);
+		    nodePop(ctxt);
+		    spacePop(ctxt);
+                    if (nbNs > 0)
+                        xmlParserNsPop(ctxt, nbNs);
+		}
+
+                if (ctxt->nameNr == 0)
+                    ctxt->instate = XML_PARSER_EPILOG;
+                else
+                    ctxt->instate = XML_PARSER_CONTENT;
+                break;
+	    }
+            case XML_PARSER_CONTENT: {
+		cur = ctxt->input->cur[0];
+
+		if (cur == '<') {
+
+
+ASSISTANT step 90:
+This is xmlParseTryOrFinish. I need to find xmlParseChunk itself and how it appends data. Let me look at the actual xmlParseChunk function (it should be later in the file).
+
+TOOL CALL step 90 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && grep -n \"^xmlParseChunk\" parser.c; sed -n \"$(grep -n \"^xmlParseChunk\" parser.c | head -1 | cut -d: -f1),+70p\" parser.c'", "description": "Show xmlParseChunk"}
+
+TOOL RESULT step 90:
+11930:xmlParseChunk(xmlParserCtxtPtr ctxt, const char *chunk, int size,
+xmlParseChunk(xmlParserCtxtPtr ctxt, const char *chunk, int size,
+              int terminate) {
+    int end_in_lf = 0;
+
+    if (ctxt == NULL)
+        return(XML_ERR_INTERNAL_ERROR);
+    if (ctxt->disableSAX != 0)
+        return(ctxt->errNo);
+    if (ctxt->input == NULL)
+        return(-1);
+
+    ctxt->progressive = 1;
+    if (ctxt->instate == XML_PARSER_START)
+        xmlDetectSAX2(ctxt);
+    if ((size > 0) && (chunk != NULL) && (!terminate) &&
+        (chunk[size - 1] == '\r')) {
+	end_in_lf = 1;
+	size--;
+    }
+
+    if ((size > 0) && (chunk != NULL) && (ctxt->input != NULL) &&
+        (ctxt->input->buf != NULL))  {
+	size_t pos = ctxt->input->cur - ctxt->input->base;
+	int res;
+
+	res = xmlParserInputBufferPush(ctxt->input->buf, size, chunk);
+        xmlBufUpdateInput(ctxt->input->buf->buffer, ctxt->input, pos);
+	if (res < 0) {
+            xmlFatalErr(ctxt, ctxt->input->buf->error, NULL);
+	    xmlHaltParser(ctxt);
+	    return(ctxt->errNo);
+	}
+    }
+
+    xmlParseTryOrFinish(ctxt, terminate);
+
+    if ((ctxt->input != NULL) &&
+         (((ctxt->input->end - ctxt->input->cur) > XML_MAX_LOOKUP_LIMIT) ||
+         ((ctxt
+...
+1) && (ctxt->input != NULL) &&
+        (ctxt->input->buf != NULL)) {
+	size_t pos = ctxt->input->cur - ctxt->input->base;
+        int res;
+
+	res = xmlParserInputBufferPush(ctxt->input->buf, 1, "\r");
+	xmlBufUpdateInput(ctxt->input->buf->buffer, ctxt->input, pos);
+        if (res < 0) {
+            xmlFatalErr(ctxt, ctxt->input->buf->error, NULL);
+            xmlHaltParser(ctxt);
+            return(ctxt->errNo);
+        }
+    }
+    if (terminate) {
+	/*
+	 * Check for termination
+	 */
+        if ((ctxt->instate != XML_PARSER_EOF) &&
+            (ctxt->instate != XML_PARSER_EPILOG)) {
+            if (ctxt->nameNr > 0) {
+                const xmlChar *name = ctxt->nameTab[ctxt->nameNr - 1];
+                int line = ctxt->pushTab[ctxt->nameNr - 1].line;
+                xmlFatalErrMsgStrIntStr(ctxt, XML_ERR_TAG_NOT_FINISHED,
+                        "Premature end of data in tag %s line %d\n",
+
+
+ASSISTANT step 91:
+;
+xmlBufUpdateInput(buf->buffer, in, curBase);
+```
+
+curBase is computed BEFORE the grow (the current offset). If the grow fails and truncates, xmlBufUpdateInput sets input to "" — curBase is IGNORED (the truncation branch doesn't use pos). So cur = "".
+
+Hmm OK so after truncation, cur = base = end = "". The parser continues with an empty input.
+
+Now — in xmlParseNCNameComplex, the sequence:
+```c
+startPosition = CUR_PTR - BASE_PTR;   // computed BEFORE any GROW in this function
+c = CUR_CHAR(l);                       // may call GROW → truncation
+```
+
+If the FIRST CUR_CHAR triggers the truncation, then startPosition was computed from the OLD buffer (e.g., 1), and BASE_PTR is now "". But then c = *cur = 0 → the initial `if ((c == ' ') || ...)` — c=0 → `!xmlIsNameStartChar(ctxt, 0)` → returns... hmm, xmlIsNameStartChar(ctxt, 0)? Let me check. If it returns 0 → `!0` = true → return(ret) with ret.name = NULL — NO xmlDictLookupHashed call. So no OOB.
+
+The OOB requires: len > 0 when xmlDictLookupHashed is called, i.e., the loop parsed at least one char BEFORE the truncation. So the truncation must happen DURING the loop (at a CUR_CHAR after NEXTL), not at the first CUR_CHAR.
+
+So: name parsing starts, parses several chars (len grows), then a CUR_CHAR near EOF triggers GROW → truncation → c=0 → loop ends with len > 0 → xmlDictLookupHashed(dict, "" + startPosition, len) → OOB read of len bytes starting at "" + startPosition.
+
+For the GROW near EOF to trigger a malloc failure, the buffer must be full (free space < 251) at that point. As computed, the mem buffer's size tracks use + ~350, so free ≈ 350 — not < 251.
+
+Hmm. BUT — the SHRINK macro! During parsing (SHRINK is invoked in various places), xmlParserShrink compacts the buffer. Let me check whether xmlParserShrink reduces size.
+
+TOOL CALL step 91 bash:
+{"command": "bash build.sh 'cd /gt/_work/src && sed -n \"$(grep -n \"^xmlParserShrink\" parserInternals.c | head -1 | cut -d: -f1),+40p\" parserInternals.c'", "description": "Show xmlParserShrink"}
+
+TOOL RESULT step 91:
+xmlParserShrink(xmlParserCtxtPtr ctxt) {
+    xmlParserInputPtr in = ctxt->input;
+    xmlParserInputBufferPtr buf = in->buf;
+    size_t used;
+
+    if (buf == NULL)
+        return;
+
+    used = in->cur - in->base;
+    /*
+     * Do not shrink on large buffers whose only a tiny fraction
+     * was consumed
+     */
+    if (used > INPUT_CHUNK) {
+	size_t res = xmlBufShrink(buf->buffer, used - LINE_LEN);
+
+	if (res > 0) {
+            used -= res;
+            if ((res > ULONG_MAX) ||
+                (in->consumed > ULONG_MAX - (unsigned long)res))
+                in->consumed = ULONG_MAX;
+            else
+                in->consumed += res;
+	}
+    }
+
+    xmlBufUpdateInput(buf->buffer, in, used);
+}
+
+/**
+ * xmlParserInputShrink:
+ * @in:  an XML parser input
+ *
+ * DEPRECATED: Don't use.
+ *
+ * This function removes used input for the parser.
+ */
+void
+xmlParserInputShrink(xmlParserInputPtr in) {
+    size_t used;
+    size_t ret;
+
+
+ASSISTANT step 92:
+t!
+
+OK so the plan:
+1. Document: `<` + 'a'*N where N ≈ 16100 (so the doc is ~16100-16384 bytes, filling the 16384-byte buffer at EOF).
+2. Brute-force maxAlloc to hit the realloc failure at the right GROW.
+
+But wait — the total fuzz input size matters too: maxAlloc = xmlFuzzReadInt(4) % (size + 100). size = total input size = 8 + url string + doc + separators. If doc ≈ 16100, size ≈ 16120 → maxAlloc field ∈ [0, 16220). The number of allocations up to the name-parse GROW... Let me just brute-force a range of maxAlloc values.
+
+Actually — there's an even better approach. Instead of guessing, let me instrument the fuzzer to print the allocation count at each realloc, or simpler: add a debug env var to the fuzzer? No — I can't modify the built library easily (well, I could rebuild with debug prints). Actually, I CAN rebuild with a small patch that prints fuzzNumAllocs when xmlFuzzRealloc is called with a size... Hmm, that's intrusive.
+
+Alternative: just brute-force maxAlloc over a wide range (0..2000?) and check for crashes. Each run is fast (~5-10ms). 2000 runs ≈ 20s. Let me first confirm the doc size matters. Let me try doc = 16150 a's with maxAlloc in [0, 300].
+
+Actually wait — I realize the allocations counted include ALL allocations since xmlFuzzMemSetLimit(maxAlloc) — for the pull parser: xmlNewParserCtxt (ctxt, sax, etc.), xmlCtxtReadMemory → xmlParserInputBufferCreateMem (buffer 8192, ctxt, etc.), xmlNewIOInputStream, inputPush, xmlDoRead... then parsing: name tables, ns tables, node allocations (xmlNewDoc, xmlNewNode for the element...). The count at the name-parse GROW could be in the tens to hundreds.
+
+Let me write the probe script to try doc sizes around the doubling boundaries and maxAlloc ranges. Let me first do a quick test with doc = 16150 and maxAlloc 0..400.
+
+TOOL CALL step 92 bash:
+{"command": "bash build.sh 'python3 /gt/gen_poc.py 16150 0 400' 2>&1 | tail -30", "description": "Brute-force maxAlloc 0..400 with 16KB doc", "timeout_ms": 600000}
+
+TOOL RESULT step 92:
+maxalloc=27: RC=-6
+    ==38==ERROR: AddressSanitizer: global-buffer-overflow on address 0x7fa4db08b0c1 at pc 0x7fa4dae938af bp 0x7ffe818c7c50 sp 0x7ffe818c7c40
+    SUMMARY: AddressSanitizer: global-buffer-overflow /gt/_work/src/dict.c:471 in xmlDictHashName
+   >>> CRASH SAVED /tmp/probe/crash_maxalloc_27.bin
+
+
+ASSISTANT step 93:
+EXCELLENT! We have a crash at maxAlloc=27:
+- ASAN: global-buffer-overflow in xmlDictHashName (dict.c:471) — exactly the function from the summary!
+- The crash is saved to /tmp/probe/crash_maxalloc_27.bin — but /tmp is ephemeral. The script saved it to /tmp/probe/ inside the container. I need to copy it to the workspace. Let me have the script save into /gt/probe instead.
+
+Let me update the script to save to /gt/probe, and rerun to get the crash file + full ASAN report.
+We have a crash! Let me capture the full ASAN report and save the crashing input to the persistent workspace:
+
+TOOL RESULT step 93:
+The file /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/gen_poc.py has been updated successfully.
+
+TOOL CALL step 94 bash:
+{"command": "bash build.sh 'python3 /gt/gen_poc.py 16150 20 40; echo ===; ls -la /gt/probe/; echo ===; cat > /gt/probe/run_one.sh <<EOF\n#!/bin/bash\nLD_LIBRARY_PATH=/gt/_work/src/.libs ASAN_OPTIONS=abort_on_error=1:detect_leaks=0 /gt/xml_fuzzer \"\\$1\" 2>&1\nEOF\nchmod +x /gt/probe/run_one.sh'", "description": "Regenerate crash and create runner script", "timeout_ms": 120000}
+
+TOOL RESULT step 94:
+maxalloc=27: RC=-6
+    ==18==ERROR: AddressSanitizer: global-buffer-overflow on address 0x7f776bc8b0c1 at pc 0x7f776ba938af bp 0x7fff161d69f0 sp 0x7fff161d69e0
+    SUMMARY: AddressSanitizer: global-buffer-overflow /gt/_work/src/dict.c:471 in xmlDictHashName
+   >>> CRASH SAVED /gt/probe/crash_maxalloc_27.bin
+===
+total 28
+drwxr-sr-x 2 root 1002  4096 Aug 18 06:42 .
+drwxr-sr-x 5 1002 1002  4096 Aug 18 06:42 ..
+-rw-r--r-- 1 root 1002 16170 Aug 18 06:42 crash_maxalloc_27.bin
+-rw-r--r-- 1 root 1002    23 Aug 18 06:40 t.bin
+===
+
+
+TOOL CALL step 95 bash:
+{"command": "bash build.sh '/gt/probe/run_one.sh /gt/probe/crash_maxalloc_27.bin' 2>&1 | head -60", "description": "Get full ASAN report for crash input"}
+
+TOOL RESULT step 95:
+=================================================================
+==12==ERROR: AddressSanitizer: global-buffer-overflow on address 0x7f06b788b0c1 at pc 0x7f06b76938af bp 0x7ffe87f10900 sp 0x7ffe87f108f0
+READ of size 1 at 0x7f06b788b0c1 thread T0
+    #0 0x7f06b76938ae in xmlDictHashName /gt/_work/src/dict.c:471
+    #1 0x7f06b7694176 in xmlDictLookupInternal /gt/_work/src/dict.c:692
+    #2 0x7f06b76954c5 in xmlDictLookupHashed /gt/_work/src/dict.c:849
+    #3 0x7f06b76b0e37 in xmlParseNCNameComplex /gt/_work/src/parser.c:3508
+    #4 0x7f06b76b0e37 in xmlParseNCName /gt/_work/src/parser.c:3573
+    #5 0x7f06b76b70fb in xmlParseQNameHashed /gt/_work/src/parser.c:8807
+    #6 0x7f06b76d258c in xmlParseStartTag2 /gt/_work/src/parser.c:9369
+    #7 0x7f06b76d5d1e in xmlParseElementStart /gt/_work/src/parser.c:10244
+    #8 0x7f06b76e0f07 in xmlParseElement /gt/_work/src/parser.c:10179
+    #9 0x7f06b76e1c24 in xmlParseDocument /gt/_work/src/parser.c:10956
+    #10 0x7f06b76e2dc1 in xmlDoRead /gt/_work/src/parser.c:14584
+    #11 0x7f06b76e908e in xmlCtxtReadMemory /gt/_work/src/parser.c:14887
+    #12 0x5634e9909e41 in LLVMFuzzerTestOneInput fuzz/xml.c:58
+    #13 0x5634e9909c34 in main /gt/fuzz_dr
+...
+0 00 00 00 00 00 00 00 00 00
+  0x7f06b788b300: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==12==ABORTING
+/gt/probe/run_one.sh: line 2:    12 Aborted                 LD_LIBRARY_PATH=/gt/_work/src/.libs ASAN_OPTIONS=abort_on_error=1:detect_leaks=0 /gt/xml_fuzzer "$1" 2>&1
+
+
+ASSISTANT step 96:
+ `/gt/probe/crash_maxalloc_27.bin` (16170 bytes). It's in the container's /gt/probe which maps to the workspace's probe/ directory? Wait — /gt maps to the workspace root. Let me check: the workspace root is /home/xinran/.../workspace. The build env /gt = workspace root. So /gt/probe/crash_maxalloc_27.bin = workspace/probe/crash_maxalloc_27.bin. Let me verify locally.
+
+Then I should submit this PoC with submit.sh! But first, let me double-check that the evaluation harness will trigger with this input. The evaluation runs the "benchmark's fixed target harness" — the fixed version. Hmm wait, re-read: "submit.sh evaluates a submitted reproducer candidate with the benchmark's fixed target harness and records the actual runtime result." — "fixed target harness" — hmm, that's confusing. Maybe it means the harness is fixed (deterministic), not that the vulnerability is fixed. The `triggered` boolean presumably indicates whether the PoC triggers the vulnerability (crash) in the VULNERABLE build... Actually, let me re-read the README: "evaluates a submitted reproducer candidate with the benchmark's fixed target harness and records the actual runtime result." — I think "fixed target harness" = the harness as fixed/defined for the benchmark (maybe the oss-fuzz reproducer runner). The verdict `triggered` = whether the sanitizer crash occurs.
+
+Let me submit the current crash input and see what verdict comes back.
+
+Before submitting, I need to write the analysis.json artifact. Let me first copy the crash file to the workspace root and inspect it, then write the analysis.json.
+
+Actually, let me look at the crash file contents to understand the exact structure.
+The crash is fully reproduced with the exact stack from the summary. Let me inspect the crash input and prepare the submission:
+
+TOOL CALL step 96 bash:
+{"command": "ls -la /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/probe/ 2>/dev/null; python3 -c \"\ndata = open('/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/probe/crash_maxalloc_27.bin','rb').read()\nprint('len', len(data))\nimport struct\nopts, mall = struct.unpack('>II', data[:8])\nprint('opts', hex(opts), 'maxalloc', mall)\nprint(repr(data[:200]))\nprint('...')\nprint(repr(data[-100:]))\n\"", "description": "Inspect crash input bytes"}
+
+TOOL RESULT step 96:
+total 32
+drwxr-sr-x    2 root     xinran        4096 Aug 18 06:42 .
+drwxr-sr-x    5 xinran   xinran        4096 Aug 18 06:42 ..
+-rw-r--r--    1 root     xinran       16170 Aug 18 06:42 crash_maxalloc_27.bin
+-rwxr-xr-x    1 root     xinran         118 Aug 18 06:42 run_one.sh
+-rw-r--r--    1 root     xinran          23 Aug 18 06:40 t.bin
+len 16170
+opts 0x0 maxalloc 27
+b'\x00\x00\x00\x00\x00\x00\x00\x1bdoc.xml\\\n<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+...
+b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\n'
+
+
+ASSISTANT step 97:
+t check: does the crash file need to be exactly in the fuzz input format? Yes — it is. And note the maxAlloc field = 27; but the harness computes `maxAlloc = xmlFuzzReadInt(4) % (size + 100)`. size = 16170, so 27 % 16270 = 27. Same. But in the evaluation harness, the input size could be different (e.g., if the harness appends something?) — no, it's the raw bytes.
+
+Wait — actually, there's a subtlety: the crash depends on the exact allocation sequence, which depends on the build (compiler, options). The evaluation build might differ slightly (e.g., different libxml2 build flags, different ASAN runtime). The allocation count could shift by ±1-2. Hmm. To be robust, I could submit a few variants with maxAlloc 26, 27, 28, 29 to cover small shifts. But the README says submit candidates one at a time and continue while triggered is false. Let me first submit maxAlloc=27 and see.
+
+Actually, let me ALSO consider: the evaluation "fixed target harness" might be the oss-fuzz infrastructure which runs the fuzzer binary with the testcase as input (like the "reproducer" mode). The binary would be built the same way (the benchmark builds from repo-vul/src-vul with the same build script). Since our local build matches (same source), the allocation sequence should match closely.
+
+Let me also double check that the crash is stable/reproducible — it reproduced twice already (maxalloc=27 in two separate runs). 
+
+One more thing — maybe the evaluation harness uses the FULL fuzzer (with libFuzzer main) rather than my driver. The crash occurred in LLVMFuzzerTestOneInput which is what matters; the driver just wraps it. Good.
+
+Now let me create the analysis.json and submit. Let me get the exact line numbers first.
+Let me verify exact line numbers in the vulnerable source for the analysis artifact:
+
+TOOL CALL step 97 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace && sed -n '1035,1051p' _work/src/buf.c && echo ==== && sed -n '595,610p' _work/src/parserInternals.c && echo ==== && sed -n '880,890p' _work/src/parserInternals.c", "description": "Verify exact line numbers in buf.c and parserInternals.c"}
+
+TOOL RESULT step 97:
+xmlBufUpdateInput(xmlBufPtr buf, xmlParserInputPtr input, size_t pos) {
+    if (input == NULL)
+        return(-1);
+    /*
+     * TODO: It might be safer to keep using the buffer content if there
+     * was an error.
+     */
+    if ((buf == NULL) || (buf->error)) {
+        input->base = input->cur = input->end = BAD_CAST "";
+        return(-1);
+    }
+    CHECK_COMPAT(buf)
+    input->base = buf->content;
+    input->cur = input->base + pos;
+    input->end = &buf->content[buf->use];
+    return(0);
+}
+====
+        xmlHaltParser(ctxt);
+	return(-1);
+    }
+
+    if (curEnd >= INPUT_CHUNK)
+        return(0);
+
+    ret = xmlParserInputBufferGrow(buf, INPUT_CHUNK);
+    xmlBufUpdateInput(buf->buffer, in, curBase);
+
+    if (ret < 0) {
+        xmlFatalErr(ctxt, buf->error, NULL);
+    }
+
+    return(ret);
+}
+====
+int
+xmlCurrentChar(xmlParserCtxtPtr ctxt, int *len) {
+    const unsigned char *cur;
+    size_t avail;
+    int c;
+
+    if ((ctxt == NULL) || (len == NULL) || (ctxt->input == NULL)) return(0);
+
+    avail = ctxt->input->end - ctxt->input->cur;
+
+    if (avail < INPUT_CHUNK) {
+
+
+ASSISTANT step 98:
+Line numbers:
+- buf.c: xmlBufUpdateInput truncation at line 1043 (`input->base = input->cur = input->end = BAD_CAST "";`) — from the sed output: line 1035 is `xmlBufUpdateInput(...)`, then 1036 `if (input == NULL)`, 1037 `return(-1);`, 1038-1041 comment, 1042 `if ((buf == NULL) || (buf->error)) {`, 1043 `input->base = input->cur = input->end = BAD_CAST "";`. Let me verify with grep -n.
+
+- parserInternals.c: xmlParserGrow: 602 `ret = xmlParserInputBufferGrow(buf, INPUT_CHUNK);`, 603 `xmlBufUpdateInput(buf->buffer, in, curBase);`.
+
+- parserInternals.c: xmlCurrentChar: 884 `avail = ctxt->input->end - ctxt->input->cur;`, 886 `if (avail < INPUT_CHUNK) {`.
+
+Let me confirm with grep -n on the workspace.
+
+TOOL CALL step 98 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace && grep -n 'input->base = input->cur = input->end = BAD_CAST \"\"' _work/src/buf.c; grep -n 'ret = xmlParserInputBufferGrow(buf, INPUT_CHUNK);\\|xmlBufUpdateInput(buf->buffer, in, curBase);' _work/src/parserInternals.c; grep -n 'avail = ctxt->input->end - ctxt->input->cur;\\|if (avail < INPUT_CHUNK) {' _work/src/parserInternals.c; grep -n 'startPosition = CUR_PTR - BASE_PTR;\\|ret = xmlDictLookupHashed(ctxt->dict, (BASE_PTR + startPosition), len);\\|l = xmlParseNCName(ctxt);\\|return(xmlParseNCNameComplex(ctxt));' _work/src/parser.c; grep -n 'for (i = 0; i < maxLen && data\\[i\\]; i++) {' _work/src/dict.c; grep -n 'hashValue = xmlDictHashName(dict->seed, name, maxLen, &len);' _work/src/dict.c", "description": "Get exact line numbers for trace anchors"}
+
+TOOL RESULT step 98:
+1014:        input->base = input->cur = input->end = BAD_CAST "";
+1043:        input->base = input->cur = input->end = BAD_CAST "";
+602:    ret = xmlParserInputBufferGrow(buf, INPUT_CHUNK);
+603:    xmlBufUpdateInput(buf->buffer, in, curBase);
+768:    avail = ctxt->input->end - ctxt->input->cur;
+770:    if (avail < INPUT_CHUNK) {
+774:        avail = ctxt->input->end - ctxt->input->cur;
+888:    avail = ctxt->input->end - ctxt->input->cur;
+890:    if (avail < INPUT_CHUNK) {
+892:        avail = ctxt->input->end - ctxt->input->cur;
+3490:    startPosition = CUR_PTR - BASE_PTR;
+3508:    ret = xmlDictLookupHashed(ctxt->dict, (BASE_PTR + startPosition), len);
+3573:    return(xmlParseNCNameComplex(ctxt));
+8807:    l = xmlParseNCName(ctxt);
+8813:            l = xmlParseNCName(ctxt);
+471:    for (i = 0; i < maxLen && data[i]; i++) {
+692:        hashValue = xmlDictHashName(dict->seed, name, maxLen, &len);
+
+
+ASSISTANT step 99:
+All line numbers confirmed:
+- buf.c:1043 — truncation in xmlBufUpdateInput
+- buf.c:1014 — truncation in xmlBufResetInput (also present)
+- parserInternals.c:602-603 — xmlParserGrow
+- parserInternals.c:888-892 — xmlCurrentChar
+- parser.c:3490, 3508, 3573, 8807
+- dict.c:471 (sink read), 692
+
+Now let me write the analysis.json artifact and submit the PoC. I'll copy the crash file to the workspace root as poc.bin first (or use the path directly).
+
+The submission command: `bash submit.sh /path/to/poc ./analysis.json`.
+
+Let me write analysis.json with the fine_trace and vuln_logic.
+All anchors confirmed. Now let me write the analysis artifact and submit the crashing PoC:
+
+TOOL RESULT step 99:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace/analysis.json</path>
+<type>file</type>
+<content>
+Created file
+</content>
+
+TOOL CALL step 100 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_local_secbench_oss_libxml2.ossfuzz-42531092_0bw700i5/workspace && cp probe/crash_maxalloc_27.bin poc.bin && bash submit.sh ./poc.bin ./analysis.json", "description": "Submit first PoC candidate", "timeout_ms": 240000}
+
+TOOL RESULT step 100:
+[stderr]
+propagation[1] must contain from,to,type,via and optional relation
+[exit code: 2]
+
+Rules:
+- Output one bare JSON object only. No markdown, no prose.
+- sample_id must be "secbench_oss_libxml2.ossfuzz-42531092".
+- If the trajectory is uncertain, choose the most concrete vulnerability
+  hypothesis supported by the issue description and cited source snippets.
+- Keep operands/relation grounded in the same fine_trace step's var/code.
+- Keep fine_trace compact: 3 to 8 steps total. Never output more than 8 steps.
+
+Return exactly one JSON object with exactly these top-level keys:
+sample_id, fine_trace, vuln_logic.
+
+fine_trace: ordered project-source causal path. Use 3 to 8 steps only:
+source, root_cause, sink, plus only indispensable intermediate steps. Do not
+expand loops, repeated call chains, or every observed action. Each step has:
+step:int, file:string, function:string, line:int|null, var:string, code:string,
+note:string, role:"source"|"root_cause"|"sink"|"intermediate"|null.
+Do not output depends_on.
+
+Mark exactly one source, one root_cause, and one sink step.
+
+vuln_logic:
+- source/root_cause/sink copy file/function/line from the matching role-marked
+  fine_trace step and include operands: non-empty string array. In vuln_logic,
+  line must be an integer.
+- root_cause and sink include relation exactly {"op":"...","left":"...","right":"..."}.
+  op is one of eq, ne, lt, le, gt, ge, same_object.
+- propagation is an array of edges. Each edge contains from, to, type, via,
+  optional relation. from/to copy file/function/line from existing fine_trace
+  steps and each from/to endpoint must include operands: non-empty string array.
+  type is data, control, or order. via is non-empty string array.
+
+Use vulnerable project source only. Do not cite README, analysis files,
+checkpoint files, runtime logs, harness/test/fuzz setup, or old results.
+

@@ -20,6 +20,33 @@ from evaluator.reachability.probes import compile_runtime_probes
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GT_RESULTS = REPO_ROOT / "gt_results"
 POC_RESULTS = REPO_ROOT / "poc_generation" / "poc_results"
+_RUNTIME_TRACE_EDGE_BYTES = 256 * 1024
+
+
+def _read_runtime_trace_for_oracle(path: Path) -> str | None:
+    """Read enough runtime output for sanitizer oracle parsing without hanging.
+
+    Some failed PoCs print very large logs.  The sanitizer signature and stack
+    are normally near the beginning or end, so keep both edges and avoid feeding
+    multi-megabyte non-sanitizer text into regex parsing.
+    """
+    if not path.is_file():
+        return None
+    size = path.stat().st_size
+    edge = _RUNTIME_TRACE_EDGE_BYTES
+    with path.open("rb") as handle:
+        if size <= edge * 2:
+            data = handle.read()
+        else:
+            head = handle.read(edge)
+            handle.seek(max(size - edge, 0))
+            tail = handle.read(edge)
+            data = (
+                head
+                + b"\n\n[... runtime log truncated for evaluation ...]\n\n"
+                + tail
+            )
+    return data.decode("utf-8", errors="replace")
 
 
 def audit_gt() -> dict[str, Any]:
@@ -143,11 +170,7 @@ def evaluate_sample(
             if ledger_error is None:
                 loaded = json.loads(hit_path.read_text(encoding="utf-8"))
                 hits = loaded.get("hits", []) if isinstance(loaded, dict) else []
-                runtime_text = (
-                    runtime_path.read_text(encoding="utf-8", errors="replace")
-                    if runtime_path.is_file()
-                    else None
-                )
+                runtime_text = _read_runtime_trace_for_oracle(runtime_path)
                 location_report = evaluate_r1_r5(
                     gt=gt,
                     hits=hits,
@@ -240,8 +263,9 @@ def _saved_gdb_ledger_error(output_dir: Path) -> str | None:
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return f"saved GDB command metadata is invalid: {type(exc).__name__}"
-    if "-runs=0" in command:
-        return "legacy GDB invocation did not execute the submitted PoC (-runs=0)"
+    # Do not reject "-runs=0" by itself.  libFuzzer-style ARVO targets commonly
+    # use "-runs=0 <input-file>" and still execute the submitted PoC once; when
+    # no breakpoint is hit, an empty saved ledger is a valid R0 observation.
     stderr_path = output_dir / "gdb_stderr.txt"
     if stderr_path.is_file() and "error while loading shared libraries" in (
         stderr_path.read_text(encoding="utf-8", errors="replace")

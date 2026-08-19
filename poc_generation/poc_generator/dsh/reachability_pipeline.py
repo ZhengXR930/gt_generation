@@ -38,6 +38,18 @@ def sample_has_reachability_input(sample_result_dir: Path) -> tuple[bool, str]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return False, f"invalid_manifest: {exc}"
+    runtime_readiness = manifest.get("runtime_readiness")
+    if (
+        isinstance(runtime_readiness, dict)
+        and runtime_readiness.get("runtime_spec_ready") is False
+    ):
+        return False, "unavailable_runtime_spec"
+    poc_generation = manifest.get("poc_generation")
+    if (
+        isinstance(poc_generation, dict)
+        and poc_generation.get("runtime_unavailable") is True
+    ):
+        return False, "unavailable_runtime_spec"
     candidates = manifest.get("deduplicated_pocs")
     if not isinstance(candidates, list) or not candidates:
         return False, "no_deduplicated_pocs"
@@ -146,6 +158,14 @@ def run_reachability_pipeline(
         metadata["seconds"] = round(time.monotonic() - started, 1)
         if "skipped" in result:
             metadata.update({"status": "skipped", "reason": result["skipped"]})
+        elif result.get("runtime_status") == "runtime_spec_unavailable":
+            metadata.update(
+                {
+                    "status": "skipped",
+                    "reason": "unavailable_runtime_spec",
+                    "error": result.get("error"),
+                }
+            )
         elif "error" in result:
             metadata.update({"status": "failed", "error": result["error"]})
         else:

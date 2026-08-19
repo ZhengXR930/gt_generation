@@ -1,0 +1,120 @@
+{
+  "sample_id": "arvo_42491502",
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "blosc/frame.c",
+      "function": "frame_get_lazychunk",
+      "line": 1490,
+      "var": "lazychunk_cbytes",
+      "code": "lazychunk_cbytes = sw32_(*chunk + BLOSC2_CHUNK_CBYTES);",
+      "note": "For an in-memory frame the chunk header's cbytes field (attacker-controlled) is trusted as the size of the lazy chunk without verifying that the claimed chunk fits within the frame buffer. A crafted chunk header can therefore inflate the reported chunk size arbitrarily.",
+      "role": "source"
+    },
+    {
+      "step": 2,
+      "file": "blosc/frame.c",
+      "function": "frame_decompress_chunk",
+      "line": 1675,
+      "var": "chunk_cbytes",
+      "code": "int32_t chunksize = blosc2_decompress_ctx(dctx, src, chunk_cbytes, dest, nbytes);",
+      "note": "The unverified, attacker-inflated chunk_cbytes is forwarded to the decompression context as srcsize; all subsequent bounds checks in the decompressor are performed against this inflated value instead of the real frame length.",
+      "role": "intermediate"
+    },
+    {
+      "step": 3,
+      "file": "blosc/blosc2.c",
+      "function": "initialize_context_decompression",
+      "line": 1637,
+      "var": "dict_size",
+      "code": "context->dict_size = (size_t)sw32_(context->src + bstarts_end);",
+      "note": "Because the chunk header sets the BLOSC2_USEDICT flag, the dictionary size is read from the attacker-controlled chunk data (after the bstarts section); with the inflated srcsize the 'enough input' checks pass.",
+      "role": "intermediate"
+    },
+    {
+      "step": 4,
+      "file": "blosc/blosc2.c",
+      "function": "initialize_context_decompression",
+      "line": 1642,
+      "var": "srcsize",
+      "code": "if (srcsize < (int32_t)context->dict_size) {",
+      "note": "Root cause: the only size validation for the dictionary compares the inflated claimed cbytes (srcsize) against dict_size; it never checks that dict_buffer+dict_size lies within the actual frame buffer, so a dictionary that extends far beyond the input buffer is accepted.",
+      "role": "root_cause"
+    },
+    {
+      "step": 5,
+      "file": "blosc/blosc2.c",
+      "function": "initialize_context_decompression",
+      "line": 1647,
+      "var": "dict_buffer",
+      "code": "context->dict_buffer = (void*)(context->src + bstarts_end + sizeof(int32_t));",
+      "note": "The dictionary pointer is computed inside the (small) real frame buffer while dict_size claims 128 KiB; the pointer plus dict_size extends far beyond the heap-allocated input buffer.",
+      "role": "intermediate"
+    },
+    {
+      "step": 6,
+      "file": "blosc/blosc2.c",
+      "function": "initialize_context_decompression",
+      "line": 1648,
+      "var": "dict_ddict",
+      "code": "context->dict_ddict = ZSTD_createDDict(context->dict_buffer, context->dict_size);",
+      "note": "Sink: ZSTD_createDDict internally copies dict_size bytes from dict_buffer (memcpy in ZSTD_initDDict_internal); since dict_buffer+dict_size extends beyond the frame buffer this is a heap-buffer-overflow read.",
+      "role": "sink"
+    }
+  ],
+  "vuln_logic": {
+    "source": {
+      "file": "blosc/frame.c",
+      "function": "frame_get_lazychunk",
+      "line": 1490,
+      "operands": ["src", "BLOSC2_CHUNK_CBYTES", "lazychunk_cbytes"]
+    },
+    "root_cause": {
+      "file": "blosc/blosc2.c",
+      "function": "initialize_context_decompression",
+      "line": 1642,
+      "operands": ["srcsize", "dict_size"],
+      "relation": {"op": "lt", "left": "srcsize", "right": "dict_size"}
+    },
+    "sink": {
+      "file": "blosc/blosc2.c",
+      "function": "initialize_context_decompression",
+      "line": 1648,
+      "operands": ["dict_buffer", "dict_size"],
+      "relation": {"op": "gt", "left": "dict_buffer + dict_size", "right": "frame_buffer_end"}
+    },
+    "propagation": [
+      {
+        "from": {"file": "blosc/frame.c", "function": "frame_get_lazychunk", "line": 1490, "operands": ["lazychunk_cbytes"]},
+        "to": {"file": "blosc/frame.c", "function": "frame_decompress_chunk", "line": 1675, "operands": ["chunk_cbytes"]},
+        "type": "data",
+        "via": ["return value", "chunk_cbytes"]
+      },
+      {
+        "from": {"file": "blosc/frame.c", "function": "frame_decompress_chunk", "line": 1675, "operands": ["chunk_cbytes"]},
+        "to": {"file": "blosc/blosc2.c", "function": "initialize_context_decompression", "line": 1642, "operands": ["srcsize"]},
+        "type": "data",
+        "via": ["blosc2_decompress_ctx", "srcsize"]
+      },
+      {
+        "from": {"file": "blosc/blosc2.c", "function": "initialize_context_decompression", "line": 1637, "operands": ["dict_size"]},
+        "to": {"file": "blosc/blosc2.c", "function": "initialize_context_decompression", "line": 1642, "operands": ["dict_size"]},
+        "type": "data",
+        "via": ["chunk header", "dict_size"]
+      },
+      {
+        "from": {"file": "blosc/blosc2.c", "function": "initialize_context_decompression", "line": 1642, "operands": ["srcsize", "dict_size"]},
+        "to": {"file": "blosc/blosc2.c", "function": "initialize_context_decompression", "line": 1647, "operands": ["dict_buffer"]},
+        "type": "control",
+        "via": ["bounds check passes"]
+      },
+      {
+        "from": {"file": "blosc/blosc2.c", "function": "initialize_context_decompression", "line": 1647, "operands": ["dict_buffer"]},
+        "to": {"file": "blosc/blosc2.c", "function": "initialize_context_decompression", "line": 1648, "operands": ["dict_buffer", "dict_size"]},
+        "type": "data",
+        "via": ["ZSTD_createDDict"]
+      }
+    ],
+    "issue_alignment": "The lazy-chunk decompression path (frame_get_lazychunk for in-memory frames) trusts the chunk header's cbytes field without verifying the claimed chunk fits within the frame. The inflated cbytes becomes the decompression srcsize, so the USEDICT dictionary-size checks pass for a dictionary that lies beyond the input buffer, and ZSTD_createDDict's internal memcpy reads past the heap buffer."
+  }
+}

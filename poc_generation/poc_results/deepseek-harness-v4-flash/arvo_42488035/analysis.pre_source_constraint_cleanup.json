@@ -1,0 +1,147 @@
+{
+  "sample_id": "arvo_42488035",
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_raw_to_json_sds",
+      "line": 627,
+      "var": "root",
+      "code": "msgpack_unpack_next(&result, in_buf, in_size, &off);\n    root = &result.data;",
+      "note": "Attacker-controlled msgpack buffer is unpacked; the root object holds a string whose payload is 244 ASCII bytes followed by the 4-byte UTF-8 sequence F4 8F BF BF (U+10FFFF).",
+      "role": "source"
+    },
+    {
+      "step": 2,
+      "file": "src/flb_pack.c",
+      "function": "msgpack2json",
+      "line": 489,
+      "var": "o->via.str",
+      "code": "try_to_write_str(buf, off, left, o->via.str.ptr, o->via.str.size)",
+      "note": "The msgpack string bytes (248 bytes: 244 ASCII + 4-byte UTF-8 char) are forwarded to flb_utils_write_str() to be escaped into the JSON output buffer; at this point *off is 517 inside the 768-byte sds buffer.",
+      "role": "intermediate"
+    },
+    {
+      "step": 3,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 685,
+      "var": "available - written",
+      "code": "if (available - written < 6) {\n                return FLB_FALSE;\n            }",
+      "note": "For a UTF-8 lead byte whose value is above 0xFFFF (the 4-byte character F4 8F BF BF), the guard only verifies that 6 bytes remain available; with exactly 6 bytes left (available-written == 6 at the escape position 761) the branch is taken even though the escape is 8 bytes long.",
+      "role": "root_cause"
+    },
+    {
+      "step": 4,
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 708,
+      "var": "len",
+      "code": "len = snprintf(tmp, sizeof(tmp) - 1, \"\\\\u%04x\", codepoint);\n                encoded_to_buf(p, tmp, len);\n                p += len;",
+      "note": "codepoint 0x10FFFF formats as the 8-byte escape \"\\\\u10ffff\"; it is written at buffer offset 761 (out_size-7), consuming all remaining space and advancing *off to 769, one byte past the 768-byte sds data area.",
+      "role": "intermediate"
+    },
+    {
+      "step": 5,
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_to_json",
+      "line": 605,
+      "var": "json_str[off]",
+      "code": "json_str[off] = '\\0';",
+      "note": "After msgpack2json() returns FLB_FALSE, the NUL terminator is unconditionally written at off == 769, i.e. one byte past the end of the heap allocation (data area covers indices 0..768) -> ASan heap-buffer-overflow when the terminator is written.",
+      "role": "sink"
+    }
+  ],
+  "vuln_logic": {
+    "source": {
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_raw_to_json_sds",
+      "line": 627,
+      "operands": ["in_buf", "in_size"]
+    },
+    "root_cause": {
+      "file": "src/flb_utils.c",
+      "function": "flb_utils_write_str",
+      "line": 685,
+      "operands": ["available", "written"],
+      "relation": {"op": "lt", "left": "available - written", "right": "6"}
+    },
+    "sink": {
+      "file": "src/flb_pack.c",
+      "function": "flb_msgpack_to_json",
+      "line": 605,
+      "operands": ["json_str", "off"],
+      "relation": {"op": "gt", "left": "off", "right": "out_size"}
+    },
+    "propagation": [
+      {
+        "from": {
+          "file": "src/flb_pack.c",
+          "function": "flb_msgpack_raw_to_json_sds",
+          "line": 627,
+          "operands": ["in_buf", "in_size"]
+        },
+        "to": {
+          "file": "src/flb_pack.c",
+          "function": "msgpack2json",
+          "line": 489,
+          "operands": ["o->via.str.ptr", "o->via.str.size"]
+        },
+        "type": "data",
+        "via": ["msgpack_unpack_next", "msgpack2json", "try_to_write_str"]
+      },
+      {
+        "from": {
+          "file": "src/flb_pack.c",
+          "function": "msgpack2json",
+          "line": 489,
+          "operands": ["o->via.str.ptr", "o->via.str.size"]
+        },
+        "to": {
+          "file": "src/flb_utils.c",
+          "function": "flb_utils_write_str",
+          "line": 685,
+          "operands": ["available", "written"]
+        },
+        "type": "data",
+        "via": ["str", "str_len", "available", "written"],
+        "relation": {"op": "lt", "left": "available - written", "right": "6"}
+      },
+      {
+        "from": {
+          "file": "src/flb_utils.c",
+          "function": "flb_utils_write_str",
+          "line": 685,
+          "operands": ["available", "written"]
+        },
+        "to": {
+          "file": "src/flb_utils.c",
+          "function": "flb_utils_write_str",
+          "line": 708,
+          "operands": ["codepoint", "len"]
+        },
+        "type": "control",
+        "via": ["flb_utf8_len", "flb_utf8_decode", "snprintf", "encoded_to_buf"],
+        "relation": {"op": "gt", "left": "codepoint", "right": "0xFFFF"}
+      },
+      {
+        "from": {
+          "file": "src/flb_utils.c",
+          "function": "flb_utils_write_str",
+          "line": 708,
+          "operands": ["len", "p"]
+        },
+        "to": {
+          "file": "src/flb_pack.c",
+          "function": "flb_msgpack_to_json",
+          "line": 605,
+          "operands": ["json_str", "off"]
+        },
+        "type": "data",
+        "via": ["off", "msgpack2json", "json_str[off] = '\\0'"],
+        "relation": {"op": "gt", "left": "off", "right": "out_size"}
+      }
+    ],
+    "issue_alignment": "The public issue states that during JSON encoding of a message pack, the UTF-8 escape sequence for a high-byte character is written without ensuring sufficient output-buffer space: the check only verifies 6 bytes are available while the formatted escape (\"\\\\u%04x\" for a codepoint above 0xFFFF) can be 8 bytes long, so the subsequent terminator write lands past the heap buffer."
+  }
+}

@@ -1,0 +1,1000 @@
+You are finalizing the output of a timed-out PoC generation agent.
+
+The original PoC generation run ended with status: iteration_cap. Its saved
+analysis is missing or does not satisfy the current required schema. You are
+not judging the agent and you must not propose new PoC construction steps.
+Your task is only to convert the saved reasoning trajectory into the required
+structured analysis artifact.
+
+Trusted issue description:
+An out-of-bounds read occurs when decoding the superblock prefix in `H5F__cache_superblock_get_final_load_size()`. The code in `H5F__superblock_prefix_decode()` reads fields from the on-disk image buffer, including the signature and address/size bytes, without enforcing that the supplied `image_len` is large enough for those accesses, which can cause `memcmp` and subsequent parsing to read past the end of the buffer.
+
+Saved trajectory evidence:
+ch access is O(1) in CPython but... hmm, actually `bytes[i]` is fast.
+
+Hmm, unless the timeout is being hit much earlier than 55s? The message says "Terminated timeout 55" — exit 143 = SIGTERM from timeout. Maybe the actual execution is slow due to... OH WAIT. I bet the issue is the ENVIRONMENT's CPU is heavily throttled or the sandbox is slow. Or maybe python startup + reading 650MB idx + 650MB pack = memory pressure.
+
+Actually, the packdata read (650MB) into memory, plus the idx, plus the offsets list... that's fine memory-wise.
+
+Hmm, let me test something trivial: time a simple loop of 1M operations.
+
+TOOL CALL step 77 bash:
+{"command": "timeout 50 python3 -c \"\nimport time\nt0=time.time()\ns=0\nfor i in range(1000000):\n    s+=i\nprint('1M loop:', time.time()-t0)\n\"; echo \"exit: $?\"", "description": "Benchmark basic python loop speed"}
+
+TOOL RESULT step 77:
+1M loop: 0.11635422706604004
+exit: 0
+
+
+ASSISTANT step 78:
+Basic Python is fast. So the issue is with the pack operations. Let me test reading a 650MB file and random indexing.
+
+TOOL CALL step 78 bash:
+{"command": "timeout 50 python3 << 'EOF'\nimport time, struct\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nt0=time.time()\npackdata = open(packfile,'rb').read()\nprint('read pack:', time.time()-t0, 'len:', len(packdata))\nt0=time.time()\ns=0\nfor i in range(0, 100000, 1000):\n    s += packdata[i]\nprint('100k indexed reads:', time.time()-t0)\nEOF", "description": "Benchmark pack file reading"}
+
+TOOL RESULT step 78:
+read pack: 0.23889613151550293 len: 650464525
+100k indexed reads: 2.574920654296875e-05
+
+
+ASSISTANT step 79:
+Reading the pack is fast, indexing is fast. So why did the header scan of 818K objects time out?! Let me test just the header scan loop directly.
+
+TOOL CALL step 79 bash:
+{"command": "timeout 50 python3 << 'EOF'\nimport time, struct\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\nt0=time.time()\ndata = open(idxfile,'rb').read()\nprint('read idx:', time.time()-t0)\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nprint('n:', n)\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nprint('four unpacked:', time.time()-t0)\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, dat
+
+TOOL RESULT step 79:
+read idx: 0.004488229751586914
+n: 818504
+four unpacked: 0.022745132446289062
+offsets built: 0.16972970962524414
+pack read: 0.4066154956817627
+header scan: 0.3553333282470703 {6: 717772, 2: 45133, 1: 40571, 3: 14941, 4: 87}
+
+
+ASSISTANT step 80:
+All fast! So the earlier timeouts must have been caused by something else — maybe the earlier scripts had an infinite loop in the delta-application when I hit specific objects, or the `hash2idx` dict construction with 818K bytes keys... Actually the earlier "extract commits" script built `names` list of 818K entries AND wrote a json — the json.dump of 818K entries was in the first attempt. The second attempt (commit_subjects) — maybe it hung in `zlib.decompress` on a specific corrupt/malformed object... or the header parse loop `while b0 & 0x80` reading `packdata[pos]` when pos went out of range → IndexError, not hang. Hmm.
+
+Actually wait — in the commit_subjects script, for typ==1 objects I did:
+```python
+dpos = off + 1
+b0 = packdata[off]
+while b0 & 0x80:
+    b0 = packdata[dpos]; dpos += 1
+```
+That's fine. And `zlib.decompress(packdata[dpos:])` — decompresses to end of stream. Fine.
+
+Hmm, unless there are MANY commits and the total time exceeded 55s: 40K commits × decompress. Let me measure the decompress speed for commits.
+
+TOOL CALL step 80 bash:
+{"command": "timeout 50 python3 << 'EOF'\nimport time, struct, zlib\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\ndata = open(idxfile,'rb').read()\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []\nli = 0\noffsets = []\nfor v in four:\n    if v & 0x8000
+
+TOOL RESULT step 80:
+[stderr]
+Terminated                 timeout 50 python3 <<'EOF'
+import time, struct, zlib
+packfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'
+idxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'
+data = open(idxfile,'rb').read()
+n = struct.unpack('>I', data[8+4*255:8+4*256])[0]
+names_off = 8 + 1024
+crc_off = names_off + 20*n
+off_off = crc_off + 4*n
+four = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])
+nbig = sum(1 for v in four if v & 0x80000000)
+large_off = off_off + 4*n
+large = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []
+li = 0
+offsets = []
+for v in four:
+    if v & 0x80000000:
+        offsets.append(large[li]); li += 1
+    else:
+        offsets.append(v)
+names = [data[names_off + 20*i : names_off + 20*i + 20] for i in range(n)]
+packdata = open(packfile,'rb').read()
+t0=time.time()
+fout = open('/tmp/commit_subjects.txt','w')
+cnt=0
+for i, off in enumerate(offsets):
+    b0 = packdata[off]
+    typ = (b0 >> 4) & 7
+    if typ == 1:
+        pos = off + 1
+        b0 = packdata[off]
+        while b0 & 0x80:
+            b0 = packdata[pos]; pos += 1
+        raw = zlib.decompress(packdata[pos:])
+        lines = raw.decode('utf-8', 'replace').split('\n')
+        msg = [ln.strip() for ln in lines if ln.startswith(' ')]
+        subject = msg[0] if msg else '?'
+        fout.write(names[i].hex() + '\t' + subject + '\n')
+        cnt += 1
+        if cnt % 10000 == 0:
+            fout.flush()
+            print("progress:", cnt, "elapsed:", time.time()-t0, flush=True)
+fout.close()
+print("total commits:", cnt, "elapsed:", time.time()-t0)
+EOF
+
+[exit code: 143]
+
+ASSISTANT step 81:
+It timed out WITHOUT printing progress — so it hangs before reaching 10,000 commits. So there IS a hang. The `while b0 & 0x80` loop — if some object's header has the high bit set forever (reading `packdata[pos]` where pos runs past the end → IndexError) — that would raise, not hang. A hang means an infinite loop with valid indices: `while b0 & 0x80: b0 = packdata[pos]; pos += 1` — if b0 keeps having bit 7 set... could happen if `pos` lands in a region that looks like continuation bytes... but the header continuation bytes must terminate.
+
+Hmm wait — maybe the issue is `zlib.decompress(packdata[pos:])` on a HUGE blob — some commit objects can't be huge... commits are small.
+
+OR — `names[i]` list building: 818K entries — fast.
+
+Let me debug: run the loop but only over the first 20,000 objects with prints and a step counter, and catch exceptions. Also add a hard cap on the header continuation loop (e.g., 20 iterations). Let me find which object index hangs.
+
+TOOL CALL step 81 bash:
+{"command": "timeout 50 python3 << 'EOF'\nimport time, struct, zlib\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\ndata = open(idxfile,'rb').read()\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []\nli = 0\noffsets = []\nfor v in four:\n    if v & 0x8000
+
+TOOL RESULT step 81:
+[stderr]
+Terminated                 timeout 50 python3 <<'EOF'
+import time, struct, zlib
+packfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'
+idxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'
+data = open(idxfile,'rb').read()
+n = struct.unpack('>I', data[8+4*255:8+4*256])[0]
+names_off = 8 + 1024
+crc_off = names_off + 20*n
+off_off = crc_off + 4*n
+four = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])
+nbig = sum(1 for v in four if v & 0x80000000)
+large_off = off_off + 4*n
+large = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []
+li = 0
+offsets = []
+for v in four:
+    if v & 0x80000000:
+        offsets.append(large[li]); li += 1
+    else:
+        offsets.append(v)
+packdata = open(packfile,'rb').read()
+t0=time.time()
+cnt=0
+bad=0
+for idx, off in enumerate(offsets):
+    b0 = packdata[off]
+    typ = (b0 >> 4) & 7
+    if typ == 1:
+        pos = off + 1
+        b = packdata[off]
+        guard = 0
+        while b & 0x80:
+            b = packdata[pos]; pos += 1
+            guard += 1
+            if guard > 20:
+                bad += 1
+                print("bad header at idx", idx, "off", off)
+                break
+        if guard <= 20:
+            try:
+                raw = zlib.decompress(packdata[pos:])
+                cnt += 1
+            except Exception as e:
+                bad += 1
+                if bad < 5:
+                    print("decompress fail idx", idx, "off", off, e)
+        if idx > 200000:
+            break
+print("commits decompressed:", cnt, "bad:", bad, "elapsed:", time.time()-t0)
+EOF
+
+[exit code: 143]
+
+ASSISTANT step 82:
+Even with the guard, it timed out with NO output at all — not even "bad header at idx" prints. That means it hung BEFORE printing anything... but the loop should print progress. Unless the hang is in the FIRST commit's decompress! `zlib.decompress(packdata[pos:])` on the first commit — could that hang? zlib.decompress on a huge input... Commits are small. Hmm.
+
+Wait — no output at all even from prints inside the loop... The `print` calls flush? In a pipeline, stdout may be buffered; but the timeout kills before flush. The `bad header` prints use default buffering — they'd be lost on SIGTERM.
+
+Let me add flush=True and reduce the loop. Actually, let me test JUST the first commit object decompress in isolation.
+
+TOOL CALL step 82 bash:
+{"command": "timeout 40 python3 << 'EOF'\nimport time, struct, zlib\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\ndata = open(idxfile,'rb').read()\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []\nli = 0\noffsets = []\nfor v in four:\n    if v & 0x8000
+
+TOOL RESULT step 82:
+first commit at idx 22 off 12003904
+header parsed, data pos: 12003906 data len: 638460619
+decompressed in 0.2315385341644287 size: 386
+tree 7ec60d039e634e43192f5e327b0c327b94e232d9
+parent 3af26fa7a598221427d43fa8a1620cf18fbeb2dc
+author Quincey Koziol <koziol@hdfgroup.org> 1004826474 -0500
+committer Quincey Koziol <koziol@hdfgroup.org> 1004826474 -0500
+
+[svn-r4589] Purpose:
+    Code cleanup
+Description:
+    Clean up various compiler
+
+
+ASSISTANT step 83:
+ zlib stream, so it only decompresses the first object's data. Fine.
+
+Hmm wait — but for SOME object, `zlib.decompress(packdata[pos:])` might be slow if the zlib stream is large (blobs). But commits are small.
+
+Let me look again at my earlier failing script... The earlier script had `names = [data[names_off + 20*i : ...] for i in range(n)]` — building an 818K-element list of 20-byte slices — fast.
+
+OH WAIT. I see it now! In the failing script, the loop is over ALL objects `for i, off in enumerate(offsets)`. For typ==1 it decompresses. BUT for typ==6 (OFS_DELTA, 717K objects) it does nothing... that's fine.
+
+Hmm, but the earlier script never printed "progress: 10000" — meaning it didn't reach 10K commits decompressed in 50s. Let me count commits among the first 200K objects and time decompressing them. Actually — hold on, maybe the issue is much simpler: `packdata[pos:]` for objects NEAR THE END of the pack — `zlib.decompress` on a bytes slice COPIES the slice first (O(len)!). For objects near the start of the pack, `packdata[pos:]` copies ~600MB! That's the bottleneck — for each commit near the beginning, it copies hundreds of MB!
+
+In the isolated test, first commit took 0.23s just for the copy. For commits spread throughout the pack, the copies average ~300MB → 0.1-0.2s each → 40K commits → way too slow.
+
+The fix: use `zlib.decompressobj()` with `.decompress(packdata[pos:pos+size])` — but I need the exact compressed size. The header `size` field gives the UNCOMPRESSED size of the object (for non-delta objects), not the compressed size. I need to find where the zlib stream ends. Approach: use `zlib.decompressobj` and feed chunks until the stream ends (`decompressobj.eof`), tracking consumed length. Feed in chunks of e.g. 1MB to avoid huge copies.
+
+Let me implement that.
+
+TOOL CALL step 83 bash:
+{"command": "timeout 55 python3 << 'EOF'\nimport time, struct, zlib\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\ndata = open(idxfile,'rb').read()\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []\nli = 0\noffsets = []\nfor v in four:\n    if v & 0x8000
+
+TOOL RESULT step 83:
+total commits: 40571 elapsed: 0.9957921504974365
+
+
+ASSISTANT step 84:
+Now I have all 40,571 commit subjects in /tmp/commit_subjects.txt in under a second. Let me search for the fix commit — look for subjects mentioning superblock, overflow, oss-fuzz, 42520, prefix_decode, etc.
+
+TOOL CALL step 84 bash:
+{"command": "grep -iE \"superblock|prefix|42520|oss.?fuzz|out.of.bounds|buffer.overflow|overflow\" /tmp/commit_subjects.txt | head -40", "description": "Search commit subjects for fix"}
+
+TOOL RESULT step 84:
+068fc878c39a37c0b3865cb6cd01eb57f4dbde74	When a buffer overflow occurred because a name length was corrupted
+06e5cbd54149087de0c7d99f1d14be5729d6c129	Add missing HD prefix
+0af3205c18dec2c96cf59b11f982dd9876e6969a	Add prefix_relto_examplesdir function to set relative path to h5c++.
+0b25880f205f0ed6e9deb48c3e988c6e1fa6c7ce	pass to the prefix in h5tools_simple_prefix the total position instead of the current stripmine position i;
+0b6531d21fff83531e754e05e17506086e1e70e9	Remove extra / between ${DESTDIR}/@prefix@
+0c589bf7b56738d9c643718be5f12a72a1e39e83	variable H5D_EXT_PREFIX in searching for the external linked file.
+0f7e13cdb5d159d54d3b01be72cd94b6c52836ca	Change prefix in example scripts to relative path to bin. This was done for 1.8, and works wherever installed without the need to replace the original prefix.
+127fb757f815187865e9f14947ed43987a8a47cc	When a buffer overflow occurred because a name length was corrupted
+1b03a4cc34faee03625e2d71c5fd4a7e9a4adf07	Add fields for tracking attributes on objects to object header prefix,
+1ed3d8d77ec680b8ced982b1afdac94fd00c8a84	Change H5Pset_elink_prefix to be more similar to rest of library and make
+20292df3675e5cb4296d743f435bbbe1a3136f2b	
+...
+of 2 for n. When n exceeds 2^63, it overflows and becomes 0 causing the infinite looping. The fix ensures that the function checks for n >= 2^63 and returns 0.
+92d79a58400384863653ec35dbd75aa785fd984e	Use prefix variable
+9c30e7bba121b63c62b2d76c1c0353a5145bdd73	Fix off-by-one error in computing the size of metadata prefixes for v2
+9de5efb90897413ba7ebe28088978687ad672c56	Add HD prefix
+9fa5dca9c2ebc2c3cb25ded77d37b9c666e11fbd	Correct error in loading local heap prefix & data block from the file.
+a00d6795ce08dd1714664cc5b4fb5875d50001d6	Change prefix in example scripts to relative path to bin. This was done for 1.8, and works wherever installed without the need to replace the original prefix.
+a08f78f9ac569962a1261f775cb4efc78b5f484e	Merge HD prefix and whitespace changes from develop
+a21800d2f25ecd848285ddb00391219fe3b764d3	Make number of attributes tracking in object header prefix "live"
+
+
+ASSISTANT step 85:
+None of these obviously mention the fix. The commit subjects list may have truncated subjects (first line only). The fix commit might have a subject like "Add bounds checks to superblock prefix decoding" or something generic. Let me search for more specific patterns: "H5F__superblock_prefix_decode" in full commit bodies would be better, but I only extracted subjects. Let me also search subjects for "truncat" and "bounds".
+
+TOOL CALL step 85 bash:
+{"command": "grep -iE \"bounds|truncat|H5F__super|prefix_decode|decode.*super|super.*decode|final_load|load_size|speculative\" /tmp/commit_subjects.txt | head -30", "description": "Search for bounds/truncation related commits"}
+
+TOOL RESULT step 85:
+036ff0cc670b59a0e1e8568f3edf7791706828bc	Merged r21894 through r22016 from trunk to avoid_truncate branch,
+041b14c876cc7466da7868ef563563c879951ad6	Changed -Wformat-truncation to level 2 in CMake w/ gcc.
+0a18a098eabbdeb20382b044130b7ef998a3918e	Merged r21863 through r21893 from trunk to avoid_truncate branch.
+10e8a68a0c380cc58d831e95271ccc8ce658ad20	Speculatively attempt to read in the entire first chunk in object header
+150b85cc44903c005009552d692da50a4aa6c86f	Added wrappers for C functions H5P[s/g]et_libver_bounds and wrappers
+1687720a5fe51d32e1544371eaa75af162f35a31	Reduce the size of some of the group information to more reasonable bounds.
+1e89b46eabfe997d94d2cbc4601cf2746a6f1ff4	Handled truncated files better, when the truncation falls in decoding a
+2b50dc9855cfc096675698eda084830ea73427b8	Added tests SUPERBLOCK and INVALIDBOUNDS, composed by ADB.
+2e2301e683f0aadf3541b596416d04bbc7d690c0	Set V112 as the latest format and extend the arrays of version bounds.
+2e7811922ff7134defd8a5097ddafc0786412264	Make corresponding changes for version bounds in V110. This is based on PR#1639 merged to develop branch.
+308393a020bd7a812c231eee8130c9365d192e18	Change "bad" hid_t_value to H5I_INV
+...
+	Minor code/comment cleanups, found while reviewing 'avoid truncate' code.
+86d0acc0c0f5c0c50dd634f6e23d4cae7b1debb1	Merged r21409 through r21862 from trunk to avoid_truncate branch.
+8c8dad1cc779566fc689a93b0d248299786e4ce7	Interim checkin of 'avoid truncate' feature to development branch.
+8fc569f6d1771d0ca98c70b3a930746b834624be	Fixes typo and return types in version bounds test
+9adb74e41b0e6870991267a2beac9bba3c8de7f8	Fix for daily test failures Move the declarations for the three arrays of versions from H5Opkg.h: (1) H5O_layout_vers_bounds to H5Dpkg.h (2) H5O_dtype_ver_bounds to H5Tpkg.h (3) H5O_sdspace_ver_bounds to H5Spkg.h This is to fix Windows' complaint for unresolved symbols.
+9c88755922706a2f8cbf75e2ece257e1856dd9d3	Update N_FSINFO_VERSION_BOUNDS to H5F_LIBVER_NBOUND.
+9e934e75fa9a66bdd95fd3656ca0c19f910123c7	Set V112 as the latest format and extend the arrays of version bounds.
+
+
+ASSISTANT step 86:
+'s subject is probably not descriptive. Let me take a different approach: find commits between the vulnerable commit (720e04e, Jan 2023) and the head (f38cea9, May 2025) that changed H5Fsuper_cache.c. I can do this by:
+1. Walk the commit graph from f38cea9 backwards via parents until I reach 720e04e.
+2. For each commit on that path, get its tree and compare the blob of src/H5Fsuper_cache.c with the previous; when it differs and the difference introduces the bounds checks, that's the fix.
+
+That's a lot of tree walking. Alternative: find ALL commits that changed H5Fsuper_cache.c in the whole history by checking each commit's tree blob hash for that path vs its parent's. That's expensive.
+
+Better idea: The fix commit probably has "H5F__superblock_prefix_decode" or "image pointer is out of bounds" in its MESSAGE. Let me extract FULL commit messages for commits from 2023-2025 and grep for relevant content. I'll extract full messages (not just subjects) to a file. 40K commits with full messages ~ maybe 50MB. Let me do it with the fast decompressor and write the message bodies. Then grep.
+
+Actually, even better: I know the fix changes H5Fsuper_cache.c. Let me directly find the first commit AFTER 720e04e (in topological order) where the H5Fsuper_cache.c blob changed AND the change matches the "H5_IS_BUFFER_OVERFLOW" pattern. To do that efficiently:
+
+1. Extract the full commit list with parent hashes (I have the raw commit objects... I only saved subjects. Let me redo saving hash, parents, tree, author date, and full message).
+2. Build the ancestor set of 720e04e (walk parents). 
+3. Walk descendants... complex.
+
+Alternative pragmatic approach: extract full messages and grep for "H5F__superblock_prefix_decode" or "image pointer is out of bounds" or "42520" or "oss-fuzz" or "CVE".
+
+TOOL CALL step 86 bash:
+{"command": "timeout 55 python3 << 'EOF'\nimport time, struct, zlib\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\ndata = open(idxfile,'rb').read()\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []\nli = 0\noffsets = []\nfor v in four:\n    if v & 0x8000
+
+TOOL RESULT step 86:
+commits: 40571 elapsed: 1.1317858695983887
+
+
+TOOL CALL step 87 bash:
+{"command": "grep -n -B2 -A6 -iE \"H5F__superblock_prefix_decode|image pointer is out of bounds|ran off end of input buffer\" /tmp/commit_full.txt | head -60", "description": "Search commit messages for fix details"}
+
+TOOL RESULT step 87:
+(no output)
+
+ASSISTANT step 88:
+No match. The fix commit message doesn't contain those strings. Let me search for other patterns: "oss-fuzz", "42520", "superblock" in full messages with context, especially from 2023+.
+
+TOOL CALL step 88 bash:
+{"command": "grep -n -iE \"oss.?fuzz|42520|clusterfuzz\" /tmp/commit_full.txt | head -30; echo ====; grep -n \"superblock\" /tmp/commit_full.txt | grep -iE \"overflow|bounds|truncat|prefix|decode|load\" | head -30", "description": "Search for oss-fuzz and superblock mentions"}
+
+TOOL RESULT step 88:
+131875:author jhendersonHDF <jhenderson@hdfgroup.org> 1712242520 -0500
+131876:committer GitHub <noreply@github.com> 1712242520 -0500
+146324:Fixes oss-fuzz issue 58762
+216792:parent d7883f21bf2d0d4b7b21397b42520a381364f30f
+238689:author Jerome Soumagne <jsoumagne@hdfgroup.org> 1442520527 -0500
+303551:oss-fuzz occasionally complains about intermittent undefined behavior
+315015:author Allen Byrne <byrn@hdfgroup.org> 1294252015 -0500
+315016:committer Allen Byrne <byrn@hdfgroup.org> 1294252015 -0500
+340867:Fixes oss-fuzz issue 58762
+356092:tree 263cfa5e5b2b7147d511eeb8742520227fdb311f
+417684:Add OSS-Fuzz badge (#5059)
+448020:author Quincey Koziol <koziol@hdfgroup.org> 1504425208 -0500
+448021:committer Quincey Koziol <koziol@hdfgroup.org> 1504425208 -0500
+451427:===== d7883f21bf2d0d4b7b21397b42520a381364f30f =====
+488361:oss-fuzz often trips over unfreed datatype memory when parsing
+====
+118323:    is written into the superblock, and if we're not truncating the
+196970:    Reset driver info message when superblock load fails.
+464371:    Reset driver info message when superblock load fails.
+
+
+ASSISTANT step 89:
+_cache.c. 
+
+Actually — a more targeted approach: the fix commit changed `H5F__superblock_prefix_decode` to add `size_t len`. Let me find the commit right after 720e04e (Jan 17, 2023) in the develop branch history that modified H5Fsuper_cache.c. 
+
+Let me extract commit metadata (hash, parents, date) for all commits and build the graph. Then:
+1. Mark all ancestors of 720e04e.
+2. Walk from f38cea9 backwards: the first non-ancestor commit whose tree differs from its parent's tree for src/H5Fsuper_cache.c... hmm, actually the fix could be anywhere in the chain.
+
+Simpler: extract (hash, tree, parents, date) for all commits; then walk the path from f38cea9 to 720e04e via first-parent links; for each commit on the path, resolve its tree's H5Fsuper_cache.c blob hash and compare to the previous; the commit where the blob changes from the vuln version to a version with H5_IS_BUFFER_OVERFLOW is the fix.
+
+Actually simplest: for every commit, resolve src/H5Fsuper_cache.c blob hash and record (commit, blob_hash). Then diff consecutive... but commits aren't consecutive in a linear chain. 
+
+Let me just resolve the blob hash for all 40K commits' trees — that's 40K tree walks (each ~3 levels). With caching of tree objects by hash, it should be fast. Then for the fix, I look for commits where the blob hash CHANGES to one of the fixed variants (I have the head blob). Actually, I can find ALL distinct blob hashes of H5Fsuper_cache.c across history, and among the commits whose blob contains "H5_IS_BUFFER_OVERFLOW", find the earliest (by date) — that's the fix commit.
+
+Let me do it: for each commit, get tree hash, walk to src/H5Fsuper_cache.c, get blob hash. Use caches. 40K commits × 3 tree lookups — each tree lookup requires resolving the tree object (delta chains). Should be OK with caching.
+
+TOOL CALL step 89 bash:
+{"command": "timeout 58 python3 << 'EOF'\nimport time, struct, zlib, json\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\ndata = open(idxfile,'rb').read()\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []\nli = 0\noffsets = []\nfor v in four:\n    if v & 
+
+TOOL RESULT step 89:
+[stderr]
+Traceback (most recent call last):
+  File "<stdin>", line 156, in <module>
+  File "<stdin>", line 102, in tree_lookup
+  File "<stdin>", line 97, in get_by_hash
+  File "<stdin>", line 78, in get_at_offset
+  File "<stdin>", line 78, in get_at_offset
+  File "<stdin>", line 78, in get_at_offset
+  [Previous line repeated 28 more times]
+  File "<stdin>", line 67, in get_at_offset
+RuntimeError: depth
+[exit code: 1]
+
+ASSISTANT step 90:
+The delta chains can be longer than 30. Some OFS_DELTA chains are deep. Let me increase depth and also handle it better. Actually, delta depth in git packs can be up to ~50. Let me raise to 100. But deep recursion in Python may hit recursion limit. Let me use an iterative approach with explicit stack for OFS_DELTA. Hmm, that's more complex. Let me just raise the recursion limit and depth.
+
+Actually, let me use sys.setrecursionlimit and depth 200.
+
+TOOL CALL step 90 bash:
+{"command": "timeout 58 python3 << 'EOF'\nimport time, struct, zlib, json, sys\nsys.setrecursionlimit(10000)\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\ndata = open(idxfile,'rb').read()\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []\nli = 0\noffset
+
+TOOL RESULT step 90:
+[stderr]
+Terminated                 timeout 58 python3 <<'EOF'
+import time, struct, zlib, json, sys
+sys.setrecursionlimit(10000)
+packfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'
+idxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'
+data = open(idxfile,'rb').read()
+n = struct.unpack('>I', data[8+4*255:8+4*256])[0]
+names_off = 8 + 1024
+crc_off = names_off + 20*n
+off_off = crc_off + 4*n
+four = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])
+nbig = sum(1 for v in four if v & 0x80000000)
+large_off = off_off + 4*n
+large = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []
+li = 0
+offsets = []
+for v in four:
+    if v & 0x80000000:
+        offsets.append(large[li]); li += 1
+    else:
+        offsets.append(v)
+names = [data[names_off + 20*i : names_off + 20*i + 20] for i in range(n)]
+hash2idx = {names[i]: i for i in range(n)}
+packdata = open(packfile,'rb').read()
+byoff_cache =
+...
+ return None
+
+t0 = time.time()
+res = []
+for i, off in enumerate(offsets):
+    b0 = packdata[off]
+    typ = (b0 >> 4) & 7
+    if typ != 1:
+        continue
+    size = b0 & 15
+    shift = 4
+    pos = off + 1
+    b = b0
+    while b & 0x80:
+        b = packdata[pos]
+        size |= (b & 0x7f) << shift
+        shift += 7
+        pos += 1
+    d = zlib.decompressobj()
+    raw = d.decompress(packdata[pos:pos+size+100])
+    txt = raw.decode('utf-8', 'replace')
+    tree = None
+    for line in txt.split('\n'):
+        if line.startswith('tree '):
+            tree = line.split()[1]
+            break
+    if tree:
+        blob_hb = tree_lookup(bytes.fromhex(tree), ['src','H5Fsuper_cache.c'])
+        if blob_hb is not None:
+            res.append((names[i].hex(), blob_hb.hex()))
+json.dump(res, open('/tmp/commit_blobmap.json','w'))
+print("done", len(res), "elapsed", time.time()-t0)
+EOF
+
+[exit code: 143]
+
+ASSISTANT step 91:
+ffer". Maybe the "memcmp" is `HDmemcmp` in `H5F__cache_superblock_verify_chksum`?? No...
+
+Hmm, let me look at the ACTUAL OSS-Fuzz testcase. OSS-Fuzz issue 42520218 for hdf5 — the testcase would be a small file. Let me think about what file content would trigger the OOB given EOA=16... it can't with sec2!
+
+UNLESS — OH WAIT. I think I finally see it!!! Let me re-read `H5C__verify_len_eoa`:
+
+```c
+    eoa = H5F_get_eoa(f, cooked_type);
+```
+
+`cooked_type = (type->mem_type == H5FD_MEM_GHEAP) ? H5FD_MEM_DRAW : type->mem_type` — for superblock, mem_type = H5FD_MEM_SUPER, so cooked_type = H5FD_MEM_SUPER.
+
+`H5F_get_eoa(f, H5FD_MEM_SUPER)` → `H5FD_get_eoa(lf, H5FD_MEM_SUPER)` → driver's get_eoa.
+
+For SEC2: returns file->eoa = 16 (absolute). H5FD_get_eoa (private) subtracts base_addr → 16. OK.
+
+Hmm, fine.
+
+OK so let me look at this from the fix's other change: **the initial load size changed from 16 to 48 (SPEC_READ_SIZE)**. This is a HUGE hint. Why change it to 48? Because with 16 bytes, the superblock decode for the FIRST speculative read... hmm, 16 bytes is enough for the prefix decode (offsets ≤ 14).
+
+Wait — actually, maybe the change to 48 was to make the FIRST read big enough that `get_final_load_size`'s computation is CORRECT without needing the EOA extension to be checked. Hmm no.
+
+Let me look at the git blame of the SPEC_READ_SIZE change — find the commit that introduced it. I'll search commit messages for "SPEC_READ_SIZE" in full bodies... or just find the commit that changed H5Fpkg.h. 
+
+Actually — let me search commit messages for "48" or "speculative" or "initial read"... Alternatively, let me look at the HDF5 changelog RELEASE.txt in the head version — the fix would be documented there! Let me extract RELEASE.txt from the head commit and grep for superblock/prefix/OOB.
+
+TOOL CALL step 91 bash:
+{"command": "timeout 58 python3 << 'EOF'\nimport time, struct, zlib, sys\nsys.setrecursionlimit(10000)\npackfile = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.pack'\nidxfile  = '/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/.git/objects/pack/pack-4b791b5a309b3cbce2c4b1ac5891a9c1b792dc09.idx'\ndata = open(idxfile,'rb').read()\nn = struct.unpack('>I', data[8+4*255:8+4*256])[0]\nnames_off = 8 + 1024\ncrc_off = names_off + 20*n\noff_off = crc_off + 4*n\nfour = struct.unpack('>%dI' % n, data[off_off:off_off+4*n])\nnbig = sum(1 for v in four if v & 0x80000000)\nlarge_off = off_off + 4*n\nlarge = struct.unpack('>%dQ' % nbig, data[large_off:large_off+8*nbig]) if nbig else []\nli = 0\noffsets = []
+
+TOOL RESULT step 91:
+size: 45187
+
+
+TOOL CALL step 92 bash:
+{"command": "grep -n -iE \"superblock|prefix|out.of.bounds|oob|overflow\" /tmp/RELEASE_head.txt | head -30", "description": "Search RELEASE.txt for the fix"}
+
+TOOL RESULT step 92:
+60:    - Added CMAKE_INSTALL_PREFIX to the default plugin path
+63:      changed to include the CMAKE_INSTALL_PREFIX. Adding the install prefix
+137:      All other HDF5 library CMake options are prefixed with HDF5_
+157:        * H5overflow.h
+566:      recalculate the superblock checksum after changing the access flags in the
+567:      superblock, causing any subsequent attempt to open the returned file image
+761:      which will overflow (and wrap) the size_t type on 32-bit systems,
+
+
+ASSISTANT step 93:
+ `H5F_SUPERBLOCK_SPEC_READ_SIZE` and `H5_IS_BUFFER_OVERFLOW`. Let me find which commits introduced these by searching git history efficiently.
+
+Alternative smarter approach: search the FIXED H5Fsuper_cache.c for the string "H5F__cache_superblock_get_final_load_size" isn't helpful.
+
+Let me think about what I actually need: a PoC input that triggers the OOB read in the VULNERABLE code. I have the vulnerable code and the fixed code. The OOB happens when the image buffer (len) is < the access size. The fix's checks:
+1. `H5_IS_BUFFER_OVERFLOW(image, H5F_SIGNATURE_LEN, end)` — before `image += 8`: so len must be ≥ 8 (offset 0-7).
+2. `H5_IS_BUFFER_OVERFLOW(image, 1, end)` — before reading version at offset 8: len ≥ 9.
+3. v0/v1: `H5_IS_BUFFER_OVERFLOW(image, 6, end)` — before image[4], image[5] (offsets 13, 14): len ≥ 15.
+4. v2+: `H5_IS_BUFFER_OVERFLOW(image, 2, end)` — before image[0], image[1] (offsets 9, 10): len ≥ 11.
+
+So the OOB read requires len < 15 (v0/v1) or len < 11 (v2+). The buffer len is 16 normally...
+
+Hmm, so len must be < 11 for the FIRST crash. With EOA=16 → len=16. NO CRASH. 
+
+I'm now seriously doubting that EOA is always 16. Let me look at H5F__super_read one more time — line 431-434 — hmm, actually, wait. Let me look at what `H5F__set_eoa` does when `f->shared->lf` is a WRAPPED driver... no.
+
+Actually — let me look at the FIXED version of H5F__super_read. It sets EOA to `H5F_SUPERBLOCK_SPEC_READ_SIZE` (48). If the bug were about EOA < 16, changing to 48 wouldn't fix it (48 > 16, and both are > 15). So the EOA/trim theory must be wrong, OR the fix's SPEC_READ_SIZE change addresses a DIFFERENT aspect.
+
+Let me look at the FIXED H5Fsuper.c more carefully — specifically what changed around the superblock load. Let me diff H5Fsuper_vuln.c vs H5Fsuper_head.c fully.
+
+TOOL CALL step 93 bash:
+{"command": "cd /tmp && diff -u H5Fsuper_vuln.c H5Fsuper_head.c | grep -E \"^[-+][^-+]\" | grep -vE \"^\\+\\+\\+|^---\" | head -80", "description": "Diff H5Fsuper.c vuln vs head"}
+
+TOOL RESULT step 93:
+- * the COPYING file, which can be found at the root of the source code       *
++ * the LICENSE file, which can be found at the root of the source code       *
+-#include "H5CXprivate.h" /* API Contexts                         */
++#include "H5FLprivate.h" /* Free Lists                               */
++    HDF5_SUPERBLOCK_VERSION_3,     /* H5F_LIBVER_V200 */
+- * Programmer:  Vailin Choi; Feb 2009
+- *
+-    HDassert(f);
+-    HDassert(f->shared);
+-    HDassert(f->shared->sblock);
+-    HDassert(!H5F_addr_defined(f->shared->sblock->ext_addr));
+-    HDassert(ext_ptr);
++    assert(f);
++    assert(f->shared);
++    assert(f->shared->sblock);
++    assert(!H5_addr_defined(f->shared->sblock->ext_addr));
++    assert(ext_ptr);
+-                    f->shared->sblock->super_vers)
+-    else if (H5F_addr_defined(f->shared->sblock->ext_addr))
+-        HGOTO_ERROR(H5E_FILE, H5E_CANTCREATE, FAIL, "superblock extension already exists?!?!")
++                    f->shared->sblock->super_vers);
++    else if (H5_addr_defined(f->shared->sblock->ext_addr))
++        HGOTO_ERROR(H5E_FILE, H5E_CANTCREATE, FAIL, "superblock extension already exists?!?!");
+-            HGOTO_ERROR(H5E_OHDR, H5E_CANTCREATE, FAIL, "u
+...
+      "unable to update driver info header message")
++                                    "unable to update driver info header message");
+- * Programmer:  Bill Wendling
+- *              Sept 12, 2003
+- *
+-H5F__super_read(H5F_t *f, H5P_genplist_t *fa_plist, hbool_t initial_read)
++H5F__super_read(H5F_t *f, H5P_genplist_t *fa_plist, bool initial_read)
+-    haddr_t  super_addr;                        /* Absolute address of superblock */
++    haddr_t  super_addr   = HADDR_UNDEF;        /* Absolute address of superblock */
+-    hbool_t  skip_eof_check = FALSE;            /* Whether to skip checking the EOF value */
++    bool     skip_eof_check = false;            /* Whether to skip checking the EOF value */
+-            HGOTO_ERROR(H5E_FILE, H5E_CANTGET, FAIL, "can't retrieve MPI communicator size")
++            HGOTO_ERROR(H5E_FILE, H5E_CANTGET, FAIL, "can't retrieve MPI communicator size");
+
+
+ASSISTANT step 94:
+ to 48. And the fixed `H5F__superblock_prefix_decode` checks bounds against image_len. If EOA=48 → image_len=48 → no OOB. But with the OLD code, EOA=16 → image_len=16 → no OOB either (reads ≤ 14). So the SPEC_READ_SIZE change is NOT the fix for the OOB — it's probably a separate change (maybe to make the checksum verification work with the larger initial read, or an unrelated refactor).
+
+OK, so the OOB read in the OLD code requires image_len < 15. Given that in H5F__super_read, EOA=16 → image_len=16 — the OOB CANNOT occur via that path. So the ARVO benchmark must trigger it through a DIFFERENT path!
+
+What other path calls `H5F__cache_superblock_get_final_load_size` or `H5F__superblock_prefix_decode`?
+
+`H5F__superblock_prefix_decode` is called from:
+1. `H5F__cache_superblock_get_final_load_size` (via H5AC/H5C speculative load)
+2. `H5F__cache_superblock_deserialize` (via H5AC/H5C deserialize)
+
+Both are H5AC callbacks, called from H5C__load_entry with the buffer.
+
+Hmm — what about when the metadata cache loads the superblock from a CACHE IMAGE? H5Cimage.c — when a file has a metadata cache image (SWMR), entries are loaded from the cache image buffer rather than the file. In that path, `len` for the entry comes from the cache image's entry sizes... but the superblock is never in the cache image (it's expunged).
+
+What about `H5F__super_read` being invoked when `shared->nrefs > 1`... no, first open loads.
+
+Hmm, what about the **file image** case (H5Fopen with H5Pset_file_image + H5FD_CORE)? The image buffer is user-provided. EOA is set to 16 by H5F__super_read. Buffer allocated 16 bytes. Reads ≤ 14. No OOB.
+
+What about `H5Fis_accessible`?? Let me check its implementation — it might probe the file WITHOUT setting EOA to 16. Let me look at H5Fint.c / H5F.c for H5Fis_accessible.
+
+TOOL CALL step 94 grep:
+{"path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/src", "pattern": "H5Fis_accessible|H5F__is_accessible"}
+
+TOOL RESULT step 94:
+Found 17 matches
+
+repo-vul/src-vul/hdf5/src/H5VLcallback.c
+Line 3688:  *              H5Fis_accessible returns true for the given filename and
+
+repo-vul/src-vul/hdf5/src/H5VLmodule.h
+Line 352:  * <h4>H5Fis_hdf5() → H5Fis_accessible()</h4>
+Line 355:  * As a VOL-enabled replacement, \ref H5Fis_accessible() has been added to the
+Line 362:  *     htri_t H5Fis_accessible(const char *container_name, hid_t fapl_id)
+Line 537:  * <li> H5File::isHdf5 uses \ref H5Fis_accessible(), though it always passes #H5P_DEFAULT
+Line 563:  * Additionally, h5fis_hdf5_f was updated to use \ref H5Fis_accessible internally,
+Line 574:  * <li>\ref H5Fis_accessible is available and takes a fapl, allowing it to work with
+
+repo-vul/src-vul/hdf5/src/H5ESmodule.h
+Line 53:  * <td>#H5Fcreate, #H5Fflush, #H5Fis_accessible, #H5Fopen, #H5Fclose
+
+repo-vul/src-vul/hdf5/src/H5VLnative_file.c
+Line 340:         /* H5Fis_accessible */
+
+repo-vul/src-vul/hdf5/src/H5Fint.c
+Line 1036:     /* NOTE:    This now uses the fapl_id that was passed in, so H5Fis_accessible()
+
+repo-vul/src-vul/hdf5/src/H5F.c
+Line 465:  * Function:    H5Fis_accessible
+Line 475: H5Fis_accessible(const char *filename, hid_t fapl_id)
+Line 509: } /* end H5Fis_accessible() */
+
+repo-vul/src-vul/hdf5/src/H5Fpublic.h
+Line 264:  * \details H5Fis_accessible() checks if the file specified by \p
+Line 268:  * \note The H5Fis_accessible() function enables files to be checked with a
+Line 275: H5_DLL htri_t H5Fis_accessible(const char *container_name, hid_t fapl_id);
+Line 638:  *          is an HDF5 file via H5Fis_accessible(). This is done to ensure that
+
+ASSISTANT step 95:
+Let me look at the H5Fis_accessible path — H5VLnative_file.c line 340 and H5F.c line 475. H5Fis_accessible calls H5VL_file_is_accessible → H5F__is_accessible → H5FD_locate_signature probably, without a full superblock load. Let me check.
+
+TOOL CALL step 95 read:
+{"file_path": "/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/src/H5VLnative_file.c", "limit": 70, "offset": 320}
+
+TOOL RESULT step 95:
+<path>/home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5/src/H5VLnative_file.c</path>
+<type>file</type>
+<content>
+320:             }     /* end if */
+321: 
+322:             break;
+323:         }
+324: 
+325:         /* H5Freopen */
+326:         case H5VL_FILE_REOPEN: {
+327:             H5F_t *new_file;
+328: 
+329:             /* Reopen the file through the VOL connector */
+330:             if (NULL == (new_file = H5F__reopen((H5F_t *)obj)))
+331:                 HGOTO_ERROR(H5E_FILE, H5E_CANTINIT, FAIL, "unable to reopen file")
+332:             new_file->id_exists = TRUE;
+333: 
+334:             /* Set 'out' value */
+335:             *args->args.reopen.file = new_file;
+336: 
+337:             break;
+338:         }
+339: 
+340:         /* H5Fis_accessible */
+341:         case H5VL_FILE_IS_ACCESSIBLE: {
+342:             htri_t result;
+343: 
+344:             if ((result = H5F__is_hdf5(args->args.is_accessible.filename, args->args.is_accessible.fapl_id)) <
+345:                 0)
+346:                 HGOTO_ERROR(H5E_FILE, H5E_CANTGET, FAIL, "error in HDF5 file check")
+347: 
+348:             /* Set 'out' value */
+349:             *a
+...
+qual.same_file = FALSE;
+366:             else
+367:                 *args->args.is_equal.same_file =
+368:                     (((H5F_t *)obj)->shared == ((H5F_t *)args->args.is_equal.obj2)->shared);
+369: 
+370:             break;
+371:         }
+372: 
+373:         default:
+374:             HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL, "invalid specific operation")
+375:     } /* end switch */
+376: 
+377: done:
+378:     FUNC_LEAVE_NOAPI(ret_value)
+379: } /* end H5VL__native_file_specific() */
+380: 
+381: /*-------------------------------------------------------------------------
+382:  * Function:    H5VL__native_file_optional
+383:  *
+384:  * Purpose:     Handles the file optional callback
+385:  *
+386:  * Return:      SUCCEED/FAIL
+387:  *
+388:  *-------------------------------------------------------------------------
+389:  */
+
+(Showing lines 320-389 of 788. Use offset=390 to continue.)
+</content>
+
+ASSISTANT step 96:
+y the OOB happens in the DESERIALIZE phase (H5F__cache_superblock_deserialize) — but the description specifically says get_final_load_size.
+
+Hmm wait, wait. Let me reconsider. Maybe the initial load size ISN'T 16 in the target build! What if the benchmark's harness calls `H5F__cache_superblock_get_final_load_size` DIRECTLY (as a unit test)? No — the benchmark runs a real program.
+
+Hold on. Let me look at the OSS-Fuzz build for hdf5. The OSS-Fuzz hdf5 fuzzer... Actually, let me look at what ARVO benchmark does for HDF5. ARVO (Automated Reproduction of Vulnerabilities from OSS-Fuzz) — each sample = an OSS-Fuzz bug report (issue id), with the vulnerable commit checked out. The PoC is the OSS-Fuzz testcase (a raw file). The target is the OSS-Fuzz fuzz target binary for that project.
+
+For HDF5 in OSS-Fuzz: the fuzz targets include `h5dump`, `h5stat`, `h5ls`, etc.? Actually I recall OSS-Fuzz hdf5 has one fuzz target: `h5dump_fuzzer` or similar that writes the input to a temp file and invokes h5dump's logic via a library call. Hmm.
+
+Actually, let me check the OSS-Fuzz HDF5 project: https://github.com/google/oss-fuzz/tree/master/projects/hdf5. From memory: they build hdf5 with a fuzz target `h5dump` that reads the fuzz input from a file (the input is written to a temp file). They use the "h5dump" tool.
+
+Let me think about h5dump's behavior: h5dump calls H5Fopen(filename, H5F_ACC_RDONLY, fapl). Then it traverses. The H5Fopen → H5F__super_read → sets EOA=16 → load superblock with 16-byte buffer.
+
+So len=16 — no OOB in prefix decode. UNLESS the trim happens. UGH.
+
+Wait — actually — let me RE-READ H5F__super_read line 431-434 in the ACTUAL WORKSPACE FILE, not my memory. Maybe the version in the workspace does NOT set EOA to 16! Let me re-read the workspace H5Fsuper.c lines 425-450.
+
+TOOL CALL step 96 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5 && sed -n '395,450p' src/H5Fsuper.c", "description": "Re-read H5Fsuper.c signature/EOA section"}
+
+TOOL RESULT step 96:
+    else {
+        /* Locate the signature as per per the serial library */
+#endif /* H5_HAVE_PARALLEL */
+
+        if (H5FD_locate_signature(file, &super_addr) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_NOTHDF5, FAIL, "unable to locate file signature")
+
+#ifdef H5_HAVE_PARALLEL
+    }  /* end else */
+#endif /* H5_HAVE_PARALLEL */
+    if (!H5F_addr_defined(super_addr))
+        HGOTO_ERROR(H5E_FILE, H5E_NOTHDF5, FAIL, "file signature not found")
+
+    /* Check for userblock present */
+    if (H5F_addr_gt(super_addr, 0)) {
+        /* Set the base address for the file in the VFD now */
+        if (H5F__set_base_addr(f, super_addr) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTSET, FAIL, "failed to set base address for file driver")
+    } /* end if */
+
+    /* Determine file intent for superblock protect */
+
+    /* Must tell cache at protect time that the super block is to be
+     * flushed last (and collectively in the parallel case).
+     */
+    rw_flags = H5AC__FLUSH_LAST_FLAG;
+#ifdef H5_HAVE_PARALLEL
+    rw_flags |= H5C__FLUSH_COLLECTIVELY_FLAG;
+#endif /* H5_HAVE_PARALLEL */
+    if (!(H5F_INTENT(f) & H5F_ACC_RDWR))
+        rw_flags |= H5AC__READ_ONLY_FLAG;
+
+    /* Get the shared file c
+...
+K_FIXED_SIZE + H5F_SUPERBLOCK_MINIMAL_VARLEN_SIZE)) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_CANTSET, FAIL, "set end of space allocation request failed")
+
+    /* Set up the user data for cache callbacks */
+    udata.f               = f;
+    udata.ignore_drvrinfo = H5F_HAS_FEATURE(f, H5FD_FEAT_IGNORE_DRVRINFO);
+    udata.sym_leaf_k      = 0;
+    if (H5P_get(c_plist, H5F_CRT_BTREE_RANK_NAME, udata.btree_k) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_CANTGET, FAIL, "unable to get rank for btree internal nodes")
+    udata.stored_eof       = HADDR_UNDEF;
+    udata.drvrinfo_removed = FALSE;
+
+    /* Set the ring type in the API context */
+    H5AC_set_ring(H5AC_RING_SB, &orig_ring);
+
+    /* Look up the superblock */
+    if (NULL == (sblock = (H5F_super_t *)H5AC_protect(f, H5AC_SUPERBLOCK, (haddr_t)0, &udata, rw_flags)))
+        HGOTO_ERROR(H5E_FILE, H5E_CANTPROTECT, FAIL, "unable to load superblock")
+
+
+ASSISTANT step 97:
+then h5dump tries to read the root group object header, etc. But the description explicitly says the OOB is in `H5F__cache_superblock_get_final_load_size`.
+
+Hmm hold on, let me reconsider. Maybe the description is about the SECOND speculative load. Let me trace a scenario where the buffer gets SMALLER than 16:
+
+1. First load: len=16, get_final_load_size computes actual_len.
+   - EOA extended to FIXED + variable_size.
+   - actual_len = FIXED + variable_size.
+   - If actual_len != 16: verify_len_eoa(actual=TRUE): addr(0) + actual_len ≤ eoa (which was extended) → OK.
+   - Buffer reallocated to actual_len, extra bytes read.
+2. Second iteration: get_final_load_size(image, len=actual_len, ...) → same actual_len → stable.
+
+So len only grows. Never shrinks below 16.
+
+Hmm... unless get_final_load_size FAILS on the first call → `continue` → RETRY → re-read → fails again... after max_tries (default 1 for H5F_GET_READ_ATTEMPTS?) → error. No OOB.
+
+OK so I really cannot make the prefix decode OOB with the sec2 driver. Let me now seriously consider that the target uses a NON-sec2 driver or a different harness. Since the benchmark is from OSS-Fuzz and the description matches an OSS-Fuzz crash, let me look at the ACTUAL OSS-Fuzz hdf5 fuzz target. From my memory of OSS-Fuzz's hdf5 project:
+
+```bash
+# projects/hdf5/build.sh
+...
+$CXX $CXXFLAGS -std=c++11 -I$SRC/hdf5/src \
+    $SRC/hdf5/test/fuzz/h5dump_fuzzer.cc ... 
+```
+
+Hmm, not sure. Actually — I recall OSS-Fuzz hdf5 uses `h5dump` with the fuzz input written to a file named by an env var, and it uses the SEC2 driver... 
+
+Hmm wait, actually, maybe the harness uses the CORE driver with H5Pset_fapl_core + backing store, or the "file image" API. Let me look at HDF5's test/fuzz directory — the workspace has test/ — let me check for fuzz dir.
+
+TOOL CALL step 97 bash:
+{"command": "cd /home/xinran/.cache/gt_generation_dsh_scratch/run_dsh_arvo_arvo_42520218_m11nq40e/workspace/repo-vul/src-vul/hdf5 && ls test/ | grep -iE \"fuzz|h5dump\" ; ls tools/src/ | head -40", "description": "Check test and tools directories"}
+
+TOOL RESULT step 97:
+CMakeLists.txt
+Makefile.am
+h5copy
+h5diff
+h5dump
+h5format_convert
+h5import
+h5jam
+h5ls
+h5perf
+h5repack
+h5stat
+misc
+
+
+ASSISTANT step 98:
+ed from cache images though.
+
+Hmm. OR — the crash is via `H5F__cache_superblock_deserialize` being called with a small `len` from somewhere else. The `deserialize` callback gets `len` = final image length. For the superblock, that's FIXED + variable_size computed from the (attacker-controlled) version/sizes. All within buffer.
+
+Hmm, ok, let me try to think about the ACTUAL ASan stack from the description: "An out-of-bounds read occurs when decoding the superblock prefix in H5F__cache_superblock_get_final_load_size(). The code in H5F__superblock_prefix_decode() reads fields from the on-disk image buffer, including the signature and address/size bytes, without enforcing that the supplied image_len is large enough for those accesses, which can cause memcmp and subsequent parsing to read past the end of the buffer."
+
+"including the signature" — the fix checks `H5_IS_BUFFER_OVERFLOW(image, H5F_SIGNATURE_LEN, end)` before `image += H5F_SIGNATURE_LEN`. But in the VULNERABLE code, `image += H5F_SIGNATURE_LEN` — this just ADVANCES the pointer; it doesn't READ the signature. But the FIXED code checks it as if reading... because `image += 8` itself is fine, but the check is a general "the buffer must contain at least the signature + version + sizes". Actually the fix checks each step.
+
+Hmm, "which can cause memcmp" — the fix description mentions memcmp... Wait, maybe the FIX also added a memcmp? Let me look at the fixed H5F__cache_superblock_deserialize — the diff showed bounds checks everywhere but no memcmp addition. Hmm.
+
+Let me look at the ACTUAL issue in the HDF5 JIRA/GitHub. The fix commit... Let me search the commit full messages for "58762" — that was "Fixes oss-fuzz issue 58762". Not ours.
+
+Let me try searching the full commit messages for "H5F__cache_superblock" (exact):
+
+TOOL CALL step 98 bash:
+{"command": "grep -n -B3 -A10 \"H5F__cache_superblock\" /tmp/commit_full.txt | head -80", "description": "Search commit messages for cache_superblock mentions"}
+
+TOOL RESULT step 98:
+(no output)
+
+ASSISTANT step 99:
+FASTER tree resolution.
+
+The slow part was resolving deep delta chains for tree objects. Let me cache resolved objects by offset (already doing) and use the decompress-with-hint trick for speed. The earlier attempt timed out at 58s — the main cost is resolving tree deltas. Let me measure: how many tree objects are there? 45,133 trees. Resolving each via delta chains... the deep chains (depth>30) caused recursion errors before. Let me check the max delta depth — maybe some chains are very long.
+
+Actually — alternative much simpler approach: I DON'T need the full history. I need to find the fix commit. Let me look at HDF5's GitHub via my training knowledge: the commit "Fix heap buffer overflow in H5F__cache_superblock_get_final_load_size" — hmm.
+
+Actually — let me think about this from the FIX DESCRIPTION angle. The fix commit message might mention the issue number 42520... wait, let me search for "42520" more carefully — earlier grep found "parent d7883f21bf2d0d4b7b21397b42520a381364f30f" (a hash containing 42520). Let me search for the issue differently — maybe as "oss-fuzz:42520" or "ClusterFuzz". Let me look at the commits around Apr-May 2024 (1712242520 = Apr 4, 2024 — that was near "Fixes oss-fuzz issue 58762"). 
+
+Hmm wait, actually, let me look at issue 42520218 date: OSS-Fuzz issue IDs in the 42,520,000 range... hmm, those are actually just sequential. Let me estimate: OSS-Fuzz issue 42520 was around December 2021. But the vuln commit is Jan 2023 — so the bug was introduced or still present in Jan 2023. The FIX might be much later (2024-2025).
+
+Let me look for the fix by searching commit messages for keywords like "superblock" AND ("size" or "read" or "decode") around 2023-2025. Let me grep commit_full.txt for lines with "superblock" and show their commit headers.
+
+TOOL CALL step 99 bash:
+{"command": "awk '/^===== /{h=$2} /superblock/{print h\": \"$0}' /tmp/commit_full.txt | grep -iE \"superblock\" | grep -viE \"extens|flush|checksum|swmr|version|test|dirty|create|write|pin|evict|eoa|driver|image|locking|userblock|base addr|truncat\" | head -40", "description": "Find superblock-related commits"}
+
+TOOL RESULT step 99:
+0624ed2e480729e30dfc71aaf016f78c940c1316: Also accept transitions of the superblock status flags to
+06b7c1a3262ba321cf34142c276ff8cb9236dfa8:     Store the indexed storage B-tree internal 'K' value in the superblock.
+071be8ef3b668af0a4b3171cf02cbbdeffd52084: longer saved in the superblock because different pathname can make the name
+071be8ef3b668af0a4b3171cf02cbbdeffd52084: in the superblock.
+071be8ef3b668af0a4b3171cf02cbbdeffd52084: in file superblock.  When file is reopened,the size passed in thrin superblock.  A different size
+0d68ff7cc8124c3ff138c8b7e5d18ac40e6dc408: 	Eliminate some unnecessary properties for unused aspects of superblock.
+11c42cd994d49c68728f94261b39726a4b10bb21: 	Move split between "fixed" and "variable length" portions of superblock
+11c42cd994d49c68728f94261b39726a4b10bb21: 	Minor cleanups in h5debug's handling of superblock signature.
+12d84d4b12f4b43dc3a399fe3ffe8a8a15797b23: superblock routines into their own file also.
+14a19b8c905328344c7d33505986d340eab34933: Harden superblock cache deserialization (#2809)
+14cc7053529a7734a9f326becb7f35e4e18ed889: file's superblock.
+15a79009266ab9f05deeac6131752fb91568501c: Store metadata plugin info in superblock
+182c05c
+...
+3ba9cb77573e9853c5: sure the superblock isn't corrupted.
+4a85877fdc3b6b4a4e87dad27149148c7ac6ebf5:    Those issued during the superblock read seemed necessary,
+4a85877fdc3b6b4a4e87dad27149148c7ac6ebf5:    so I inserted a barrier at the end of the superblock read,
+51bb07ba914eaff9389511f732fdf0e2f920306f: displaying global heaps, and make it dump the file's superblock again when
+543c958928c02caccbc823d6f849b27e91405b73:     superblock.
+54b4c41c7fdf4b623c0ecb06ecd28fe05f5ea9b4: Merge pull request #751 in HDFFV/hdf5 from optimized_superblock_1_10 to hdf5_1_10
+552bb205b9ff9ba43e91d81e9ecc69357b3b0cf3: 	Further cleanups to superblock code:
+55fbd2aaac6e51bcf292d105ed84f77935c2d747: The family member size is saved in the superblock and compared to
+5a50fca18dd2ffd58160c38486cc4f0de8fdc460:    superblock before the recovery process begins.
+5a50fca18dd2ffd58160c38486cc4f0de8fdc460:    superblock.
+
+
+ASSISTANT step 100:
+**FOUND IT**: `14a19b8c905328344c7d33505986d340eab34933: Harden superblock cache deserialization (#2809)`
+
+That's the fix commit! Let me read its full message and date.
+
+TOOL CALL step 100 bash:
+{"command": "awk '/^===== 14a19b8c905328344c7d33505986d340eab34933 =====/{f=1} f{print} /^===== / && f && !/14a19b8c/{exit}' /tmp/commit_full.txt | head -60", "description": "Read fix commit message"}
+
+TOOL RESULT step 100:
+===== 14a19b8c905328344c7d33505986d340eab34933 =====
+tree 7c85400be405b51eacbc1cf3feda56060ee1b5d2
+parent bd7616cf98ae52e77f710a16fb4d334be3cb5ce9
+author Dana Robinson <43805+derobins@users.noreply.github.com> 1682555982 -0700
+committer GitHub <noreply@github.com> 1682555982 -0700
+
+Harden superblock cache deserialization (#2809)
+
+
+===== 14a242987fa8f44c0ca9ca8798580a4521afe712 =====
+
+Rules:
+- Output one bare JSON object only. No markdown, no prose.
+- sample_id must be "arvo_42520218".
+- If the trajectory is uncertain, choose the most concrete vulnerability
+  hypothesis supported by the issue description and cited source snippets.
+- Keep operands/relation grounded in the same fine_trace step's var/code.
+- Keep fine_trace compact: 3 to 8 steps total. Never output more than 8 steps.
+
+Required analysis.json schema:
+- Return/write one bare JSON object with exactly three top-level keys: sample_id, fine_trace, and vuln_logic. Do not emit Markdown, prose, XML, DSML, tool calls, confidence fields, GT identifiers, trace_step references, or extra top-level keys.
+- sample_id must be exactly 'arvo_42520218'; do not rewrite separators or dataset prefixes.
+Compactness: keep fine_trace to 3 to 8 steps when evidence allows; include only indispensable intermediate steps.
+
+
+Required JSON shape:
+{
+  "sample_id": "exact_sample_id",
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "project/source/file.c",
+      "function": "function_name",
+      "line": 123,
+      "var": "source_expr",
+      "code": "source statement",
+      "role": "source",
+      "note": "why this step matters"
+    }
+  ],
+  "vuln_logic": {
+    "source": {
+      "file": "same file as the fine_trace source step",
+      "function": "same function",
+      "line": 123,
+      "operands": ["attacker_controlled_expr"]
+    },
+    "root_cause": {
+      "file": "same file as the fine_trace root_cause step",
+      "function": "same function",
+      "line": 130,
+      "operands": ["left_expr", "right_expr"],
+      "relation": {"op": "lt", "left": "left_expr", "right": "right_expr"}
+    },
+    "sink": {
+      "file": "same file as the fine_trace sink step",
+      "function": "same function",
+      "line": 140,
+      "operands": ["left_expr", "right_expr"],
+      "relation": {"op": "gt", "left": "left_expr", "right": "right_expr"}
+    },
+    "propagation": [
+      {
+        "from": {"file": "file.c", "function": "f", "line": 123, "operands": ["expr"]},
+        "to": {"file": "file.c", "function": "f", "line": 140, "operands": ["expr"]},
+        "type": "data",
+        "via": ["expr"],
+        "relation": {"op": "eq", "left": "expr", "right": "expr"}
+      }
+    ]
+  }
+}
+
+Field meanings:
+- sample_id: the exact benchmark sample id provided by the task. Do not convert between forms such as arvo_123 and arvo:123.
+- fine_trace: the shortest sufficient causal path through vulnerable implementation source code under the local benchmark input. Omit harness boilerplate, setup, generic parser admission, README/workspace artifacts, runtime logs, and incidental exploration. A harness/test/fuzz frame may appear only as an unscored intermediate when needed to show how bytes enter the target; it must not be source, root_cause, sink, or a vuln_logic propagation endpoint.
+- fine_trace.step: integer steps starting at 1 in causal/execution order. Do not output depends_on.
+- fine_trace.file/function/line: vulnerable project source location. line may be null only when the evidence truly has no line, but any step used by vuln_logic must have an integer line. For a file-scope declaration with no enclosing function, set function to "<global>".
+- fine_trace.var: one concrete source expression, variable, field, macro, literal, or language-native variable token at that step.
+- fine_trace.code: the source statement or a concise source-level description from the evidence.
+- fine_trace.role: one of source, root_cause, sink, intermediate, or null. There must be exactly one source step, one root_cause step, and one sink step.
+- fine_trace.note: concise reason this step is on the causal path.
+
+Role meanings:
+- source: first vulnerable implementation source statement where attacker-controlled data or vulnerability-relevant state becomes a program value used by the real implementation. It is not a fuzz harness entrypoint, test driver, README, workspace setup, generic parser admission, or build/setup wrapper unless that code is itself the vulnerable implementation being scored. If the first observed input is only in harness code, keep that harness step unrole-marked or role=intermediate and choose the first downstream vulnerable implementation statement as source.
+- root_cause: project source statement that represents the missing or violated safety obligation: pointer must be NULL after transfer, index < capacity, remaining bytes >= read size, object alive before use, buffer initialized before read, etc. It is not a symptom, crash line, generic error check, or harness line.
+- sink: project source statement where the unsafe operation or vulnerability manifestation happens: out-of-bounds read/write, use-after-free, double free, invalid free, uninitialized read, null dereference, or overflow-triggering operation. It is not merely the final sanitizer stack frame if the actual unsafe project operation is visible elsewhere.
+- intermediate: project source statement needed to carry data, control, object identity, lifetime, size, or ordering from source/root_cause to sink. Use null or omit role for ordinary nearby statements.
+
+vuln_logic field meanings:
+- vuln_logic is a projection from role-marked fine_trace steps, not a second independent story. If an anchor is wrong, fix the fine_trace role step first, then copy it into vuln_logic.
+- vuln_logic must contain source, root_cause, sink, and propagation. It may also include issue_alignment when useful.
+- source: copy file/function/line from the single fine_trace step with role=source. operands names the attacker-controlled value/object/size expression at that source. source has no relation or op.
+- root_cause: copy file/function/line from the single fine_trace step with role=root_cause. operands are the concrete expressions involved in the violated safety obligation. relation is required and must be exactly {"op": "...", "left": "...", "right": "..."}.
+- sink: copy file/function/line from the single fine_trace step with role=sink. operands are the concrete expressions involved in the unsafe operation or violated sink predicate. relation is required and must be exactly {"op": "...", "left": "...", "right": "..."}.
+- propagation: each edge connects two existing fine_trace steps. from and to must copy file/function/line from existing fine_trace steps, usually source/root_cause/sink or intermediate. type is data, control, or order. via is the carrier expression, guard expression, or order keyword. relation is optional and, when present, must be exactly {"op": "...", "left": "...", "right": "..."}.
+- Consistency: source/root_cause/sink operands and relation terms must be grounded in the same fine_trace step marked with that role. If vuln_logic.sink talks about glyph_props, the fine_trace sink step must also be the source statement involving glyph_props; do not put glyph_props under sink when the sink role step is a different call or variable.
+
+Expression rules:
+- relation.op must be one of eq, ne, lt, le, gt, ge, or same_object. Keep left/right direction meaningful for lt, le, gt, and ge.
+- root_cause.relation states the safety condition that should have held to avoid the bug, not the vulnerable-path negation; for example, if the bug happens because i >= capacity, write root_cause.relation as lt(i, capacity).
+- sink.relation must be the target operation's required or violated sink predicate.
+- Do not use tautologies such as {"op":"eq","left":"x","right":"x"} or {"op":"same_object","left":"x","right":"x"} to fill relation.
+- operands, via, relation.left, and relation.right must be concrete verbatim source expressions or literals from the cited source evidence: variables, fields, macros, constants, string/integer literals, calls, or language-native variables such as PHP $name tokens.
+- Never put English explanations, conceptual phrases, unresolved instrumentation placeholders such as $event.field, or invented property names in operands, via, relation.left, or relation.right.
+- README.md, description.txt, workspace, checkpoint files, candidate_trace.json, analysis.json, prompts, runtime logs, harness, test, fuzz setup, and build/setup code are not valid anchors for source, root_cause, sink, or vuln_logic propagation endpoints.
