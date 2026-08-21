@@ -1,0 +1,124 @@
+{
+  "sample_id": "osv_ossfuzz_OSV-2026-703",
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59101,
+      "var": "argv[0], argv[1], argv[2]",
+      "code": "js_atomics_get_ptr(ctx, &ptr, &p, &idx, &size_log2, &class_id, argv[0], argv[1], 0)",
+      "note": "Attacker-controlled JS arguments enter: a TypedArray ta over a resizable ArrayBuffer buf (4 bytes), index 0, and a value object whose valueOf() resizes the buffer. get_ptr validates idx against the stale count and records the raw backing pointer used for the later atomic access.",
+      "role": "source"
+    },
+    {
+      "step": 2,
+      "file": "quickjs.c",
+      "function": "js_atomics_get_ptr",
+      "line": 59076,
+      "var": "ptr",
+      "code": "ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);",
+      "note": "Raw data pointer into the current 4-byte backing store is captured in the caller's local. This pointer becomes dangling as soon as the backing store is reallocated by user JS executed afterwards.",
+      "role": "intermediate"
+    },
+    {
+      "step": 3,
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59120,
+      "var": "v32",
+      "code": "if (JS_ToUint32(ctx, &v32, argv[2])) return JS_EXCEPTION;",
+      "note": "Converting the attacker-supplied value object invokes ToPrimitive -> valueOf(), re-entering arbitrary JS while ptr is still live. That JS calls buf.resize(), reallocating the backing store.",
+      "role": "intermediate"
+    },
+    {
+      "step": 4,
+      "file": "quickjs.c",
+      "function": "js_array_buffer_resize",
+      "line": 56542,
+      "var": "data",
+      "code": "data = js_realloc(ctx, abuf->data, max_int(len, 1));",
+      "note": "valueOf() executed buf.resize(1048576): realloc moves the 4-byte backing block to a new 1 MiB block and frees the old one. abuf->data now points to the new block, but js_atomics_op's local ptr still points at the freed 4-byte block.",
+      "role": "intermediate"
+    },
+    {
+      "step": 5,
+      "file": "quickjs.c",
+      "function": "js_array_buffer_resize",
+      "line": 56550,
+      "var": "p->u.array.count",
+      "code": "js_array_buffer_update_typed_arrays(abuf);",
+      "note": "Typed-array views are refreshed: p->u.array.count becomes (1048576 >> 2) = 262144 and p->u.array.u.ptr points to the new block, so the later idx >= p->u.array.count revalidation (0 >= 262144 is false) will pass.",
+      "role": "intermediate"
+    },
+    {
+      "step": 6,
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59129,
+      "var": "ptr",
+      "code": "if (typed_array_is_oob(p)) return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);",
+      "note": "Post-conversion revalidation only checks typed_array_is_oob(p) (which returns FALSE for RAB-tracked arrays, see line 56681) and idx >= p->u.array.count (0 < 262144). It never recomputes ptr from the current p->u.array.u.uint8_ptr, so the stale pointer into freed memory survives to the write.",
+      "role": "root_cause"
+    },
+    {
+      "step": 7,
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59151,
+      "var": "ptr",
+      "code": "OP(ADD, atomic_fetch_add)",
+      "note": "atomic_fetch_add((_Atomic(uint32_t) *)ptr, v) performs a 4-byte read-modify-write on the freed backing block -> ASan heap-use-after-free WRITE 4 in js_atomics_op, matching the OSS-Fuzz crash state.",
+      "role": "sink"
+    }
+  ],
+  "vuln_logic": {
+    "source": {
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59101,
+      "operands": [
+        "argv[0]",
+        "argv[1]",
+        "argv[2]"
+      ]
+    },
+    "root_cause": {
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59129,
+      "operands": [
+        "ptr",
+        "p->u.array.u.uint8_ptr",
+        "idx"
+      ],
+      "relation": {
+        "op": "eq",
+        "left": "ptr",
+        "right": "p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2)"
+      }
+    },
+    "sink": {
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59151,
+      "operands": [
+        "ptr",
+        "v"
+      ],
+      "relation": {
+        "op": "ne",
+        "left": "ptr",
+        "right": "p->u.array.u.uint8_ptr"
+      }
+    },
+    "propagation": [],
+    "issue_alignment": {
+      "admission": "JavaScript program bytes are evaluated by the OSS-Fuzz fuzz_eval harness; the script constructs a resizable ArrayBuffer, a TypedArray over it, and calls Atomics.add with a value object whose valueOf() resizes the buffer.",
+      "source": "Attacker-controlled JS values (typed array over a resizable ArrayBuffer, index 0, value object) enter js_atomics_op as argv; js_atomics_get_ptr captures a raw backing pointer and index.",
+      "root_cause": "After the JS value conversion (JS_ToUint32) that can resize/detach the buffer, js_atomics_op revalidates bounds but never recomputes the raw backing pointer, so the stale pointer to the realloc-freed block is used.",
+      "propagation": "valueOf() during JS_ToUint32 calls buf.resize(1048576); js_realloc moves and frees the 4-byte backing store; js_array_buffer_update_typed_arrays refreshes count to 262144 so the idx<count revalidation passes; stale ptr reaches the atomic write.",
+      "sink": "atomic_fetch_add writes 4 bytes through the stale ptr into freed memory -> ASan heap-use-after-free WRITE 4 in js_atomics_op (OSS-Fuzz crash state js_atomics_op / js_call_c_function / JS_CallInternal)."
+    }
+  }
+}

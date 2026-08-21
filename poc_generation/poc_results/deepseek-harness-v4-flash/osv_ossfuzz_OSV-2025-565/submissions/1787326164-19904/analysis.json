@@ -1,0 +1,130 @@
+{
+  "sample_id": "OSV-2025-565",
+  "fine_trace": [
+    {
+      "step": 1,
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdLayer::SomeIpSdLayer",
+      "line": 439,
+      "var": "data",
+      "code": "SomeIpSdLayer::SomeIpSdLayer(uint8_t *data, size_t dataLen, Layer *prevLayer, Packet *packet) : SomeIpLayer(data, dataLen, prevLayer, packet) { m_NumOptions = countOptions(); }",
+      "note": "Attacker-controlled 32-byte UDP payload becomes the layer raw buffer. The length-of-options field inside it is set to 4 and the single option declares type 0x06 (IPv6Endpoint) with length 1, so only 4 option bytes exist while the code will treat it as a 24-byte IPv6 option.",
+      "role": "source"
+    },
+    {
+      "step": 2,
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdLayer::getOptions",
+      "line": 516,
+      "var": "remainingLen",
+      "code": "size_t remainingLen = getLenOptions();",
+      "note": "getLenOptions() reads the attacker-controlled length-of-options field (4) at offset 24 of the layer; the while loop parses options while remainingLen > 0.",
+      "role": "intermediate"
+    },
+    {
+      "step": 3,
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdLayer::getOptions",
+      "line": 521,
+      "var": "hdr",
+      "code": "SomeIpSdOption::someipsdhdroptionsbase *hdr = (SomeIpSdOption::someipsdhdroptionsbase *)(m_Data + offset);",
+      "note": "hdr points at the option base header at layer offset 28 (the last 4 bytes of the 32-byte payload): length field = 1, type byte = 0x06.",
+      "role": "intermediate"
+    },
+    {
+      "step": 4,
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdLayer::getOptions",
+      "line": 522,
+      "var": "optionType",
+      "code": "SomeIpSdOption::OptionType optionType = static_cast<SomeIpSdOption::OptionType>(hdr->type);",
+      "note": "The attacker-controlled type byte 0x06 selects SomeIpSdOption::OptionType::IPv6Endpoint, which will be dispatched to the IPv6 option parser.",
+      "role": "intermediate"
+    },
+    {
+      "step": 5,
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdLayer::getOptions",
+      "line": 524,
+      "var": "option",
+      "code": "option = parseOption(optionType, offset);",
+      "note": "parseOption() constructs a typed option from the unchecked type byte without verifying that sizeof(someipsdhdroptionsipv6) bytes are present: the option only declares be16toh(hdr->length)+3 = 4 bytes, but the code casts it to the 24-byte someipsdhdroptionsipv6 struct. The safety check be16toh(hdr->length)+3 >= sizeof(someipsdhdroptionsipv6) should have been enforced here.",
+      "role": "root_cause"
+    },
+    {
+      "step": 6,
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdIPv6Option::SomeIpSdIPv6Option",
+      "line": 134,
+      "var": "m_DataLen",
+      "code": "m_DataLen = sizeof(someipsdhdroptionsipv6);",
+      "note": "The parsed IPv6 option assumes the full 24-byte struct even though only 4 bytes of option data remain at layer offset 28; getDataPtr() will return m_Data+28.",
+      "role": "intermediate"
+    },
+    {
+      "step": 7,
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdIPv6Option::getIpAddress",
+      "line": 140,
+      "var": "hdr->ipv6Address",
+      "code": "someipsdhdroptionsipv6 *hdr = (someipsdhdroptionsipv6 *)getDataPtr(); IPv6Address ipAddr(hdr->ipv6Address);",
+      "note": "hdr->ipv6Address is read as 16 bytes starting at m_Data+32, exactly one byte past the end of the 74-byte raw packet buffer (frame = 14 Eth + 20 IPv4 + 8 UDP + 32 payload), producing a heap-buffer-overflow READ of size 16.",
+      "role": "sink"
+    },
+    {
+      "step": 8,
+      "file": "Common++/header/IpAddress.h",
+      "function": "IPv6Address::IPv6Address",
+      "line": 204,
+      "var": "m_Bytes",
+      "code": "IPv6Address(const uint8_t bytes[16]) { memcpy(m_Bytes, bytes, sizeof(m_Bytes)); }",
+      "note": "The 16-byte memcpy from the out-of-bounds hdr->ipv6Address pointer is where ASAN reports the heap-buffer-overflow READ of size 16.",
+      "role": "intermediate"
+    }
+  ],
+  "vuln_logic": {
+    "source": {
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdLayer::SomeIpSdLayer",
+      "line": 439,
+      "operands": ["data", "dataLen"]
+    },
+    "root_cause": {
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdLayer::getOptions",
+      "line": 524,
+      "operands": ["optionType", "offset", "hdr->length", "remainingLen"],
+      "relation": {"op": "ge", "left": "be16toh(hdr->length) + 3", "right": "sizeof(someipsdhdroptionsipv6)"}
+    },
+    "sink": {
+      "file": "Packet++/src/SomeIpSdLayer.cpp",
+      "function": "SomeIpSdIPv6Option::getIpAddress",
+      "line": 140,
+      "operands": ["hdr->ipv6Address", "getDataPtr()", "hdr->length"],
+      "relation": {"op": "gt", "left": "sizeof(someipsdhdroptionsbase) + 16", "right": "be16toh(hdr->length) + 3"}
+    },
+    "propagation": [
+      {
+        "from": {"file": "Packet++/src/SomeIpSdLayer.cpp", "function": "SomeIpSdLayer::SomeIpSdLayer", "line": 439, "operands": ["data", "dataLen"]},
+        "to": {"file": "Packet++/src/SomeIpSdLayer.cpp", "function": "SomeIpSdLayer::getOptions", "line": 522, "operands": ["optionType", "hdr->type"]},
+        "type": "data",
+        "via": ["m_Data", "offset", "hdr->type"],
+        "relation": {"op": "eq", "left": "hdr->type", "right": "SomeIpSdOption::OptionType::IPv6Endpoint"}
+      },
+      {
+        "from": {"file": "Packet++/src/SomeIpSdLayer.cpp", "function": "SomeIpSdLayer::getOptions", "line": 522, "operands": ["optionType", "hdr->type"]},
+        "to": {"file": "Packet++/src/SomeIpSdLayer.cpp", "function": "SomeIpSdLayer::parseOption", "line": 766, "operands": ["type", "offset"]},
+        "type": "control",
+        "via": ["type", "offset"],
+        "relation": {"op": "eq", "left": "type", "right": "SomeIpSdOption::OptionType::IPv6Endpoint"}
+      },
+      {
+        "from": {"file": "Packet++/src/SomeIpSdLayer.cpp", "function": "SomeIpSdIPv6Option::SomeIpSdIPv6Option", "line": 134, "operands": ["m_DataLen"]},
+        "to": {"file": "Packet++/src/SomeIpSdLayer.cpp", "function": "SomeIpSdIPv6Option::getIpAddress", "line": 140, "operands": ["hdr->ipv6Address", "getDataPtr()"]},
+        "type": "data",
+        "via": ["m_DataLen", "getDataPtr()", "hdr->ipv6Address"],
+        "relation": {"op": "eq", "left": "m_DataLen", "right": "sizeof(someipsdhdroptionsipv6)"}
+      }
+    ]
+  }
+}
