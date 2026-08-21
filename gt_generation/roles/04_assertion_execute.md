@@ -19,6 +19,10 @@ either instrumentation patch, `.assertion_spec_frozen.json`, or
 let its absence block a GT package whose core assertion, invariant, and
 reachability evidence is complete.
 
+Write artifacts with ordinary shell/Python file writes available inside the CLI
+session. Do not invoke a special `apply_patch` command from the shell; it is not
+part of the Stage 04 execution runtime environment.
+
 Do not add artifact-level `schema_version` to `verified_assertions.json`,
 `verified_invariants.json`, `field_bindings.json`, or `event_locations.json`.
 The only schema-versioned file in this stage is the frozen assertion spec
@@ -35,6 +39,13 @@ preflight report must have `track` starting with `repo/`; an ARVO preflight
 must not be reused for a repo-track sample. If a frozen patch unexpectedly fails
 during execution, report which side failed; rerun only that side's
 instrumentation stage. Do not edit the plan or either patch here.
+
+If `<result_dir>/assertion_execute_feedback.md` exists, read it before running.
+It means a prior 04B attempt did not write the complete execution package. Treat
+that as an execution-only retry: reuse the frozen plan and patches, run both
+sides serially, and write every required output. Do not convert this feedback
+into a Stage 04A semantic rewrite unless the deterministic assertion results
+prove the required root predicate is not a vulnerable/fixed differential.
 
 ## Execution order
 
@@ -55,6 +66,9 @@ instrumentation stage. Do not edit the plan or either patch here.
    the root `required` differential; fixed-side outcomes of `observed` and
    `transition` assertions are diagnostic only and do not gate propagation
    verification.
+   The fixed trace is mandatory even if the vulnerable run already proves a
+   crash. Never stop after the vulnerable trace; without
+   `fixed_assertion_trace.txt`, the stage is incomplete and cannot be packaged.
    If vulnerable and fixed originals have the same truth value for every
    required assertion, the sample does not yet have a valid root differential.
    Do not package it. Either the fixed oracle is wrong, or the required
@@ -66,6 +80,16 @@ instrumentation stage. Do not edit the plan or either patch here.
    guard. This is a hard maximum of one non-original case across the fixed
    trace: never try a second fallback, enumerate values, or fuzz. Stop
    immediately after that one case, whether it succeeds or fails.
+   A perturbation is still mandatory even when the original fixed run is clean:
+   the deterministic verifier rejects a guarded fixed-side witness until the
+   fixed trace contains one non-original CASE. Use this exact procedure:
+   copy `<result_dir>/poc` to a result-dir-local file such as
+   `<result_dir>/fixed_guard_probe.poc`, make the smallest source-grounded edit
+   that should pass the new guard and still reach the same protected operation
+   when feasible, then append it only to the fixed trace with the deterministic
+   workspace runner. If the file format is not obvious, still run one closest
+   conservative mutation and let the recorded CASE show whether it reached the
+   event. Never hand-write that CASE.
 4. Keep only runtime-verified candidate invariants in
    `verified_invariants.json`. Preserve the GT contract shape from
    `candidate_invariants.json`: `root_cause_criterion` is only a pointer to the
@@ -176,6 +200,21 @@ commands from `reproduction_report.json`; if those commands were recorded as
 through the current `<result_dir>/build.sh`. Never run the target directly on
 the host.
 
+Repo-track execution is stateful and must be strictly serial. The vulnerable
+and fixed runs share `<result_dir>/_work/src`, `<result_dir>/_out`, and the same
+repo checkout. Do not run the vulnerable and fixed `repo-workspace run`
+commands concurrently, in the background, through shell `&`, or via any parallel
+tool. Start the fixed run only after the vulnerable command has exited and
+`vulnerable_assertion_trace.txt` exists with a complete `CASE ... ENDCASE`
+block. If a command fails, inspect that side's trace and run log before starting
+any other side.
+For repo-track side selection, trust the deterministic runner's
+`repo_workspace/<version>_<case>_run.json` fields (`version`, `target_commit`,
+`result`, `matched`) and the `GT_REPO_WORKSPACE_COMMIT ... observed_commit=...`
+marker. Do not infer that a side was swapped from a raw `HEAD is now at ...`
+line in stdout; `git reset --hard HEAD` can print the previous checkout before
+the runner switches to the requested commit.
+
 Use the deterministic repo runner so the toolkit owns reset, fixed checkout,
 patch application, setup, target invocation, and `CASE ... ENDCASE` framing:
 
@@ -202,3 +241,7 @@ source-grounded perturbation case to the same fixed trace with
 <result-dir-local-mutated-poc> ...` and stop. The perturbation PoC must be a
 single file under `<result_dir>` so the deterministic runner records the real
 input path and writes a normal `CASE` block; never edit the trace by hand.
+After appending the perturbation CASE, rerun the deterministic
+`gt_toolkit assertions` command. If `perturbation_results.json` still reports
+`single_perturbation_attempt_recorded: false`, the execution stage is
+incomplete; do not report success and do not rewrite the assertion plan.

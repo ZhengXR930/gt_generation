@@ -1,0 +1,460 @@
+{
+  "sample_id": "osv_ossfuzz_OSV-2026-703",
+  "vuln_id": "OSV-2026-703",
+  "project": {
+    "id": "quickjs",
+    "repo": "https://github.com/bellard/quickjs",
+    "vulnerable_commit": "d7ae12ae71dfd6ab2997527d295014a8996fa0f9",
+    "fixed_commit": "e182e3df5c51017a7faa97a654b3f2b9c6330448"
+  },
+  "classification": {
+    "class": "heap-use-after-free",
+    "cwe": "CWE-416"
+  },
+  "bug_description": {
+    "original": "Heap-use-after-free in js_atomics_op OSS-Fuzz report: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=510792185 ``` Crash type: Heap-use-after-free WRITE 4 Crash state: js_atomics_op js_call_c_function JS_CallInternal ```",
+    "original_source": "OSV.summary/details",
+    "normalized": "The staged JavaScript program creates a resizable 4-byte ArrayBuffer, makes an Int32Array view over it, and passes an object with a `valueOf()` callback as the third argument to `Atomics.add(ta, 0, obj)`. In vulnerable QuickJS, `js_atomics_op` first resolves the typed-array element pointer with `js_atomics_get_ptr`, storing `ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2)` for the original 4-byte backing store. It then coerces the third argument with `JS_ToUint32(ctx, &v32, argv[2])`; the PoC's `valueOf()` runs during this coercion and calls `ab.resize(1024)`. `js_array_buffer_resize` reallocates the ArrayBuffer data with `js_realloc`, freeing the old 4-byte region and updating the typed-array view to the new storage. After coercion returns, `js_atomics_op` only rechecks logical bounds via `typed_array_is_oob(p)` and `idx >= p->u.array.count`, but it does not recompute `ptr`. The subsequent `atomic_fetch_add((_Atomic(uint32_t) *)ptr, v)` therefore writes through the stale pointer into freed heap memory, matching the ASan heap-use-after-free WRITE 4 in `js_atomics_op` with the free inside `js_array_buffer_resize`."
+  },
+  "source": {
+    "file": "quickjs.c",
+    "function": "js_atomics_op",
+    "line": 59120,
+    "code": "if (JS_ToUint32(ctx, &v32, argv[2]))\n    return JS_EXCEPTION;",
+    "var": "argv[2], v32",
+    "description": "First project-code consumption of attacker-controlled state relevant to the bug. `js_atomics_op` coerces the third JavaScript argument, and this conversion executes the PoC's `valueOf()` callback that resizes the backing ArrayBuffer.",
+    "value_from": "The staged PoC passes `obj` as the third argument of `Atomics.add(ta, 0, obj)`. Its `valueOf()` method prints `Resizing array buffer...`, calls `ab.resize(1024)`, and returns `1`, which matches the sanitizer log and the PoC source.",
+    "trace_step": 4,
+    "operands": [
+      "argv[2]",
+      "v32"
+    ],
+    "relation": {
+      "op": "same_object",
+      "left": "argv[2]",
+      "right": "argv[2]",
+      "description": "Source identity relation for the attacker-controlled operand consumed by the coercion."
+    }
+  },
+  "root_cause": {
+    "file": "quickjs.c",
+    "function": "js_atomics_op",
+    "line": 59101,
+    "code": "if (js_atomics_get_ptr(ctx, &ptr, &p, &idx, &size_log2, &class_id,\n                       argv[0], argv[1], 0))\n    return JS_EXCEPTION;",
+    "var": "ptr",
+    "description": "`js_atomics_op` snapshots the typed-array element pointer before coercing `argv[2]`. Because that coercion can run user JavaScript and resize the backing ArrayBuffer, the saved pointer may become dangling before the atomic operation executes.",
+    "note": "The fix stops returning a precomputed pointer from the helper, keeps only the object and index, and recomputes `ptr` after argument coercion and post-coercion bounds checks.",
+    "trace_step": 3,
+    "operands": [
+      "ptr",
+      "p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2)"
+    ],
+    "relation": {
+      "op": "eq",
+      "left": "ptr",
+      "right": "p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2)"
+    }
+  },
+  "sink": {
+    "file": "quickjs.c",
+    "function": "js_atomics_op",
+    "line": 59151,
+    "code": "a = atomic_fetch_add((_Atomic(uint32_t) *)ptr, v);",
+    "var": "ptr, v",
+    "description": "The final unsafe operation writes through the stale cached pointer after the backing store was reallocated and the old 4-byte region was freed.",
+    "note": "ASan reports `WRITE of size 4` at this line and identifies the freed 4-byte region as having been released by `js_array_buffer_resize` via `js_realloc`.",
+    "trace_step": 8,
+    "operands": [
+      "ptr",
+      "p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2)"
+    ],
+    "relation": {
+      "op": "ne",
+      "left": "ptr",
+      "right": "p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2)"
+    }
+  },
+  "tainted_value_origin": {
+    "file": "quickjs.c",
+    "function": "js_typed_array_constructor",
+    "line": 58575,
+    "code": "if (typed_array_init(ctx, obj, buffer, offset, len, track_rab))\n    goto fail;",
+    "var": "buffer, obj, len",
+    "description": "Creates the `Int32Array` view used by the PoC's `Atomics.add` call and ties it to the resizable ArrayBuffer backing store.",
+    "value_from": "In the staged PoC, `const ta = new Int32Array(ab);` uses the same `ab` created as `new ArrayBuffer(4, { maxByteLength: 1024 })`, so the typed array initially spans one 32-bit element over a 4-byte resizable backing store.",
+    "note": "This establishes the typed-array object whose cached element pointer later becomes stale after `ab.resize(1024)` reallocates the backing memory."
+  },
+  "reachability_checkpoints": {
+    "parser_admitted": {
+      "file": "quickjs.c",
+      "function": "JS_EvalInternal",
+      "line": 36737,
+      "code": "return __JS_EvalInternal(ctx, this_obj, input, input_len, filename, eval_flags, scope_idx);",
+      "description": "`JS_Eval` in the project runtime accepts the staged JavaScript source and enters normal evaluation of the script, after which the `ArrayBuffer`, `Int32Array`, and `Atomics.add` operations execute.",
+      "admitted_location": {
+        "file": "quickjs.c",
+        "function": "js_atomics_op",
+        "line": 59101,
+        "code": "if (js_atomics_get_ptr(ctx, &ptr, &p, &idx, &size_log2, &class_id,\n                       argv[0], argv[1], 0))"
+      }
+    }
+  },
+  "fine_trace": [
+    {
+      "step": 0,
+      "file": "fuzz/fuzz_eval.c",
+      "function": "LLVMFuzzerTestOneInput",
+      "line": 36,
+      "var": "data, size",
+      "code": "JSValue val = JS_Eval(ctx, (const char *)null_terminated_data, size, \"<none>\", JS_EVAL_TYPE_GLOBAL);",
+      "note": "Harness step only. The testcase bytes are evaluated as a JavaScript program that creates a resizable `ArrayBuffer`, an `Int32Array` view, and an object whose `valueOf()` resizes the buffer during `Atomics.add`."
+    },
+    {
+      "step": 1,
+      "file": "quickjs.c",
+      "function": "js_array_buffer_constructor3",
+      "line": 56095,
+      "var": "abuf->data, abuf->byte_length, abuf->max_byte_length",
+      "code": "abuf->data = js_mallocz(ctx, max_int(len, 1));",
+      "note": "The evaluated script creates `ab` as a resizable ArrayBuffer with initial length 4 and `maxByteLength` 1024, so the backing store starts as a distinct 4-byte heap allocation.",
+      "depends_on": [
+        {
+          "on": 0,
+          "type": "data",
+          "via": "new ArrayBuffer(4, { maxByteLength: 1024 })"
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "file": "quickjs.c",
+      "function": "typed_array_init",
+      "line": 58343,
+      "var": "p->u.array.u.ptr, p->u.array.count",
+      "code": "p->u.array.u.ptr = abuf->data + offset;",
+      "note": "`new Int32Array(ab)` binds the typed-array view to step 1's backing store. With a 4-byte buffer and element size 4, the view initially exposes exactly one `Int32` element at the current `abuf->data` address.",
+      "depends_on": [
+        {
+          "on": 1,
+          "type": "data",
+          "via": "abuf->data"
+        },
+        {
+          "on": 0,
+          "type": "data",
+          "via": "new Int32Array(ab)"
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59101,
+      "line_end": 59102,
+      "var": "ptr, p, idx, size_log2, class_id",
+      "code": "if (js_atomics_get_ptr(ctx, &ptr, &p, &idx, &size_log2, &class_id,\n                       argv[0], argv[1], 0))\n    return JS_EXCEPTION;",
+      "note": "Root cause. Before coercing the value argument, `js_atomics_op` validates the `Int32Array` and index 0, then caches `ptr` to the current backing-store element. This pointer still targets the original 4-byte allocation from step 1.",
+      "depends_on": [
+        {
+          "on": 2,
+          "type": "data",
+          "via": "p->u.array.u.ptr"
+        },
+        {
+          "on": 0,
+          "type": "data",
+          "via": "Atomics.add(ta, 0, obj)"
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59120,
+      "var": "argv[2], v32",
+      "code": "if (JS_ToUint32(ctx, &v32, argv[2]))\n    return JS_EXCEPTION;",
+      "note": "Source. Converting the third argument executes user-defined coercion. For the PoC's object, `valueOf()` runs here, prints `Resizing array buffer...`, calls `ab.resize(1024)`, and returns integer `1`, so `v` becomes the attacker's coerced write operand.",
+      "depends_on": [
+        {
+          "on": 3,
+          "type": "order",
+          "via": "free_before_use",
+          "obj": "ptr"
+        },
+        {
+          "on": 0,
+          "type": "data",
+          "via": "argv[2]"
+        }
+      ]
+    },
+    {
+      "step": 5,
+      "file": "quickjs.c",
+      "function": "js_array_buffer_resize",
+      "line": 56542,
+      "line_end": 56548,
+      "var": "data, abuf->data, abuf->byte_length",
+      "code": "data = js_realloc(ctx, abuf->data, max_int(len, 1));\nif (!data)\n    return JS_EXCEPTION;\n...\nabuf->byte_length = len;\nabuf->data = data;",
+      "note": "Inside the callback from step 4, resizing the non-shared resizable ArrayBuffer reallocates the backing store from 4 bytes to 1024 bytes. ASan's free stack shows this `js_realloc` path frees the old 4-byte region at `0x502000000cb0`.",
+      "depends_on": [
+        {
+          "on": 4,
+          "type": "data",
+          "via": "ab.resize(1024)"
+        }
+      ]
+    },
+    {
+      "step": 6,
+      "file": "quickjs.c",
+      "function": "js_array_buffer_update_typed_arrays",
+      "line": 56548,
+      "line_end": 56550,
+      "var": "p->u.array.count, p->u.array.u.ptr",
+      "code": "p->u.array.count = ta->length >> size_log2;\np->u.array.u.ptr = &data[ta->offset];",
+      "note": "The resize path updates typed-array views to the new storage. The `Int32Array` object `p` remains logically valid and now points at the resized backing store, but the local cached `ptr` from step 3 is not updated.",
+      "depends_on": [
+        {
+          "on": 5,
+          "type": "data",
+          "via": "abuf->data"
+        }
+      ]
+    },
+    {
+      "step": 7,
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59129,
+      "line_end": 59132,
+      "var": "p->u.array.count, idx",
+      "code": "if (typed_array_is_oob(p))\n    return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);\nif (idx >= p->u.array.count)\n    return JS_ThrowRangeError(ctx, \"out-of-bound access\");",
+      "note": "After the callback returns, `js_atomics_op` rechecks only the typed array's logical state. Because resize updated the view in step 6, the array is neither detached nor out of bounds at index 0, so execution continues even though `ptr` still aliases freed memory.",
+      "depends_on": [
+        {
+          "on": 6,
+          "type": "control",
+          "via": "!typed_array_is_oob(p)"
+        },
+        {
+          "on": 6,
+          "type": "control",
+          "via": "idx < p->u.array.count"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "ptr"
+        }
+      ]
+    },
+    {
+      "step": 8,
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59151,
+      "var": "ptr, v",
+      "code": "a = atomic_fetch_add((_Atomic(uint32_t) *)ptr, v);",
+      "note": "Sink. The atomic add still uses the pre-resize pointer captured in step 3, so it performs a 4-byte write into the freed old backing store instead of the new buffer.",
+      "depends_on": [
+        {
+          "on": 7,
+          "type": "control",
+          "via": "idx < p->u.array.count"
+        },
+        {
+          "on": 3,
+          "type": "data",
+          "via": "ptr"
+        },
+        {
+          "on": 4,
+          "type": "data",
+          "via": "v"
+        },
+        {
+          "on": 5,
+          "type": "order",
+          "via": "free_before_use",
+          "obj": "ptr"
+        }
+      ]
+    }
+  ],
+  "sanitizer_ground_truth": {
+    "detector": "address",
+    "trace_format": "AddressSanitizer",
+    "sanitizer": "ASAN",
+    "crash_type": "heap-use-after-free",
+    "access_type": "write",
+    "access_size": 4,
+    "crash_location": {
+      "file": "quickjs.c",
+      "function": "js_atomics_op",
+      "line": 59151
+    },
+    "allocation_context": {
+      "file": "quickjs.c",
+      "function": "js_array_buffer_constructor3",
+      "line": 56095
+    },
+    "free_context": {
+      "file": "quickjs.c",
+      "function": "js_array_buffer_resize",
+      "line": 56542
+    },
+    "crash_stack": [
+      {
+        "frame": 0,
+        "function": "js_atomics_op",
+        "file": "quickjs.c",
+        "line": 59151
+      },
+      {
+        "frame": 1,
+        "function": "js_call_c_function",
+        "file": "quickjs.c",
+        "line": 17263
+      },
+      {
+        "frame": 2,
+        "function": "JS_CallInternal",
+        "file": "quickjs.c",
+        "line": 17445
+      },
+      {
+        "frame": 3,
+        "function": "JS_CallInternal",
+        "file": "quickjs.c",
+        "line": 17849
+      },
+      {
+        "frame": 4,
+        "function": "JS_CallFree",
+        "file": "quickjs.c",
+        "line": 20155
+      },
+      {
+        "frame": 5,
+        "function": "JS_EvalFunctionInternal",
+        "file": "quickjs.c",
+        "line": 36578
+      },
+      {
+        "frame": 6,
+        "function": "__JS_EvalInternal",
+        "file": "quickjs.c",
+        "line": 36711
+      },
+      {
+        "frame": 7,
+        "function": "JS_EvalInternal",
+        "file": "quickjs.c",
+        "line": 36737
+      },
+      {
+        "frame": 8,
+        "function": "JS_EvalThis",
+        "file": "quickjs.c",
+        "line": 36771
+      },
+      {
+        "frame": 9,
+        "function": "JS_Eval",
+        "file": "quickjs.c",
+        "line": 36779
+      }
+    ],
+    "allocation_stack": [
+      {
+        "frame": 0,
+        "function": "js_array_buffer_constructor3",
+        "file": "quickjs.c",
+        "line": 56095
+      },
+      {
+        "frame": 1,
+        "function": "js_array_buffer_constructor2",
+        "file": "quickjs.c",
+        "line": 56131
+      },
+      {
+        "frame": 2,
+        "function": "js_array_buffer_constructor0",
+        "file": "quickjs.c",
+        "line": 56195
+      },
+      {
+        "frame": 3,
+        "function": "js_call_c_function",
+        "file": "quickjs.c",
+        "line": 17250
+      }
+    ],
+    "free_stack": [
+      {
+        "frame": 0,
+        "function": "js_def_realloc",
+        "file": "quickjs.c",
+        "line": 1784
+      },
+      {
+        "frame": 1,
+        "function": "js_realloc_rt",
+        "file": "quickjs.c",
+        "line": 1392
+      },
+      {
+        "frame": 2,
+        "function": "js_realloc",
+        "file": "quickjs.c",
+        "line": 1442
+      },
+      {
+        "frame": 3,
+        "function": "js_array_buffer_resize",
+        "file": "quickjs.c",
+        "line": 56542
+      },
+      {
+        "frame": 4,
+        "function": "js_call_c_function",
+        "file": "quickjs.c",
+        "line": 17263
+      },
+      {
+        "frame": 5,
+        "function": "JS_ToUint32",
+        "file": "quickjs.h",
+        "line": 724
+      },
+      {
+        "frame": 6,
+        "function": "js_atomics_op",
+        "file": "quickjs.c",
+        "line": 59120
+      }
+    ],
+    "patch_resolves": true,
+    "cross_tool_confirmed": false,
+    "reproduction_rate": 1.0,
+    "flaky": false,
+    "cross_validation": {
+      "sink_matches_crash": true,
+      "root_cause_matches_allocation_context": true,
+      "trace_consistent_with_stack": true,
+      "tainted_value_reaches_sink": true
+    }
+  },
+  "poc": {
+    "path": "gt_results/osv_ossfuzz_OSV-2026-703/poc",
+    "trigger": "Evaluate the staged JavaScript program so that `Atomics.add(ta, 0, obj)` coerces `obj` via `valueOf()`, and that callback calls `ab.resize(1024)` on the same resizable ArrayBuffer backing `ta` before returning `1`.",
+    "format": {
+      "name": "JavaScript source evaluated by fuzz_eval",
+      "contract": "The program must create a resizable non-shared ArrayBuffer of initial byteLength 4, create an `Int32Array` view over it, and invoke `Atomics.add` with an index that is in bounds before and after resize. The third argument must be an object whose numeric coercion callback resizes that same ArrayBuffer to a larger size during `JS_ToUint32`, so `js_atomics_op` uses a pointer captured before the realloc after the old backing store has been freed."
+    }
+  }
+}

@@ -5,6 +5,12 @@ vulnerable source, sanitizer trace, and issue. Do not edit `ground_truth.json`
 and do not create assertions. Your output is the only information passed into a later
 repair session.
 
+Your failure output is a repair contract for Stage 02, not a prose critique. If you
+reject the GT, every issue must tell the next Stage 02 author exactly what to change,
+where to change it, and what evidence makes the old version invalid. Do not leave broad
+instructions such as "make the trace more precise" or "check the source"; name the bad
+field, the unsupported claim, and the replacement shape that would satisfy this review.
+
 ## Evidence hierarchy
 
 Rank the inputs. The sanitizer trace is authoritative for the root cause and the crash
@@ -172,3 +178,47 @@ true (with a precise `observe`) only in the bounded exception above — when the
 remaining blocker is one load-bearing runtime-resolvable causal gap that static analysis
 cannot establish. The harness will launch the conditional runtime-disambiguation session
 and then a new reviewer session; do not repair the GT yourself.
+
+## Feedback requirements
+
+When `needs_revision` is true, each issue must be usable as a step-by-step edit request
+by the next Stage 02 run:
+
+1. `location` must identify the exact JSON object or field, for example
+   `ground_truth.json: fine_trace[6]`, `root_cause.relation`, `sink.trace_step`, or
+   `poc.format.contract`. If multiple fields are linked, list all of them in one issue
+   only when they must be changed together.
+2. `problem` must state the concrete contradiction or unsupported claim. Tie it to the
+   saved evidence: sanitizer frame, vulnerable source statement, existing trace step,
+   or reproduction report field. Do not rely on patch text alone.
+3. `required_change` must say the exact repair operation: remove a step, demote a claim
+   to a note, change an anchor to a named source line, replace an operand/relation with a
+   source expression, add a missing dependency edge, or narrow the PoC contract.
+4. If the current GT chose the wrong source/root/sink line, name the correct project-code
+   candidate with file/function/line when the source makes it clear. If no correct
+   candidate can be selected statically, explain the one missing runtime observation and
+   use `needs_runtime_disambiguation` only when the runtime flag allows it.
+5. If a trace step is unsupported, say whether Stage 02 should remove it entirely or keep
+   the fact as non-scored prose in a nearby `note`. Do not ask for both.
+6. If a dependency edge is missing or wrong, specify its endpoint step numbers, expected
+   `type` (`data`, `control`, or `order`), and the exact `via` source expression.
+7. If the PoC contract overgeneralizes, replace it with the narrow witnessed contract
+   supported by the saved PoC bytes and source. Do not ask Stage 02 to prove a class of
+   inputs from a single witness.
+
+Bad feedback:
+
+```json
+{"location": "ground_truth.json", "problem": "trace is vague",
+ "required_change": "make it more source-grounded"}
+```
+
+Good feedback:
+
+```json
+{
+  "location": "ground_truth.json: fine_trace[6]",
+  "problem": "This step asserts the loop-header dereference `*pstr != '\\0'` was observed, but the saved sanitizer trace only proves the later call to `NextCharLength` and no saved runtime artifact records this loop test on the crashing iteration.",
+  "required_change": "Remove this as a scored fine-trace step, or move the reachability fact into the nearest downstream step's note. Keep the causal edge from the corrupted `pstr`/`length` state directly to the later `NextCharLength(pstr)` call."
+}
+```

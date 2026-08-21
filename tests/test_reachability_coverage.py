@@ -237,3 +237,27 @@ def test_r5_rejects_same_sanitizer_class_at_wrong_location():
     assert evaluate_r1_r5(
         gt=gt, sanitizer_trace=matching
     )["target_vulnerability_triggered"] is True
+
+
+def test_r5_matches_gt_source_file_with_commit_anchor():
+    gt = {
+        "sample_id": "sample",
+        "sanitizer_ground_truth": {
+            "detector": "address",
+            "crash_type": "heap-buffer-overflow",
+            "crash_location": {
+                "file": "src/core/compile.c@883dde4fa5267e828044da5791beb4cd28557d2f",
+                "function": "janetc_pop_funcdef",
+                "line": 965,
+            },
+        },
+    }
+    trace = (
+        "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n"
+        "    #0 0x1 in janetc_pop_funcdef /gt/_work/janet/src/core/compile.c:965:44\n"
+        "SUMMARY: AddressSanitizer: heap-buffer-overflow /gt/_work/janet/src/core/compile.c:965:44 in janetc_pop_funcdef\n"
+    )
+
+    assert evaluate_r1_r5(
+        gt=gt, sanitizer_trace=trace
+    )["target_vulnerability_triggered"] is True

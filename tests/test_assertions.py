@@ -89,6 +89,44 @@ def _minimal_v3_spec(assertions):
     return _freeze_dict(spec)
 
 
+def test_cli_freeze_only_accepts_missing_content_hash(tmp_path):
+    spec_path = tmp_path / "candidate_assertions.json"
+    marker_path = tmp_path / ".assertion_spec_frozen.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "assertion-spec-v3",
+                "sample_id": "sample",
+                "assertions": [
+                    {
+                        "id": "root.assertion",
+                        "kind": "required",
+                        "at": "root",
+                        "check": ["lt", "$root.idx", "$root.count"],
+                        "invariants": ["root.invariant"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = assertions_module.main(
+        [
+            "--spec",
+            str(spec_path),
+            "--freeze-only",
+            "--freeze-marker",
+            str(marker_path),
+        ]
+    )
+
+    frozen = json.loads(spec_path.read_text())
+    assert rc == 0
+    assert frozen["content_hash"].startswith("sha256:")
+    assert json.loads(marker_path.read_text())["content_hash"] == frozen["content_hash"]
+
+
 def test_required_assertion_distinguishes_violation_guard_and_genuine_execution():
     spec, vulnerable, fixed = _inputs()
     assertion = next(item for item in spec["assertions"] if item["kind"] == "required")
@@ -122,6 +160,11 @@ def test_transition_pairs_first_target_after_latest_relevant_source():
     assert result["to_index"] == 2
 
 
+def test_parse_trace_matrix_rejects_malformed_case_line():
+    with pytest.raises(ValueError, match="malformed CASE line"):
+        parse_trace_matrix("CASE original\nASSERT_EVT point=sink value=1\nENDCASE\n")
+
+
 def test_minimal_assertions_validate_on_vulnerable_fixed_differential():
     spec, vulnerable, fixed = _inputs()
     results = validate_assertions(spec, vulnerable, fixed)
@@ -145,7 +188,7 @@ def test_minimal_assertions_validate_on_vulnerable_fixed_differential():
     }
 
 
-def test_guarded_required_assertion_fails_without_genuine_perturbation():
+def test_guarded_required_assertion_needs_one_recorded_perturbation():
     spec, vulnerable, fixed = _inputs()
     original = spec["original_case"]
     results = validate_assertions(
@@ -157,11 +200,35 @@ def test_guarded_required_assertion_fails_without_genuine_perturbation():
     required = next(item for item in results["assertions"] if item["kind"] == "required")
     assert required["verified"] is False
     assert required["genuine_witness_case"] is None
-    assert "protected event" in required["verification_error"]
+    assert "exactly one perturbation" in required["verification_error"]
     assert results["all_verified"] is False
 
 
-def test_assertion_cli_exits_nonzero_when_perturbation_gate_fails(tmp_path, monkeypatch):
+def test_guarded_required_assertion_accepts_single_attempt_without_genuine_witness():
+    spec, vulnerable, fixed = _inputs()
+    original = spec["original_case"]
+    attempted_fixed = dict(fixed[original])
+    results = validate_assertions(
+        spec,
+        {original: vulnerable[original]},
+        {
+            original: fixed[original],
+            "attempted": attempted_fixed,
+        },
+    )
+
+    required = next(item for item in results["assertions"] if item["kind"] == "required")
+    assert required["verified"] is True
+    assert required["genuine_witness_case"] is None
+    assert required["fixed_guard_acceptance"]
+    assert results["required_verified"] is True
+    perturbations = build_perturbation_results(spec, results)
+    assert perturbations["all_needed_witnessed"] is False
+    assert perturbations["single_perturbation_attempt_recorded"] is True
+    assert perturbations["accepted_after_single_attempt"] is True
+
+
+def test_assertion_cli_accepts_guarded_fixed_with_recorded_perturbation(tmp_path, monkeypatch):
     spec, vulnerable, fixed = _inputs()
     original = spec["original_case"]
     vulnerable_trace = tmp_path / "vulnerable.txt"
@@ -169,7 +236,13 @@ def test_assertion_cli_exits_nonzero_when_perturbation_gate_fails(tmp_path, monk
     source_vulnerable = (FIXTURE / "vulnerable_trace.txt").read_text()
     source_fixed = (FIXTURE / "fixed_trace.txt").read_text()
     vulnerable_trace.write_text(source_vulnerable.split("CASE name=neg4", 1)[0])
-    fixed_trace.write_text(source_fixed.split("CASE name=neg4", 1)[0])
+    original_fixed = source_fixed.split("CASE name=neg4", 1)[0]
+    fixed_trace.write_text(
+        original_fixed
+        + "CASE name=attempted rc=0 result=clean\n"
+        + "ASSERT_EVT point=sanitize branch_taken=1 is_negative=1 sanitized=0 source_count=-2147483648\n"
+        + "ENDCASE\n"
+    )
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(spec))
     results_path = tmp_path / "results.json"
@@ -183,13 +256,12 @@ def test_assertion_cli_exits_nonzero_when_perturbation_gate_fails(tmp_path, monk
         "--perturbation-results-out", str(perturbations_path),
     ])
 
-    with pytest.raises(SystemExit) as exc:
-        assertions_module.main()
-    assert exc.value.code == 1
-    assert json.loads(results_path.read_text())["all_verified"] is False
+    assert assertions_module.main() == 0
+    assert json.loads(results_path.read_text())["required_verified"] is True
     perturbations = json.loads(perturbations_path.read_text())
     assert perturbations["needed"] is True
     assert perturbations["all_needed_witnessed"] is False
+    assert perturbations["accepted_after_single_attempt"] is True
 
 
 def test_avoided_required_assertion_requests_genuine_perturbation():
@@ -227,10 +299,134 @@ def test_avoided_required_assertion_requests_genuine_perturbation():
     assert required["matrix"]["fixed"]["original"]["status"] == "avoided"
     assert required["verified"] is False
     assert required["genuine_witness_case"] is None
-    assert "fixed original is avoided" in required["verification_error"]
+    assert "exactly one perturbation" in required["verification_error"]
     perturbations = build_perturbation_results(spec, results)
     assert perturbations["needed"] is True
     assert perturbations["genuine_witness_cases"] == {"required.guard": None}
+
+
+def test_protects_must_resolve_to_event_location():
+    spec = _minimal_v3_spec([
+        {
+            "id": "required.guard",
+            "invariants": ["root"],
+            "kind": "required",
+            "at": "guard",
+            "protects": "header->numbodyparts",
+            "check": ["ge", "$guard.available", "$guard.required"],
+        }
+    ])
+
+    report = validate_binding_coverage(
+        spec,
+        {
+            "guard.available": {"expr": "available"},
+            "guard.required": {"expr": "required"},
+        },
+        {
+            "guard": {"file": "src/parser.c", "function": "parse", "line": 10},
+        },
+    )
+
+    assert report["valid"] is False
+    assert "header->numbodyparts" in report["errors"][0]
+    assert "at/from/protects" in report["errors"][0]
+
+
+def test_guarded_fixed_only_needs_perturbation_after_vulnerable_violation():
+    spec = {
+        "schema_version": "assertion-spec-v3",
+        "sample_id": "guarded",
+        "original_case": "original",
+        "assertions": [
+            {
+                "id": "required.guard",
+                "invariants": ["root"],
+                "kind": "required",
+                "at": "guard",
+                "protects": "sink",
+                "check": ["ge", "$guard.available", "$guard.required"],
+            }
+        ],
+    }
+    spec = _freeze_dict(spec)
+    vulnerable = parse_trace_matrix(
+        "CASE name=original rc=1 result=crash\n"
+        "ASSERT_EVT point=guard available=76 required=208\n"
+        "ENDCASE\n"
+    )
+    fixed = parse_trace_matrix("CASE name=original rc=0 result=clean\nENDCASE\n")
+
+    results = validate_assertions(spec, vulnerable, fixed)
+    perturbations = build_perturbation_results(spec, results)
+
+    assert results["assertions"][0]["matrix"]["vulnerable"]["original"]["status"] == "guarded"
+    assert perturbations["needed"] is False
+    assert perturbations["single_perturbation_attempt_recorded"] is True
+
+
+def test_required_protects_pairs_with_following_event_not_any_prior_sink():
+    spec = {
+        "schema_version": "assertion-spec-v3",
+        "sample_id": "loop_guard",
+        "original_case": "original",
+        "assertions": [
+            {
+                "id": "required.trailing_percent",
+                "invariants": ["root"],
+                "kind": "required",
+                "at": "root",
+                "protects": "sink",
+                "check": ["ne", "$root.ch", "$root.nul"],
+            }
+        ],
+    }
+    spec = _freeze_dict(spec)
+    vulnerable = parse_trace_matrix(
+        "CASE name=original rc=1 result=crash\n"
+        "ASSERT_EVT point=root ch=65 nul=0\n"
+        "ASSERT_EVT point=sink ch=65 nul=0\n"
+        "ASSERT_EVT point=root ch=0 nul=0\n"
+        "ASSERT_EVT point=sink ch=0 nul=0\n"
+        "ENDCASE\n"
+    )
+    fixed = parse_trace_matrix(
+        "CASE name=original rc=1 result=error\n"
+        "ASSERT_EVT point=root ch=65 nul=0\n"
+        "ASSERT_EVT point=sink ch=65 nul=0\n"
+        "ASSERT_EVT point=root ch=0 nul=0\n"
+        "ENDCASE\n"
+        "CASE name=attempted rc=1 result=error\n"
+        "ASSERT_EVT point=root ch=66 nul=0\n"
+        "ASSERT_EVT point=sink ch=66 nul=0\n"
+        "ENDCASE\n"
+    )
+
+    results = validate_assertions(spec, vulnerable, fixed)
+
+    required = results["assertions"][0]
+    assert required["matrix"]["fixed"]["original"]["status"] == "guarded"
+    assert required["matrix"]["fixed"]["attempted"]["status"] == "genuine"
+    assert required["verified"] is True
+
+
+def test_required_protects_does_not_cross_next_root_iteration():
+    case = parse_trace_matrix(
+        "CASE name=original rc=1 result=error\n"
+        "ASSERT_EVT point=root ch=0 nul=0\n"
+        "ASSERT_EVT point=root ch=66 nul=0\n"
+        "ASSERT_EVT point=sink ch=66 nul=0\n"
+        "ENDCASE\n"
+    )["original"]
+
+    result = assertions_module._protected_event_after_target(
+        case,
+        "sink",
+        target_point="root",
+        target_index=0,
+    )
+
+    assert result is None
 
 
 def test_frozen_hash_detects_post_execution_rewrite():
@@ -261,6 +457,32 @@ def test_differential_status_not_applicable_for_uninitialized_bugs():
     results = validate_assertions(spec, vulnerable, fixed, differential_applicable=False)
     assert results["all_verified"] is True
     assert results["differential_status"] == "not_applicable"
+
+
+def test_required_root_satisfied_on_vulnerable_is_classified_as_semantic_failure():
+    spec, vulnerable, fixed = _inputs()
+    original = spec["original_case"]
+    vulnerable[original]["events"][0]["stored_count"] = 2
+    vulnerable[original]["events"][0]["source_count"] = 3
+
+    results = validate_assertions(spec, vulnerable, fixed)
+
+    assert results["required_verified"] is False
+    assert results["failure_class"] == "root_not_violated_on_vulnerable_witness"
+    assert results["stage04b_failure"]["classification"] == "semantic_root_failure"
+    assert results["stage04b_failure"]["evidence"] == [
+        {
+            "id": "root.bound",
+            "reason": (
+                "required root predicate is not violated on the vulnerable "
+                "original witness"
+            ),
+            "vulnerable_status": "genuine",
+            "left": 2,
+            "op": "lt",
+            "right": 3,
+        }
+    ]
 
 
 def test_parse_msan_uninit_reads_offset_and_size():

@@ -418,6 +418,14 @@ def test_instrumentation_plan_compiles_both_sides_and_cleans_containers(
     fixed = tmp_path / "fixed-instrumentation.patch"
     vulnerable.write_text("vulnerable patch", encoding="utf-8")
     fixed.write_text("fixed patch", encoding="utf-8")
+    (tmp_path / "candidate_assertions.json").write_text(
+        json.dumps({"assertions": []}),
+        encoding="utf-8",
+    )
+    (tmp_path / "field_bindings.json").write_text(
+        json.dumps({"bindings": {}}),
+        encoding="utf-8",
+    )
     calls = []
     monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
     monkeypatch.setattr(
@@ -478,6 +486,14 @@ def test_instrumentation_side_compiles_only_selected_image_and_cleans_container(
     }
     fixed = tmp_path / "fixed-instrumentation.patch"
     fixed.write_text("fixed patch", encoding="utf-8")
+    (tmp_path / "candidate_assertions.json").write_text(
+        json.dumps({"assertions": []}),
+        encoding="utf-8",
+    )
+    (tmp_path / "field_bindings.json").write_text(
+        json.dumps({"bindings": {}}),
+        encoding="utf-8",
+    )
     calls = []
     monkeypatch.setattr(arvo_workspace, "_context", lambda result_dir: context)
     monkeypatch.setattr(

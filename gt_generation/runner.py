@@ -25,6 +25,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,20 @@ VULNERABLE_INSTRUMENTATION_STAGE = "04_instrument_vulnerable"
 FIXED_INSTRUMENTATION_STAGE = "04_instrument_fixed"
 ASSERTION_EXECUTE_STAGE = "04_assertion_execute"
 LEGACY_ASSERTION_STAGE = "04_assertion_validator"
+ASSERTION_SEMANTIC_REPAIR_STAGES = (
+    ASSERTION_PLAN_STAGE,
+    VULNERABLE_INSTRUMENTATION_STAGE,
+    FIXED_INSTRUMENTATION_STAGE,
+    ASSERTION_EXECUTE_STAGE,
+)
+ASSERTION_PLAN_INPUTS = (
+    "candidate_assertions.json",
+    "candidate_invariants.json",
+    "field_bindings.json",
+    "event_locations.json",
+    ".assertion_spec_frozen.json",
+    "assertion_preflight.json",
+)
 STAGE_ALIASES = {
     LEGACY_ASSERTION_STAGE: ASSERTION_PLAN_STAGE,
 }
@@ -166,6 +181,17 @@ def main() -> None:
 
     state_path = generation_state_path(result_dir, dry_run=args.dry_run)
     prior_ok = prior_ok_stages(state_path) if args.resume else set()
+    resumable_ok = current_resumable_ok_stages(
+        stages=stages,
+        prior_ok=prior_ok,
+        config=config,
+        sample=sample,
+        sample_path=args.sample.resolve(),
+        sample_id=sample_id,
+        repo_root=repo_root,
+        code_root=code_root,
+        result_dir=result_dir,
+    )
 
     state = {
         "sample_id": sample_id,
@@ -182,7 +208,7 @@ def main() -> None:
     active_stages = [
         stage for stage in stages
         if should_run(str(stage.get("name") or ""))
-        and str(stage.get("name") or "") not in prior_ok
+        and str(stage.get("name") or "") not in resumable_ok
     ]
     if not args.dry_run and any(
         str(stage.get("name") or "") == "03_trace_review"
@@ -209,7 +235,7 @@ def main() -> None:
         name = str(stage.get("name") or "")
         if not name:
             raise SystemExit("Stage without name")
-        if not should_run(name) or name in prior_ok:
+        if not should_run(name) or name in resumable_ok:
             append_stage(state_path, skipped_result(name))
             continue
 
@@ -237,6 +263,26 @@ def main() -> None:
                 state_path=state_path,
                 stage_kwargs=stage_kwargs,
             )
+        if (
+            not result.ok
+            and name == ASSERTION_EXECUTE_STAGE
+            and not args.dry_run
+        ):
+            if result.failure_kind == "differential_unverified":
+                result = run_assertion_semantic_repair_loop(
+                    initial_result=result,
+                    stages=stages,
+                    state_path=state_path,
+                    stage_kwargs=stage_kwargs,
+                )
+            else:
+                write_stage_retry_feedback(name, result_dir, result=result)
+        if (
+            not result.ok
+            and name in {VULNERABLE_INSTRUMENTATION_STAGE, FIXED_INSTRUMENTATION_STAGE}
+            and not args.dry_run
+        ):
+            write_stage_retry_feedback(name, result_dir)
         if not result.ok:
             failed = True
             if not args.keep_going:
@@ -278,7 +324,14 @@ def main() -> None:
             "stages": merged_stage_timings,
         },
     )
-    if not failed and config.get("compact_on_success") and not args.dry_run:
+    should_compact_result = (
+        not failed
+        and config.get("compact_on_success")
+        and not args.dry_run
+        and should_run(FINAL_STAGE)
+        and FINAL_STAGE not in prior_ok
+    )
+    if should_compact_result:
         from gt_toolkit.compact_result import compact_result
 
         compact_report = compact_result(result_dir)
@@ -326,7 +379,17 @@ def run_stage_with_retries(**kwargs: Any) -> StageResult:
     retries = int(stage.get("retries", config.get("default_retries", 0)))
     result = run_stage(**kwargs)
     attempt = 1
-    while not result.ok and attempt <= retries and not (result.dry_run or result.skipped):
+    while (
+        not result.ok
+        and attempt <= retries
+        and not (result.dry_run or result.skipped)
+        and stage_retry_is_useful(str(stage.get("name") or ""), result.failure_kind)
+    ):
+        write_stage_retry_feedback(
+            str(stage.get("name") or ""),
+            Path(kwargs["result_dir"]),
+            result=result,
+        )
         attempt += 1
         prepare_stage_retry(
             str(stage.get("name") or ""),
@@ -335,6 +398,531 @@ def run_stage_with_retries(**kwargs: Any) -> StageResult:
         result = run_stage(**kwargs)
         result.attempts = attempt
     return result
+
+
+def stage_retry_is_useful(stage_name: str, failure_kind: str) -> bool:
+    """Avoid replaying frozen work after deterministic evidence disproves it."""
+    if (
+        stage_name == ASSERTION_EXECUTE_STAGE
+        and failure_kind == "differential_unverified"
+    ):
+        return False
+    return True
+
+
+def run_assertion_semantic_repair_loop(
+    *,
+    initial_result: StageResult,
+    stages: list[dict[str, Any]],
+    state_path: Path,
+    stage_kwargs: dict[str, Any],
+) -> StageResult:
+    """Retry Stage 04 from planning when runtime disproves the root predicate.
+
+    A failed required assertion is a semantic failure of the frozen Stage 04A
+    contract. Re-running only Stage 04B repeats the same invalid predicate, so
+    route deterministic differential failures back through the whole Stage 04
+    chain with the generated plan feedback visible to the planner.
+    """
+    if initial_result.failure_kind != "differential_unverified":
+        return initial_result
+    result_dir = Path(stage_kwargs["result_dir"])
+    write_assertion_plan_feedback(result_dir)
+    stage_by_name = {str(stage.get("name") or ""): stage for stage in stages}
+    semantic_stages = [
+        stage_by_name[name]
+        for name in ASSERTION_SEMANTIC_REPAIR_STAGES
+        if name in stage_by_name
+    ]
+    if len(semantic_stages) != len(ASSERTION_SEMANTIC_REPAIR_STAGES):
+        return initial_result
+    config = stage_kwargs.get("config")
+    rounds = 1
+    if isinstance(config, dict):
+        rounds = int(config.get("assertion_semantic_feedback_rounds", rounds))
+    result = initial_result
+    for round_number in range(1, max(0, rounds) + 1):
+        for semantic_stage in semantic_stages:
+            retry_stage = {
+                **semantic_stage,
+                "_log_suffix": f"semantic_feedback_{round_number}",
+            }
+            prepare_stage_entry(str(retry_stage.get("name") or ""), result_dir)
+            result = run_stage_with_retries(
+                **{**stage_kwargs, "stage": retry_stage}
+            )
+            append_stage(state_path, result)
+            if not result.ok:
+                if result.name == ASSERTION_EXECUTE_STAGE:
+                    write_stage_retry_feedback(result.name, result_dir, result=result)
+                elif result.name in {
+                    VULNERABLE_INSTRUMENTATION_STAGE,
+                    FIXED_INSTRUMENTATION_STAGE,
+                }:
+                    write_stage_retry_feedback(result.name, result_dir)
+                break
+        if result.ok:
+            return result
+        if result.name != ASSERTION_EXECUTE_STAGE:
+            return result
+        if result.failure_kind != "differential_unverified":
+            return result
+        write_assertion_plan_feedback(result_dir)
+    return result
+
+
+def write_assertion_plan_feedback(result_dir: Path) -> Path | None:
+    """Summarize a failed Stage 04B run as actionable input for the next 04A.
+
+    Stage 04B is not allowed to edit the frozen assertion plan. When execution
+    proves the plan wrong, persist a compact diagnosis where Stage 04A already
+    looks for it, so a retry from 04A can rewrite the root obligation instead of
+    repeating the same frozen predicate.
+    """
+    results_path = result_dir / "assertion_results.json"
+    if not results_path.is_file():
+        return None
+    try:
+        results = load_json(results_path)
+    except Exception:
+        return None
+
+    sample_id = str(results.get("sample_id") or result_dir.name)
+    lines = [
+        f"# Assertion Plan Feedback for {sample_id}",
+        "",
+        "Stage 04B could not verify the frozen assertion plan. The next Stage 04A run must rewrite the semantic assertion plan; do not reuse the failed predicate, event placement, or instrumentation expression unchanged.",
+        "",
+    ]
+
+    failure_class = results.get("failure_class")
+    if failure_class:
+        lines.extend(["## Failure Class", "", str(failure_class), ""])
+    summary = results.get("summary")
+    if summary:
+        lines.extend(["## Summary", "", str(summary), ""])
+
+    stage04b_failure = results.get("stage04b_failure")
+    if isinstance(stage04b_failure, dict):
+        lines.extend(["## Stage 04B Diagnosis", ""])
+        for key in ("classification", "message"):
+            value = stage04b_failure.get(key)
+            if value:
+                lines.append(f"- {key}: {value}")
+        evidence = stage04b_failure.get("evidence")
+        if evidence:
+            lines.append(f"- evidence: {json.dumps(evidence, ensure_ascii=False, sort_keys=True)}")
+        lines.append("")
+
+    runs = results.get("runs")
+    if isinstance(runs, dict):
+        lines.extend(["## Runtime/Build Runs", ""])
+        for side in ("vulnerable", "fixed"):
+            run = runs.get(side)
+            if not isinstance(run, dict):
+                continue
+            parts = [
+                f"runner={run.get('runner_result')}",
+                f"returncode={run.get('returncode')}",
+            ]
+            if run.get("compile_failed") is not None:
+                parts.append(f"compile_failed={run.get('compile_failed')}")
+            if run.get("failure_summary"):
+                parts.append(f"failure_summary={run.get('failure_summary')}")
+            lines.append(f"- {side}: " + "; ".join(parts))
+        lines.append("")
+
+    assertion_items: list[dict[str, Any]] = []
+    for key in (
+        "assertions",
+        "required_assertions",
+        "observed_assertions",
+        "transition_assertions",
+    ):
+        value = results.get(key)
+        if isinstance(value, list):
+            assertion_items.extend(item for item in value if isinstance(item, dict))
+    seen_ids: set[str] = set()
+    failing_items: list[dict[str, Any]] = []
+    for item in assertion_items:
+        item_id = str(item.get("id") or "")
+        dedupe = item_id or json.dumps(item, sort_keys=True, default=str)
+        if dedupe in seen_ids:
+            continue
+        seen_ids.add(dedupe)
+        if (
+            item.get("verified") is False
+            or item.get("differential") in {"failed", "unavailable"}
+            or item.get("status") in {"not_exercised", "failed"}
+            or item.get("verification_error")
+            or item.get("probe_placement_error")
+        ):
+            failing_items.append(item)
+
+    if failing_items:
+        lines.extend(["## Failed Assertions", ""])
+        for item in failing_items:
+            lines.append(f"### {item.get('id', '<unknown>')}")
+            for key in (
+                "kind",
+                "differential",
+                "status",
+                "verification_error",
+                "probe_placement_error",
+            ):
+                value = item.get(key)
+                if value:
+                    lines.append(f"- {key}: {value}")
+            matrix = item.get("matrix")
+            if isinstance(matrix, dict):
+                for side in ("vulnerable", "fixed"):
+                    original = (matrix.get(side) or {}).get("original")
+                    if isinstance(original, dict):
+                        compact = {
+                            key: original.get(key)
+                            for key in (
+                                "status",
+                                "satisfied",
+                                "triggered",
+                                "left",
+                                "op",
+                                "right",
+                                "from",
+                                "to",
+                                "ordered",
+                            )
+                            if key in original
+                        }
+                        lines.append(
+                            f"- {side} original: "
+                            f"{json.dumps(compact, ensure_ascii=False, sort_keys=True)}"
+                        )
+            lines.append("")
+
+    lines.extend([
+        "## Required Stage 04A Repair",
+        "",
+        "1. Re-read `ground_truth.json`, `sanitizer_trace.txt`, `reproduction_report.json`, and the vulnerable source.",
+        "2. Redesign the `required` root obligation so vulnerable original violates it when the protected operation runs.",
+        "3. Ensure the fixed original satisfies the same obligation or avoids the protected operation through a real guard.",
+        "4. Move any protected event to immediately before the dangerous operation and after every guard that can skip it.",
+        "5. Avoid instrumentation expressions that are known to fail compilation; bind source variables or simple runtime fields instead.",
+        "6. Regenerate `candidate_assertions.json`, `candidate_invariants.json`, `field_bindings.json`, `event_locations.json`, `.assertion_spec_frozen.json`, and `assertion_preflight.json` from scratch.",
+        "",
+    ])
+
+    out = result_dir / "assertion_plan_feedback.md"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+def write_stage_retry_feedback(
+    stage_name: str,
+    result_dir: Path,
+    *,
+    result: StageResult | None = None,
+) -> Path | None:
+    """Write deterministic repair hints before retrying or stopping a stage."""
+    if stage_name == VULNERABLE_INSTRUMENTATION_STAGE:
+        return write_instrumentation_feedback(result_dir, "vulnerable")
+    if stage_name == FIXED_INSTRUMENTATION_STAGE:
+        return write_instrumentation_feedback(result_dir, "fixed")
+    if stage_name == ASSERTION_EXECUTE_STAGE:
+        if result is not None and result.failure_kind == "differential_unverified":
+            return write_assertion_plan_feedback(result_dir)
+        return write_assertion_execute_feedback(result_dir)
+    return None
+
+
+def assertion_execute_needs_execution_retry(result_dir: Path) -> bool:
+    """Return true when 04B failed from missing execution evidence, not semantics.
+
+    A guarded fixed-side witness is acceptable only after Stage 04B records one
+    fixed non-original perturbation case. If the deterministic projection says
+    that perturbation was needed but not attempted, the plan may still be good:
+    the execute stage simply stopped before collecting all evidence.
+    """
+    results_path = result_dir / "assertion_results.json"
+    if not results_path.is_file():
+        return False
+    try:
+        results = load_json(results_path)
+    except Exception:
+        return False
+    missing_fixed_perturbation = False
+    original = str(results.get("original_case") or "original")
+    for item in results.get("assertions", []):
+        if not isinstance(item, dict) or item.get("kind") != "required":
+            continue
+        matrix = item.get("matrix") if isinstance(item.get("matrix"), dict) else {}
+        vulnerable_original = (
+            matrix.get("vulnerable", {}).get(original, {})
+            if isinstance(matrix.get("vulnerable"), dict)
+            else {}
+        )
+        fixed_original = (
+            matrix.get("fixed", {}).get(original, {})
+            if isinstance(matrix.get("fixed"), dict)
+            else {}
+        )
+        if vulnerable_original.get("status") != "violated":
+            continue
+        error = str(item.get("verification_error") or "")
+        if (
+            fixed_original.get("status") in {"guarded", "avoided"}
+            and "add exactly one perturbation case" in error
+        ):
+            missing_fixed_perturbation = True
+    if not missing_fixed_perturbation:
+        return False
+    perturbation_path = result_dir / "perturbation_results.json"
+    if not perturbation_path.is_file():
+        return True
+    try:
+        perturbation = load_json(perturbation_path)
+    except Exception:
+        return True
+    return (
+        perturbation.get("needed") is True
+        and perturbation.get("single_perturbation_attempt_recorded") is not True
+    )
+
+
+def assertion_execute_has_trace_format_error(result_dir: Path) -> bool:
+    """Return true when deterministic projection rejected malformed raw traces."""
+    stderr_path = result_dir / "role_logs" / f"{ASSERTION_EXECUTE_STAGE}.finalize.stderr.txt"
+    if not stderr_path.is_file():
+        return False
+    text = stderr_path.read_text(encoding="utf-8", errors="replace")
+    return (
+        "malformed CASE line" in text
+        or "CASE name=<name> rc=<int> result=<result>" in text
+        or "parse_trace_matrix" in text
+    )
+
+
+def append_assertion_execute_blockers(lines: list[str], result_dir: Path) -> None:
+    """Add deterministic 04B blockers that do not require a semantic rewrite."""
+    results_path = result_dir / "assertion_results.json"
+    if not results_path.is_file():
+        return
+    try:
+        results = load_json(results_path)
+    except Exception:
+        return
+    blockers: list[dict[str, Any]] = []
+    for item in results.get("assertions", []):
+        if not isinstance(item, dict) or item.get("kind") != "required":
+            continue
+        error = str(item.get("verification_error") or "")
+        if "add exactly one perturbation case" not in error:
+            continue
+        matrix = item.get("matrix") if isinstance(item.get("matrix"), dict) else {}
+        fixed_original = (
+            matrix.get("fixed", {}).get("original", {})
+            if isinstance(matrix.get("fixed"), dict)
+            else {}
+        )
+        blockers.append({
+            "id": item.get("id"),
+            "fixed_status": fixed_original.get("status"),
+            "verification_error": error,
+        })
+    if not blockers:
+        return
+    lines.extend([
+        "",
+        "## Execution Blockers From Deterministic Projection",
+        "",
+    ])
+    for blocker in blockers:
+        lines.append(
+            "- "
+            + json.dumps(blocker, ensure_ascii=False, sort_keys=True)
+        )
+
+
+def write_assertion_execute_feedback(result_dir: Path) -> Path | None:
+    """Summarize missing Stage 04B outputs for an execution-only retry.
+
+    Missing raw traces or deterministic JSON projections are an execution
+    completeness issue, not evidence that Stage 04A chose the wrong predicate.
+    Keep this feedback separate from assertion_plan_feedback.md so the next
+    04B attempt continues from the frozen plan instead of needlessly rewriting
+    semantics.
+    """
+    required = (
+        "vulnerable_assertion_trace.txt",
+        "fixed_assertion_trace.txt",
+        "assertion_results.json",
+        "perturbation_results.json",
+        "verified_assertions.json",
+        "verified_invariants.json",
+    )
+    missing = [name for name in required if not (result_dir / name).is_file()]
+    stale_or_empty = [
+        name for name in required
+        if (result_dir / name).is_file() and (result_dir / name).stat().st_size == 0
+    ]
+    lines = [
+        f"# Assertion Execute Feedback for {result_dir.name}",
+        "",
+        "Stage 04B did not produce a complete execution package. This is an execution completeness retry, not a Stage 04A semantic rewrite request.",
+        "",
+        "## Missing Or Empty Outputs",
+        "",
+    ]
+    if missing:
+        lines.append("- missing: " + ", ".join(missing))
+    if stale_or_empty:
+        lines.append("- empty: " + ", ".join(stale_or_empty))
+    if not missing and not stale_or_empty:
+        lines.append("- none detected by file presence; inspect finalizer logs below.")
+    integrity_path = result_dir / "assertion_execute_integrity.json"
+    if integrity_path.is_file():
+        try:
+            integrity = load_json(integrity_path)
+        except Exception:
+            integrity = {}
+        lines.extend([
+            "",
+            "## Frozen Plan Mutation",
+            "",
+            "Stage 04B modified one or more frozen Stage 04A files. The runner restored the original bytes and rejected the execution attempt.",
+        ])
+        modified = integrity.get("modified_files")
+        if isinstance(modified, list):
+            for item in modified:
+                if isinstance(item, dict):
+                    lines.append(
+                        "- "
+                        + json.dumps(item, ensure_ascii=False, sort_keys=True)
+                    )
+    if assertion_execute_needs_execution_retry(result_dir):
+        lines.extend([
+            "",
+            "## Missing Fixed Perturbation",
+            "",
+            "The deterministic assertion projection shows the fixed original skipped the protected event and a single non-original fixed perturbation case was required but not recorded. This is still a Stage 04B execution issue, not a Stage 04A semantic rewrite.",
+            "",
+            "Run exactly one closest source-grounded fixed-side perturbation through `gt_toolkit repo-workspace run --version fixed --append-trace --case-name <name> --poc <result-dir-local-poc>` so the fixed trace contains a normal non-original `CASE name=... rc=... result=...` block. Do not edit the trace by hand.",
+        ])
+    if assertion_execute_has_trace_format_error(result_dir):
+        lines.extend([
+            "",
+            "## Malformed Raw Trace",
+            "",
+            "The deterministic assertion finalizer rejected the raw trace syntax. Rebuild the affected trace only through the deterministic workspace runner. Do not hand-write, replace, or post-process `CASE`/`ENDCASE` framing.",
+        ])
+    append_assertion_execute_blockers(lines, result_dir)
+    lines.extend([
+        "",
+        "## Required 04B Repair",
+        "",
+        "1. Reuse the frozen `candidate_assertions.json`, `candidate_invariants.json`, `field_bindings.json`, `event_locations.json`, `.assertion_spec_frozen.json`, and instrumentation patches.",
+        "2. Execute vulnerable and fixed sides serially through the deterministic workspace runner.",
+        "3. Do not stop after the vulnerable side. The fixed trace is mandatory before any JSON projection can be valid.",
+        "4. Do not hand-write or post-process trace files; the workspace runner must produce normal CASE/ENDCASE framing.",
+        "5. After both raw traces exist, run the deterministic `gt_toolkit assertions` projection to produce `assertion_results.json`, `perturbation_results.json`, and `verified_assertions.json`.",
+        "",
+    ])
+    append_log_tail(
+        lines,
+        "Stage 04B Stdout",
+        result_dir / "role_logs" / f"{ASSERTION_EXECUTE_STAGE}.stdout.txt",
+    )
+    append_log_tail(
+        lines,
+        "Stage 04B Stderr",
+        result_dir / "role_logs" / f"{ASSERTION_EXECUTE_STAGE}.stderr.txt",
+    )
+    append_log_tail(
+        lines,
+        "Finalizer Stderr",
+        result_dir / "role_logs" / f"{ASSERTION_EXECUTE_STAGE}.finalize.stderr.txt",
+    )
+    out = result_dir / "assertion_execute_feedback.md"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+def write_instrumentation_feedback(result_dir: Path, version: str) -> Path | None:
+    """Expose repo/arvo preflight failures as concrete patch-repair input.
+
+    The instrumentation agent can repair an apply/compile mismatch only if it
+    sees the exact deterministic gate output. Persisting this feedback also
+    makes interrupted repair queues auditable without asking a human to inspect
+    several tool-specific logs first.
+    """
+    report_path = result_dir / f"{version}_instrumentation_preflight.json"
+    if not report_path.is_file():
+        return None
+    try:
+        report = load_json(report_path)
+    except Exception:
+        return None
+    if report.get("ok") is True:
+        return None
+    track = str(report.get("track") or "")
+    prefix = "repo_workspace" if track.startswith("repo/") else "arvo_workspace"
+    log_dir = result_dir / prefix
+    apply_log = log_dir / f"plan_{version}_apply.log"
+    compile_log = log_dir / f"plan_{version}_compile.log"
+
+    check = report.get("check") if isinstance(report.get("check"), dict) else {}
+    lines = [
+        f"# Instrumentation Feedback for {result_dir.name} ({version})",
+        "",
+        "The deterministic instrumentation preflight rejected the current patch. The next instrumentation attempt must repair only the observation patch; do not rewrite the frozen assertion plan, invariant graph, field bindings, event locations, fine trace, or ground truth.",
+        "",
+        "## Preflight Summary",
+        "",
+        f"- track: {track or '<unknown>'}",
+        f"- patch: {check.get('patch') or f'{version}-instrumentation.patch'}",
+        f"- apply_returncode: {check.get('apply_returncode')}",
+        f"- compile_returncode: {check.get('compile_returncode')}",
+        f"- setup_masks_failures: {check.get('setup_masks_failures')}",
+    ]
+    markers = check.get("compile_failure_markers")
+    if markers:
+        lines.append(
+            "- compile_failure_markers: "
+            + json.dumps(markers, ensure_ascii=False, sort_keys=True)
+        )
+    runtime_field_quality = check.get("runtime_field_quality")
+    if isinstance(runtime_field_quality, dict):
+        errors = runtime_field_quality.get("errors")
+        if errors:
+            lines.append(
+                "- runtime_field_quality_errors: "
+                + json.dumps(errors, ensure_ascii=False, sort_keys=True)
+            )
+    lines.extend([
+        "",
+        "## Required Repair",
+        "",
+        "1. Re-read `candidate_assertions.json`, `field_bindings.json`, `event_locations.json`, and the real source selected by the preflight gate.",
+        "2. If `apply_returncode` is non-zero, regenerate the patch against the exact commit/tree used by the gate, not a previously patched or fixed checkout.",
+        "3. If `compile_returncode` is non-zero, fix only C/C++ syntax, includes, scope, or expression availability in the observation patch.",
+        "4. If `runtime_field_quality_errors` is present, rewrite the patch so every non-literal field used by a required assertion is computed from real program state at the event. Literal fields such as false_literal/null_literal may be constants; measured fields such as len, alive, initialized, or free_before_use must not be printed as the expected answer.",
+        "5. Rerun the same preflight command until this side's report has `ok: true`.",
+        "",
+    ])
+    append_log_tail(lines, "Apply Log", apply_log)
+    append_log_tail(lines, "Compile Log", compile_log)
+    out = result_dir / f"instrumentation_feedback_{version}.md"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+def append_log_tail(lines: list[str], title: str, path: Path, *, max_lines: int = 80) -> None:
+    lines.extend([f"## {title}", ""])
+    if not path.is_file():
+        lines.extend([f"Missing log: `{path}`", ""])
+        return
+    text = path.read_text(encoding="utf-8", errors="replace")
+    tail = text.splitlines()[-max_lines:]
+    lines.extend(["```text", *tail, "```", ""])
 
 
 def prepare_stage_retry(stage_name: str, result_dir: Path) -> list[Path]:
@@ -370,6 +958,7 @@ def prepare_stage_retry(stage_name: str, result_dir: Path) -> list[Path]:
             "perturbation_results.json",
             "verified_assertions.json",
             "verified_invariants.json",
+            "assertion_execute_integrity.json",
         ),
         "04_reachability": (
             "reachability_report.json",
@@ -423,6 +1012,18 @@ def prepare_stage_entry(stage_name: str, result_dir: Path) -> list[Path]:
             removed.extend(prepare_stage_retry(owned_stage, result_dir))
     elif stage_name in {ASSERTION_EXECUTE_STAGE, "04_reachability"}:
         removed.extend(prepare_stage_retry(stage_name, result_dir))
+        if stage_name == ASSERTION_EXECUTE_STAGE:
+            workspace = result_dir / "repo_workspace"
+            for pattern in (
+                "vulnerable_*_run.log",
+                "vulnerable_*_run.json",
+                "fixed_*_run.log",
+                "fixed_*_run.json",
+            ):
+                for path in workspace.glob(pattern):
+                    if path.is_file() or path.is_symlink():
+                        path.unlink()
+                        removed.append(path)
     return removed
 
 
@@ -605,6 +1206,11 @@ def run_stage(
         sample_id=sample_id, repo_root=repo_root, code_root=code_root, result_dir=result_dir,
     )
     command = render(stage_command(stage, config), variables)
+    frozen_inputs = (
+        snapshot_assertion_plan_inputs(result_dir)
+        if name == ASSERTION_EXECUTE_STAGE and not dry_run
+        else {}
+    )
 
     if dry_run:
         stdout_path.write_text(command + "\n", encoding="utf-8")
@@ -632,20 +1238,34 @@ def run_stage(
 
     returncode = proc.returncode
     if name == ASSERTION_EXECUTE_STAGE:
-        finalize_code = finalize_assertion_execute_outputs(
-            variables=variables,
-            repo_root=repo_root,
-            code_root=code_root,
-            result_dir=result_dir,
-            logs_dir=logs_dir,
+        mutation_report = restore_modified_assertion_plan_inputs(
+            result_dir, frozen_inputs
         )
-        # Stage 04B's agent owns execution and raw trace collection. The runner
-        # owns the frozen assertion contract: final JSON artifacts must be a
-        # deterministic projection of the raw traces, never a hand-authored
-        # interpretation left by the agent. If the deterministic finalizer
-        # succeeds, allow a non-zero agent exit caused by its own stale gate
-        # interpretation to be recovered. If it fails, the stage fails.
-        returncode = 0 if finalize_code == 0 else (finalize_code or proc.returncode)
+        if mutation_report["modified_files"]:
+            write_json(
+                result_dir / "assertion_execute_integrity.json",
+                mutation_report,
+            )
+            returncode = 3
+        else:
+            integrity_path = result_dir / "assertion_execute_integrity.json"
+            if integrity_path.is_file() or integrity_path.is_symlink():
+                integrity_path.unlink()
+        if returncode != 3:
+            finalize_code = finalize_assertion_execute_outputs(
+                variables=variables,
+                repo_root=repo_root,
+                code_root=code_root,
+                result_dir=result_dir,
+                logs_dir=logs_dir,
+            )
+            # Stage 04B's agent owns execution and raw trace collection. The runner
+            # owns the frozen assertion contract: final JSON artifacts must be a
+            # deterministic projection of the raw traces, never a hand-authored
+            # interpretation left by the agent. If the deterministic finalizer
+            # succeeds, allow a non-zero agent exit caused by its own stale gate
+            # interpretation to be recovered. If it fails, the stage fails.
+            returncode = 0 if finalize_code == 0 else (finalize_code or proc.returncode)
 
     required_outputs_ok = check_required_outputs(stage, variables, started_ts)
     success_check_ok = (
@@ -659,10 +1279,72 @@ def run_stage(
         ended_at=now(), stdout_path=str(stdout_path), stderr_path=str(stderr_path),
         required_outputs_ok=required_outputs_ok, success_check_ok=success_check_ok,
         failure_kind=stage_failure_kind(
-            name, returncode, required_outputs_ok, success_check_ok
+            name, returncode, required_outputs_ok, success_check_ok, result_dir
         ),
         duration_seconds=round(time.monotonic() - started_monotonic, 3),
     )
+
+
+def sha256_file(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def snapshot_assertion_plan_inputs(result_dir: Path) -> dict[str, dict[str, Any]]:
+    """Capture frozen Stage 04A files before Stage 04B runs.
+
+    The execute agent may create raw traces, but the assertion contract was
+    frozen by Stage 04A. Keep bytes in memory so an accidental 04B rewrite cannot
+    contaminate deterministic projection or future retries.
+    """
+    snapshot: dict[str, dict[str, Any]] = {}
+    for name in ASSERTION_PLAN_INPUTS:
+        path = result_dir / name
+        if not path.is_file():
+            snapshot[name] = {"exists": False, "sha256": "", "bytes": b""}
+            continue
+        raw = path.read_bytes()
+        snapshot[name] = {
+            "exists": True,
+            "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "bytes": raw,
+        }
+    return snapshot
+
+
+def restore_modified_assertion_plan_inputs(
+    result_dir: Path, snapshot: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """Restore frozen inputs if Stage 04B modified them and report the violation."""
+    modified: list[dict[str, Any]] = []
+    for name, info in snapshot.items():
+        path = result_dir / name
+        before_exists = bool(info.get("exists"))
+        before_hash = str(info.get("sha256") or "")
+        after_exists = path.is_file()
+        after_hash = sha256_file(path) if after_exists else ""
+        if before_exists == after_exists and before_hash == after_hash:
+            continue
+        modified.append({
+            "file": name,
+            "before_exists": before_exists,
+            "after_exists": after_exists,
+            "before_sha256": before_hash,
+            "after_sha256": after_hash,
+        })
+        if before_exists:
+            path.write_bytes(info["bytes"])
+        elif path.is_file() or path.is_symlink():
+            path.unlink()
+    return {
+        "ok": not modified,
+        "modified_files": modified,
+        "restored": bool(modified),
+        "message": (
+            "Stage 04B must not modify frozen Stage 04A assertion-plan inputs"
+            if modified
+            else ""
+        ),
+    }
 
 
 def finalize_assertion_execute_outputs(
@@ -777,6 +1459,7 @@ def stage_failure_kind(
     returncode: int | None,
     required_outputs_ok: bool,
     success_check_ok: bool,
+    result_dir: Path | None = None,
 ) -> str:
     if returncode == 0 and required_outputs_ok and success_check_ok:
         return ""
@@ -796,6 +1479,18 @@ def stage_failure_kind(
             else "instrumentation_invalid"
         )
     if stage_name == ASSERTION_EXECUTE_STAGE:
+        if result_dir is not None and (result_dir / "assertion_execute_integrity.json").is_file():
+            return "assertion_plan_mutated"
+        if (
+            result_dir is not None
+            and required_outputs_ok
+            and not success_check_ok
+            and (
+                assertion_execute_needs_execution_retry(result_dir)
+                or assertion_execute_has_trace_format_error(result_dir)
+            )
+        ):
+            return "assertion_execution_incomplete"
         return (
             "assertion_execution_incomplete"
             if not required_outputs_ok
@@ -906,6 +1601,10 @@ def check_success(stage: dict[str, Any], variables: dict[str, str]) -> bool:
     check = stage.get("success_check") or {}
     if not check:
         return True
+    if check.get("repo_fixed_oracle_gate"):
+        path_text = str(check.get("path") or "")
+        if not repo_fixed_oracle_gate_passes(variables, path_text):
+            return False
     if check.get("reachability_gate"):
         path_text = str(check.get("path") or "")
         if not path_text:
@@ -924,6 +1623,59 @@ def check_success(stage: dict[str, Any], variables: dict[str, str]) -> bool:
             for clause in clauses if isinstance(clause, dict)
         )
     return _json_condition_matches(check, variables)
+
+
+def repo_fixed_oracle_gate_passes(variables: dict[str, str], report_path_text: str) -> bool:
+    """Require an early fixed-side smoke oracle for repo-track samples.
+
+    Stage 01 is primarily a reproducer gate, but repo/OSV/NVD samples with a
+    declared fix commit are only useful GT candidates when the same PoC is clean
+    on the fixed side. ARVO and repo samples without a fix commit are left to
+    their existing stage-specific gates.
+    """
+    result_dir = Path(variables["result_dir"])
+    prepare_path = result_dir / "prepare_report.json"
+    sample_path = result_dir / "sample_info.json"
+    if not prepare_path.exists() or not sample_path.exists():
+        return True
+    try:
+        prepare = load_json(prepare_path)
+        sample = load_json(sample_path)
+    except Exception:
+        return True
+    track = str(prepare.get("track") or "")
+    if not track.startswith("repo/"):
+        return True
+    fix_commit = str(sample.get("fix_commit") or sample.get("fixed_commit") or "").strip()
+    if not fix_commit:
+        return True
+    if not report_path_text:
+        return False
+    report_path = Path(render(report_path_text, variables).strip("'"))
+    if not report_path.exists():
+        return False
+    try:
+        report = load_json(report_path)
+    except Exception:
+        return False
+
+    checked = report.get("fixed_oracle_checked")
+    acceptable = report.get("fixed_oracle_acceptable")
+    fixed_oracle = report.get("fixed_oracle")
+    if isinstance(fixed_oracle, dict):
+        checked = fixed_oracle.get("checked", checked)
+        acceptable = fixed_oracle.get("acceptable", acceptable)
+    setup = str(report.get("setup_command") or "")
+    return checked is True and acceptable is True and not setup_command_masks_failures(setup)
+
+
+def setup_command_masks_failures(command: str) -> bool:
+    """Reject setup commands that can hide failed dependency/build steps."""
+    if re.search(r"\|\|\s*(?:true|:)(?:\s|$|[;&|)'\"`])", command):
+        return True
+    if re.search(r"(?:^|[\s;'\"`])set\s+\+e(?:$|[\s;'\"`])", command):
+        return True
+    return False
 
 
 def _json_condition_matches(
@@ -956,11 +1708,46 @@ def reachability_gate_passes(report: dict[str, Any]) -> bool:
     """
     if report.get("reachability_checked") is not True:
         return False
-    if report.get("R5_sanitizer_triggered") is not True:
+    if not (
+        report.get("target_vulnerability_triggered") is True
+        or report.get("raw_target_vulnerability_triggered") is True
+        or report.get("R5_sanitizer_triggered") is True
+    ):
         return False
     raw_hits = report.get("raw_location_hits")
     if not isinstance(raw_hits, dict):
         raw_hits = {}
+    hit_locations = [
+        hit for hit in report.get("hit_locations", []) if isinstance(hit, dict)
+    ]
+    event_reachability = report.get("assertion_event_reachability")
+    if not isinstance(event_reachability, dict):
+        event_reachability = {}
+
+    def hit_location_reached(*kinds: str) -> bool:
+        expected = set(kinds)
+        for hit in hit_locations:
+            if hit.get("kind") not in expected:
+                continue
+            if hit.get("breakpoint_error"):
+                continue
+            if hit.get("hit_count") == 0:
+                continue
+            return True
+        return False
+
+    def assertion_role_reached(role: str) -> bool:
+        for hit in hit_locations:
+            if hit.get("kind") != "assertion_event":
+                continue
+            roles = set(hit.get("assertion_role") or [])
+            if role not in roles:
+                continue
+            event_point = str(hit.get("event_point") or "")
+            if event_reachability.get(event_point) is True:
+                return True
+        return False
+
     source_or_later_reached = any(
         item is True
         for item in (
@@ -970,31 +1757,29 @@ def reachability_gate_passes(report: dict[str, Any]) -> bool:
             report.get("R3_root_cause_function_reached"),
             raw_hits.get("root_cause"),
         )
-    )
+    ) or hit_location_reached(
+        "source",
+        "root_cause",
+        "root_cause_function",
+        "sink_function",
+    ) or assertion_role_reached("root")
     if not source_or_later_reached:
         return False
     if not (
         report.get("R3_root_cause_reached") is True
         or report.get("R3_root_cause_function_reached") is True
         or raw_hits.get("root_cause") is True
+        or hit_location_reached("root_cause", "root_cause_function")
+        or assertion_role_reached("root")
     ):
         return False
     if report.get("R4_sink_reached") is True or report.get("R4_sink_line_reached") is True:
         return True
     if raw_hits.get("sink") is True:
         return True
-    event_reachability = report.get("assertion_event_reachability")
-    if not isinstance(event_reachability, dict):
-        return False
-    for hit in report.get("hit_locations", []):
-        if (
-            isinstance(hit, dict)
-            and hit.get("kind") == "assertion_event"
-            and "sink" in set(hit.get("assertion_role") or [])
-            and event_reachability.get(str(hit.get("event_point") or "")) is True
-        ):
-            return True
-    return False
+    if hit_location_reached("sink", "sink_line", "sink_function"):
+        return True
+    return assertion_role_reached("sink")
 
 
 def check_validate_gt(
@@ -1485,7 +2270,65 @@ def prior_ok_stages(state_path: Path) -> set[str]:
         prior = load_json(state_path)
     except Exception:
         return set()
-    return {str(s.get("name")) for s in prior.get("stages", []) if s.get("ok")}
+    return {
+        str(s.get("name"))
+        for s in prior.get("stages", [])
+        if s.get("ok") and not s.get("skipped") and not s.get("dry_run")
+    }
+
+
+def current_resumable_ok_stages(
+    *,
+    stages: list[dict[str, Any]],
+    prior_ok: set[str],
+    config: dict[str, Any],
+    sample: dict[str, Any],
+    sample_path: Path,
+    sample_id: str,
+    repo_root: Path,
+    code_root: Path,
+    result_dir: Path,
+) -> set[str]:
+    """Only skip resumed stages whose current artifacts still pass their gate."""
+    resumable: set[str] = set()
+    for stage in stages:
+        name = str(stage.get("name") or "")
+        if not name or name not in prior_ok:
+            continue
+        variables = build_variables(
+            stage=stage,
+            config=config,
+            sample=sample,
+            sample_path=sample_path,
+            sample_id=sample_id,
+            repo_root=repo_root,
+            code_root=code_root,
+            result_dir=result_dir,
+        )
+        if current_stage_artifacts_ok(stage, variables, repo_root, code_root, result_dir):
+            resumable.add(name)
+    return resumable
+
+
+def current_stage_artifacts_ok(
+    stage: dict[str, Any],
+    variables: dict[str, str],
+    repo_root: Path,
+    code_root: Path,
+    result_dir: Path,
+) -> bool:
+    """Gate a resume skip using current artifacts, without freshness checks."""
+    for item in stage.get("required_outputs") or []:
+        path = Path(render(str(item), variables).strip("'"))
+        if not path.exists():
+            return False
+    if str(stage.get("name") or "") == FINAL_STAGE:
+        return repair_package_ready_to_publish(result_dir)
+    return (
+        check_success(stage, variables)
+        and check_validate_gt(stage, variables, repo_root, code_root)
+        and check_assertion_stage_success(stage, variables)
+    )
 
 
 def generation_state_path(result_dir: Path, *, dry_run: bool) -> Path:

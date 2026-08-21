@@ -117,6 +117,18 @@ def validate_frozen_spec(spec: dict[str, Any]) -> None:
             )
         if not assertion.get("at"):
             raise ValueError(f"assertion {assertion_id} is missing at")
+        if assertion.get("kind") == "observed":
+            target_prefix = f"${assertion['at']}."
+            operands = check[1:]
+            if not all(
+                isinstance(operand, str) and operand.startswith(target_prefix)
+                for operand in operands
+            ):
+                raise ValueError(
+                    f"observed assertion {assertion_id} must use only fields from "
+                    f"its at event {assertion['at']!r}; use a transition assertion "
+                    "for cross-event relations"
+                )
         if assertion.get("kind") == "transition" and not assertion.get("from"):
             raise ValueError(f"transition assertion {assertion_id} is missing from")
         if assertion.get("kind") == "transition":
@@ -142,8 +154,12 @@ def validate_frozen_spec(spec: dict[str, Any]) -> None:
 def freeze_spec(spec_path: Path, marker_path: Path) -> dict[str, Any]:
     """Validate and persist the immutable pre-execution assertion commitment."""
     spec_path = spec_path.resolve()
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    actual_content_hash = assertion_content_hash(spec)
+    if spec.get("content_hash") != actual_content_hash:
+        spec["content_hash"] = actual_content_hash
+        spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
     spec_bytes = spec_path.read_bytes()
-    spec = json.loads(spec_bytes)
     validate_frozen_spec(spec)
     marker = {
         "schema_version": "assertion-freeze-v1",
@@ -323,7 +339,7 @@ def validate_binding_coverage(
     """Check that the two Stage-04 side maps actually cover what the verified
     assertions reference.
 
-    event_locations (ERROR): every event id used as an assertion `at`/`from`
+    event_locations (ERROR): every event id used as an assertion `at`/`from`/`protects`
     must resolve to a real (function, file). Without it the probe question
     splices the synthetic event id into its text -- unanswerable by
     construction (a subject greps for `enqueue_deferred`, finds nothing). This
@@ -349,7 +365,7 @@ def validate_binding_coverage(
     for assertion in spec.get("assertions", []):
         if not isinstance(assertion, dict):
             continue
-        for key in ("at", "from"):
+        for key in ("at", "from", "protects"):
             ev = assertion.get(key)
             if ev:
                 referenced_events.add(str(ev))
@@ -366,7 +382,7 @@ def validate_binding_coverage(
         if not isinstance(loc, dict) or not loc.get("function") or not loc.get("file"):
             errors.append(
                 f"event_locations missing (function,file) for event id {event!r} "
-                "referenced by an assertion at/from"
+                "referenced by an assertion at/from/protects"
             )
 
     for operand, default_event in sorted(
@@ -413,6 +429,11 @@ def parse_trace_matrix(text: str) -> dict[str, dict[str, Any]]:
             current = {"rc": int(rc), "result": result, "events": []}
             cases[name] = current
             continue
+        if line.startswith("CASE"):
+            raise ValueError(
+                "malformed CASE line; expected "
+                "`CASE name=<name> rc=<int> result=<result>`: " + line
+            )
         match = _EVENT_RE.match(line)
         if match and current is not None:
             current["events"].append(_parse_fields(match.group(1)))
@@ -461,6 +482,33 @@ def _preceding_event_with_index(
         event = case["events"][index]
         if event.get("point") == point:
             return index, event
+    return None
+
+
+def _following_event_with_index(
+    case: dict[str, Any], point: str, target_index: int
+) -> tuple[int, dict[str, Any]] | None:
+    for index in range(target_index + 1, len(case["events"])):
+        event = case["events"][index]
+        if event.get("point") == point:
+            return index, event
+    return None
+
+
+def _protected_event_after_target(
+    case: dict[str, Any],
+    protected_point: str,
+    *,
+    target_point: str,
+    target_index: int,
+) -> tuple[int, dict[str, Any]] | None:
+    for index in range(target_index + 1, len(case["events"])):
+        event = case["events"][index]
+        point = event.get("point")
+        if point == protected_point:
+            return index, event
+        if point == target_point:
+            break
     return None
 
 
@@ -574,6 +622,12 @@ def evaluate_assertion(
     else:
         target = _event_with_index(case, assertion["at"])
         if target is None:
+            if assertion["kind"] == "required" and assertion.get("protects"):
+                return {
+                    "status": "avoided",
+                    "satisfied": True,
+                    "triggered": False,
+                }
             return {"status": "not_exercised", "satisfied": None}
         target_index, target_event = target
     checked = _check(
@@ -588,7 +642,15 @@ def evaluate_assertion(
     result = {"left": left, "right": right, "op": op_name}
     protected = assertion.get("protects")
     if assertion["kind"] == "required" and protected:
-        triggered = bool(_events(case, protected))
+        if protected == assertion["at"]:
+            triggered = True
+        else:
+            triggered = _protected_event_after_target(
+                case,
+                protected,
+                target_point=assertion["at"],
+                target_index=target_index,
+            ) is not None
         if triggered:
             status = "genuine" if satisfied else "violated"
         else:
@@ -613,6 +675,7 @@ def validate_assertions(
     validate_frozen_spec(spec)
     original = spec.get("original_case", "original")
     results: list[dict[str, Any]] = []
+    semantic_failures: list[dict[str, Any]] = []
     for assertion in spec.get("assertions", []):
         matrix = {
             version: {
@@ -632,6 +695,9 @@ def validate_assertions(
             verified = vulnerable_status == "satisfied"
         elif assertion.get("protects"):
             genuine_witness_case = None
+            fixed_non_original_cases = [
+                name for name in matrix["fixed"] if name != original
+            ]
             if fixed_status in _FIXED_GUARD_STATUSES:
                 genuine_witness_case = next(
                     (
@@ -641,9 +707,14 @@ def validate_assertions(
                     ),
                     None,
                 )
+            fixed_guard_accepted = (
+                fixed_status in _FIXED_GUARD_STATUSES
+                and not fixed_crashed
+                and bool(fixed_non_original_cases)
+            )
             verified = vulnerable_status == "violated" and (
                 fixed_status == "genuine"
-                or (fixed_status in _FIXED_GUARD_STATUSES and genuine_witness_case is not None)
+                or fixed_guard_accepted
             )
         else:
             verified = vulnerable_status == "refuted" and fixed_status == "satisfied"
@@ -666,10 +737,18 @@ def validate_assertions(
             )
         if assertion.get("protects") and fixed_status in _FIXED_GUARD_STATUSES:
             item["genuine_witness_case"] = genuine_witness_case
-            if genuine_witness_case is None:
+            item["fixed_guard_status"] = fixed_status
+            item["fixed_guard_clean"] = not fixed_crashed
+            item["fixed_perturbation_cases"] = fixed_non_original_cases
+            if fixed_guard_accepted:
+                item["fixed_guard_acceptance"] = (
+                    "fixed original skipped the protected event and exited cleanly; "
+                    "one fixed perturbation was attempted and recorded"
+                )
+            elif genuine_witness_case is None:
                 item["verification_error"] = (
-                    f"fixed original is {fixed_status}; add a perturbation that executes the "
-                    "protected event while the required predicate is true"
+                    f"fixed original is {fixed_status}; add exactly one perturbation "
+                    "case before accepting the guarded fixed-side witness"
                 )
         if (
             assertion.get("protects")
@@ -688,6 +767,16 @@ def validate_assertions(
                 "operation, after every guard that can skip it; a probe emitted at "
                 "block entry observes reaching the block, not performing the operation"
             )
+        if assertion["kind"] == "required" and vulnerable_status != "violated":
+            vulnerable_original = matrix["vulnerable"].get(original, {})
+            semantic_failures.append({
+                "id": assertion["id"],
+                "reason": "required root predicate is not violated on the vulnerable original witness",
+                "vulnerable_status": vulnerable_status,
+                "left": vulnerable_original.get("left"),
+                "op": vulnerable_original.get("op"),
+                "right": vulnerable_original.get("right"),
+            })
         results.append(item)
     required_results = [item for item in results if item.get("kind") == "required"]
     propagation_results = [
@@ -715,7 +804,7 @@ def validate_assertions(
         differential_status = "probe_misplaced"
     else:
         differential_status = "vulnerable_side_only"
-    return {
+    output = {
         "schema_version": (
             "assertion-results-v3"
             if spec.get("schema_version") == "assertion-spec-v3"
@@ -730,6 +819,19 @@ def validate_assertions(
         "differential_status": differential_status,
         "assertions": results,
     }
+    if semantic_failures:
+        output["failure_class"] = "root_not_violated_on_vulnerable_witness"
+        output["stage04b_failure"] = {
+            "classification": "semantic_root_failure",
+            "message": (
+                "At least one required root predicate was already satisfied or "
+                "not exercised on the vulnerable original witness. Stage 04A "
+                "must choose a safety obligation that the vulnerable crashing "
+                "run violates before the protected operation."
+            ),
+            "evidence": semantic_failures,
+        }
+    return output
 
 
 def check_msan_offset(results: dict[str, Any], msan: dict[str, int]) -> dict[str, Any]:
@@ -1011,6 +1113,8 @@ def build_perturbation_results(
         if (
             item["matrix"].get("fixed", {}).get(original, {}).get("status")
             in _FIXED_GUARD_STATUSES
+            and item["matrix"].get("vulnerable", {}).get(original, {}).get("status")
+            == "violated"
         )
     ]
     case_names = list(dict.fromkeys(
@@ -1041,6 +1145,8 @@ def build_perturbation_results(
         if str(item["id"]) in needed_ids
     }
     all_needed_witnessed = all(witnesses.get(assertion_id) for assertion_id in needed_ids)
+    attempted_cases = [case for case in cases if case.get("name")]
+    single_attempt_recorded = (not needed_ids) or bool(attempted_cases)
     return {
         "schema_version": "perturbation-results-v1",
         "sample_id": spec.get("sample_id"),
@@ -1053,6 +1159,10 @@ def build_perturbation_results(
         "cases": cases,
         "genuine_witness_cases": witnesses,
         "all_needed_witnessed": all_needed_witnessed,
+        "single_perturbation_attempt_recorded": single_attempt_recorded,
+        "accepted_after_single_attempt": bool(needed_ids)
+        and single_attempt_recorded
+        and not all_needed_witnessed,
     }
 
 
@@ -1220,12 +1330,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--freeze-marker", type=Path)
     args = parser.parse_args(argv)
     spec = json.loads(args.spec.read_text(encoding="utf-8"))
-    validate_frozen_spec(spec)
     if args.freeze_only:
         if not args.freeze_marker:
             parser.error("--freeze-only requires --freeze-marker")
         print(json.dumps(freeze_spec(args.spec, args.freeze_marker), indent=2))
         return 0
+    validate_frozen_spec(spec)
     if args.check_bindings_only:
         if not args.verified_invariants:
             parser.error("--check-bindings-only requires --verified-invariants")
@@ -1265,22 +1375,21 @@ def main(argv: list[str] | None = None) -> int:
     if msan:
         results["msan_offset_check"] = check_msan_offset(results, msan)
     verified_invariants = None
+    projected_verified_invariants = None
     if args.verified_invariants:
         verified_invariants = json.loads(
             args.verified_invariants.read_text(encoding="utf-8")
         )
-        results["invariant_binding"] = validate_invariant_bindings(
-            build_verified_invariants(verified_invariants, results), spec
+        projected_verified_invariants = build_verified_invariants(
+            verified_invariants, results
         )
-        if not results["invariant_binding"]["valid"]:
-            raise ValueError("invalid invariant bindings")
+        results["invariant_binding"] = validate_invariant_bindings(
+            projected_verified_invariants, spec
+        )
     args.results_out.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    if args.verified_invariants and verified_invariants is not None:
+    if args.verified_invariants and projected_verified_invariants is not None:
         args.verified_invariants.write_text(
-            json.dumps(
-                build_verified_invariants(verified_invariants, results),
-                indent=2,
-            )
+            json.dumps(projected_verified_invariants, indent=2)
             + "\n",
             encoding="utf-8",
         )
@@ -1324,6 +1433,8 @@ def main(argv: list[str] | None = None) -> int:
             encoding="utf-8",
         )
     offset_error = bool(results.get("msan_offset_check", {}).get("error"))
+    if results.get("invariant_binding", {}).get("valid") is False:
+        raise ValueError("invalid invariant bindings")
     if not results["required_verified"] or offset_error:
         raise SystemExit(1)
     return 0

@@ -313,3 +313,50 @@ def test_cli_uses_frozen_trace_hits_and_writes_package_local_artifacts(
         "assertion_spec": "candidate_assertions.json",
         "assertion_trace": "vulnerable_assertion_trace.txt",
     }
+
+
+def test_cli_falls_back_to_saved_sanitizer_trace(tmp_path, monkeypatch):
+    gt = {
+        "sample_id": "sample",
+        "sanitizer_ground_truth": {
+            "detector": "address",
+            "crash_type": "heap-buffer-overflow",
+            "crash_location": {
+                "file": "src/a.c",
+                "function": "sink",
+                "line": 10,
+            },
+        },
+        "sink": {
+            "file": "src/a.c",
+            "function": "sink",
+            "line": 10,
+            "relation": {"op": "eq", "left": "x", "right": "x"},
+        },
+    }
+    saved = (
+        "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n"
+        "    #0 0x1 in sink src/a.c:10:1\n"
+        "SUMMARY: AddressSanitizer: heap-buffer-overflow src/a.c:10:1 in sink\n"
+    )
+    (tmp_path / "ground_truth.json").write_text(__import__("json").dumps(gt))
+    (tmp_path / "sanitizer_trace.txt").write_text(saved)
+    out_dir = tmp_path / "reachability"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "reachability",
+            "--gt", str(tmp_path / "ground_truth.json"),
+            "--sanitizer-command", "printf 'language error only'",
+            "--sanitizer-trace", str(tmp_path / "sanitizer_trace.txt"),
+            "--out-dir", str(out_dir),
+        ],
+    )
+
+    reachability_main()
+
+    report = __import__("json").loads(
+        (out_dir / "reachability_report.json").read_text()
+    )
+    assert report["target_vulnerability_triggered"] is True
+    assert report["sanitizer_observed"]["crash_type"] == "heap-buffer-overflow"

@@ -34,6 +34,10 @@ Write `<result_dir>/ground_truth.json` and run:
 PYTHONPATH=gt_generation python3 -m gt_toolkit validate <result_dir>/ground_truth.json
 ```
 
+Write artifacts with ordinary shell/Python file writes available inside the CLI
+session. Do not invoke a special `apply_patch` command from the shell; it is not
+part of the Stage 02 runtime environment.
+
 The `fine_trace` is the **irreducible, lossless vulnerability-logic trace**, not a
 complete execution transcript, crash stack, or coarse source/root/sink summary. Record
 the vulnerability-relevant data flow step by step. Each step introduces exactly one

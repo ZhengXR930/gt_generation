@@ -34,6 +34,18 @@ def _repo_root() -> Path:
     return here.parents[2]
 
 
+def _has_sanitizer_finding(text: str) -> bool:
+    try:
+        from reachability.engine import parse_sanitizer_trace
+    except ModuleNotFoundError:
+        root = _repo_root()
+        sys.path.insert(0, str(root / "evaluator"))
+        from reachability.engine import parse_sanitizer_trace
+
+    observed = parse_sanitizer_trace(text)
+    return bool(observed.get("crash_type") or observed.get("sanitizer"))
+
+
 def _engine_env(root: Path) -> dict[str, str]:
     eval_dir = root / "evaluator"
     missing = [str(eval_dir)] if not (eval_dir / "reachability").exists() else []
@@ -59,6 +71,7 @@ def _pad_separators(command: str) -> str:
     shlex keeps punctuation attached, so "pipefail;" arrives as one token and the
     rest of the line looks like arguments to `set`.
     """
+    command = command.replace("\r\n", "\n").replace("\n", " ; ")
     return re.sub(r"(\|\||&&|[;|&])", r" \1 ", command)
 
 
@@ -150,32 +163,74 @@ def derive_debug_command(result_dir: Path) -> str | None:
     return " ".join(argv)
 
 
-def _restore_uninstrumented_source(result_dir: Path, timeout: int = 1800) -> dict[str, Any]:
-    """Undo Stage 04's instrumentation so line numbers match the GT again.
+def _sample_vulnerable_commit(result_dir: Path) -> str:
+    for name in ("sample_info.json", "prepare_report.json"):
+        path = result_dir / name
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        commit = str(data.get("vulnerable_commit") or "")
+        if commit:
+            return commit
+    gt_path = result_dir / "ground_truth.json"
+    if gt_path.is_file():
+        try:
+            gt = json.loads(gt_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            gt = {}
+        project = gt.get("project") if isinstance(gt.get("project"), dict) else {}
+        commit = str(project.get("vulnerable_commit") or gt.get("vulnerable_commit") or "")
+        if commit:
+            return commit
+    return ""
 
-    Returns what happened so the caller can record it; a checkout that is not a
-    git tree, or one with no modifications, is left alone.
+
+def _restore_vulnerable_source(result_dir: Path, timeout: int = 1800) -> dict[str, Any]:
+    """Put repo-track reachability back on the vulnerable, uninstrumented build.
+
+    Stage 04 runs both vulnerable and fixed instrumentation in the same result
+    workspace.  A clean tree may therefore still be checked out at the fixed
+    commit, and the root sanitizer trace may be stale.  Reachability is a
+    vulnerable-target measurement, so make that state explicit and rebuild.
     """
     src = result_dir / "_work" / "src"
-    status = {"reverted": False, "rebuilt": False}
+    status = {"reset": False, "checked_out": False, "rebuilt": False}
     if not (src / ".git").exists():
         return status
 
-    dirty = subprocess.run(
-        ["git", "-C", str(src), "status", "--porcelain"],
+    before = subprocess.run(
+        ["git", "-C", str(src), "rev-parse", "HEAD"],
         capture_output=True, text=True, errors="replace",
     )
-    if dirty.returncode != 0 or not dirty.stdout.strip():
-        return status
+    if before.returncode == 0:
+        status["before_commit"] = before.stdout.strip()
 
-    revert = subprocess.run(
-        ["git", "-C", str(src), "checkout", "--", "."],
+    vulnerable_commit = _sample_vulnerable_commit(result_dir)
+    if not vulnerable_commit:
+        status["error"] = "missing vulnerable_commit"
+        return status
+    status["target_commit"] = vulnerable_commit
+
+    reset = subprocess.run(
+        ["git", "-C", str(src), "reset", "--hard", "HEAD"],
         capture_output=True, text=True, errors="replace",
     )
-    if revert.returncode != 0:
-        status["error"] = revert.stderr[-300:]
+    if reset.returncode != 0:
+        status["error"] = reset.stderr[-300:]
         return status
-    status["reverted"] = True
+    status["reset"] = True
+
+    checkout = subprocess.run(
+        ["git", "-C", str(src), "checkout", "-q", vulnerable_commit],
+        capture_output=True, text=True, errors="replace",
+    )
+    if checkout.returncode != 0:
+        status["error"] = checkout.stderr[-300:]
+        return status
+    status["checked_out"] = True
 
     # Rebuild with the command Stage 01 established, so the binary the debugger
     # attaches to is the one the GT line numbers belong to.
@@ -194,6 +249,9 @@ def _restore_uninstrumented_source(result_dir: Path, timeout: int = 1800) -> dic
     parts = shlex.split(setup) if setup else []
     if parts and parts[0].endswith("build.sh") and len(parts) >= 2:
         inner = parts[1]
+    vulnerable_commit = _sample_vulnerable_commit(result_dir)
+    if vulnerable_commit:
+        inner = inner.replace("<COMMIT>", vulnerable_commit)
     proc = subprocess.run(
         [str(build_sh), inner], capture_output=True, text=True,
         errors="replace", timeout=timeout,
@@ -202,6 +260,45 @@ def _restore_uninstrumented_source(result_dir: Path, timeout: int = 1800) -> dic
     if proc.returncode != 0:
         status["error"] = proc.stderr[-300:]
     return status
+
+
+def _recorded_setup_inner(result_dir: Path) -> str:
+    report = result_dir / "reproduction_report.json"
+    if not report.is_file():
+        return ""
+    try:
+        setup = str(json.loads(report.read_text(encoding="utf-8")).get("setup_command") or "")
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if not setup.strip():
+        return ""
+    try:
+        parts = shlex.split(setup)
+    except ValueError:
+        return setup
+    if parts and parts[0].endswith("build.sh") and len(parts) >= 2:
+        return parts[1]
+    return setup
+
+
+def _optional_reachability_args(result_dir: Path) -> list[str]:
+    """Return optional files that actually exist in this compacted GT package."""
+    args: list[str] = []
+    assertion_spec = result_dir / "candidate_assertions.json"
+    if not assertion_spec.is_file():
+        assertion_spec = result_dir / "verified_assertions.json"
+    if assertion_spec.is_file():
+        args += ["--assertion-spec", f"/gt/{assertion_spec.name}"]
+
+    optional_files = {
+        "--assertion-trace": "vulnerable_assertion_trace.txt",
+        "--verified-invariants": "verified_invariants.json",
+        "--sanitizer-trace": "sanitizer_trace.txt",
+    }
+    for flag, name in optional_files.items():
+        if (result_dir / name).is_file():
+            args += [flag, f"/gt/{name}"]
+    return args
 
 
 def _arvo_target_from_traces(result_dir: Path) -> str:
@@ -375,21 +472,21 @@ def run_for_result_dir(result_dir: Path, timeout: int = 900) -> int:
         print(json.dumps({"reachability": "skipped", "reason": "no reproduction command"}))
         return 0
 
-    restored = _restore_uninstrumented_source(result_dir)
-
-    inner = " ".join([
+    restored = _restore_vulnerable_source(result_dir)
+    arguments = [
         "PYTHONPATH=/repo/gt_generation:/repo",
         "python3", "-m", "gt_toolkit", "reachability",
         "--gt", "/gt/ground_truth.json",
         "--codebase", "/gt/_work/src",
-        "--assertion-spec", "/gt/candidate_assertions.json",
-        "--assertion-trace", "/gt/vulnerable_assertion_trace.txt",
-        "--verified-invariants", "/gt/verified_invariants.json",
-        "--sanitizer-trace", "/gt/sanitizer_trace.txt",
+    ]
+    arguments.extend(_optional_reachability_args(result_dir))
+    arguments.extend([
+        "--sanitizer-command", shlex.quote(f"{debug_command} 2>&1"),
         "--debug-command", shlex.quote(debug_command),
         "--poc", "/gt/poc",
         "--out-dir", "/gt/reachability",
     ])
+    inner = " ".join(arguments)
     proc = subprocess.run(
         [str(build_sh), inner], capture_output=True, text=True,
         errors="replace", timeout=timeout,
@@ -400,6 +497,16 @@ def run_for_result_dir(result_dir: Path, timeout: int = 900) -> int:
         (result_dir / "reachability_report.json").write_text(
             produced.read_text(encoding="utf-8"), encoding="utf-8"
         )
+        produced_trace = result_dir / "reachability" / "sanitizer_trace.txt"
+        if produced_trace.is_file():
+            produced_text = produced_trace.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            if _has_sanitizer_finding(produced_text):
+                (result_dir / "sanitizer_trace.txt").write_text(
+                    produced_text,
+                    encoding="utf-8",
+                )
         print(json.dumps({
             "reachability": "ran",
             "returncode": proc.returncode,

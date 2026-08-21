@@ -24,6 +24,13 @@ CODEX_ADAPTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$CODEX_ADAPTER_DIR/../../.." && pwd)"
 mkdir -p "$RESULT_DIR"
 
+for _codex_bin_dir in "$HOME/.local/bin" "$HOME/.trae/cli/tmp/arg0/traecli-K3rUnE"; do
+  if [[ -d "$_codex_bin_dir" && ":$PATH:" != *":$_codex_bin_dir:"* ]]; then
+    PATH="$_codex_bin_dir:$PATH"
+  fi
+done
+export PATH
+
 load_config_key() {
   local name="$1"
   local value=""

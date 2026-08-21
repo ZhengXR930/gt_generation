@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -122,6 +123,10 @@ def load_config(path: Path) -> dict[str, Any]:
             )
         stop_after = "05_validate"
 
+    run_mode = "stage01_screening" if (
+        not start_at and stop_after == "01_reproducer"
+    ) else "full_gt_generation"
+
     return {
         "cli": cli,
         "adapter": adapter,
@@ -140,6 +145,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "reuse_repair_staging": bool(raw.get("reuse_repair_staging", False)),
         "start_at": start_at,
         "stop_after": stop_after,
+        "run_mode": run_mode,
     }
 
 
@@ -255,6 +261,100 @@ def completed_samples_to_skip(
         for sample_id in samples
         if gt_status.classify(sample_id)[0] == "complete"
     ]
+
+
+def _load_json_or_none(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _setup_command_masks_failures(command: str) -> bool:
+    if re.search(r"\|\|\s*(?:true|:)(?:\s|$|[;&|)'\"`])", command):
+        return True
+    if re.search(r"(?:^|[\s;'\"`])set\s+\+e(?:$|[\s;'\"`])", command):
+        return True
+    return False
+
+
+def _repo_fixed_oracle_required(result_dir: Path, sample: dict[str, Any]) -> bool:
+    prepare = _load_json_or_none(result_dir / "prepare_report.json")
+    info = _load_json_or_none(result_dir / "sample_info.json")
+    track = str((prepare or {}).get("track") or "")
+    if not track.startswith("repo/"):
+        return False
+    fix_commit = str(
+        (info or {}).get("fix_commit")
+        or (info or {}).get("fixed_commit")
+        or sample.get("fix_commit")
+        or sample.get("fixed_commit")
+        or ""
+    ).strip()
+    return bool(fix_commit)
+
+
+def evaluate_stage01_screening(
+    result_dir: Path, sample: dict[str, Any], runner_returncode: int
+) -> dict[str, Any]:
+    """Classify a Stage-01-only run without requiring a completed GT package."""
+    report_path = result_dir / "reproduction_report.json"
+    report = _load_json_or_none(report_path)
+    fixed_required = _repo_fixed_oracle_required(result_dir, sample)
+    status = "incomplete_stage01"
+    reason = "missing_or_invalid_reproduction_report"
+    accepted = False
+
+    if isinstance(report, dict):
+        reproduced = report.get("vulnerable_reproduced") is True
+        matches_issue = report.get("matches_issue") is True
+        fixed = report.get("fixed_oracle")
+        fixed_checked = report.get("fixed_oracle_checked")
+        fixed_acceptable = report.get("fixed_oracle_acceptable")
+        if isinstance(fixed, dict):
+            fixed_checked = fixed.get("checked", fixed_checked)
+            fixed_acceptable = fixed.get("acceptable", fixed_acceptable)
+        masked_setup = _setup_command_masks_failures(str(report.get("setup_command") or ""))
+
+        if not reproduced:
+            status = "rejected_by_stage01"
+            reason = "vulnerable_reproduction_not_established"
+        elif not matches_issue:
+            status = "rejected_by_stage01"
+            reason = "sanitizer_finding_does_not_match_issue"
+        elif fixed_required and fixed_checked is not True:
+            status = "rejected_by_stage01"
+            reason = "fixed_oracle_not_checked"
+        elif fixed_required and fixed_acceptable is not True:
+            status = "rejected_by_stage01"
+            reason = "fixed_oracle_not_clean"
+        elif fixed_required and masked_setup:
+            status = "rejected_by_stage01"
+            reason = "setup_command_masks_build_failures"
+        else:
+            status = "accepted_for_gt"
+            reason = "vulnerable_crash_and_fixed_oracle_confirmed" if fixed_required else "vulnerable_crash_confirmed"
+            accepted = True
+
+    screening = {
+        "sample_id": result_dir.name,
+        "status": status,
+        "accepted_for_gt": accepted,
+        "reason": reason,
+        "fixed_oracle_required": fixed_required,
+        "runner_returncode": runner_returncode,
+        "reproduction_report": str(report_path),
+    }
+    return screening
+
+
+def audit_completed_package(result_dir: Path) -> bool:
+    audit = subprocess.run(
+        [sys.executable, "-m", "gt_toolkit", "audit-package", "--result-dir", str(result_dir)],
+        cwd=REPO_ROOT, env={**os.environ, "PYTHONPATH": str(CODE_ROOT)},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return audit.returncode == 0
 
 
 def _command_output(command: list[str]) -> str:
@@ -387,22 +487,31 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
     with running_lock:
         running.pop(sample_id, None)
 
-    # Final deterministic gate: the packaged GT passes audit-package.
+    screening: dict[str, Any] | None = None
     audit_ok = False
     if completed.returncode == 0:
-        audit = subprocess.run(
-            [sys.executable, "-m", "gt_toolkit", "audit-package", "--result-dir", str(result_dir)],
-            cwd=REPO_ROOT, env={**os.environ, "PYTHONPATH": str(CODE_ROOT)},
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        audit_ok = audit.returncode == 0
+        if cfg["run_mode"] == "stage01_screening":
+            screening = evaluate_stage01_screening(result_dir, sample, completed.returncode)
+        else:
+            audit_ok = audit_completed_package(result_dir)
+    elif cfg["run_mode"] == "stage01_screening":
+        screening = evaluate_stage01_screening(result_dir, sample, completed.returncode)
+
+    succeeded = (
+        bool(screening and screening.get("accepted_for_gt"))
+        if cfg["run_mode"] == "stage01_screening"
+        else completed.returncode == 0 and audit_ok
+    )
 
     result = {
         "sample_id": sample_id,
         "track": track,
         "project": sample.get("project"),
         "returncode": completed.returncode,
+        "run_mode": cfg["run_mode"],
+        "succeeded": succeeded,
         "audit_ok": audit_ok,
+        "stage01_screening": screening,
         "duration_seconds": round(time.monotonic() - started, 3),
         "result_dir": str(result_dir),
         "log": str(log_path),
@@ -456,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
         "model": cfg["model"],
         "reasoning_effort": cfg["reasoning_effort"],
         "strict_config": cfg["strict_config"],
+        "run_mode": cfg["run_mode"],
         "codex_provider": (
             {key: value for key, value in cfg["codex_provider"].items() if key != "env_key"}
             if cfg.get("codex_provider") else None
@@ -494,7 +604,6 @@ def main(argv: list[str] | None = None) -> int:
                 print("HEARTBEAT " + json.dumps(active, ensure_ascii=False), flush=True)
 
     results.sort(key=lambda item: cfg["samples"].index(item["sample_id"]))
-    succeeded = sum(r["returncode"] == 0 and r["audit_ok"] for r in results)
     summary = {
         "batch": args.batch_name,
         "cli": cfg["cli"],
@@ -504,15 +613,20 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.get("codex_provider") else None
         ),
         "parallel_dockers": cfg["parallel_dockers"],
+        "run_mode": cfg["run_mode"],
         "requested": len(cfg["samples"]),
-        "succeeded": succeeded,
+        "succeeded": sum(1 for r in results if r.get("succeeded")),
+        "accepted_for_gt": (
+            sum(1 for r in results if (r.get("stage01_screening") or {}).get("accepted_for_gt"))
+            if cfg["run_mode"] == "stage01_screening" else None
+        ),
         "results": results,
     }
     summary_path = REPO_ROOT / "gt_results" / f"batch_{args.batch_name}.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("SUMMARY " + json.dumps(summary, ensure_ascii=False), flush=True)
-    return 0 if succeeded == len(cfg["samples"]) else 1
+    return 0 if summary["succeeded"] == len(cfg["samples"]) else 1
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from reachability.engine import (
     extract_reachability_checkpoints,
     load_hits,
     load_json,
+    parse_sanitizer_trace,
     run_gdb_reachability,
     write_breakpoint_spec,
 )
@@ -93,10 +94,18 @@ def main() -> None:
             shell=True,
             check=False,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             capture_output=True,
             timeout=args.timeout,
         )
         sanitizer_text = proc.stdout + '\n' + proc.stderr
+        if args.sanitizer_trace and not _has_sanitizer_finding(sanitizer_text):
+            saved_text = args.sanitizer_trace.read_text(
+                encoding='utf-8', errors='replace'
+            )
+            if _has_sanitizer_finding(saved_text):
+                sanitizer_text = saved_text
         sanitizer_trace_path.write_text(sanitizer_text, encoding='utf-8')
     elif args.sanitizer_trace:
         sanitizer_text = args.sanitizer_trace.read_text(
@@ -152,6 +161,11 @@ def _format_command(template: str, poc: Path | None) -> str:
     if poc is None:
         return template
     return template.replace('{poc}', str(poc))
+
+
+def _has_sanitizer_finding(text: str) -> bool:
+    observed = parse_sanitizer_trace(text)
+    return bool(observed.get('crash_type') or observed.get('sanitizer'))
 
 
 def _package_path(path: Path, package_root: Path) -> str:

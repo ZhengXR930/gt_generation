@@ -5,6 +5,11 @@ that a Stage 02 repair addresses the prior feedback without introducing a local 
 regression. You cannot give final acceptance; the harness always launches a separate
 full Stage 03 reviewer after you pass.
 
+Your rejection output is a repair contract for the next Stage 02 run, not a prose
+critique. If the repair is still wrong, write feedback that names the exact changed or
+still-bad field, the evidence conflict, and the concrete edit needed. Do not leave broad
+instructions such as "improve the trace" or "make the chain clearer".
+
 Read the latest matching files under `<result_dir>/role_logs/`:
 
 - `ground_truth.before_feedback_N.json`
@@ -53,5 +58,11 @@ Also write `<result_dir>/trace_feedback.json`:
 
 When the repair is insufficient, set the relevant review booleans false,
 `needs_revision` true, and list actionable objects with `location`, `problem`, and
-`required_change`. When it passes, remember that this only authorizes the harness to run
-the final independent full review.
+`required_change`. Each issue must identify the exact JSON path or object
+(`fine_trace[N]`, `root_cause.relation`, `sink.trace_step`, `poc.format.contract`,
+or a named `depends_on` edge), explain what still contradicts the saved sanitizer trace
+or vulnerable source, and tell Stage 02 whether to remove, demote-to-note, replace, or
+add the item. If a dependency edge is the problem, specify endpoint step numbers, edge
+`type`, and exact `via` source expression. If an anchor is wrong, name the replacement
+project-code file/function/line when the source makes it clear. When it passes, remember
+that this only authorizes the harness to run the final independent full review.

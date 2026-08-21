@@ -16,6 +16,7 @@ KEEP_FILES = {
     # Repairing a package later needs the original ARVO image/target metadata.
     "prepare_report.json",
     "sample_info.json",
+    "issue_description.json",
     "build.sh",
     "poc",
     "default_crash_trace.txt",
@@ -23,7 +24,6 @@ KEEP_FILES = {
     "ground_truth.json",
     "verified_invariants.json",
     "verified_assertions.json",
-    "assertion_reward_spec.json",
     "field_bindings.json",
     "event_locations.json",
     "assertion_results.json",

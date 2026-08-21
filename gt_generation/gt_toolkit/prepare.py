@@ -17,12 +17,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import io
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tarfile
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +50,170 @@ def _sh(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProce
     return subprocess.run(
         cmd, capture_output=True, text=True, errors="replace", timeout=timeout
     )
+
+
+def _repo_clone_candidates(repo: str) -> list[str]:
+    mirror_prefix = "https://gitlab.gnome.org/GNOME/"
+    if repo.startswith(mirror_prefix) and repo.endswith(".git"):
+        project = repo[len(mirror_prefix): -len(".git")]
+        # GNOME GitLab can be very slow from this environment; GitHub is the
+        # official project mirror and is much more reliable for bulk cloning.
+        return [f"https://github.com/GNOME/{project}.git", repo]
+    return [repo]
+
+
+def _repo_cache_root() -> Path:
+    return Path(
+        os.environ.get("GT_REPO_CACHE_DIR", "")
+        or Path(__file__).resolve().parents[2] / "external" / "repo-cache"
+    )
+
+
+def _repo_cache_dir(repo: str) -> Path:
+    parsed = urllib.parse.urlparse(repo)
+    if parsed.scheme and parsed.netloc:
+        key = f"{parsed.netloc}{parsed.path}"
+    else:
+        key = repo
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key.strip("/"))
+    if not key:
+        key = hashlib.sha256(repo.encode("utf-8")).hexdigest()[:16]
+    return _repo_cache_root() / f"{key}.git"
+
+
+def _commitish_exists(repo: Path, commitish: str) -> bool:
+    if not commitish:
+        return True
+    return _sh(["git", "-C", str(repo), "cat-file", "-e", f"{commitish}^{{commit}}"], timeout=30).returncode == 0
+
+
+def _ensure_repo_commit(repo: Path, remote: str, commitish: str) -> dict[str, Any]:
+    status: dict[str, Any] = {"commit": commitish}
+    shallow = _sh(["git", "-C", str(repo), "rev-parse", "--is-shallow-repository"], timeout=30)
+    status["was_shallow"] = shallow.stdout.strip() == "true"
+    if status["was_shallow"]:
+        unshallow = _sh(["git", "-C", str(repo), "fetch", "--unshallow", "--no-tags", "origin"], timeout=2400)
+        status["unshallow_returncode"] = unshallow.returncode
+        if unshallow.returncode != 0:
+            status["unshallow_stderr"] = (unshallow.stderr or "")[-2000:]
+    status["present"] = _commitish_exists(repo, commitish)
+    if not commitish or status["present"]:
+        if commitish:
+            _sh(["git", "-C", str(repo), "update-ref", f"refs/gt-cache/{commitish}", commitish], timeout=30)
+        return status
+    fetched = _sh(["git", "-C", str(repo), "fetch", "--no-tags", "origin", commitish], timeout=1800)
+    status["fetch_returncode"] = fetched.returncode
+    status["present"] = _commitish_exists(repo, commitish)
+    if status["present"]:
+        _sh(["git", "-C", str(repo), "update-ref", f"refs/gt-cache/{commitish}", commitish], timeout=30)
+    if not status["present"]:
+        status["stderr"] = (fetched.stderr or "")[-2000:]
+    return status
+
+
+def _materialize_repo_checkout(
+    repo: str, src: Path, commits: list[str]
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """Checkout repo into src using a reusable local object cache.
+
+    Repo-track samples often share large upstream projects. A normal full clone
+    per sample is slow and repeatedly redownloads the same history. Keep a bare
+    cache per remote URL, fetch only the required commits, and clone locally.
+    """
+    clone_errors: list[dict[str, Any]] = []
+    for clone_repo in _repo_clone_candidates(str(repo)):
+        cache = _repo_cache_dir(clone_repo)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache_status: dict[str, Any] = {
+            "cache": str(cache),
+            "source": clone_repo,
+            "reused": cache.is_dir(),
+        }
+        if not (cache / "objects").is_dir():
+            shutil.rmtree(cache, ignore_errors=True)
+            created = _sh(["git", "init", "--bare", str(cache)], timeout=120)
+            if created.returncode != 0:
+                clone_errors.append({
+                    "repo": clone_repo,
+                    "reason": "cache init failed",
+                    "stderr": (created.stderr or "")[-2000:],
+                })
+                continue
+            remote = _sh(["git", "-C", str(cache), "remote", "add", "origin", clone_repo], timeout=60)
+            if remote.returncode != 0:
+                clone_errors.append({
+                    "repo": clone_repo,
+                    "reason": "cache remote add failed",
+                    "stderr": (remote.stderr or "")[-2000:],
+                })
+                continue
+        else:
+            _sh(["git", "-C", str(cache), "remote", "set-url", "origin", clone_repo], timeout=60)
+
+        fetch_reports = []
+        ok = True
+        for commit in [c for c in commits if c]:
+            report = _ensure_repo_commit(cache, clone_repo, commit)
+            fetch_reports.append(report)
+            if not report.get("present"):
+                ok = False
+        cache_status["fetches"] = fetch_reports
+        if not ok:
+            clone_errors.append({
+                "repo": clone_repo,
+                "reason": "required commit fetch failed",
+                "cache": str(cache),
+                "fetches": fetch_reports,
+            })
+            continue
+
+        shutil.rmtree(src, ignore_errors=True)
+        cloned = _sh(["git", "clone", "--no-checkout", str(cache), str(src)], timeout=600)
+        if cloned.returncode != 0:
+            clone_errors.append({
+                "repo": clone_repo,
+                "reason": "local clone from cache failed",
+                "cache": str(cache),
+                "stderr": (cloned.stderr or "")[-2000:],
+            })
+            continue
+        _sh(["git", "-C", str(src), "remote", "set-url", "origin", clone_repo], timeout=60)
+        for commit in [c for c in commits if c]:
+            fetched_local = _sh(
+                [
+                    "git", "-C", str(src), "fetch", "--no-tags", str(cache),
+                    f"refs/gt-cache/{commit}:refs/gt-cache/{commit}",
+                ],
+                timeout=300,
+            )
+            if fetched_local.returncode != 0:
+                clone_errors.append({
+                    "repo": clone_repo,
+                    "reason": "local fetch from cache failed",
+                    "cache": str(cache),
+                    "commit": commit,
+                    "stderr": (fetched_local.stderr or "")[-2000:],
+                })
+                shutil.rmtree(src, ignore_errors=True)
+                break
+        if not src.is_dir():
+            continue
+        first_commit = next((c for c in commits if c), "")
+        if first_commit:
+            checked = _sh(["git", "-C", str(src), "checkout", "-q", first_commit], timeout=300)
+            if checked.returncode != 0:
+                clone_errors.append({
+                    "repo": clone_repo,
+                    "reason": "checkout required commit failed",
+                    "cache": str(cache),
+                    "commit": first_commit,
+                    "stderr": (checked.stderr or "")[-2000:],
+                })
+                shutil.rmtree(src, ignore_errors=True)
+                continue
+            cache_status["checked_out"] = first_commit
+        return clone_repo, clone_errors, cache_status
+    return "", clone_errors, {}
 
 
 def _pull(img: str, retries: int = 3) -> bool:
@@ -176,6 +344,17 @@ def _stage_default_crash_trace(
         if public_poc.get("default_crash_trace_staged"):
             return public_poc
     if not destination.is_file() or not destination.stat().st_size:
+        issue_context = _public_issue_context(sample)
+        if issue_context:
+            destination.write_text(issue_context, encoding="utf-8")
+            digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+            return {
+                "default_crash_trace_staged": True,
+                "source": "sample.issue_description",
+                "source_kind": "public_issue_context",
+                "sha256": f"sha256:{digest}",
+            }
+    if not destination.is_file() or not destination.stat().st_size:
         return {"default_crash_trace_staged": False}
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
     return {
@@ -183,6 +362,25 @@ def _stage_default_crash_trace(
         "source": source,
         "sha256": f"sha256:{digest}",
     }
+
+
+def _public_issue_context(sample: dict[str, Any]) -> str:
+    """Fallback public context for repo samples that ship a PoC but no trace.
+
+    Some OSV.dev Git/NVD records in this dataset have a local PoC and fix diff
+    but no saved sanitizer log. Stage 01 still has to reproduce the crash and
+    write the real sanitizer trace; this text only preserves the public problem
+    statement so Stage 01/02 do not start from an empty context.
+    """
+    for key in ("original_bug_description", "issue_description", "summary", "details"):
+        value = sample.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip() + "\n"
+        if isinstance(value, dict):
+            text = value.get("original") or value.get("summary") or value.get("details")
+            if isinstance(text, str) and text.strip():
+                return text.strip() + "\n"
+    return ""
 
 
 def _stage_default_crash_trace_from_public_poc(
@@ -513,6 +711,871 @@ def _poc_source_dir(sample: dict[str, Any], sid: str) -> Path | None:
     return None
 
 
+def _oss_fuzz_checkout_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "external" / "oss-fuzz"
+
+
+def _ensure_oss_fuzz_project_dir(project: str) -> tuple[Path | None, dict[str, Any]]:
+    """Return the official google/oss-fuzz projects/<project> directory.
+
+    The dataset config stores snippets such as build.sh, but some projects rely
+    on Dockerfile context, helper scripts, or project-level metadata. Keep a
+    sparse checkout of the official repository under external/oss-fuzz and stage
+    the project directory from there.
+    """
+    project = project.strip()
+    status: dict[str, Any] = {"project": project, "available": False}
+    if not project:
+        status["reason"] = "no oss-fuzz project name"
+        return None, status
+    checkout = _oss_fuzz_checkout_root()
+    project_dir = checkout / "projects" / project
+    if (checkout / ".git").is_dir():
+        rev = _sh(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], timeout=30)
+        exists = _sh(
+            ["git", "-C", str(checkout), "cat-file", "-e", f"HEAD:projects/{project}"],
+            timeout=30,
+        )
+        if exists.returncode == 0:
+            status.update({
+                "available": True,
+                "path": str(project_dir),
+                "checkout": str(checkout),
+                "commit": rev.stdout.strip() if rev.returncode == 0 else "",
+                "reused": project_dir.is_dir(),
+                "tree_available": True,
+            })
+            return project_dir, status
+    if project_dir.is_dir():
+        rev = _sh(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], timeout=30)
+        status.update({
+            "available": True,
+            "path": str(project_dir),
+            "checkout": str(checkout),
+            "commit": rev.stdout.strip() if rev.returncode == 0 else "",
+            "reused": True,
+        })
+        return project_dir, status
+
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    if not (checkout / ".git").is_dir():
+        shutil.rmtree(checkout, ignore_errors=True)
+        cloned = _sh([
+            "git", "clone", "--depth", "1", "--filter=blob:none", "--no-checkout",
+            "https://github.com/google/oss-fuzz.git", str(checkout)
+        ], timeout=1800)
+        if cloned.returncode != 0:
+            status.update({
+                "reason": "clone google/oss-fuzz failed",
+                "stderr": cloned.stderr[-2000:],
+            })
+            return None, status
+    rev = _sh(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], timeout=30)
+    exists = _sh(
+        ["git", "-C", str(checkout), "cat-file", "-e", f"HEAD:projects/{project}"],
+        timeout=30,
+    )
+    if exists.returncode == 0:
+        status.update({
+            "available": True,
+            "path": str(project_dir),
+            "checkout": str(checkout),
+            "commit": rev.stdout.strip() if rev.returncode == 0 else "",
+            "reused": False,
+            "tree_available": True,
+        })
+        return project_dir, status
+
+    _sh(["git", "-C", str(checkout), "config", "core.sparseCheckout", "true"], timeout=30)
+    sparse_file = checkout / ".git" / "info" / "sparse-checkout"
+    existing = sparse_file.read_text(encoding="utf-8").splitlines() if sparse_file.is_file() else []
+    wanted = f"projects/{project}/*"
+    if wanted not in existing:
+        sparse_file.parent.mkdir(parents=True, exist_ok=True)
+        sparse_file.write_text("\n".join(existing + [wanted]) + "\n", encoding="utf-8")
+    checked = _sh(["git", "-C", str(checkout), "checkout", "HEAD"], timeout=1800)
+    if checked.returncode != 0:
+        status.update({
+            "reason": "sparse checkout failed",
+            "stderr": checked.stderr[-2000:],
+        })
+        return None, status
+    if not project_dir.is_dir():
+        status["reason"] = f"projects/{project} not present in google/oss-fuzz"
+        return None, status
+    rev = _sh(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], timeout=30)
+    status.update({
+        "available": True,
+        "path": str(project_dir),
+        "checkout": str(checkout),
+        "commit": rev.stdout.strip() if rev.returncode == 0 else "",
+        "reused": False,
+    })
+    return project_dir, status
+
+
+def _oss_fuzz_project_commit_before(
+    checkout: Path, project: str, reference_time: str
+) -> tuple[str, dict[str, Any]]:
+    status: dict[str, Any] = {"reference_time": reference_time}
+    if not reference_time:
+        return "", status
+    unshallow = _sh(["git", "-C", str(checkout), "rev-parse", "--is-shallow-repository"], timeout=30)
+    if unshallow.stdout.strip() == "true":
+        fetched = _sh(
+            ["git", "-C", str(checkout), "fetch", "--unshallow", "--filter=blob:none", "origin"],
+            timeout=2400,
+        )
+        status["unshallow_fetch"] = fetched.returncode == 0
+        if fetched.returncode != 0:
+            status["unshallow_fetch_error"] = fetched.stderr[-1000:]
+    rev = _sh(
+        [
+            "git", "-C", str(checkout), "rev-list", "-1",
+            f"--before={reference_time}", "HEAD", "--", f"projects/{project}",
+        ],
+        timeout=120,
+    )
+    commit = rev.stdout.strip()
+    status["historical_commit"] = commit[:12] if commit else ""
+    if rev.returncode != 0 or not commit:
+        status["historical_commit_error"] = (rev.stderr or "no project commit before reference time")[-1000:]
+        return "", status
+    exists = _sh(
+        ["git", "-C", str(checkout), "cat-file", "-e", f"{commit}:projects/{project}"],
+        timeout=30,
+    )
+    if exists.returncode != 0:
+        status["historical_commit_error"] = f"projects/{project} absent at {commit[:12]}"
+        return "", status
+    return commit, status
+
+
+def _export_oss_fuzz_project_at_commit(
+    checkout: Path, project: str, commit: str, target: Path
+) -> dict[str, Any]:
+    export_status: dict[str, Any] = {
+        "source": "google/oss-fuzz",
+        "historical_commit": commit[:12],
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".{target.name}.tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    archived = subprocess.run(
+        ["git", "-C", str(checkout), "archive", "--format=tar", f"{commit}:projects/{project}"],
+        capture_output=True,
+        timeout=300,
+    )
+    if archived.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        export_status.update({
+            "exported": False,
+            "checkout_error": archived.stderr.decode("utf-8", errors="replace")[-1000:],
+        })
+        return export_status
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as tar:
+            tar.extractall(tmp)
+    except (tarfile.TarError, OSError) as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        export_status.update({
+            "exported": False,
+            "tar_error": str(exc),
+        })
+        return export_status
+    if not any(tmp.iterdir()):
+        shutil.rmtree(tmp, ignore_errors=True)
+        export_status.update({
+            "exported": False,
+            "tar_error": f"projects/{project} archive was empty",
+        })
+        return export_status
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.move(str(tmp), str(target))
+    export_status["exported"] = True
+    return export_status
+
+
+def _stage_oss_fuzz_project_context(
+    d: Path, project: str, reference_time: str = ""
+) -> dict[str, Any]:
+    project_dir, status = _ensure_oss_fuzz_project_dir(project)
+    target = d / "oss_fuzz_project"
+    shutil.rmtree(target, ignore_errors=True)
+    if not project_dir:
+        return status
+    historical_status: dict[str, Any] = {}
+    commit = ""
+    checkout = Path(str(status.get("checkout") or _oss_fuzz_checkout_root()))
+    if reference_time and checkout.is_dir():
+        commit, historical_status = _oss_fuzz_project_commit_before(
+            checkout, project, reference_time
+        )
+        status["historical_checkout"] = historical_status
+    if commit:
+        exported = _export_oss_fuzz_project_at_commit(checkout, project, commit, target)
+        status["historical_export"] = exported
+        if not exported.get("exported"):
+            current_export = _export_oss_fuzz_project_at_commit(checkout, project, "HEAD", target)
+            status["historical_export_fallback"] = current_export
+            if not current_export.get("exported"):
+                shutil.copytree(project_dir, target)
+                status["historical_export_fallback_copytree"] = "current_sparse_checkout"
+    else:
+        current_export = _export_oss_fuzz_project_at_commit(checkout, project, "HEAD", target)
+        status["current_export"] = current_export
+        if not current_export.get("exported"):
+            shutil.copytree(project_dir, target)
+            status["current_export_fallback"] = "current_sparse_checkout"
+    file_count = sum(1 for path in target.rglob("*") if path.is_file())
+    status.update({
+        "staged": True,
+        "staged_path": str(target),
+        "files": file_count,
+        "has_dockerfile": (target / "Dockerfile").is_file(),
+        "has_build_sh": (target / "build.sh").is_file(),
+        "has_project_yaml": (target / "project.yaml").is_file(),
+    })
+    status["dockerfile_git_clones"] = _stage_oss_fuzz_dockerfile_clones(
+        d, target, project, reference_time
+    )
+    status["dockerfile_setup_script"] = _stage_oss_fuzz_dockerfile_setup_script(
+        d, target, project
+    )
+    status["dockerfile_workdir"] = _oss_fuzz_dockerfile_workdir(target / "Dockerfile")
+    return status
+
+
+def _stage_oss_fuzz_dockerfile_clones(
+    d: Path, project_dir: Path, project: str, reference_time: str = ""
+) -> list[dict[str, Any]]:
+    """Stage helper repositories cloned by an OSS-Fuzz Dockerfile.
+
+    The vulnerable project itself is already checked out at its benchmark commit
+    under _work/src. Helper repos such as curl-fuzzer are not, and staging only
+    projects/<project>/build.sh leaves the agent without scripts referenced by
+    the official recipe. Clone those helpers deterministically from the URLs in
+    Dockerfile and record the resulting commit.
+    """
+    dockerfile = project_dir / "Dockerfile"
+    if not dockerfile.is_file():
+        return []
+    clone_specs = _oss_fuzz_dockerfile_clone_specs(dockerfile)
+    staged_root = d / "oss_fuzz_src"
+    shutil.rmtree(staged_root, ignore_errors=True)
+    results: list[dict[str, Any]] = []
+    normalized_project = _normalize_repo_name(project)
+    for spec in clone_specs:
+        raw_repo_name = _repo_basename_from_url(spec["url"])
+        repo_name = _normalize_repo_name(raw_repo_name)
+        dest_name = _oss_fuzz_src_dest_name(spec["dest"], raw_repo_name)
+        if _normalize_repo_name(dest_name) == normalized_project or repo_name == normalized_project:
+            results.append({**spec, "staged": False, "skipped": "benchmark source is _work/src"})
+            continue
+        target = staged_root / dest_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cmd = ["git", "clone", "--filter=blob:none", spec["url"], str(target)]
+        if not reference_time:
+            cmd.insert(2, "--depth")
+            cmd.insert(3, "1")
+        cloned = _sh(cmd, timeout=1800)
+        item = {**spec, "staged": cloned.returncode == 0, "path": str(target)}
+        if cloned.returncode == 0:
+            if reference_time:
+                checkout = _checkout_repo_before(target, reference_time)
+                item.update(checkout)
+            rev = _sh(["git", "-C", str(target), "rev-parse", "--short", "HEAD"], timeout=30)
+            item["commit"] = rev.stdout.strip() if rev.returncode == 0 else ""
+        else:
+            item["stderr"] = cloned.stderr[-2000:]
+            shutil.rmtree(target, ignore_errors=True)
+        results.append(item)
+    if not any(item.get("staged") for item in results):
+        shutil.rmtree(staged_root, ignore_errors=True)
+    return results
+
+
+def _checkout_repo_before(repo: Path, reference_time: str) -> dict[str, Any]:
+    """Check a helper repo out to the latest commit before the sample commit time."""
+    status: dict[str, Any] = {"reference_time": reference_time}
+    rev = _sh(
+        ["git", "-C", str(repo), "rev-list", "-1", f"--before={reference_time}", "HEAD"],
+        timeout=120,
+    )
+    target = rev.stdout.strip()
+    if rev.returncode != 0 or not target:
+        status["checkout_before"] = False
+        status["checkout_before_error"] = (rev.stderr or "no commit before reference time")[-1000:]
+        return status
+    checked = _sh(["git", "-C", str(repo), "checkout", "-q", target], timeout=300)
+    status["checkout_before"] = checked.returncode == 0
+    status["checkout_before_commit"] = target[:12]
+    if checked.returncode != 0:
+        status["checkout_before_error"] = checked.stderr[-1000:]
+    return status
+
+
+def _oss_fuzz_dockerfile_clone_specs(dockerfile: Path) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for line in _dockerfile_logical_lines(dockerfile):
+        if not line.upper().startswith("RUN ") or "git clone" not in line:
+            continue
+        command = line[4:].strip()
+        for part in re.split(r"\s+(?:&&|;)\s+", command):
+            if "git clone" not in part:
+                continue
+            try:
+                tokens = shlex.split(part)
+            except ValueError:
+                continue
+            if len(tokens) < 3 or tokens[0:2] != ["git", "clone"]:
+                continue
+            url_index = next(
+                (i for i, token in enumerate(tokens[2:], start=2)
+                 if token.startswith("http://") or token.startswith("https://")),
+                -1,
+            )
+            if url_index < 0:
+                continue
+            url = tokens[url_index]
+            dest = ""
+            if url_index + 1 < len(tokens) and not tokens[url_index + 1].startswith("-"):
+                dest = tokens[url_index + 1]
+            specs.append({"url": url, "dest": dest, "dockerfile": str(dockerfile)})
+    return specs
+
+
+def _dockerfile_logical_lines(dockerfile: Path) -> list[str]:
+    try:
+        text = dockerfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    logical_lines: list[str] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if pending:
+            pending += " " + line
+        else:
+            pending = line
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip()
+            continue
+        logical_lines.append(pending)
+        pending = ""
+    if pending:
+        logical_lines.append(pending)
+    return logical_lines
+
+
+def _oss_fuzz_dockerfile_workdir(dockerfile: Path) -> str:
+    """Return the final WORKDIR from an OSS-Fuzz Dockerfile, if present."""
+    workdir = ""
+    if not dockerfile.is_file():
+        return workdir
+    for line in _dockerfile_logical_lines(dockerfile):
+        if not line.upper().startswith("WORKDIR "):
+            continue
+        raw = line.split(None, 1)[1].strip()
+        try:
+            tokens = shlex.split(raw)
+            if tokens:
+                raw = tokens[0]
+        except ValueError:
+            pass
+        workdir = raw
+    return workdir
+
+
+def _oss_fuzz_runtime_workdir(d: Path, fallback: str = "$SRC") -> str:
+    """Translate the staged Dockerfile WORKDIR into the runtime /gt/_work layout."""
+    dockerfile = d / "oss_fuzz_project" / "Dockerfile"
+    workdir = _oss_fuzz_dockerfile_workdir(dockerfile) or fallback
+    replacements = {
+        "${SRC}": "/gt/_work",
+        "$SRC": "/gt/_work",
+        "/src": "/gt/_work",
+        "${OUT}": "/gt/_out",
+        "$OUT": "/gt/_out",
+        "/out": "/gt/_out",
+        "${WORK}": "/gt/_work",
+        "$WORK": "/gt/_work",
+        "/work": "/gt/_work",
+    }
+    for old, new in replacements.items():
+        if workdir == old:
+            return new
+        if workdir.startswith(old + "/"):
+            return new + workdir[len(old):]
+    if workdir and not workdir.startswith("/"):
+        return "/gt/_work/" + workdir.strip("/")
+    return workdir
+
+
+def _setup_command_local_scripts(d: Path, project: str, command: str) -> list[Path]:
+    """Return prepared project scripts invoked by a Dockerfile RUN command."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    scripts: list[Path] = []
+    source_root = d / "_work" / "src"
+    for token in tokens:
+        cleaned = token.strip("'\"")
+        if not cleaned or cleaned.startswith("-"):
+            continue
+        relative_candidates: list[str] = []
+        if "/" in cleaned or cleaned.endswith(".sh"):
+            relative_candidates.append(cleaned)
+            for prefix in (f"{project}/", f"./{project}/"):
+                if cleaned.startswith(prefix):
+                    relative_candidates.append(cleaned[len(prefix):])
+        for relative in relative_candidates:
+            candidate = source_root / relative.lstrip("./")
+            if candidate.is_file():
+                scripts.append(candidate)
+        for prefix in (
+            f"${{SRC}}/{project}/",
+            f"$SRC/{project}/",
+            f"/src/{project}/",
+            f"/gt/_work/{project}/",
+        ):
+            if cleaned.startswith(prefix):
+                rel = cleaned[len(prefix):]
+                candidate = source_root / rel
+                if candidate.is_file():
+                    scripts.append(candidate)
+                break
+    return scripts
+
+
+def _setup_script_needs_root(path: Path) -> bool:
+    """Conservatively detect official setup scripts that install system deps."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    low = text.lower()
+    return (
+        "apt-get " in low
+        or re.search(r"(^|\s)apt\s+", low) is not None
+        or "/usr/local" in low
+        or re.search(r"(^|\s)make\s+install(\s|$)", low) is not None
+        or re.search(r"(^|\s)(install|cp|mv|rm|ln|chmod|chown)\s+/(?!gt\b|tmp\b)", low) is not None
+    )
+
+
+def _translate_oss_fuzz_path(path: str) -> str:
+    """Translate common OSS-Fuzz Docker paths into the staged /gt layout."""
+    path = path.strip()
+    replacements = {
+        "${SRC}": "/gt/_work",
+        "$SRC": "/gt/_work",
+        "/src": "/gt/_work",
+        "${OUT}": "/gt/_out",
+        "$OUT": "/gt/_out",
+        "/out": "/gt/_out",
+        "${WORK}": "/gt/_work",
+        "$WORK": "/gt/_work",
+        "/work": "/gt/_work",
+    }
+    for old, new in replacements.items():
+        if path == old:
+            return new
+        if path.startswith(old + "/"):
+            return new + path[len(old):]
+    if path and not path.startswith("/"):
+        return "/gt/_work/" + path.strip("/")
+    return path
+
+
+def _dockerfile_env_exports(dockerfile: Path) -> list[str]:
+    """Return shell exports for Dockerfile ENV instructions."""
+    exports: list[str] = []
+    if not dockerfile.is_file():
+        return exports
+    for line in _dockerfile_logical_lines(dockerfile):
+        if not line.upper().startswith("ENV "):
+            continue
+        raw = line[4:].strip()
+        try:
+            tokens = shlex.split(raw)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        pairs: list[tuple[str, str]] = []
+        if any("=" in token for token in tokens):
+            for token in tokens:
+                key, sep, value = token.partition("=")
+                if sep and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+                    pairs.append((key, value))
+        elif len(tokens) >= 2 and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", tokens[0]):
+            pairs.append((tokens[0], " ".join(tokens[1:])))
+        for key, value in pairs:
+            exports.append(f"export {key}={shlex.quote(value)}")
+    return exports
+
+
+def _download_oss_fuzz_dockerfile_add_urls(d: Path, project_dir: Path) -> list[dict[str, Any]]:
+    """Download remote Dockerfile ADD artifacts into the per-sample result dir.
+
+    Docker would fetch these URLs while building the official OSS-Fuzz builder
+    image. Stage 01 runs in gt-memory-env instead, so the files must be staged
+    explicitly from the Dockerfile URL for this sample.
+    """
+    dockerfile = project_dir / "Dockerfile"
+    if not dockerfile.is_file():
+        return []
+    downloads_root = d / "oss_fuzz_downloads"
+    results: list[dict[str, Any]] = []
+    for line in _dockerfile_logical_lines(dockerfile):
+        if not line.upper().startswith("ADD "):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue
+        if len(tokens) < 3:
+            continue
+        args = tokens[1:]
+        if args[0].startswith("--"):
+            continue
+        dest = _translate_oss_fuzz_path(args[-1])
+        for source in args[:-1]:
+            if not source.startswith(("http://", "https://")):
+                continue
+            filename = Path(urllib.parse.urlparse(source).path).name
+            if not filename:
+                filename = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            target = downloads_root / filename
+            item: dict[str, Any] = {
+                "url": source,
+                "dest": dest,
+                "filename": filename,
+                "path": str(target),
+                "staged": False,
+            }
+            try:
+                downloads_root.mkdir(parents=True, exist_ok=True)
+                if not target.is_file() or target.stat().st_size == 0:
+                    tmp = target.with_name(f".{target.name}.tmp")
+                    with urllib.request.urlopen(source, timeout=600) as response:
+                        with tmp.open("wb") as out:
+                            shutil.copyfileobj(response, out)
+                    tmp.replace(target)
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                item.update({
+                    "staged": target.is_file() and target.stat().st_size > 0,
+                    "bytes": target.stat().st_size,
+                    "sha256": f"sha256:{digest}",
+                })
+            except Exception as exc:  # noqa: BLE001 - record per-sample fetch failure.
+                item["error"] = str(exc)
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            results.append(item)
+    if not any(item.get("staged") for item in results):
+        shutil.rmtree(downloads_root, ignore_errors=True)
+    return results
+
+
+def _dockerfile_copy_commands(
+    project_dir: Path, remote_adds: list[dict[str, Any]] | None = None
+) -> list[str]:
+    """Replay simple Dockerfile COPY/ADD instructions from staged project files."""
+    dockerfile = project_dir / "Dockerfile"
+    if not dockerfile.is_file():
+        return []
+    remote_by_url = {
+        str(item.get("url")): str(item.get("filename"))
+        for item in (remote_adds or [])
+        if item.get("staged") and item.get("url") and item.get("filename")
+    }
+    commands: list[str] = []
+    for line in _dockerfile_logical_lines(dockerfile):
+        upper = line.upper()
+        if not (upper.startswith("COPY ") or upper.startswith("ADD ")):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue
+        if len(tokens) < 3:
+            continue
+        args = tokens[1:]
+        if args[0].startswith("--"):
+            # Cross-stage COPY and other advanced Dockerfile forms are not
+            # needed for the OSS-Fuzz project scripts we replay here.
+            continue
+        dest = _translate_oss_fuzz_path(args[-1])
+        sources = args[:-1]
+        dest_is_dir = len(sources) > 1 or dest.endswith("/")
+        for source in sources:
+            if source.startswith("--"):
+                continue
+            if source.startswith(("http://", "https://")):
+                remote_name = remote_by_url.get(source)
+                if not remote_name:
+                    continue
+                source_path = f"/gt/oss_fuzz_downloads/{remote_name}"
+            else:
+                source = source.lstrip("/")
+                source_path = f"/gt/oss_fuzz_project/{source}"
+            quoted_source = shlex.quote(source_path)
+            has_glob = any(ch in source_path for ch in "*?[")
+            if dest_is_dir:
+                quoted_dest = shlex.quote(dest.rstrip("/") or dest)
+                if has_glob:
+                    commands.append(
+                        f"shopt -s nullglob; _gt_copy_matches=({source_path}); "
+                        f"if (( ${{#_gt_copy_matches[@]}} )); then "
+                        f"mkdir -p {quoted_dest}; cp -a \"${{_gt_copy_matches[@]}}\" {quoted_dest}/; fi; "
+                        "unset _gt_copy_matches"
+                    )
+                else:
+                    commands.append(
+                        f"if [[ -e {quoted_source} ]]; then "
+                        f"mkdir -p {quoted_dest}; cp -a {quoted_source} {quoted_dest}/; fi"
+                    )
+            else:
+                quoted_dest = shlex.quote(dest)
+                quoted_parent = shlex.quote(str(Path(dest).parent))
+                if has_glob:
+                    commands.append(
+                        f"shopt -s nullglob; _gt_copy_matches=({source_path}); "
+                        f"if (( ${{#_gt_copy_matches[@]}} == 1 )); then "
+                        f"mkdir -p {quoted_parent}; cp -a \"${{_gt_copy_matches[0]}}\" {quoted_dest}; fi; "
+                        "unset _gt_copy_matches"
+                    )
+                else:
+                    commands.append(
+                        f"if [[ -e {quoted_source} ]]; then "
+                        f"mkdir -p {quoted_parent}; cp -a {quoted_source} {quoted_dest}; fi"
+                    )
+    return commands
+
+
+def _stage_oss_fuzz_dockerfile_setup_script(
+    d: Path, project_dir: Path, project: str
+) -> dict[str, Any]:
+    """Write a runnable subset of the official Dockerfile dependency setup.
+
+    Stage 01 runs inside the shared gt-memory-env image rather than building the
+    exact OSS-Fuzz Docker image. Still, several projects keep required setup in
+    Dockerfile RUN lines: curl runs curl-fuzzer's dependency script, clamav
+    builds /mussels, and POCO copies its upstream build script. Preserve those
+    official commands as an explicit artifact instead of expecting the agent to
+    rediscover them.
+    """
+    dockerfile = project_dir / "Dockerfile"
+    status: dict[str, Any] = {"staged": False}
+    if not dockerfile.is_file():
+        status["reason"] = "no Dockerfile"
+        return status
+
+    dockerfile_env = _dockerfile_env_exports(dockerfile)
+    remote_adds = _download_oss_fuzz_dockerfile_add_urls(d, project_dir)
+    copy_commands = _dockerfile_copy_commands(project_dir, remote_adds)
+    commands: list[str] = []
+    for line in _dockerfile_logical_lines(dockerfile):
+        upper = line.upper()
+        if not upper.startswith("RUN "):
+            continue
+        command = line[4:].strip()
+        if _skip_dockerfile_setup_command(command):
+            continue
+        commands.append(command)
+    workdir = _oss_fuzz_runtime_workdir(d)
+    command_scripts = [
+        script
+        for command in commands
+        for script in _setup_command_local_scripts(d, project, command)
+    ]
+    needs_root = any(
+        re.search(r"(^|\s)(mkdir|install|cp|mv|rm|ln|chmod|chown)\s+/(?!gt\b|tmp\b)", command)
+        or "/mussels" in command
+        for command in commands
+    ) or any(_setup_script_needs_root(script) for script in command_scripts)
+    dockerfile_text = dockerfile.read_text(encoding="utf-8", errors="replace")
+    rust_base_image = "base-builder-rust" in dockerfile_text
+    needs_rustup = (
+        rust_base_image
+        or project == "clamav"
+        or any(re.search(r"(^|\s)rustup(\s|$)", command) for command in commands)
+    )
+    rustup_bootstrap = ""
+    if needs_rustup:
+        nightly_setup = ""
+        if project == "clamav" and "RUSTUP_TOOLCHAIN" not in "\n".join(dockerfile_env):
+            nightly_setup = (
+                "rustup toolchain install nightly --profile minimal || rustup update nightly\n"
+                "export RUSTUP_TOOLCHAIN=nightly-x86_64-unknown-linux-gnu\n"
+            )
+        rustup_bootstrap = (
+            "\n"
+            "# The official OSS-Fuzz base-builder-rust image already provides rustup.\n"
+            "# gt-memory-env may only have distro cargo/rustc, so bootstrap rustup\n"
+            "# into HOME before replaying official rustup commands.\n"
+            "if ! command -v rustup >/dev/null 2>&1; then\n"
+            "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | "
+            "sh -s -- -y --profile minimal --default-toolchain stable\n"
+            "  export PATH=\"${HOME:-/tmp}/.cargo/bin:$PATH\"\n"
+            "fi\n"
+            + nightly_setup
+        )
+
+    env_block = (
+        "\n".join(dockerfile_env) + "\n\n"
+        if dockerfile_env
+        else "# No Dockerfile ENV instructions.\n\n"
+    )
+    copy_block = (
+        "\n".join(copy_commands) + "\n\n"
+        if copy_commands
+        else "# No project-local COPY/ADD scripts.\n\n"
+    )
+    run_block = (
+        "\n".join(commands) + "\n"
+        if commands
+        else "# No extra RUN setup commands; layout only.\n"
+    )
+    setup_parts = [
+        "#!/usr/bin/env bash\n",
+        "set -euo pipefail\n\n",
+        'export SRC="${SRC:-/gt/_work}"\n',
+        'export OUT="${OUT:-/gt/_out}"\n',
+        'export WORK="${WORK:-/gt/_work}"\n',
+        'export PATH="${HOME:-/tmp}/.cargo/bin:$PATH"\n',
+        'export PIP_BREAK_SYSTEM_PACKAGES="${PIP_BREAK_SYSTEM_PACKAGES:-1}"\n',
+        'mkdir -p "$SRC" "$OUT" "$WORK"\n\n',
+        "# Recreate the official OSS-Fuzz /src layout from prepared local material.\n",
+        f'if [[ ! -e "$SRC/{project}" && -d /gt/_work/src ]]; then\n',
+        f'  ln -s /gt/_work/src "$SRC/{project}"\n',
+        "fi\n",
+        'if [[ -d /gt/oss_fuzz_src ]]; then\n',
+        '  cp -a -n /gt/oss_fuzz_src/. "$SRC"/\n',
+        "fi\n",
+        f'mkdir -p {shlex.quote(workdir)} 2>/dev/null || true\n\n',
+        "# Make official dependency scripts retry-safe in the persistent /gt/_work.\n",
+        "_gt_real_git() { command git \"$@\"; }\n",
+        "git() {\n",
+        "  if [[ \"${1:-}\" == \"clone\" ]]; then\n",
+        "    local _gt_url=\"\" _gt_dest=\"\" _gt_i\n",
+        "    local _gt_args=(\"$@\")\n",
+        "    for ((_gt_i=1; _gt_i<${#_gt_args[@]}; _gt_i++)); do\n",
+        "      case \"${_gt_args[$_gt_i]}\" in\n",
+        "        --branch|--depth|--filter|--origin|--reference|--template|--upload-pack|--config|--separate-git-dir|--jobs)\n",
+        "          ((_gt_i++)) || true\n",
+        "          ;;\n",
+        "        http://*|https://*|git@*|*.git)\n",
+        "          _gt_url=\"${_gt_args[$_gt_i]}\"\n",
+        "          if (( _gt_i + 1 < ${#_gt_args[@]} )) && [[ \"${_gt_args[$((_gt_i+1))]}\" != -* ]]; then\n",
+        "            _gt_dest=\"${_gt_args[$((_gt_i+1))]}\"\n",
+        "          fi\n",
+        "          ;;\n",
+        "      esac\n",
+        "    done\n",
+        "    if [[ -z \"$_gt_dest\" && -n \"$_gt_url\" ]]; then\n",
+        "      _gt_dest=\"${_gt_url##*/}\"\n",
+        "      _gt_dest=\"${_gt_dest%.git}\"\n",
+        "    fi\n",
+        "    if [[ -n \"$_gt_dest\" ]]; then\n",
+        "      case \"$_gt_dest\" in\n",
+        f"        \"$SRC/{project}\"|\"$SRC/{project}/\"*) ;;\n",
+        "        /gt/_work/*|\"$SRC\"/*|\"$WORK\"/*) rm -rf \"$_gt_dest\" ;;\n",
+        "      esac\n",
+        "    fi\n",
+        "  fi\n",
+        "  _gt_real_git \"$@\"\n",
+        "}\n",
+        "export -f git _gt_real_git\n\n",
+        "# Dockerfile ENV instructions required by the official build.\n",
+        env_block,
+        "# Dockerfile COPY/ADD instructions for project-local helper scripts.\n",
+        copy_block,
+        rustup_bootstrap,
+        f"# Official non-clone RUN commands from projects/{project}/Dockerfile.\n",
+        run_block,
+    ]
+    setup_text = "".join(setup_parts)
+    script = d / "oss_fuzz_setup.sh"
+    script.write_text(setup_text, encoding="utf-8")
+    script.chmod(0o755)
+    status.update({
+        "staged": True,
+        "path": str(script),
+        "commands": len(commands),
+        "env_exports": len(dockerfile_env),
+        "copy_commands": len(copy_commands),
+        "remote_adds": remote_adds,
+        "workdir": workdir,
+        "needs_root": needs_root,
+        "inspected_setup_scripts": [str(path) for path in command_scripts],
+    })
+    return status
+
+
+def _skip_dockerfile_setup_command(command: str) -> bool:
+    """True when prepare or the base image already covers a Dockerfile RUN line.
+
+    The repositories themselves are staged separately under oss_fuzz_src, while
+    non-clone commands such as dependency builds must be preserved. Package
+    installs are deliberately not replayed from Stage 01; if a project needs a
+    new system package, that belongs in the shared gt-memory-env image.
+    """
+    parts = [part.strip() for part in re.split(r"\s+(?:&&|;)\s+", command) if part.strip()]
+    if not parts:
+        return False
+    low = command.lower()
+    if "apt-get " in low or "apt " in low:
+        return True
+    if re.search(r"\bcp\s+.*oss-fuzz-build\.sh\b", command):
+        return True
+    for part in parts:
+        try:
+            tokens = shlex.split(part)
+        except ValueError:
+            return False
+        if len(tokens) < 3 or tokens[0:2] != ["git", "clone"]:
+            return False
+    return True
+
+
+def _oss_fuzz_src_dest_name(dest: str, repo_name: str) -> str:
+    if dest:
+        cleaned = dest.rstrip("/")
+        for prefix in ("/src/", "$SRC/", "${SRC}/"):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):]
+                break
+        if cleaned in ("/src", "$SRC", "${SRC}"):
+            cleaned = repo_name
+        name = Path(cleaned).name
+        if name:
+            return name
+    return repo_name
+
+
+def _repo_basename_from_url(url: str) -> str:
+    name = Path(url.rstrip("/")).name
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name
+
+
+def _normalize_repo_name(name: str) -> str:
+    name = name.strip().lower()
+    if name.endswith(".git"):
+        name = name[:-4]
+    return re.sub(r"[^a-z0-9]+", "", name)
+
+
 # A crash type implies which sanitizer produced it, and therefore which build
 # flags reproduce it. Projects are usually fuzzed under several, so the crash
 # record is what narrows it down. Ordered: first match wins.
@@ -742,6 +1805,50 @@ def _synthesize_ossfuzz_bug_report(sample: dict[str, Any], d: Path, sid: str) ->
         lines.append(cfg["build_sh"].rstrip())
         lines.append("```")
         lines.append("")
+    staged_project = d / "oss_fuzz_project"
+    if staged_project.is_dir():
+        lines.append("## Official OSS-Fuzz project context staged by prepare")
+        lines.append("")
+        staged_files = sorted(
+            str(path.relative_to(staged_project))
+            for path in staged_project.rglob("*")
+            if path.is_file()
+        )
+        if staged_files:
+            lines.append("Files staged from google/oss-fuzz:")
+            lines += [f"  - {path}" for path in staged_files[:40]]
+            if len(staged_files) > 40:
+                lines.append(f"  - ... {len(staged_files) - 40} more")
+            lines.append("")
+        dockerfile = staged_project / "Dockerfile"
+        if dockerfile.is_file():
+            lines.append("Dockerfile:")
+            lines.append("")
+            lines.append("```Dockerfile")
+            lines.append(dockerfile.read_text(encoding="utf-8", errors="replace").rstrip())
+            lines.append("```")
+            lines.append("")
+        setup_script = d / "oss_fuzz_setup.sh"
+        if setup_script.is_file():
+            lines.append("Dockerfile dependency/setup commands staged by prepare:")
+            lines.append("  - /gt/oss_fuzz_setup.sh")
+            lines.append("")
+            lines.append(
+                "Run this setup script before /gt/oss_fuzz_build.sh when the "
+                "Dockerfile installs project dependencies, builds helper "
+                "prefixes such as /mussels, or runs companion-repository "
+                "dependency scripts."
+            )
+            lines.append("")
+        staged_helpers = d / "oss_fuzz_src"
+        if staged_helpers.is_dir():
+            helper_dirs = sorted(
+                path.name for path in staged_helpers.iterdir() if path.is_dir()
+            )
+            if helper_dirs:
+                lines.append("Helper repositories staged from Dockerfile git clones:")
+                lines += [f"  - /gt/oss_fuzz_src/{name}" for name in helper_dirs]
+                lines.append("")
     if cfg.get("source"):
         lines.append(f"## Project configuration: {cfg['source']}")
         lines.append("")
@@ -750,17 +1857,98 @@ def _synthesize_ossfuzz_bug_report(sample: dict[str, Any], d: Path, sid: str) ->
     return True
 
 
-def _stage_ossfuzz_build_recipe(d: Path, cfg: dict[str, Any]) -> bool:
-    build_sh = str(cfg.get("build_sh") or "").rstrip()
-    if not build_sh:
+def _write_oss_fuzz_build_wrapper(d: Path, body: str, workdir: str) -> bool:
+    body = body.rstrip()
+    if not body:
         return False
     recipe = d / "oss_fuzz_build.sh"
-    recipe.write_text(build_sh + "\n", encoding="utf-8")
+    recipe.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'export SRC="${SRC:-/gt/_work}"\n'
+        'export OUT="${OUT:-/gt/_out}"\n'
+        'export WORK="${WORK:-/gt/_work}"\n'
+        f'cd "${{GT_OSS_FUZZ_WORKDIR:-{workdir}}}"\n'
+        "\n"
+        + body
+        + "\n",
+        encoding="utf-8",
+    )
     recipe.chmod(0o755)
     return True
 
 
-def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dict[str, Any]:
+def _stage_ossfuzz_build_recipe(d: Path, cfg: dict[str, Any]) -> bool:
+    build_sh = str(cfg.get("build_sh") or "").rstrip()
+    if not build_sh:
+        return False
+    return _write_oss_fuzz_build_wrapper(d, build_sh, _oss_fuzz_runtime_workdir(d))
+
+
+def _stage_official_oss_fuzz_build_recipe(d: Path) -> bool:
+    """Stage projects/<project>/build.sh from official google/oss-fuzz."""
+    candidate = d / "oss_fuzz_project" / "build.sh"
+    if not candidate.is_file():
+        return False
+    return _write_oss_fuzz_build_wrapper(
+        d,
+        "# Staged from official google/oss-fuzz projects/<project>/build.sh\n"
+        + candidate.read_text(encoding="utf-8", errors="replace"),
+        _oss_fuzz_runtime_workdir(d),
+    )
+
+
+def _stage_upstream_ossfuzz_build_recipe(d: Path) -> bool:
+    """Stage a project-local OSS-Fuzz build script from the vulnerable checkout."""
+    src = d / "_work" / "src"
+    for rel in (
+        "build/script/oss-fuzz-build.sh",
+        "build/oss-fuzz-build.sh",
+        "fuzzer/ossfuzz.sh",
+        "tests/ossfuzz.sh",
+    ):
+        candidate = src / rel
+        if candidate.is_file():
+            return _write_oss_fuzz_build_wrapper(
+                d,
+                candidate.read_text(encoding="utf-8", errors="replace"),
+                _oss_fuzz_runtime_workdir(d),
+            )
+    for rel in (
+        "build/script/oss-fuzz-build.sh",
+        "build/oss-fuzz-build.sh",
+        "fuzzer/ossfuzz.sh",
+        "tests/ossfuzz.sh",
+    ):
+        body, source = _read_upstream_repo_file(src, rel)
+        if body:
+            return _write_oss_fuzz_build_wrapper(
+                d,
+                f"# Staged from upstream project repository: {source}\n" + body,
+                _oss_fuzz_runtime_workdir(d),
+            )
+    return False
+
+
+def _read_upstream_repo_file(repo: Path, rel: str) -> tuple[str, str]:
+    """Read a harness/build helper from the same upstream repo when the
+    vulnerable checkout predates it.
+
+    This is for OSS-Fuzz build material only. The vulnerable and fixed source
+    used for GT semantics remains the checked-out benchmark commit.
+    """
+    if not (repo / ".git").exists():
+        return "", ""
+    for rev in ("origin/HEAD", "origin/main", "origin/master", "HEAD"):
+        shown = _sh(["git", "-C", str(repo), "show", f"{rev}:{rel}"], timeout=60)
+        if shown.returncode == 0 and shown.stdout.strip():
+            return shown.stdout, f"{rev}:{rel}"
+    return "", ""
+
+
+def _stage_reproduction_config(
+    sample: dict[str, Any], d: Path, sid: str, reference_time: str = ""
+) -> dict[str, Any]:
     """Copy the benchmark's own reproduction material next to the PoC.
 
     SEC-bench records the fuzzing engine, fuzz target, job type and sanitizer in
@@ -768,7 +1956,16 @@ def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dic
     crash trace, and a libFuzzer testcase fed to a command line tool reproduces
     nothing.
     """
-    staged: dict[str, Any] = {"bug_report": False, "harness_downloads": 0, "oss_fuzz_build_recipe": False}
+    staged: dict[str, Any] = {
+        "bug_report": False,
+        "harness_downloads": 0,
+        "oss_fuzz_build_recipe": False,
+    }
+    project = str(sample.get("project") or sample.get("oss_fuzz_project") or "").strip()
+    if project:
+        staged["oss_fuzz_project"] = _stage_oss_fuzz_project_context(
+            d, project, reference_time
+        )
     pocdir = _poc_source_dir(sample, sid)
     if pocdir is None or not pocdir.is_dir():
         if _synthesize_ossfuzz_bug_report(sample, d, sid):
@@ -781,7 +1978,6 @@ def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dic
         shutil.copy(report, d / "bug_report.md")
         staged["bug_report"] = True
 
-    project = str(sample.get("project") or sample.get("oss_fuzz_project") or "").strip()
     cfg_path = (
         Path(__file__).resolve().parents[2]
         / "dataset" / "ossfuzz_project_config" / f"{project}.json"
@@ -793,6 +1989,10 @@ def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dic
             cfg = {}
         if cfg:
             staged["oss_fuzz_build_recipe"] = _stage_ossfuzz_build_recipe(d, cfg)
+            if not staged["oss_fuzz_build_recipe"]:
+                staged["oss_fuzz_build_recipe"] = _stage_official_oss_fuzz_build_recipe(d)
+            if not staged["oss_fuzz_build_recipe"]:
+                staged["oss_fuzz_build_recipe"] = _stage_upstream_ossfuzz_build_recipe(d)
 
     downloads = pocdir / "downloads"
     if downloads.is_dir():
@@ -804,6 +2004,10 @@ def _stage_reproduction_config(sample: dict[str, Any], d: Path, sid: str) -> dic
     if not staged["bug_report"] and _synthesize_ossfuzz_bug_report(sample, d, sid):
         staged["bug_report"] = True
         staged["bug_report_assembled"] = True
+    if not staged["oss_fuzz_build_recipe"]:
+        staged["oss_fuzz_build_recipe"] = _stage_official_oss_fuzz_build_recipe(d)
+    if not staged["oss_fuzz_build_recipe"]:
+        staged["oss_fuzz_build_recipe"] = _stage_upstream_ossfuzz_build_recipe(d)
     return staged
 
 
@@ -825,13 +2029,37 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     env_ok = _ensure_memory_env(env_image, env_context)
     repo_root = Path(__file__).resolve().parents[2]
     src = d / "_work" / "src"
-    shutil.rmtree(src, ignore_errors=True)
-    if _sh(["git", "clone", str(repo), str(src)], timeout=1800).returncode != 0:
-        return {"prepared": False, "track": "repo", "reason": f"clone failed: {repo}", "env": env_ok}
+    fcommit = sample.get("fix_commit")
+    cloned_from, clone_errors, repo_cache = _materialize_repo_checkout(
+        str(repo), src, [str(vcommit or ""), str(fcommit or "")]
+    )
+    if not cloned_from:
+        return {
+            "prepared": False,
+            "track": "repo",
+            "reason": f"clone failed: {repo}",
+            "env": env_ok,
+            "clone_errors": clone_errors,
+        }
     if vcommit:
         _sh(["git", "-C", str(src), "checkout", "-q", str(vcommit)])
+    source_ready = src.exists() and any(
+        path.name != ".git" for path in src.iterdir()
+    )
+    if not source_ready:
+        return {
+            "prepared": False,
+            "track": "repo",
+            "reason": "source checkout is empty after vulnerable commit checkout",
+            "env": env_ok,
+            "repo": repo,
+            "clone_repo": cloned_from,
+            "vulnerable_commit": vcommit,
+            "repo_cache": repo_cache,
+            "clone_errors": clone_errors,
+        }
+    reference_time = _git_commit_time(src, str(vcommit)) if vcommit else ""
     # patch = diff between vulnerable and fix commit (deterministic)
-    fcommit = sample.get("fix_commit")
     if vcommit and fcommit:
         diff = _sh(["git", "-C", str(src), "diff", str(vcommit), str(fcommit)])
         if diff.stdout.strip():
@@ -839,7 +2067,7 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     if not (d / "patch.diff").exists():
         _stage_patch(sample, d, sid)
     staged_poc = _stage_repo_poc(sample, d, sid)
-    repro_config = _stage_reproduction_config(sample, d, sid)
+    repro_config = _stage_reproduction_config(sample, d, sid, reference_time)
     (d / "build.sh").write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n\n"
@@ -857,7 +2085,9 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
         'for _v in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do\n'
         '  if [[ -n "${!_v:-}" ]]; then PROXY_ENV+=(-e "${_v}=${!_v}"); fi\n'
         'done\n'
-        'exec docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp '
+        'USER_ENV=(--user "$(id -u):$(id -g)")\n'
+        'if [[ "${GT_BUILD_AS_ROOT:-0}" == "1" ]]; then USER_ENV=(); fi\n'
+        'exec docker run --rm "${USER_ENV[@]}" -e HOME=/tmp '
         '"${PROXY_ENV[@]}" '
         '-v "${ASSET_DIR}:/gt" '
         # The toolkit runs inside the image for reachability: the target binary
@@ -871,10 +2101,14 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     _init_state(sid, d)
     report = {"track": "repo/secbench", "sample_id": sid, "env": env_image,
               "env_context": str(env_context), "env_ok": env_ok,
-              "repo": repo, "vulnerable_commit": vcommit, "source": src.exists(),
+              "repo": repo, "clone_repo": cloned_from, "vulnerable_commit": vcommit, "source": src.exists(),
+              "source_ready": source_ready,
+              "repo_cache": repo_cache,
               "poc": (d / "poc").exists(), "poc_source": staged_poc,
               "bug_report": repro_config["bug_report"],
               "harness_downloads": repro_config["harness_downloads"],
+              "oss_fuzz_project": repro_config.get("oss_fuzz_project"),
+              "oss_fuzz_build_recipe": repro_config.get("oss_fuzz_build_recipe", False),
               "patch": (d / "patch.diff").exists(),
               "prepared": bool(src.exists())}
     for key in (
@@ -892,6 +2126,16 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
         if sample.get(key):
             report[key] = sample[key]
     return report
+
+
+def _git_commit_time(repo: Path, commit: str) -> str:
+    if not commit:
+        return ""
+    shown = _sh(
+        ["git", "-C", str(repo), "show", "-s", "--format=%cI", commit],
+        timeout=60,
+    )
+    return shown.stdout.strip() if shown.returncode == 0 else ""
 
 
 def _stage_repo_poc(sample: dict[str, Any], d: Path, sid: str) -> str:

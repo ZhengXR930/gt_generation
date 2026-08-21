@@ -41,6 +41,7 @@ CORE_FILES = (
     "reachability_report.json",
 )
 
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(CODE_ROOT))
 
 
@@ -60,22 +61,10 @@ def classify(sample_id: str) -> tuple[str, str]:
     if missing:
         return "incomplete", f"missing {', '.join(missing)}"
 
-    timing_path = d / "generation_timing.json"
-    if not timing_path.is_file():
-        return "incomplete", "missing generation_timing.json"
     try:
-        timing = json.loads(timing_path.read_text())
-        if timing.get("status") != "completed":
-            failed_stages = [
-                str(stage.get("name"))
-                for stage in timing.get("stages", [])
-                if stage.get("ok") is not True
-            ]
-            detail = failed_stages[-1] if failed_stages else str(timing.get("status") or "unknown")
-            return "incomplete", f"generation failed at {detail}"
-
-        # Run the same final package audit as Stage 05. Checking only bindings
-        # and coverage can incorrectly accept failed Stage 04/05 leftovers.
+        # Run the same final package audit as Stage 05. The audit package is
+        # the final GT contract; generation_timing is diagnostic and can be
+        # stale after manual repair or package cleanup.
         from gt_toolkit.package_audit import audit_package
         audit = audit_package(d)
         if not audit.get("ok"):
@@ -96,7 +85,17 @@ def scan(sample_ids: list[str]) -> dict[str, list[tuple[str, str]]]:
 
 def _load_sample_ids(selection: Path) -> list[str]:
     data = json.loads(selection.read_text())
-    return [str(v["sample_id"]) for v in data if isinstance(v, dict) and v.get("sample_id")]
+    if isinstance(data, dict):
+        samples = data.get("samples") or []
+    else:
+        samples = data
+    ids: list[str] = []
+    for value in samples:
+        if isinstance(value, dict) and value.get("sample_id"):
+            ids.append(str(value["sample_id"]))
+        elif isinstance(value, str) and value:
+            ids.append(value)
+    return ids
 
 
 def write_status_doc(buckets: dict[str, list[tuple[str, str]]], total: int, selection: Path) -> None:

@@ -323,8 +323,8 @@ def _sanitizer_matches_gt(gt: dict[str, Any], observed: dict[str, Any]) -> bool:
 def _location_matches(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
     if not expected or not observed:
         return False
-    expected_file = str(expected.get('file') or '')
-    observed_file = str(observed.get('file') or '')
+    expected_file = _normalize_source_file(str(expected.get('file') or ''))
+    observed_file = _normalize_source_file(str(observed.get('file') or ''))
     file_match = bool(
         expected_file
         and observed_file
@@ -348,6 +348,14 @@ def _location_matches(expected: dict[str, Any], observed: dict[str, Any]) -> boo
     if expected_function:
         return function_match
     return file_match
+
+
+def _normalize_source_file(path: str) -> str:
+    """Strip source-version anchors while preserving path suffix matching."""
+    path = path.replace('\\', '/')
+    if '@' in path:
+        path = path.split('@', 1)[0]
+    return path
 
 
 def _reachability_depth(

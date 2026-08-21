@@ -165,6 +165,12 @@ not from any one CLI's skill mechanism.
 
 `00_prepare -> 01_reproducer -> 02_fine_trace -> 03_trace_review -> 04_assertion_validator -> 05_validate`
 
+`01_reproducer` is a hard screening gate. A config with
+`"stop_after": "01_reproducer"` is a first-class pre-screening batch: success is
+judged from `reproduction_report.json` plus the fixed-oracle gate when a fixed commit
+exists, and does not require `audit-package`. Only samples accepted by that gate should
+be queued for Stage 02 and later.
+
 Stages 01–04 are fresh external coding-agent CLI sessions. They share only files in the
 sample result directory. When Stage 03 rejects completeness, the runner launches a new
 Stage 02 session with `trace_feedback.json`, then a new Stage 03 session, for at most the

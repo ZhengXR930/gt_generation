@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .instrumentation_quality import validate_instrumentation_runtime_fields
+
 
 def _run(cmd: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -491,6 +493,8 @@ def validate_instrumentation_plan(
 ) -> int:
     """Compile both frozen instrumentation patches in disposable ARVO containers."""
     marker = _require_frozen_spec(result_dir)
+    spec = _load(result_dir / "candidate_assertions.json")
+    field_bindings = _load(result_dir / "field_bindings.json")
     context = _context(result_dir)
     checks: dict[str, Any] = {}
     for version, patch, image in (
@@ -551,13 +555,21 @@ def validate_instrumentation_plan(
                 ).hexdigest(),
                 "apply_returncode": applied.returncode,
                 "compile_returncode": compiled.returncode,
+                "runtime_field_quality": validate_instrumentation_runtime_fields(
+                    spec=spec,
+                    field_bindings=field_bindings,
+                    patch_text=expected.read_text(encoding="utf-8", errors="replace"),
+                    patch_name=expected.name,
+                ),
             }
     report = {
         "schema_version": "instrumentation-build-preflight-v1",
         "sample_id": context["sample_id"],
         "assertion_content_hash": marker["content_hash"],
         "ok": all(
-            check["apply_returncode"] == 0 and check["compile_returncode"] == 0
+            check["apply_returncode"] == 0
+            and check["compile_returncode"] == 0
+            and check["runtime_field_quality"]["valid"]
             for check in checks.values()
         ) and set(checks) == {"vulnerable", "fixed"},
         "checks": checks,
@@ -576,6 +588,8 @@ def validate_instrumentation_side(
     if version not in {"vulnerable", "fixed"}:
         raise ValueError(f"unsupported instrumentation side: {version}")
     marker = _require_frozen_spec(result_dir)
+    spec = _load(result_dir / "candidate_assertions.json")
+    field_bindings = _load(result_dir / "field_bindings.json")
     context = _context(result_dir)
     expected, patch_version = _require_persisted_instrumentation_patch(
         result_dir, patch
@@ -639,6 +653,12 @@ def validate_instrumentation_side(
         ).hexdigest(),
         "apply_returncode": applied.returncode,
         "compile_returncode": compiled.returncode,
+        "runtime_field_quality": validate_instrumentation_runtime_fields(
+            spec=spec,
+            field_bindings=field_bindings,
+            patch_text=expected.read_text(encoding="utf-8", errors="replace"),
+            patch_name=expected.name,
+        ),
     }
     report = {
         "schema_version": "instrumentation-side-preflight-v1",
@@ -648,6 +668,7 @@ def validate_instrumentation_side(
         "ok": (
             check["apply_returncode"] == 0
             and check["compile_returncode"] == 0
+            and check["runtime_field_quality"]["valid"]
         ),
         "check": check,
     }

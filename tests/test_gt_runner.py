@@ -21,6 +21,45 @@ def _result(name: str, ok: bool) -> runner.StageResult:
     )
 
 
+def test_repo_fixed_oracle_gate_rejects_masked_setup_command(tmp_path):
+    runner.write_json(tmp_path / "prepare_report.json", {"track": "repo/secbench"})
+    runner.write_json(
+        tmp_path / "sample_info.json",
+        {
+            "sample_id": "sample",
+            "fix_commit": "fixed",
+        },
+    )
+    runner.write_json(
+        tmp_path / "reproduction_report.json",
+        {
+            "fixed_oracle_checked": True,
+            "fixed_oracle_acceptable": True,
+            "setup_command": "/tmp/result/build.sh 'set -euo pipefail\nninja || true'",
+        },
+    )
+
+    assert runner.repo_fixed_oracle_gate_passes(
+        {"result_dir": str(tmp_path)},
+        "{result_dir}/reproduction_report.json",
+    ) is False
+
+
+def test_stage01_only_filter_does_not_select_final_validation():
+    workflow = json.loads(
+        (Path(__file__).parents[1] / "gt_generation" / "workflow.json").read_text()
+    )
+    stages = workflow["stages"]
+
+    should_run = runner.make_stage_filter(
+        stages, start_at="", stop_after="01_reproducer", only=""
+    )
+
+    assert should_run("00_prepare") is True
+    assert should_run("01_reproducer") is True
+    assert should_run("05_validate") is False
+
+
 def test_workflow_splits_assertion_plan_execution_and_reachability():
     workflow = json.loads(
         (Path(__file__).parents[1] / "gt_generation" / "workflow.json").read_text()
@@ -56,7 +95,7 @@ def test_workflow_splits_assertion_plan_execution_and_reachability():
     )
     assert assertion_stage["success_check"] == {
         "path": "{result_dir}/assertion_results.json",
-        "field": "all_verified",
+        "field": "required_verified",
         "equals": True,
     }
     reachability_stage = next(
@@ -68,14 +107,7 @@ def test_workflow_splits_assertion_plan_execution_and_reachability():
     )
     assert reachability_stage["success_check"] == {
         "path": "{result_dir}/reachability_report.json",
-        "all": [
-            {"field": "reachability_checked", "equals": True},
-            {"field": "R1_parser_admitted", "equals": True},
-            {"field": "R2_source_reached", "equals": True},
-            {"field": "R3_root_cause_reached", "equals": True},
-            {"field": "R4_sink_reached", "equals": True},
-            {"field": "R5_sanitizer_triggered", "equals": True},
-        ],
+        "reachability_gate": True,
     }
     prepare_stage = next(
         stage for stage in workflow["stages"] if stage["name"] == "00_prepare"
@@ -488,6 +520,389 @@ def test_split_stage_failure_kinds_are_specific():
     ) == "reachability_failed"
 
 
+def test_assertion_execute_failure_writes_plan_feedback(tmp_path):
+    runner.write_json(
+        tmp_path / "assertion_results.json",
+        {
+            "sample_id": "sample",
+            "differential_status": "probe_misplaced",
+            "assertions": [
+                {
+                    "id": "A_root",
+                    "kind": "required",
+                    "verified": False,
+                    "probe_placement_error": "probe fired before the fixed guard",
+                    "matrix": {
+                        "vulnerable": {
+                            "original": {
+                                "status": "violated",
+                                "satisfied": False,
+                                "left": 0,
+                                "op": "ne",
+                                "right": 0,
+                            }
+                        },
+                        "fixed": {
+                            "original": {
+                                "status": "violated",
+                                "satisfied": False,
+                                "left": 0,
+                                "op": "ne",
+                                "right": 0,
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    out = runner.write_assertion_plan_feedback(tmp_path)
+
+    assert out == tmp_path / "assertion_plan_feedback.md"
+    text = out.read_text(encoding="utf-8")
+    assert "A_root" in text
+    assert "probe fired before the fixed guard" in text
+    assert "Redesign the `required` root obligation" in text
+
+
+def test_assertion_execute_incomplete_writes_execute_feedback(tmp_path):
+    (tmp_path / "role_logs").mkdir()
+    (tmp_path / "role_logs" / "04_assertion_execute.stdout.txt").write_text(
+        "ran vulnerable only\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "role_logs" / "04_assertion_execute.stderr.txt").write_text(
+        "",
+        encoding="utf-8",
+    )
+    (tmp_path / "role_logs" / "04_assertion_execute.finalize.stderr.txt").write_text(
+        "FileNotFoundError: fixed_assertion_trace.txt\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "vulnerable_assertion_trace.txt").write_text(
+        "CASE name=original\nENDCASE\n",
+        encoding="utf-8",
+    )
+
+    out = runner.write_stage_retry_feedback("04_assertion_execute", tmp_path)
+
+    assert out == tmp_path / "assertion_execute_feedback.md"
+    text = out.read_text(encoding="utf-8")
+    assert "execution completeness retry" in text
+    assert "fixed_assertion_trace.txt" in text
+    assert "Do not stop after the vulnerable side" in text
+    assert not (tmp_path / "assertion_plan_feedback.md").exists()
+
+
+def test_assertion_execute_guarded_without_perturbation_writes_execute_feedback(tmp_path):
+    runner.write_json(
+        tmp_path / "assertion_results.json",
+        {
+            "sample_id": "sample",
+            "differential_status": "vulnerable_side_only",
+            "assertions": [
+                {
+                    "id": "A_root",
+                    "kind": "required",
+                    "verified": False,
+                    "verification_error": "fixed original is avoided",
+                    "matrix": {
+                        "vulnerable": {
+                            "original": {
+                                "status": "violated",
+                                "satisfied": False,
+                            }
+                        },
+                        "fixed": {
+                            "original": {
+                                "status": "avoided",
+                                "satisfied": True,
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    runner.write_json(
+        tmp_path / "perturbation_results.json",
+        {
+            "needed": True,
+            "single_perturbation_attempt_recorded": False,
+        },
+    )
+    result = runner.StageResult(
+        name="04_assertion_execute",
+        command="cmd",
+        returncode=1,
+        started_at="start",
+        ended_at="end",
+        stdout_path="",
+        stderr_path="",
+        required_outputs_ok=True,
+        success_check_ok=False,
+        failure_kind="differential_unverified",
+    )
+
+    out = runner.write_stage_retry_feedback(
+        "04_assertion_execute",
+        tmp_path,
+        result=result,
+    )
+
+    assert out == tmp_path / "assertion_execute_feedback.md"
+    assert "fixed original is avoided" in out.read_text(encoding="utf-8")
+    assert "Missing Fixed Perturbation" in out.read_text(encoding="utf-8")
+    assert not (tmp_path / "assertion_plan_feedback.md").exists()
+
+
+def test_assertion_execute_differential_failure_writes_plan_feedback(tmp_path):
+    runner.write_json(
+        tmp_path / "assertion_results.json",
+        {
+            "sample_id": "sample",
+            "differential_status": "failed",
+            "assertions": [
+                {
+                    "id": "A_root",
+                    "kind": "required",
+                    "verified": False,
+                    "matrix": {
+                        "vulnerable": {
+                            "original": {
+                                "status": "satisfied",
+                                "satisfied": True,
+                            }
+                        },
+                        "fixed": {
+                            "original": {
+                                "status": "satisfied",
+                                "satisfied": True,
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    result = runner.StageResult(
+        name="04_assertion_execute",
+        command="cmd",
+        returncode=1,
+        started_at="start",
+        ended_at="end",
+        stdout_path="",
+        stderr_path="",
+        required_outputs_ok=True,
+        success_check_ok=False,
+        failure_kind="differential_unverified",
+    )
+
+    out = runner.write_stage_retry_feedback(
+        "04_assertion_execute",
+        tmp_path,
+        result=result,
+    )
+
+    assert out == tmp_path / "assertion_plan_feedback.md"
+    assert "vulnerable" in out.read_text(encoding="utf-8")
+    assert not (tmp_path / "assertion_execute_feedback.md").exists()
+
+
+def test_differential_unverified_execute_does_not_retry_same_frozen_plan(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_stage(**kwargs):
+        calls.append(kwargs["stage"]["name"])
+        return runner.StageResult(
+            name="04_assertion_execute",
+            command="cmd",
+            returncode=1,
+            started_at="start",
+            ended_at="end",
+            stdout_path="",
+            stderr_path="",
+            required_outputs_ok=True,
+            success_check_ok=False,
+            failure_kind="differential_unverified",
+        )
+
+    monkeypatch.setattr(runner, "run_stage", fake_run_stage)
+
+    result = runner.run_stage_with_retries(
+        stage={"name": "04_assertion_execute", "retries": 2},
+        config={},
+        result_dir=tmp_path,
+    )
+
+    assert result.failure_kind == "differential_unverified"
+    assert calls == ["04_assertion_execute"]
+
+
+def test_assertion_semantic_failure_reruns_full_stage04_chain(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    runner.write_json(state_path, {"stages": []})
+    runner.write_json(
+        tmp_path / "assertion_results.json",
+        {
+            "sample_id": "sample",
+            "assertions": [
+                {
+                    "id": "A_root",
+                    "kind": "required",
+                    "verified": False,
+                    "matrix": {
+                        "vulnerable": {
+                            "original": {
+                                "status": "satisfied",
+                                "satisfied": True,
+                                "left": 1024,
+                                "op": "ge",
+                                "right": 1024,
+                            }
+                        },
+                        "fixed": {
+                            "original": {
+                                "status": "satisfied",
+                                "satisfied": True,
+                                "left": 1024,
+                                "op": "ge",
+                                "right": 1024,
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    stages = [
+        {"name": "04_assertion_plan"},
+        {"name": "04_instrument_vulnerable"},
+        {"name": "04_instrument_fixed"},
+        {"name": "04_assertion_execute"},
+    ]
+    prepared = []
+    calls = []
+
+    def fake_prepare(stage_name, result_dir):
+        prepared.append(stage_name)
+        return []
+
+    def fake_run_stage_with_retries(**kwargs):
+        stage_name = kwargs["stage"]["name"]
+        calls.append(stage_name)
+        return runner.StageResult(
+            name=stage_name,
+            command="cmd",
+            returncode=0,
+            started_at="start",
+            ended_at="end",
+            stdout_path="",
+            stderr_path="",
+            required_outputs_ok=True,
+            success_check_ok=True,
+        )
+
+    monkeypatch.setattr(runner, "prepare_stage_entry", fake_prepare)
+    monkeypatch.setattr(runner, "run_stage_with_retries", fake_run_stage_with_retries)
+
+    result = runner.run_assertion_semantic_repair_loop(
+        initial_result=runner.StageResult(
+            name="04_assertion_execute",
+            command="cmd",
+            returncode=1,
+            started_at="start",
+            ended_at="end",
+            stdout_path="",
+            stderr_path="",
+            required_outputs_ok=True,
+            success_check_ok=False,
+            failure_kind="differential_unverified",
+        ),
+        stages=stages,
+        state_path=state_path,
+        stage_kwargs={"result_dir": tmp_path, "logs_dir": tmp_path, "config": {}},
+    )
+
+    assert result.ok is True
+    assert calls == [
+        "04_assertion_plan",
+        "04_instrument_vulnerable",
+        "04_instrument_fixed",
+        "04_assertion_execute",
+    ]
+    assert prepared == calls
+    assert "1024" in (tmp_path / "assertion_plan_feedback.md").read_text(encoding="utf-8")
+
+
+def test_guarded_without_perturbation_failure_kind_is_execution_incomplete(tmp_path):
+    runner.write_json(
+        tmp_path / "perturbation_results.json",
+        {
+            "needed": True,
+            "single_perturbation_attempt_recorded": False,
+        },
+    )
+
+    assert runner.stage_failure_kind(
+        "04_assertion_execute",
+        0,
+        True,
+        False,
+        tmp_path,
+    ) == "assertion_execution_incomplete"
+
+
+def test_guarded_without_vulnerable_violation_is_differential_unverified(tmp_path):
+    runner.write_json(
+        tmp_path / "assertion_results.json",
+        {
+            "original_case": "original",
+            "assertions": [
+                {
+                    "id": "A_root",
+                    "kind": "required",
+                    "verified": False,
+                    "verification_error": (
+                        "fixed original is avoided; add exactly one perturbation "
+                        "case before accepting the guarded fixed-side witness"
+                    ),
+                    "matrix": {
+                        "vulnerable": {
+                            "original": {
+                                "status": "guarded",
+                                "satisfied": True,
+                            }
+                        },
+                        "fixed": {
+                            "original": {
+                                "status": "avoided",
+                                "satisfied": True,
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    runner.write_json(
+        tmp_path / "perturbation_results.json",
+        {
+            "needed": True,
+            "single_perturbation_attempt_recorded": False,
+        },
+    )
+
+    assert runner.stage_failure_kind(
+        "04_assertion_execute",
+        1,
+        True,
+        False,
+        tmp_path,
+    ) == "differential_unverified"
+
+
 def test_repair_staging_failure_leaves_published_package_unchanged(tmp_path):
     published = tmp_path / "sample"
     published.mkdir()
@@ -641,6 +1056,28 @@ def test_verified_graph_cannot_add_or_move_candidate_invariants():
     assert runner.verified_graph_is_candidate_subset(candidate, verified) is False
     verified["nodes"] = [{**candidate["nodes"][0], "verified_by": "assertion.root"}]
     assert runner.verified_graph_is_candidate_subset(candidate, verified) is True
+
+
+def test_assertion_execute_restores_mutated_frozen_inputs(tmp_path):
+    original = {"nodes": [{"invariant_id": "root", "role": "root_cause"}]}
+    runner.write_json(tmp_path / "candidate_invariants.json", original)
+    for name in (
+        "candidate_assertions.json",
+        "field_bindings.json",
+        "event_locations.json",
+        ".assertion_spec_frozen.json",
+        "assertion_preflight.json",
+    ):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+
+    snapshot = runner.snapshot_assertion_plan_inputs(tmp_path)
+    runner.write_json(tmp_path / "candidate_invariants.json", {"nodes": []})
+
+    report = runner.restore_modified_assertion_plan_inputs(tmp_path, snapshot)
+
+    assert report["ok"] is False
+    assert report["modified_files"][0]["file"] == "candidate_invariants.json"
+    assert runner.load_json(tmp_path / "candidate_invariants.json") == original
 
 
 def test_failed_atomic_publish_restores_original_package(tmp_path, monkeypatch):
@@ -814,6 +1251,49 @@ def test_new_review_run_clears_only_stale_feedback_control_files(tmp_path):
     assert set(removed) == set(stale)
     assert all(not path.exists() for path in stale)
     assert all(path.exists() for path in preserved)
+
+
+def test_resume_skip_requires_current_stage_gate(tmp_path):
+    stage = {
+        "name": "03_trace_review",
+        "required_outputs": [
+            "{result_dir}/static_review.json",
+            "{result_dir}/trace_feedback.json",
+        ],
+        "success_check": {
+            "path": "{result_dir}/static_review.json",
+            "all": [
+                {"field": "static_valid", "equals": True},
+                {"field": "trace_complete", "equals": True},
+                {"field": "local_transitions_closed", "equals": True},
+                {"field": "global_causal_chain_closed", "equals": True},
+            ],
+        },
+    }
+    runner.write_json(
+        tmp_path / "static_review.json",
+        {
+            "static_valid": False,
+            "trace_complete": True,
+            "local_transitions_closed": True,
+            "global_causal_chain_closed": True,
+        },
+    )
+    runner.write_json(tmp_path / "trace_feedback.json", {"needs_revision": True})
+
+    resumable = runner.current_resumable_ok_stages(
+        stages=[stage],
+        prior_ok={"03_trace_review"},
+        config={"vars": {}},
+        sample={},
+        sample_path=tmp_path / "sample.json",
+        sample_id="sample",
+        repo_root=tmp_path,
+        code_root=Path(__file__).parents[1] / "gt_generation",
+        result_dir=tmp_path,
+    )
+
+    assert resumable == set()
 
 
 def test_partial_rerun_timing_keeps_latest_duration_per_stage():

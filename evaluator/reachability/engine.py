@@ -443,6 +443,8 @@ def run_gdb_reachability(
     proc = subprocess.run(
         full_command,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         capture_output=True,
         timeout=timeout,
         env=env,
@@ -474,21 +476,6 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
         'free_stack': [],
         'allocation_stack': [],
     }
-    if (
-        'Sanitizer' not in trace_text
-        and 'runtime error:' not in trace_text
-        and 'ERROR:' not in trace_text
-        and 'SUMMARY:' not in trace_text
-    ):
-        return {
-            'crash_type': crash_type,
-            'sanitizer': '',
-            'access_type': access_type,
-            'crash_location': {},
-            'free_context': {},
-            'allocation_context': {},
-            **sections,
-        }
     # Do not accept arbitrary application diagnostics such as
     # ``ERROR: dwarf_srclines: ...`` as sanitizer headers.  They can precede
     # the real ASan report by hundreds of lines.
@@ -580,16 +567,14 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
     crash_location = first_project_frame(sections['crash_stack'])
     if not crash_location:
         # UBSan states the source position on the runtime error line itself.
-        if 'runtime error:' in trace_text:
-            runtime_error = re.search(
-                r'([^\s:]+\.[A-Za-z0-9_+]+):(\d+)(?::(\d+))?:\s+runtime error:',
-                trace_text,
-            )
-            if runtime_error:
-                crash_location = {
-                    'file': runtime_error.group(1),
-                    'line': int(runtime_error.group(2)),
-                }
+        runtime_error = re.search(
+            r'([^\s:]+\.[A-Za-z0-9_+]+):(\d+)(?::(\d+))?:\s+runtime error:', trace_text
+        )
+        if runtime_error:
+            crash_location = {
+                'file': runtime_error.group(1),
+                'line': int(runtime_error.group(2)),
+            }
     return {
         'crash_type': crash_type,
         'sanitizer': sanitizer_name,
