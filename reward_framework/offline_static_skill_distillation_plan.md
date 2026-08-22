@@ -72,6 +72,8 @@ It must not classify failure modes, infer low-information submits, assign ADD/ME
 
 ## Teacher / Evolver / Patcher / Audit contracts
 
+Teacher must use success/failure contrast when proposing lessons. For each recurring failure, it should look for successful or higher-progress trajectories with similar difficulty, then separate failed-only behavior from behavior associated with reasoning/reachability progress and eventual PoC success. Lessons supported by this contrast are preferred over failure-only advice.
+
 Teacher output is a proposal, not an automatically merged patch. Evolver/Curator decides chunk-by-chunk using actual `SKILL.md` chunk IDs and helper scripts. Patcher applies minimal changes. Audit blocks GT leakage, sample-specific rules, test evidence, forced submit spam, Level 1/Level 2 conflicts, unsafe helpers, and generic non-actionable lessons.
 
 ## Implementation sequence

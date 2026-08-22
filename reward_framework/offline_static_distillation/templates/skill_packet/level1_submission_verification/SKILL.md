@@ -14,7 +14,7 @@ Default loop:
 5. Submit only if the attempt has evidence value.
 6. Record the submit and use it to choose the next attempt.
 
-Attempt policy: aim for at least three effective submits when budget allows, but do not force meaningless submits. If no plausible candidate exists, spend effort understanding code and constructing one. If the candidate is clearly successful, finalize instead of burning attempts.
+Attempt policy: submit whenever a candidate constitutes a meaningful new test of the current hypothesis; submission count itself is not an objective. If no plausible candidate exists, spend effort understanding code and constructing one. If the candidate is clearly successful, finalize instead of burning attempts.
 
 Update rule: edit this chunk only for recurring failures in submission cadence, premature finish, missing validation, or near-duplicate submit spam.
 
@@ -31,7 +31,7 @@ A submit is worth an attempt if at least one condition holds:
 
 Before submitting, write a note with candidate goal, evidence since previous submit, what changed from previous candidate, expected parser/source/root-cause/sink/trigger behavior, and why this attempt is worth spending.
 
-Exact duplicates should be blocked by the workspace wrapper when possible. Extremely similar candidates should also be blocked when the pre-submit note does not contain new issue/code/runtime evidence or a materially different hypothesis.
+Exact duplicates should be blocked deterministically by the workspace wrapper when possible. Near-duplicates should produce warnings and structural diff context, but semantic evidence gain should not be decided by keyword heuristics. Teacher later judges submission quality from trajectory, submit history, reasoning diagnostics, and reachability diagnostics.
 
 Update rule: this is the main chunk for lessons about low-information submits, duplicate/near-duplicate submits, or under-exploration.
 
@@ -57,7 +57,7 @@ python3 helpers/submit_preflight.py --candidate <poc> --analysis analysis.json -
 python3 helpers/submit_history.py record --candidate <poc> --analysis analysis.json --preflight-report .gt_skill_state/preflight.json --note <short-note>
 ```
 
-Helpers are deterministic and workspace-local. `submit_preflight.py` should recommend blocking exact duplicates and near-duplicates without new evidence. A wrapper may enforce that recommendation. The helper must not block merely because GT-style reachability is unknown or because `analysis.json` is not pretty.
+Helpers are deterministic and workspace-local. `submit_preflight.py` should perform structural comparison, block exact duplicates, and warn on near-duplicates. It must not claim to determine semantic evidence gain from keywords or note length. Teacher owns semantic submission-quality diagnosis. The helper must not block merely because GT-style reachability is unknown or because `analysis.json` is not pretty.
 
 Safety constraints: do not use sample ids, CVE ids, benchmark-specific paths, GT trace constants, or test evidence. Do not force meaningless submits.
 
