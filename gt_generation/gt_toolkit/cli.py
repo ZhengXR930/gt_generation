@@ -12,6 +12,7 @@ Subcommands:
   macro-aliases  Add per-sample constant macro aliases to field_bindings.json.
   context       Collect PoC execution context as context_trace.json.
   compact-result Remove generation-only files from a validated result directory.
+  hydrate-runtime Restore compact non-ARVO runtime material before local testing.
   arvo-workspace Reuse one ARVO container across vulnerable/fixed validation.
   repo-workspace Run repo-track instrumentation gates through build.sh.
   gdb-watch      Emit / run the GDB python recorder for watchpoint coverage.
@@ -34,8 +35,8 @@ def main(argv: list[str] | None = None) -> int:
     commands = [
         "prepare", "validate", "state", "reachability", "assertions",
         "assertion-preflight", "audit-package", "bind-evidence",
-        "macro-aliases", "context", "compact-result", "arvo-workspace",
-        "repo-workspace", "gdb-watch", "schema-path",
+        "macro-aliases", "context", "compact-result", "hydrate-runtime",
+        "arvo-workspace", "repo-workspace", "gdb-watch", "schema-path",
     ]
     parser = argparse.ArgumentParser(prog="gt-toolkit", description=__doc__)
     parser.add_argument("--version", action="version", version=f"gt-toolkit {__version__}")
@@ -86,6 +87,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "compact-result":
         from . import compact_result
         return compact_result.main(rest)
+    if ns.command == "hydrate-runtime":
+        from . import prepare
+        return prepare.hydrate_main(rest)
     if ns.command == "arvo-workspace":
         from . import arvo_workspace
         return arvo_workspace.main(rest)

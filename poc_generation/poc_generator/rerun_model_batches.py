@@ -5,6 +5,8 @@ Results are replaced in-place by run_sample.py.  A sample is skipped only when
 its current model-specific result is already a complete v2, 100-iteration run.
 """
 
+from __future__ import annotations
+
 import fcntl
 import json
 import os

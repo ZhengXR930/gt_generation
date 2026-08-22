@@ -292,6 +292,77 @@ def prepare(sample_path: str, result_dir: str) -> dict[str, Any]:
     return report
 
 
+def hydrate_runtime(result_dir: str | Path, *, force: bool = False) -> dict[str, Any]:
+    """Restore the local execution workspace for a compact GT package.
+
+    Compact GT packages intentionally do not commit `_work/` or compiled output.
+    This helper rebuilds the deterministic source/material scaffold from the
+    package's `sample_info.json` so local PoC evaluation can run on another
+    machine without depending on stale absolute paths.
+    """
+    result_path = Path(result_dir)
+    sample_info = result_path / "sample_info.json"
+    if not sample_info.is_file():
+        return {
+            "prepared": False,
+            "hydrated": False,
+            "reason": f"missing sample_info.json: {sample_info}",
+        }
+    src = result_path / "_work" / "src"
+    if not force and src.is_dir() and any(src.iterdir()):
+        return {
+            "prepared": True,
+            "hydrated": False,
+            "reused": True,
+            "source": str(src),
+        }
+    preserved = _snapshot_existing_durable_files(result_path)
+    report = prepare(str(sample_info), str(result_path))
+    _restore_existing_durable_files(result_path, preserved)
+    report["hydrated"] = bool(report.get("prepared"))
+    return report
+
+
+_HYDRATE_PRESERVED_FILES = (
+    "build.sh",
+    "poc",
+    "ground_truth.json",
+    "verified_invariants.json",
+    "verified_assertions.json",
+    "field_bindings.json",
+    "assertion_results.json",
+    "perturbation_results.json",
+    "event_locations.json",
+    "evidence_commitment.json",
+    "generation_provenance.json",
+    "generation_timing.json",
+    "reachability_report.json",
+    "context_trace.json",
+    "default_crash_trace.txt",
+    "sanitizer_trace.txt",
+    "reproduction_report.json",
+    "runtime_spec.json",
+)
+
+
+def _snapshot_existing_durable_files(result_path: Path) -> dict[str, bytes]:
+    saved: dict[str, bytes] = {}
+    for name in _HYDRATE_PRESERVED_FILES:
+        path = result_path / name
+        if path.is_file():
+            saved[name] = path.read_bytes()
+    return saved
+
+
+def _restore_existing_durable_files(
+    result_path: Path, saved: dict[str, bytes]
+) -> None:
+    for name, data in saved.items():
+        path = result_path / name
+        if not path.is_file() or path.read_bytes() != data:
+            path.write_bytes(data)
+
+
 def _stage_default_crash_trace(
     sample: dict[str, Any], source_sample_path: Path, result_dir: Path
 ) -> dict[str, Any]:
@@ -692,6 +763,45 @@ def _ensure_memory_env(tag: str | None = None, context: str | Path | None = None
     if _sh(["docker", "images", "-q", tag]).stdout.strip():
         return True
     return _sh(["docker", "build", "-t", tag, str(context)], timeout=3000).returncode == 0
+
+
+def repo_track_build_sh(env_image: str | None = None) -> str:
+    """Return the portable repo-track Docker wrapper used by non-ARVO samples."""
+    image = shlex.quote(env_image or os.environ.get("GT_REPO_DOCKER_IMAGE", "gt-memory-env:latest"))
+    return (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n\n"
+        'ASSET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+        f"IMAGE={image}\n"
+        'REPO_ROOT="${GT_REPO_ROOT:-}"\n'
+        'if [[ -z "${REPO_ROOT}" ]]; then\n'
+        '  if git -C "${ASSET_DIR}" rev-parse --show-toplevel >/dev/null 2>&1; then\n'
+        '    REPO_ROOT="$(git -C "${ASSET_DIR}" rev-parse --show-toplevel)"\n'
+        '  else\n'
+        '    REPO_ROOT="$(cd "${ASSET_DIR}/../.." && pwd)"\n'
+        '  fi\n'
+        'fi\n'
+        'if [[ ! -d "${REPO_ROOT}/gt_generation" ]]; then\n'
+        '  echo "cannot locate gt_generation repo root; set GT_REPO_ROOT" >&2\n'
+        '  exit 2\n'
+        'fi\n'
+        'if [[ $# -eq 0 ]]; then\n'
+        '  echo "usage: $0 <build-or-reproduction command>" >&2\n'
+        '  exit 2\n'
+        'fi\n'
+        'PROXY_ENV=()\n'
+        'for _v in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do\n'
+        '  if [[ -n "${!_v:-}" ]]; then PROXY_ENV+=(-e "${_v}=${!_v}"); fi\n'
+        'done\n'
+        'USER_ENV=(--user "$(id -u):$(id -g)")\n'
+        'if [[ "${GT_BUILD_AS_ROOT:-0}" == "1" ]]; then USER_ENV=(); fi\n'
+        'exec docker run --rm "${USER_ENV[@]}" -e HOME=/tmp '
+        '"${PROXY_ENV[@]}" '
+        '-v "${ASSET_DIR}:/gt" '
+        '-v "${REPO_ROOT}:/repo:ro" '
+        '-w /gt/_work/src "${IMAGE}" '
+        'bash -lc "$*"\n'
+    )
 
 
 def _poc_source_dir(sample: dict[str, Any], sid: str) -> Path | None:
@@ -2068,35 +2178,7 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
         _stage_patch(sample, d, sid)
     staged_poc = _stage_repo_poc(sample, d, sid)
     repro_config = _stage_reproduction_config(sample, d, sid, reference_time)
-    (d / "build.sh").write_text(
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n\n"
-        'ASSET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
-        f"IMAGE={shlex.quote(env_image)}\n"
-        'if [[ $# -eq 0 ]]; then\n'
-        '  echo "usage: $0 <build-or-reproduction command>" >&2\n'
-        '  exit 2\n'
-        'fi\n'
-        # Repo-track builds clone submodules and fetch dependencies from
-        # GitHub/GitLab. On a network-restricted host the container reaches
-        # nothing unless the caller's proxy is forwarded, so mirror whichever
-        # proxy variables are set instead of hardcoding an endpoint.
-        'PROXY_ENV=()\n'
-        'for _v in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do\n'
-        '  if [[ -n "${!_v:-}" ]]; then PROXY_ENV+=(-e "${_v}=${!_v}"); fi\n'
-        'done\n'
-        'USER_ENV=(--user "$(id -u):$(id -g)")\n'
-        'if [[ "${GT_BUILD_AS_ROOT:-0}" == "1" ]]; then USER_ENV=(); fi\n'
-        'exec docker run --rm "${USER_ENV[@]}" -e HOME=/tmp '
-        '"${PROXY_ENV[@]}" '
-        '-v "${ASSET_DIR}:/gt" '
-        # The toolkit runs inside the image for reachability: the target binary
-        # links against the image's glibc and sanitizer runtime, and gdb lives
-        # there too, so driving it from the host is the wrong side of the wall.
-        f'-v {shlex.quote(str(repo_root))}:/repo:ro '
-        '-w /gt/_work/src "${IMAGE}" '
-        'bash -lc "$*"\n'
-    )
+    (d / "build.sh").write_text(repo_track_build_sh(env_image))
     (d / "build.sh").chmod(0o755)
     _init_state(sid, d)
     report = {"track": "repo/secbench", "sample_id": sid, "env": env_image,
@@ -2235,8 +2317,17 @@ def _stage_patch(sample: dict[str, Any], d: Path, sid: str) -> None:
 
 def _init_state(sample_id: str, d: Path) -> None:
     try:
+        import contextlib
         from . import state as _state
-        _state.main(["init", "--sample-id", sample_id, "--output", str(d / "sample_state.json")])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            _state.main([
+                "init",
+                "--sample-id",
+                sample_id,
+                "--output",
+                str(d / "sample_state.json"),
+            ])
     except Exception:
         pass
 
@@ -2247,6 +2338,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--result-dir", required=True)
     ns = ap.parse_args(argv)
     res = prepare(ns.sample, ns.result_dir)
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("prepared") else 1
+
+
+def hydrate_main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="gt-toolkit hydrate-runtime",
+        description="Restore _work/src and repo-track runtime scaffold for a compact GT package.",
+    )
+    ap.add_argument("--result-dir", required=True)
+    ap.add_argument("--force", action="store_true")
+    ns = ap.parse_args(argv)
+    res = hydrate_runtime(ns.result_dir, force=ns.force)
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("prepared") else 1
 

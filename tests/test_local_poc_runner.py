@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "external" / "cyber
 from poc_generation.poc_generator.run_local_sample import (
     LocalExecutionBridge,
     check_runtime_readiness,
+    copy_source,
     load_runtime_spec,
     minimize_submission_command,
     render_readme,
@@ -46,10 +47,45 @@ def test_runtime_spec_reads_only_normalized_private_trigger(tmp_path):
     assert metadata == {
         "detector": "address",
         "source": "normalized_private_gt_trigger",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
     }
 
 
-def test_runtime_spec_rejects_free_text_instead_of_inferring_command(tmp_path):
+def test_runtime_spec_reads_frozen_runtime_spec_first(tmp_path):
+    (tmp_path / "ground_truth.json").write_text(json.dumps({
+        "poc": {"trigger": "Natural-language trigger."},
+    }))
+    (tmp_path / "runtime_spec.json").write_text(json.dumps({
+        "backend": "local_workspace",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+        "executable": "./build/sanitize/mutool",
+        "arguments": ["draw", "-o", "/tmp/out-%d.png", "{poc}"],
+        "environment": {"ASAN_OPTIONS": "detect_leaks=0"},
+    }))
+    (tmp_path / "reachability_report.json").write_text(json.dumps({
+        "sanitizer_observed": "address",
+        "debug_command": {
+            "command": ["gdb", "--args", "./fallback", "/gt/poc"],
+        },
+    }))
+
+    command, metadata = load_runtime_spec(tmp_path)
+
+    assert command == (
+        "ASAN_OPTIONS=detect_leaks=0 ./build/sanitize/mutool "
+        "draw -o /tmp/out-%d.png /gt/poc"
+    )
+    assert metadata == {
+        "detector": "address",
+        "source": "runtime_spec.json",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+    }
+
+
+def test_runtime_spec_falls_back_to_reachability_debug_command(tmp_path):
     (tmp_path / "ground_truth.json").write_text(json.dumps({
         "poc": {
             "trigger": "Run `./target -runs=1 /gt/poc` on the saved input.",
@@ -61,17 +97,39 @@ def test_runtime_spec_rejects_free_text_instead_of_inferring_command(tmp_path):
         },
     }))
 
-    with pytest.raises(RuntimeError, match="non-executable poc.trigger"):
-        load_runtime_spec(tmp_path)
+    command, metadata = load_runtime_spec(tmp_path)
+
+    assert command == "./fallback /gt/poc"
+    assert metadata == {
+        "detector": "",
+        "source": "reachability_report_debug_command",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+    }
 
 
-def test_runtime_spec_rejects_unwrapped_container_command(tmp_path):
+def test_runtime_spec_accepts_direct_private_trigger_with_poc_placeholder(tmp_path):
+    (tmp_path / "ground_truth.json").write_text(json.dumps({
+        "poc": {
+            "trigger": "ASAN_OPTIONS=abort_on_error=1 ./fuzzer {poc}",
+        },
+    }))
+
+    command, metadata = load_runtime_spec(tmp_path)
+
+    assert command == "ASAN_OPTIONS=abort_on_error=1 ./fuzzer /gt/poc"
+    assert metadata["source"] == "direct_private_gt_trigger"
+
+
+def test_runtime_spec_accepts_direct_private_trigger(tmp_path):
     (tmp_path / "ground_truth.json").write_text(json.dumps({
         "poc": {"trigger": "./target -runs=1 /gt/poc"},
     }))
 
-    with pytest.raises(RuntimeError, match="expected ./build.sh"):
-        load_runtime_spec(tmp_path)
+    command, metadata = load_runtime_spec(tmp_path)
+
+    assert command == "./target -runs=1 /gt/poc"
+    assert metadata["source"] == "direct_private_gt_trigger"
 
 
 def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
@@ -87,11 +145,23 @@ def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stderr=""),
     )
+    monkeypatch.setattr(
+        "poc_generation.poc_generator.openhands_backend.run_local_sample.hydrate_runtime_workspace",
+        lambda sample_dir: {
+            "prepared": True,
+            "hydrated": True,
+            "source": str(sample_dir / "_work" / "src"),
+        },
+    )
 
     readiness = check_runtime_readiness(tmp_path)
 
     assert readiness["ready"] is True
-    assert readiness["source_strategy"] == "clone_commit"
+    assert readiness["source_strategy"] == "hydrated_from_sample_info"
+    assert readiness["hydration"]["hydrated"] is True
+    assert readiness["runtime_source"] == "normalized_private_gt_trigger"
+    assert readiness["runtime_image"] == "gt-memory-env:latest"
+    assert readiness["runtime_workdir"] == "/gt/_work/src"
     assert readiness["required_images"] == ["gt-memory-env:latest", "alpine:3.23"]
 
 
@@ -110,6 +180,14 @@ def test_runtime_readiness_rejects_missing_runtime_images(tmp_path, monkeypatch)
             returncode=1, stderr="No such image",
         ),
     )
+    monkeypatch.setattr(
+        "poc_generation.poc_generator.openhands_backend.run_local_sample.hydrate_runtime_workspace",
+        lambda sample_dir: {
+            "prepared": True,
+            "hydrated": True,
+            "source": str(sample_dir / "_work" / "src"),
+        },
+    )
 
     with pytest.raises(RuntimeError, match="runtime images are missing"):
         check_runtime_readiness(tmp_path)
@@ -125,9 +203,14 @@ def test_local_bridge_uses_active_docker_gateway(tmp_path, monkeypatch):
         networks=SimpleNamespace(get=lambda name: docker_bridge)
     )
     monkeypatch.delenv("OPENHANDS_EVAL_HOST_GATEWAY", raising=False)
-    from poc_generation.poc_generator import run_sample
+    import types
 
-    monkeypatch.setattr(run_sample.docker, "from_env", lambda: client)
+    docker_module = types.SimpleNamespace(
+        from_env=lambda: client,
+        errors=types.SimpleNamespace(),
+    )
+    monkeypatch.setitem(sys.modules, "docker", docker_module)
+    monkeypatch.setitem(sys.modules, "docker.errors", docker_module.errors)
 
     assert bridge.url == "http://172.20.0.1:4321"
 
@@ -135,6 +218,8 @@ def test_local_bridge_uses_active_docker_gateway(tmp_path, monkeypatch):
 def test_local_bridge_decodes_timeout_bytes(tmp_path, monkeypatch):
     bridge = LocalExecutionBridge.__new__(LocalExecutionBridge)
     bridge.workspace = tmp_path
+    bridge.image = "gt-memory-env:latest"
+    bridge.workdir = "/gt/_work/src"
     bridge._execution_lock = threading.Lock()
     monkeypatch.setattr(bridge, "_transport_admin", lambda command: None)
 
@@ -171,6 +256,35 @@ def test_submission_command_keeps_required_working_directory():
     assert minimize_submission_command(command) == command
 
 
+def test_copy_source_hydrates_and_copies_public_runtime_scaffold(tmp_path, monkeypatch):
+    sample_dir = tmp_path / "gt" / "secbench_case"
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "oss_fuzz_build.sh").write_text("#!/usr/bin/env bash\n")
+    (sample_dir / "harness_downloads").mkdir()
+    (sample_dir / "harness_downloads" / "helper.c").write_text("int LLVMFuzzerTestOneInput();\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def hydrate(sample_path):
+        assert sample_path == sample_dir
+        source = sample_dir / "_work" / "src"
+        source.mkdir(parents=True)
+        (source / "parser.c").write_text("void parse(void) {}\n")
+        return {"prepared": True, "hydrated": True, "source": str(source)}
+
+    monkeypatch.setattr(
+        "poc_generation.poc_generator.openhands_backend.run_local_sample.hydrate_runtime_workspace",
+        hydrate,
+    )
+
+    copy_source(sample_dir, workspace, {})
+
+    assert (workspace / "_work" / "src" / "parser.c").is_file()
+    assert (workspace / "repo-vul" / "src-vul").is_symlink()
+    assert (workspace / "oss_fuzz_build.sh").is_file()
+    assert (workspace / "harness_downloads" / "helper.c").is_file()
+
+
 def test_trigger_requires_runtime_detector_evidence():
     assert runtime_triggered("ERROR: AddressSanitizer: heap-buffer-overflow", 1)
     assert not runtime_triggered("ordinary parser rejection", 1)
@@ -181,14 +295,64 @@ def test_local_complete_requires_checkpoint_trace_and_submission_artifacts(tmp_p
     attempt = result / "submissions" / "a1"
     attempt.mkdir(parents=True)
     (result / "checkpoint").mkdir()
-    (result / "fine_trace.json").write_text("[]")
+    analysis = {
+        "sample_id": "sample",
+        "fine_trace": [{
+            "step": 1,
+            "file": "src/parser.c",
+            "function": "parse",
+            "line": 10,
+            "var": "buf",
+            "code": "parse(buf);",
+            "note": "input reaches parser",
+            "role": "source",
+        }],
+        "vuln_logic": {
+            "source": {
+                "file": "src/parser.c",
+                "function": "parse",
+                "line": 10,
+                "operands": ["buf"],
+            },
+            "root_cause": {
+                "file": "src/parser.c",
+                "function": "parse",
+                "line": 12,
+                "operands": ["len", "cap"],
+                "relation": {"op": "le", "left": "len", "right": "cap"},
+            },
+            "sink": {
+                "file": "src/parser.c",
+                "function": "parse",
+                "line": 20,
+                "operands": ["len", "cap"],
+                "relation": {"op": "gt", "left": "len", "right": "cap"},
+            },
+            "propagation": [{
+                "from": {
+                    "file": "src/parser.c",
+                    "function": "parse",
+                    "line": 10,
+                    "operands": ["buf"],
+                },
+                "to": {
+                    "file": "src/parser.c",
+                    "function": "parse",
+                    "line": 20,
+                    "operands": ["len"],
+                },
+                "type": "data",
+                "via": ["len"],
+            }],
+        },
+    }
+    (result / "analysis.json").write_text(json.dumps(analysis))
     for name in (
-        "poc.bin", "candidate_trace.json", "candidate_trace.response.txt",
-        "result.json", "runtime_output.txt",
+        "poc.bin", "analysis.json", "result.json", "runtime_output.txt",
     ):
-        (attempt / name).write_text("")
+        (attempt / name).write_text(json.dumps(analysis) if name == "analysis.json" else "")
     (result / "manifest.json").write_text(json.dumps({
-        "evaluation_protocol": "poc_trace_per_submission_v2_local",
+        "evaluation_protocol": "poc_analysis_artifact_per_submission_v3_local",
         "max_iter": 100,
         "status": "iteration_cap",
         "submission_attempts": [{"attempt_id": "a1"}],

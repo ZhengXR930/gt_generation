@@ -17,6 +17,62 @@ def _remove_prefix(value: str, prefix: str) -> str:
     return value[len(prefix):] if value.startswith(prefix) else value
 
 
+def _shell_join(argv: list[str]) -> str:
+    return " ".join(shlex.quote(str(item)) for item in argv)
+
+
+def _split_shell_sequence(command: str) -> list[str]:
+    """Split simple shell command lists on top-level ';' and '&&' only."""
+    pieces: list[str] = []
+    current: list[str] = []
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            current.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char == ";":
+            piece = "".join(current).strip()
+            if piece:
+                pieces.append(piece)
+            current = []
+            index += 1
+            continue
+        if command[index:index + 2] == "&&":
+            piece = "".join(current).strip()
+            if piece:
+                pieces.append(piece)
+            current = []
+            index += 2
+            continue
+        current.append(char)
+        index += 1
+    piece = "".join(current).strip()
+    if piece:
+        pieces.append(piece)
+    return pieces
+
+
 class RuntimeSpecError(RuntimeError):
     """The frozen package cannot currently reconstruct its target runtime."""
 
@@ -38,7 +94,7 @@ class RuntimeSpec:
 
 
 def compile_runtime_spec(
-    gt_dir: Path, *, require_artifacts: bool = True
+    gt_dir: Path, *, require_artifacts: bool = True, prefer_frozen: bool = True
 ) -> RuntimeSpec:
     """Compile a minimal runtime contract without exposing it to the agent."""
     gt_dir = gt_dir.resolve()
@@ -58,7 +114,7 @@ def compile_runtime_spec(
         )
 
     frozen_path = gt_dir / "runtime_spec.json"
-    if frozen_path.is_file():
+    if prefer_frozen and frozen_path.is_file():
         spec = _load_frozen_spec(
             frozen_path, sample_id, require_artifacts=require_artifacts
         )
@@ -68,13 +124,9 @@ def compile_runtime_spec(
             else spec
         )
 
-    report_path = gt_dir / "reproduction_report.json"
-    if not report_path.is_file():
-        raise RuntimeSpecError("reproduction recipe is missing after GT compaction")
-    report = _load_json(report_path)
-    command = _unwrap_reproduction_command(str(report.get("command") or ""))
+    command, source = _runtime_command_from_packaged_artifacts(gt_dir)
     if not command:
-        raise RuntimeSpecError("reproduction report has no command")
+        raise RuntimeSpecError("runtime recipe is missing after GT compaction")
     workdir, invocation = _select_invocation(command)
     environment, executable, arguments = _parse_invocation(invocation)
     if not any("{poc}" in item for item in arguments):
@@ -89,8 +141,9 @@ def compile_runtime_spec(
         arguments=arguments,
         environment=environment,
         input_placeholder="{poc}",
-        source="reproduction_report.json",
+        source=source,
     )
+    spec = _normalize_local_workspace_spec(spec)
     if require_artifacts:
         spec = _unwrap_libtool_executable(spec, gt_dir)
     validate_runtime_spec(spec, gt_dir, require_artifacts=require_artifacts)
@@ -127,7 +180,9 @@ def container_path_on_host(gt_dir: Path, value: str, workdir: str) -> Path:
 
 
 def write_runtime_spec(gt_dir: Path) -> Path:
-    spec = compile_runtime_spec(gt_dir)
+    spec = compile_runtime_spec(
+        gt_dir, require_artifacts=False, prefer_frozen=False
+    )
     path = gt_dir / "runtime_spec.json"
     path.write_text(
         json.dumps(spec.to_dict(), indent=2, ensure_ascii=False) + "\n",
@@ -230,6 +285,104 @@ def _load_frozen_spec(
     return spec
 
 
+def _normalize_local_workspace_spec(spec: RuntimeSpec) -> RuntimeSpec:
+    """Prefer /gt/_work/src as the mounted source workdir when possible."""
+    if spec.backend != "local_workspace":
+        return spec
+    if spec.workdir == "/gt" and spec.executable.startswith("./_work/src/"):
+        return replace(
+            spec,
+            workdir="/gt/_work/src",
+            executable="./" + spec.executable[len("./_work/src/"):],
+        )
+    if spec.workdir == "/gt" and spec.executable.startswith("/gt/_work/src/"):
+        return replace(
+            spec,
+            workdir="/gt/_work/src",
+            executable="./" + spec.executable[len("/gt/_work/src/"):],
+        )
+    return spec
+
+
+def _runtime_command_from_packaged_artifacts(gt_dir: Path) -> tuple[str, str]:
+    for supplier in (
+        _command_from_reproduction_report,
+        _command_from_ground_truth_trigger,
+        _command_from_reachability_report,
+    ):
+        command, source = supplier(gt_dir)
+        if command:
+            return command, source
+    return "", ""
+
+
+def _command_from_reproduction_report(gt_dir: Path) -> tuple[str, str]:
+    report_path = gt_dir / "reproduction_report.json"
+    if not report_path.is_file():
+        return "", ""
+    report = _load_json(report_path)
+    command = _unwrap_reproduction_command(str(report.get("command") or ""))
+    return (command, "reproduction_report.json") if command else ("", "")
+
+
+def _command_from_ground_truth_trigger(gt_dir: Path) -> tuple[str, str]:
+    gt_path = gt_dir / "ground_truth.json"
+    if not gt_path.is_file():
+        return "", ""
+    gt = _load_json(gt_path)
+    trigger = str((gt.get("poc") or {}).get("trigger") or "").strip()
+    if not trigger or "\n" in trigger or len(trigger) >= 1000:
+        return "", ""
+    try:
+        parts = shlex.split(trigger)
+    except ValueError:
+        return "", ""
+    if (
+        len(parts) == 2
+        and parts[0] == "./build.sh"
+        and ("/gt/poc" in parts[1] or "{poc}" in parts[1])
+    ):
+        return (
+            parts[1].replace("{poc}", "/gt/poc"),
+            "ground_truth.poc.trigger",
+        )
+    if (
+        ("/gt/poc" in trigger or "{poc}" in trigger)
+        and not re.search(
+            r"\b(run|pass|saved|reproduced|trigger|input)\b", trigger, re.I
+        )
+    ):
+        return (
+            trigger.replace("{poc}", "/gt/poc"),
+            "ground_truth.poc.trigger",
+        )
+    return "", ""
+
+
+def _command_from_reachability_report(gt_dir: Path) -> tuple[str, str]:
+    path = gt_dir / "reachability_report.json"
+    if not path.is_file():
+        return "", ""
+    report = _load_json(path)
+    debug_command = report.get("debug_command") or {}
+    command = (
+        debug_command.get("command") if isinstance(debug_command, dict) else None
+    )
+    if not isinstance(command, list):
+        return "", ""
+    try:
+        args_index = command.index("--args")
+    except ValueError:
+        return "", ""
+    argv = [str(item) for item in command[args_index + 1:] if str(item)]
+    if not argv or not any("/gt/poc" in item or "{poc}" in item for item in argv):
+        return "", ""
+    return (
+        _shell_join([item.replace("{poc}", "/gt/poc") for item in argv]),
+        "reachability_report.debug_command",
+    )
+
+
 def _unwrap_reproduction_command(command: str) -> str:
     if not command.strip():
         return ""
@@ -247,7 +400,7 @@ def _unwrap_reproduction_command(command: str) -> str:
 
 def _select_invocation(command: str) -> tuple[str, str]:
     workdir = "/gt/_work/src"
-    pieces = [piece.strip() for piece in re.split(r"\s+&&\s+|;\s*", command)]
+    pieces = _split_shell_sequence(command)
     selected_index = -1
     for index, piece in enumerate(pieces):
         if "/gt/poc" in piece or "{poc}" in piece:

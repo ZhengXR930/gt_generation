@@ -33,7 +33,10 @@ import threading
 import uuid
 from pathlib import Path
 
-import tomli_w
+try:
+    import tomli_w
+except ModuleNotFoundError:  # Keep lightweight local tests runnable.
+    tomli_w = None
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11 in the gtpy runner environment.
@@ -43,6 +46,7 @@ BACKEND_ROOT = Path(__file__).resolve().parent
 ROOT = BACKEND_ROOT.parent
 GT_ROOT = ROOT.parents[1]
 sys.path.insert(0, str(GT_ROOT))
+sys.path.insert(0, str(GT_ROOT / "gt_generation"))
 
 from poc_generation.analysis_artifact_prompt import (  # noqa: E402
     analysis_artifact_task_readme_section,
@@ -97,35 +101,117 @@ def load_template_toml(text: str) -> dict:
     return result
 
 
+def dump_template_toml(data: dict) -> str:
+    """Serialize the simple OpenHands config shape without requiring tomli-w."""
+    if tomli_w is not None:
+        return tomli_w.dumps(data)
+
+    def render_value(value):
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, dict):
+            inner = ", ".join(
+                f"{key} = {render_value(item)}" for key, item in value.items()
+            )
+            return "{ " + inner + " }"
+        return json.dumps(str(value))
+
+    lines = []
+    for section, values in data.items():
+        lines.append(f"[{section}]")
+        for key, value in values.items():
+            lines.append(f"{key} = {render_value(value)}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 DEFAULT_POC_RESULTS = ROOT.parent / "poc_results"
 
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(GT_ROOT / "external" / "cybergym" / "src"))
 
-from openhands_backend.run_openhands_cybergym import (  # noqa: E402
-    apply_sampling_config,
-    configure_harness_profile,
-    model_map,
-    run_openhands,
-    session_name_for_task,
-)
-from openhands_backend.run_sample import (  # noqa: E402
-    cleanup_scratch,
-    copy_json_redacted,
-    count_agent_actions,
-    default_api_key_env,
-    load_env_key,
-    materialize_attempt_analysis_files,
-    native_tool_calling_for_model,
-    runtime_server_url,
-    trajectory_has_finish_action,
-)
-from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
-from poc_dedup import deduplicate_submission_attempts  # noqa: E402
+
+def _runtime_server_url(server: str) -> str:
+    """Resolve host.docker.internal without importing the full ARVO runner."""
+    if sys.platform.startswith("linux"):
+        gateway = os.getenv("OPENHANDS_EVAL_HOST_GATEWAY", "").strip()
+        if not gateway:
+            try:
+                import docker
+                import docker.errors
+
+                bridge = docker.from_env().networks.get("bridge")
+                configs = (bridge.attrs.get("IPAM") or {}).get("Config") or []
+                gateway = next(
+                    str(item.get("Gateway") or "").strip()
+                    for item in configs
+                    if str(item.get("Gateway") or "").strip()
+                )
+            except Exception:
+                gateway = "172.17.0.1"
+        return server.replace("host.docker.internal", gateway)
+    return server
 
 
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def split_shell_sequence(command: str) -> list[str]:
+    """Split simple shell command lists on top-level ';' and '&&' only."""
+    pieces: list[str] = []
+    current: list[str] = []
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            current.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char == ";":
+            piece = "".join(current).strip()
+            if piece:
+                pieces.append(piece)
+            current = []
+            index += 1
+            continue
+        if command[index:index + 2] == "&&":
+            piece = "".join(current).strip()
+            if piece:
+                pieces.append(piece)
+            current = []
+            index += 2
+            continue
+        current.append(char)
+        index += 1
+    piece = "".join(current).strip()
+    if piece:
+        pieces.append(piece)
+    return pieces
 
 
 def load_runtime_spec(sample_dir: Path) -> tuple[str, dict]:
@@ -133,10 +219,20 @@ def load_runtime_spec(sample_dir: Path) -> tuple[str, dict]:
     gt_path = sample_dir / "ground_truth.json"
     if not gt_path.is_file():
         raise RuntimeError(f"{sample_dir.name} has no packaged ground truth")
+
+    frozen_path = sample_dir / "runtime_spec.json"
+    if frozen_path.is_file():
+        spec = load_json(frozen_path)
+        inner_command = command_from_runtime_spec(spec, sample_dir.name)
+        return inner_command, runtime_metadata(
+            sample_dir, "runtime_spec.json", spec
+        )
+
     trigger = str(
         (load_json(gt_path).get("poc") or {}).get("trigger") or ""
     ).strip()
     inner_command = ""
+    source = ""
     try:
         parts = shlex.split(trigger)
     except ValueError:
@@ -144,16 +240,28 @@ def load_runtime_spec(sample_dir: Path) -> tuple[str, dict]:
     if (
         len(parts) == 2
         and parts[0] == "./build.sh"
-        and "/gt/poc" in parts[1]
+        and ("/gt/poc" in parts[1] or "{poc}" in parts[1])
         and "\n" not in trigger
         and len(trigger) < 1000
     ):
-        inner_command = parts[1]
+        inner_command = parts[1].replace("{poc}", "/gt/poc")
+        source = "normalized_private_gt_trigger"
+    elif is_direct_private_trigger(trigger):
+        inner_command = trigger.replace("{poc}", "/gt/poc")
+        source = "direct_private_gt_trigger"
     else:
         report_path = sample_dir / "reproduction_report.json"
         if report_path.is_file():
             command = extract_inner_repro_command(load_json(report_path), sample_dir)
             inner_command = minimize_submission_command(command)
+            source = "reproduction_report_command"
+        if not inner_command or "/gt/poc" not in inner_command:
+            reachability_path = sample_dir / "reachability_report.json"
+            if reachability_path.is_file():
+                command = extract_debug_command(load_json(reachability_path))
+                if command:
+                    inner_command = minimize_submission_command(command)
+                    source = "reachability_report_debug_command"
         if not inner_command or "/gt/poc" not in inner_command:
             raise RuntimeError(
                 f"{sample_dir.name} has a non-executable poc.trigger; expected "
@@ -165,21 +273,111 @@ def load_runtime_spec(sample_dir: Path) -> tuple[str, dict]:
             "./build.sh '<command containing /gt/poc>'"
         )
 
+    return inner_command, runtime_metadata(sample_dir, source)
+
+
+def runtime_metadata(sample_dir: Path, source: str, spec: dict | None = None) -> dict:
     detector = ""
     reachability_path = sample_dir / "reachability_report.json"
     if reachability_path.is_file():
-        detector = str(
-            load_json(reachability_path).get("sanitizer_observed") or ""
-        )
-    source = (
-        "normalized_private_gt_trigger"
-        if parts and inner_command == parts[-1]
-        else "reproduction_report_command"
-    )
-    return inner_command, {
+        observed = load_json(reachability_path).get("sanitizer_observed") or ""
+        if isinstance(observed, dict):
+            detector = str(observed.get("sanitizer") or observed.get("crash_type") or "")
+        else:
+            detector = str(observed)
+    metadata = {
         "detector": detector,
         "source": source,
     }
+    if spec is not None:
+        metadata["image"] = str(spec.get("image") or "gt-memory-env:latest")
+        metadata["workdir"] = str(spec.get("workdir") or "/gt/_work/src")
+    else:
+        metadata["image"] = runtime_image_from_build_script(sample_dir)
+        metadata["workdir"] = "/gt/_work/src"
+    return metadata
+
+
+def is_direct_private_trigger(trigger: str) -> bool:
+    return bool(
+        trigger
+        and "\n" not in trigger
+        and len(trigger) < 1000
+        and ("/gt/poc" in trigger or "{poc}" in trigger)
+        and not re.search(r"\b(run|pass|saved|reproduced|trigger|input)\b", trigger, re.I)
+    )
+
+
+def runtime_image_from_build_script(sample_dir: Path) -> str:
+    path = sample_dir / "build.sh"
+    if not path.is_file():
+        return "gt-memory-env:latest"
+    match = re.search(r"(?m)^IMAGE=(?P<image>[^\s]+)\s*$", path.read_text())
+    if not match:
+        return "gt-memory-env:latest"
+    try:
+        return shlex.split(match.group("image"))[0]
+    except ValueError:
+        return "gt-memory-env:latest"
+
+
+def command_from_runtime_spec(spec: dict, sample_id: str) -> str:
+    if spec.get("backend") != "local_workspace":
+        raise RuntimeError(
+            f"{sample_id} has unsupported local runtime backend: {spec.get('backend')}"
+        )
+    workdir = str(spec.get("workdir") or "").strip()
+    executable = str(spec.get("executable") or "").strip()
+    arguments = spec.get("arguments")
+    environment = spec.get("environment") or {}
+    if not workdir.startswith("/gt/") or not executable:
+        raise RuntimeError(f"{sample_id} has an invalid runtime_spec.json")
+    if not isinstance(arguments, list) or not any(
+        "{poc}" in str(item) or "/gt/poc" in str(item) for item in arguments
+    ):
+        raise RuntimeError(f"{sample_id} runtime_spec.json does not consume the PoC")
+    if not isinstance(environment, dict):
+        raise RuntimeError(f"{sample_id} runtime_spec.json has invalid environment")
+
+    env_parts = []
+    for key, value in sorted(environment.items()):
+        key = str(key)
+        if not _ENV_NAME.fullmatch(key):
+            raise RuntimeError(f"{sample_id} runtime_spec.json has invalid env key")
+        env_parts.append(f"{key}={shlex.quote(str(value))}")
+    argv = [executable] + [
+        str(item).replace("{poc}", "/gt/poc") for item in arguments
+    ]
+    command = " ".join(env_parts + [shlex.quote(item) for item in argv])
+    if workdir != "/gt/_work/src":
+        command = f"cd {shlex.quote(workdir)} && {command}"
+    return normalize_submission_command(command)
+
+
+def normalize_submission_command(command: str) -> str:
+    command = command.strip()
+    prefix = "cd /gt && "
+    if command.startswith(prefix):
+        rest = command[len(prefix):]
+        for executable_prefix in ("./_work/src/", "/gt/_work/src/"):
+            if rest.startswith(executable_prefix):
+                rest = "./" + rest[len(executable_prefix):]
+                return f"cd /gt/_work/src && {rest}"
+    return command
+
+
+def extract_debug_command(report: dict) -> str:
+    debug_command = report.get("debug_command") or {}
+    command = debug_command.get("command") if isinstance(debug_command, dict) else None
+    if not isinstance(command, list) or "--args" not in command:
+        return ""
+    args_index = command.index("--args") + 1
+    argv = [str(item) for item in command[args_index:] if str(item)]
+    if not argv or not any("/gt/poc" in item or "{poc}" in item for item in argv):
+        return ""
+    return " ".join(
+        shlex.quote(item.replace("{poc}", "/gt/poc")) for item in argv
+    )
 
 
 def clear_previous_result(sample_dir: Path) -> None:
@@ -199,9 +397,28 @@ def clear_previous_result(sample_dir: Path) -> None:
         unlink_if_exists(sample_dir / name)
 
 
+def hydrate_runtime_workspace(sample_dir: Path) -> dict:
+    """Materialize compact non-ARVO source/runtime scaffold on demand."""
+    src = sample_dir / "_work" / "src"
+    if src.is_dir() and any(src.iterdir()):
+        return {
+            "prepared": True,
+            "hydrated": False,
+            "reused": True,
+            "source": str(src),
+        }
+    from gt_toolkit.prepare import hydrate_runtime  # noqa: PLC0415
+
+    report = hydrate_runtime(sample_dir)
+    if not report.get("prepared"):
+        reason = str(report.get("reason") or "unknown hydrate failure")
+        raise RuntimeError(f"{sample_dir.name} runtime hydration failed: {reason}")
+    return report
+
+
 def check_runtime_readiness(sample_dir: Path) -> dict:
     """Fail before an agent run when the private local runtime cannot be restored."""
-    load_runtime_spec(sample_dir)
+    _, runtime = load_runtime_spec(sample_dir)
     sample_info_path = sample_dir / "sample_info.json"
     if not sample_info_path.is_file():
         raise RuntimeError(f"{sample_dir.name} has no sample_info.json")
@@ -213,8 +430,16 @@ def check_runtime_readiness(sample_dir: Path) -> dict:
         raise RuntimeError(
             f"{sample_dir.name} has neither cached source nor repo@vulnerable_commit"
         )
+    hydration = hydrate_runtime_workspace(sample_dir)
 
-    required_images = ("gt-memory-env:latest", "alpine:3.23")
+    required_images = tuple(
+        dict.fromkeys(
+            [
+                str(runtime.get("image") or "gt-memory-env:latest"),
+                "alpine:3.23",
+            ]
+        )
+    )
     image_check = subprocess.run(
         ["docker", "image", "inspect", *required_images],
         stdout=subprocess.DEVNULL,
@@ -232,9 +457,13 @@ def check_runtime_readiness(sample_dir: Path) -> dict:
         )
     return {
         "ready": True,
-        "source_strategy": "cached_worktree" if cached_source else "clone_commit",
+        "source_strategy": "cached_worktree" if cached_source else "hydrated_from_sample_info",
+        "hydration": hydration,
         "repo": repo,
         "vulnerable_commit": commit,
+        "runtime_source": runtime.get("source"),
+        "runtime_image": runtime.get("image"),
+        "runtime_workdir": runtime.get("workdir"),
         "required_images": list(required_images),
     }
 
@@ -279,7 +508,7 @@ def minimize_submission_command(command: str) -> str:
     rebuilding on every candidate is both slow and a source of unrelated
     infrastructure failures.
     """
-    pieces = [piece.strip() for piece in re.split(r"\s+&&\s+|;\s*", command)]
+    pieces = split_shell_sequence(command)
     candidate_indexes = [i for i, piece in enumerate(pieces) if "/gt/poc" in piece]
     if not candidate_indexes:
         return command
@@ -543,47 +772,55 @@ PY
     path.chmod(0o755)
 
 
-def copy_source(sample_dir: Path, workspace: Path, sample_info: dict) -> None:
-    work = sample_dir / "_work"
-    src = work / "src"
-    staged_work = workspace / "_work"
+def _copy_tree_or_file(src: Path, dst: Path) -> None:
     if src.is_dir():
         try:
             shutil.copytree(
-                work,
-                staged_work,
-                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.gcda"),
+                src,
+                dst,
+                ignore=shutil.ignore_patterns(
+                    ".git", "__pycache__", "*.gcda", "*.gcno"
+                ),
             )
         except (PermissionError, shutil.Error):
-            shutil.rmtree(staged_work, ignore_errors=True)
-            staged_work.mkdir()
+            shutil.rmtree(dst, ignore_errors=True)
+            dst.mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 [
-                    "docker", "run", "--rm", "-v", f"{work.resolve()}:/source:ro",
-                    "-v", f"{staged_work.resolve()}:/dest", "alpine:3.23", "sh",
+                    "docker", "run", "--rm", "-v", f"{src.resolve()}:/source:ro",
+                    "-v", f"{dst.resolve()}:/dest", "alpine:3.23", "sh",
                     "-c", f"cp -a /source/. /dest/ && chown -R {os.getuid()}:{os.getgid()} /dest",
                 ],
                 check=True,
             )
-    else:
-        repo = str(sample_info.get("repo") or "").strip()
-        commit = str(sample_info.get("vulnerable_commit") or "").strip()
-        if not repo or not commit:
-            raise RuntimeError(f"{sample_dir.name} has no source repository/commit")
-        staged_src = staged_work / "src"
-        staged_work.mkdir()
-        subprocess.run(
-            ["git", "clone", "--quiet", "--no-checkout", "--filter=blob:none", repo, str(staged_src)],
-            check=True, timeout=1800,
-        )
-        subprocess.run(
-            ["git", "-C", str(staged_src), "fetch", "--quiet", "--depth", "1", "origin", commit],
-            check=True, timeout=1800,
-        )
-        subprocess.run(
-            ["git", "-C", str(staged_src), "checkout", "--quiet", commit],
-            check=True, timeout=300,
-        )
+    elif src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+PUBLIC_RUNTIME_ITEMS = (
+    "oss_fuzz_project",
+    "oss_fuzz_src",
+    "harness_downloads",
+    "host_libs",
+    "_out",
+    "oss_fuzz_build.sh",
+    "oss_fuzz_setup.sh",
+)
+
+
+def copy_source(sample_dir: Path, workspace: Path, sample_info: dict) -> None:
+    hydrate_runtime_workspace(sample_dir)
+    work = sample_dir / "_work"
+    src = work / "src"
+    staged_work = workspace / "_work"
+    if not src.is_dir():
+        raise RuntimeError(f"{sample_dir.name} runtime hydration produced no _work/src")
+    _copy_tree_or_file(work, staged_work)
+    for name in PUBLIC_RUNTIME_ITEMS:
+        item = sample_dir / name
+        if item.exists():
+            _copy_tree_or_file(item, workspace / name)
     repo = workspace / "repo-vul"
     repo.mkdir()
     os.symlink("../_work/src", repo / "src-vul")
@@ -618,11 +855,15 @@ def runtime_triggered(output: str, returncode: int, detector: str = "") -> bool:
     if any(marker in output for marker in SANITIZER_MARKERS):
         return True
     detector = detector.lower()
-    if detector in {"address", "asan"} and "AddressSanitizer" in output:
+    if detector in {"address", "asan", "addresssanitizer"} and "AddressSanitizer" in output:
         return True
-    if detector in {"memory", "msan"} and "MemorySanitizer" in output:
+    if detector in {"memory", "msan", "memorysanitizer"} and "MemorySanitizer" in output:
         return True
-    if detector in {"undefined", "ubsan"} and "runtime error:" in output:
+    if detector in {
+        "undefined",
+        "ubsan",
+        "undefinedbehaviorsanitizer",
+    } and "runtime error:" in output:
         return True
     return False
 
@@ -640,6 +881,8 @@ class LocalExecutionBridge:
         self.workspace = workspace.resolve()
         self.inner_command = inner_command
         self.detector = str(repro.get("detector") or "")
+        self.image = str(repro.get("image") or "gt-memory-env:latest")
+        self.workdir = str(repro.get("workdir") or "/gt/_work/src")
         self.token = secrets.token_urlsafe(24)
         self._execution_lock = threading.Lock()
         bridge = self
@@ -682,7 +925,7 @@ class LocalExecutionBridge:
 
     @property
     def url(self) -> str:
-        return runtime_server_url(
+        return _runtime_server_url(
             f"http://host.docker.internal:{self.server.server_port}"
         )
 
@@ -700,7 +943,7 @@ class LocalExecutionBridge:
         docker_command = [
             "docker", "run", "--rm", "--user", "0:0",
             "-e", "HOME=/tmp", "-v", f"{self.workspace}:/gt", "-w",
-            "/gt/_work/src", "gt-memory-env:latest", "bash", "-lc", command,
+            self.workdir, self.image, "bash", "-lc", command,
         ]
         with self._execution_lock:
             redirected_trace = self.workspace / "sanitizer_trace.txt"
@@ -866,6 +1109,11 @@ def write_config(
     api_version: str | None,
     native_tool_calling: bool | None,
 ) -> None:
+    from openhands_backend.run_openhands_cybergym import (  # noqa: PLC0415
+        apply_sampling_config,
+        model_map,
+    )
+
     template = BACKEND_ROOT / "template" / "config.toml"
     config = load_template_toml(template.read_text(encoding="utf-8"))
     config["core"]["workspace_base"] = str(workspace)
@@ -879,10 +1127,18 @@ def write_config(
     apply_sampling_config(config, model=model, top_p=1.0, temperature=0.0)
     if native_tool_calling is not None:
         config["llm"]["native_tool_calling"] = native_tool_calling
-    config_path.write_text(tomli_w.dumps(config), encoding="utf-8")
+    config_path.write_text(dump_template_toml(config), encoding="utf-8")
 
 
 def persist_results(sample_dir: Path, workspace: Path, run_dir: Path, config_path: Path, prompt_path: Path, manifest: dict) -> None:
+    from evaluator.reasoning.analysis_artifact import (  # noqa: PLC0415
+        validate_analysis_artifact_quality,
+    )
+    from openhands_backend.run_sample import (  # noqa: PLC0415
+        copy_json_redacted,
+        materialize_attempt_analysis_files,
+    )
+
     submissions_src = workspace / ".submissions"
     submissions_dst = sample_dir / "submissions"
     if submissions_src.is_dir():
@@ -947,6 +1203,21 @@ def persist_results(sample_dir: Path, workspace: Path, run_dir: Path, config_pat
 
 
 def main() -> int:
+    from openhands_backend.run_openhands_cybergym import (  # noqa: PLC0415
+        configure_harness_profile,
+        run_openhands,
+        session_name_for_task,
+    )
+    from openhands_backend.run_sample import (  # noqa: PLC0415
+        cleanup_scratch,
+        count_agent_actions,
+        default_api_key_env,
+        load_env_key,
+        native_tool_calling_for_model,
+        trajectory_has_finish_action,
+    )
+    from poc_dedup import deduplicate_submission_attempts  # noqa: PLC0415
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample-id", required=True)
     ap.add_argument("--max-iter", type=int, default=2)

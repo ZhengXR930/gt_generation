@@ -50,6 +50,71 @@ def test_runtime_spec_unwraps_libtool_script(tmp_path):
     assert spec.environment["LD_LIBRARY_PATH"] == "/gt/_work/src/.libs"
 
 
+def test_runtime_spec_uses_reachability_debug_command_fallback(tmp_path):
+    sample = tmp_path / "nvd_case"
+    sample.mkdir()
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "ground_truth.json").write_text(json.dumps({
+        "poc": {"trigger": "Run the saved witness input through the reproducer."},
+    }))
+    (sample / "reachability_report.json").write_text(json.dumps({
+        "debug_command": {
+            "command": [
+                "gdb", "--batch", "-q", "-x", "/repo/gdb.py",
+                "--args", "/tmp/repro", "/gt/poc",
+            ],
+        },
+    }))
+
+    spec = compile_runtime_spec(sample, require_artifacts=False)
+
+    assert spec.source == "reachability_report.debug_command"
+    assert spec.executable == "/tmp/repro"
+    assert spec.arguments == ["{poc}"]
+
+
+def test_runtime_spec_preserves_quoted_one_liner_semicolon(tmp_path):
+    sample = tmp_path / "ruby_case"
+    sample.mkdir()
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "ground_truth.json").write_text(json.dumps({
+        "poc": {
+            "trigger": (
+                "./build.sh 'ruby -Ilib -r ox -e "
+                "'\"'\"'data = File.binread(\"/gt/poc\"); Ox.parse(data)'\"'\"''"
+            ),
+        },
+    }))
+
+    spec = compile_runtime_spec(sample, require_artifacts=False)
+
+    assert spec.executable == "ruby"
+    assert spec.arguments == [
+        "-Ilib",
+        "-r",
+        "ox",
+        "-e",
+        'data = File.binread("{poc}"); Ox.parse(data)',
+    ]
+
+
+def test_runtime_spec_normalizes_gt_workdir_executable(tmp_path):
+    sample = tmp_path / "gpac_case"
+    sample.mkdir()
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "ground_truth.json").write_text(json.dumps({
+        "poc": {
+            "trigger": "./build.sh 'cd /gt && ./_work/src/bin/gcc/MP4Box -dash 1000 /gt/poc'",
+        },
+    }))
+
+    spec = compile_runtime_spec(sample, require_artifacts=False)
+
+    assert spec.workdir == "/gt/_work/src"
+    assert spec.executable == "./bin/gcc/MP4Box"
+    assert spec.arguments == ["-dash", "1000", "{poc}"]
+
+
 def test_runtime_checkpoint_line_is_remapped_by_frozen_statement(tmp_path):
     sample = tmp_path / "secbench_case"
     source = sample / "_work" / "src" / "src" / "parser.c"

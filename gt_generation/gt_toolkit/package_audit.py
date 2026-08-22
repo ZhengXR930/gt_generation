@@ -47,6 +47,10 @@ REACHABILITY_FIELDS = (
 )
 
 
+def _is_arvo_sample_id(sample_id: str) -> bool:
+    return sample_id.startswith("arvo_")
+
+
 def _load_json(path: Path, errors: list[str]) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -320,6 +324,40 @@ def _contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     return errors
 
 
+def _runtime_spec_errors(
+    spec: dict[str, Any], sample_id: str
+) -> list[str]:
+    errors: list[str] = []
+    if spec.get("sample_id") != sample_id:
+        errors.append(
+            f"runtime_spec.json sample_id mismatch: {spec.get('sample_id')!r} != {sample_id!r}"
+        )
+    if spec.get("backend") != "local_workspace":
+        errors.append("runtime_spec.json backend must be local_workspace for non-ARVO")
+    if not str(spec.get("image") or "").strip():
+        errors.append("runtime_spec.json missing image")
+    if not str(spec.get("workdir") or "").startswith("/gt/"):
+        errors.append("runtime_spec.json workdir must be under /gt")
+    if not str(spec.get("executable") or "").strip():
+        errors.append("runtime_spec.json missing executable")
+    arguments = spec.get("arguments")
+    if not isinstance(arguments, list) or not all(isinstance(arg, str) for arg in arguments):
+        errors.append("runtime_spec.json arguments must be a string array")
+    elif not any("{poc}" in arg for arg in arguments):
+        errors.append("runtime_spec.json arguments must contain {poc}")
+    environment = spec.get("environment")
+    if not isinstance(environment, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in environment.items()
+    ):
+        errors.append("runtime_spec.json environment must be an object of strings")
+    if spec.get("input_placeholder") != "{poc}":
+        errors.append("runtime_spec.json input_placeholder must be {poc}")
+    if not str(spec.get("source") or "").strip():
+        errors.append("runtime_spec.json missing source")
+    return errors
+
+
 def audit_package(result_dir: Path) -> dict[str, Any]:
     result_dir = result_dir.resolve()
     errors: list[str] = []
@@ -360,6 +398,13 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
             errors.append(
                 f"sample_id mismatch in {name}: {sample_id!r} != {expected_sample_id!r}"
             )
+    if expected_sample_id and not _is_arvo_sample_id(expected_sample_id):
+        runtime_spec_path = result_dir / "runtime_spec.json"
+        if not runtime_spec_path.is_file():
+            errors.append("missing required file for non-ARVO sample: runtime_spec.json")
+        else:
+            runtime_spec = _load_json(runtime_spec_path, errors)
+            errors.extend(_runtime_spec_errors(runtime_spec, expected_sample_id))
 
     gt = documents["ground_truth.json"]
     gt_report = validate_data(gt, ground_truth=str(result_dir / "ground_truth.json"))
