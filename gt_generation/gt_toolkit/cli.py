@@ -10,6 +10,7 @@ Subcommands:
   audit-package  Validate a completed GT result directory and all evidence references.
   bind-evidence  Commit the final GT and evidence files by content hash.
   macro-aliases  Add per-sample constant macro aliases to field_bindings.json.
+  context       Collect PoC execution context as context_trace.json.
   compact-result Remove generation-only files from a validated result directory.
   arvo-workspace Reuse one ARVO container across vulnerable/fixed validation.
   repo-workspace Run repo-track instrumentation gates through build.sh.
@@ -33,8 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     commands = [
         "prepare", "validate", "state", "reachability", "assertions",
         "assertion-preflight", "audit-package", "bind-evidence",
-        "macro-aliases", "compact-result", "arvo-workspace", "repo-workspace",
-        "gdb-watch", "schema-path",
+        "macro-aliases", "context", "compact-result", "arvo-workspace",
+        "repo-workspace", "gdb-watch", "schema-path",
     ]
     parser = argparse.ArgumentParser(prog="gt-toolkit", description=__doc__)
     parser.add_argument("--version", action="version", version=f"gt-toolkit {__version__}")
@@ -79,6 +80,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "macro-aliases":
         from . import macro_aliases
         return macro_aliases.main(rest)
+    if ns.command == "context":
+        from . import context_trace
+        return context_trace.main(rest)
     if ns.command == "compact-result":
         from . import compact_result
         return compact_result.main(rest)

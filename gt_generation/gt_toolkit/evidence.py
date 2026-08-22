@@ -23,6 +23,7 @@ COMMITMENT_FILES = (
 
 OPTIONAL_COMMITMENT_FILES = (
     "assertion_reward_spec.json",
+    "context_trace.json",
 )
 
 

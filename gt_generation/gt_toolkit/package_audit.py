@@ -14,6 +14,7 @@ from .assertions import (
     validate_frozen_spec,
     validate_invariant_bindings,
 )
+from .context_trace import context_trace_errors
 from .evidence import commitment_errors
 from .validate import harness_location_reason, validate_data
 
@@ -34,6 +35,7 @@ REQUIRED_FILES = (
 
 OPTIONAL_PROJECTION_FILES = (
     "assertion_reward_spec.json",
+    "context_trace.json",
 )
 
 REACHABILITY_FIELDS = (
@@ -451,6 +453,10 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         if str(commitment.get("sample_id") or "") != expected_sample_id:
             errors.append("evidence_commitment.json sample_id does not match package")
         errors.extend(commitment_errors(result_dir, commitment))
+
+    context_trace = documents.get("context_trace.json")
+    if context_trace is not None:
+        errors.extend(context_trace_errors(result_dir, context_trace))
 
     return {
         "result_dir": str(result_dir),

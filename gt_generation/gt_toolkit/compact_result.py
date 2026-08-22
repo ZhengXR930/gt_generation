@@ -29,6 +29,7 @@ KEEP_FILES = {
     "assertion_results.json",
     "perturbation_results.json",
     "reachability_report.json",
+    "context_trace.json",
     "generation_timing.json",
     "generation_provenance.json",
     "evidence_commitment.json",

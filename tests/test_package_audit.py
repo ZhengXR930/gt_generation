@@ -189,3 +189,82 @@ def test_package_audit_rejects_legacy_assertions_even_when_legacy_checks_pass(
 
     assert report["ok"] is False
     assert any("must use verified-assertions-v3" in error for error in report["errors"])
+
+
+def test_package_audit_validates_context_trace_when_present(tmp_path, monkeypatch):
+    sample_id = "sample"
+    assertion = {
+        "id": "required.root",
+        "kind": "required",
+        "at": "point",
+        "check": ["eq", "$left", "$right"],
+        "invariants": ["node.one"],
+    }
+    spec = {
+        "schema_version": "assertion-spec-v3",
+        "sample_id": sample_id,
+        "original_case": "original",
+        "assertions": [assertion],
+    }
+    spec["content_hash"] = assertion_content_hash(spec)
+    documents = {
+        "sample_info.json": {
+            "sample_id": sample_id,
+            "original_bug_description": "exact public issue",
+            "default_crash_trace": "exact public crash trace",
+        },
+        "ground_truth.json": {"sample_id": sample_id},
+        "verified_invariants.json": {
+            "sample_id": sample_id,
+            "nodes": [{"invariant_id": "node.one", "verified": True}],
+            "edges": [],
+        },
+        "verified_assertions.json": {
+            "schema_version": "verified-assertions-v3",
+            "sample_id": sample_id,
+            "content_hash": spec["content_hash"],
+            "assertions": [assertion],
+        },
+        "assertion_results.json": {
+            "sample_id": sample_id,
+            "original_case": "original",
+            "candidate_content_hash": spec["content_hash"],
+            "required_verified": True,
+        },
+        "perturbation_results.json": {
+            "sample_id": sample_id,
+            "all_needed_witnessed": True,
+        },
+        "field_bindings.json": {"sample_id": sample_id},
+        "event_locations.json": {"sample_id": sample_id},
+        "reachability_report.json": {
+            "sample_id": sample_id,
+            "reachability_checked": True,
+            "target_vulnerability_triggered": True,
+            "R2_source_reached": True,
+            "R3_root_cause_reached": True,
+            "R4_sink_reached": True,
+            **{field: True for field in package_audit.REACHABILITY_FIELDS},
+            "artifacts": {},
+        },
+        "context_trace.json": {
+            "schema_version": "gt-context-trace-v1",
+            "sample_id": sample_id,
+            "collection": {},
+            "context": [],
+        },
+    }
+    for name in package_audit.REQUIRED_FILES:
+        path = tmp_path / name
+        path.write_text(json.dumps(documents[name]) if name.endswith(".json") else "asset")
+    (tmp_path / "context_trace.json").write_text(json.dumps(documents["context_trace.json"]))
+    monkeypatch.setattr(
+        package_audit,
+        "validate_data",
+        lambda *args, **kwargs: SimpleNamespace(errors=[], warnings=[]),
+    )
+
+    report = package_audit.audit_package(tmp_path)
+
+    assert report["ok"] is False
+    assert "context_trace.json context is empty" in report["errors"]
