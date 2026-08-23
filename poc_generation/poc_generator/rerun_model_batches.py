@@ -21,22 +21,43 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 GT_ROOT = HERE.parents[1]
+REPO_PYTHON = GT_ROOT / "external" / "OpenHands" / ".venv-openhands" / "bin" / "python"
 for import_root in (GT_ROOT, GT_ROOT / "evaluator"):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
+from reward_framework.adapters.poc_generation import (
+    PocHarnessRequest,
+    build_poc_harness_command,
+    normalize_harness_name,
+)
 RESULTS_ROOT = HERE.parent / "poc_results"
 LOG_ROOT = RESULTS_ROOT / "_batch_logs"
 LOCK_ROOT = RESULTS_ROOT / "_sample_locks"
 OPENHANDS_BACKEND = HERE / "openhands_backend"
-DSH_BACKEND = HERE / "dsh"
-RUN_SAMPLE = OPENHANDS_BACKEND / "run_sample.py"
+RUN_SAMPLE = HERE / "run_sample.py"
 RUN_LOCAL_SAMPLE = OPENHANDS_BACKEND / "run_local_sample.py"
-RUN_DEEPSEEK_HARNESS_LOCAL_SAMPLE = DSH_BACKEND / "run_deepseek_harness_local_sample.py"
-RUN_DEEPSEEK_HARNESS_ARVO_SAMPLE = DSH_BACKEND / "run_deepseek_harness_arvo_sample.py"
+RUNNER_PYTHON = str(REPO_PYTHON if REPO_PYTHON.exists() else Path(sys.executable))
 
 
-def sample_environment(config: dict) -> dict[str, str]:
-    env = os.environ.copy()
+def sample_environment(config: dict, base: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(base or os.environ)
+    # poc_generation writes to poc_results and must not inherit reward-framework
+    # skill state. Skill experiments use reward_framework adapter entrypoints.
+    for name in (
+        "CYBERGYM_OPENHANDS_SKILL_PACKET_DIR",
+        "CYBERGYM_MAX_EFFECTIVE_SUBMITS",
+        "REWARD_FRAMEWORK_POC_SKILL_PACKET_DIR",
+        "REWARD_FRAMEWORK_CODEX_SKILLS_DIR",
+        "REWARD_FRAMEWORK_CLAUDE_SKILLS_DIR",
+        "REWARD_FRAMEWORK_DSH_BUNDLE_DIR",
+    ):
+        env.pop(name, None)
+    for legacy_key in ("skill_packet_dir", "openhands_skill_packet_dir"):
+        if str(config.get(legacy_key) or "").strip():
+            raise RuntimeError(
+                f"{legacy_key} is not supported by poc_generation batch runners; "
+                "use reward_framework adapter entrypoints for skill runs."
+            )
     tmp_root = str(config.get("tmp_root") or "").strip()
     if tmp_root:
         Path(tmp_root).mkdir(parents=True, exist_ok=True)
@@ -50,7 +71,6 @@ def sample_environment(config: dict) -> dict[str, str]:
     if config.get("openhands_runtime_disable_dns"):
         env["OPENHANDS_RUNTIME_DISABLE_DNS"] = "1"
     return env
-
 
 def maybe_run_reachability(config: dict, namespace: str, sample_id: str) -> dict:
     if not config.get("run_reachability_after_generation"):
@@ -186,21 +206,6 @@ def has_valid_analysis(result_dir: Path) -> bool:
     )
 
 
-def analysis_requirement_satisfied(result_dir: Path, manifest: dict) -> bool:
-    if has_valid_analysis(result_dir):
-        return True
-    if manifest.get("evaluation_protocol") == "poc_analysis_artifact_per_submission_v3_dsh_arvo":
-        attempts = manifest.get("submission_attempts") or []
-        if not attempts:
-            return False
-        return all(
-            bool(attempt.get("analysis_path"))
-            and (result_dir / str(attempt["analysis_path"])).is_file()
-            for attempt in attempts
-        )
-    return False
-
-
 def submission_files_complete(result_dir: Path, manifest: dict, *, local: bool) -> bool:
     # Historical v2 result packages often preserved only poc.bin plus the
     # per-submission analysis artifact; reachability replays PoCs later and
@@ -218,10 +223,10 @@ def submission_files_complete(result_dir: Path, manifest: dict, *, local: bool) 
             return False
         required = {
             "poc.bin",
+            "analysis.json",
             "result.json",
             "runtime_output.txt",
         }
-        required.add("analysis.json")
         if not local:
             required.add("request.json")
         if not all((attempt_dir / name).is_file() for name in required):
@@ -244,8 +249,6 @@ def submission_files_complete(result_dir: Path, manifest: dict, *, local: bool) 
             "representative_runtime_output_path",
         ):
             relative_path = poc.get(key)
-            if relative_path and (result_dir / relative_path).is_file():
-                continue
             if not relative_path or not (result_dir / relative_path).is_file():
                 return False
     return True
@@ -263,7 +266,7 @@ def result_is_complete(result_dir: Path) -> bool:
         return False
     if manifest.get("status") not in COMPLETE_STATUSES:
         return False
-    if not analysis_requirement_satisfied(result_dir, manifest):
+    if not has_valid_analysis(result_dir):
         return False
     if not (result_dir / "checkpoint").is_dir():
         return False
@@ -282,7 +285,7 @@ def local_result_is_complete(result_dir: Path) -> bool:
         return False
     if manifest.get("status") not in COMPLETE_STATUSES:
         return False
-    if not analysis_requirement_satisfied(result_dir, manifest):
+    if not has_valid_analysis(result_dir):
         return False
     if not (result_dir / "checkpoint").is_dir():
         return False
@@ -291,7 +294,6 @@ def local_result_is_complete(result_dir: Path) -> bool:
 
 def run_one(config: dict, sample_id: str) -> dict:
     namespace = config["results_namespace"]
-    backend = str(config.get("backend") or "openhands")
     LOCK_ROOT.mkdir(parents=True, exist_ok=True)
     lock_path = LOCK_ROOT / f"{sample_id}.lock"
     with lock_path.open("w", encoding="utf-8") as lock_file:
@@ -315,101 +317,57 @@ def run_one(config: dict, sample_id: str) -> dict:
         log_dir = LOG_ROOT / namespace
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{sample_id}.log"
-        if backend == "deepseek_harness":
-            if is_arvo:
-                command = [
-                    sys.executable,
-                    str(RUN_DEEPSEEK_HARNESS_ARVO_SAMPLE),
-                    "--arvo-id",
-                    remove_prefix(sample_id, "arvo_"),
-                    "--max-iter",
-                    str(config["max_iter"]),
-                    "--server",
-                    config["server"],
-                    "--difficulty",
-                    config["difficulty"],
-                    "--timeout",
-                    str(config.get("timeout", 7200)),
-                    "--model",
-                    config["model"],
-                    "--base-url",
-                    config.get("base_url", ""),
-                    "--api-key-env",
-                    config["api_key_env"],
-                    "--results-dir",
-                    str(RESULTS_ROOT / namespace),
-                    "--max-attempts",
-                    str(config.get("max_attempts", 1)),
-                ]
-            else:
-                command = [
-                    sys.executable,
-                    str(RUN_DEEPSEEK_HARNESS_LOCAL_SAMPLE),
-                    "--sample-id",
-                    sample_id,
-                    "--max-iter",
-                    str(config["max_iter"]),
-                    "--timeout",
-                    str(config.get("timeout", 7200)),
-                    "--model",
-                    config["model"],
-                    "--base-url",
-                    config.get("base_url", ""),
-                    "--api-key-env",
-                    config["api_key_env"],
-                    "--results-dir",
-                    str(RESULTS_ROOT / namespace),
-                ]
-            if config.get("dsh_src"):
-                command.extend(["--dsh-src", str(config["dsh_src"])])
-            if config.get("dsh_node_root"):
-                command.extend(["--node-root", str(config["dsh_node_root"])])
-            if config.get("dsh_home"):
-                command.extend(["--dsh-home", str(config["dsh_home"])])
-            if config.get("dsh_scratch_root"):
-                command.extend(["--scratch-root", str(config["dsh_scratch_root"])])
-            if config.get("reasoning_effort"):
-                command.extend(
-                    ["--reasoning-effort", str(config["reasoning_effort"])]
-                )
-            if config.get("allow_tool_network"):
-                command.append("--allow-tool-network")
-        elif is_arvo:
-            command = [
-                sys.executable, str(RUN_SAMPLE), "--arvo-id",
-                remove_prefix(sample_id, "arvo_"), "--max-iter",
-                str(config["max_iter"]), "--server", config["server"],
-                "--difficulty", config["difficulty"], "--model", config["model"],
-                "--openhands-repo", config["openhands_repo"], "--base-url",
-                config.get("base_url", ""), "--api-key-env", config["api_key_env"],
-                "--results-dir", str(RESULTS_ROOT / namespace), "--max-attempts",
-                str(config.get("max_attempts", 1)),
-            ]
-            harness_profile = str(config.get("harness_profile") or "baseline")
-            if harness_profile != "baseline":
-                raise RuntimeError(
-                    "poc_generation no longer launches reward harness profiles; "
-                    "use reward_framework independently"
-                )
-            command.extend(["--harness-profile", "baseline"])
+        if is_arvo:
+            harness = normalize_harness_name(config.get("harness") or config.get("backend") or "openhands")
+            request = PocHarnessRequest(
+                harness=harness,
+                arvo_id=remove_prefix(sample_id, "arvo_"),
+                model=config["model"],
+                base_url=str(config.get("base_url") or ""),
+                api_key_env=str(config.get("api_key_env") or ""),
+                api_version=str(config.get("api_version") or ""),
+                max_iter=int(config["max_iter"]),
+                max_attempts=int(config.get("generation_attempts", config.get("max_attempts", 1))),
+                timeout=int(config.get("timeout", 10800)),
+                server=config["server"],
+                difficulty=config["difficulty"],
+                results_dir=RESULTS_ROOT / namespace,
+                openhands_repo=Path(config["openhands_repo"]).expanduser() if config.get("openhands_repo") else None,
+                skill_packet_dir=None,
+            )
+            adapter_command = build_poc_harness_command(request)
+            command = adapter_command.command
+            command_cwd = adapter_command.cwd
+            command_env = sample_environment(config, adapter_command.env)
         else:
+            harness = normalize_harness_name(config.get("harness") or config.get("backend") or "openhands")
+            if harness != "openhands":
+                raise RuntimeError(
+                    f"non-ARVO sample {sample_id} is only wired for OpenHands in this runner; "
+                    f"got harness={harness!r}"
+                )
             command = [
-                sys.executable, str(RUN_LOCAL_SAMPLE), "--sample-id", sample_id,
+                RUNNER_PYTHON, str(RUN_LOCAL_SAMPLE), "--sample-id", sample_id,
                 "--max-iter", str(config["max_iter"]), "--timeout",
                 str(config.get("timeout", 7200)), "--model", config["model"],
                 "--openhands-repo", config["openhands_repo"], "--base-url",
                 config.get("base_url", ""), "--api-key-env", config["api_key_env"],
                 "--results-dir", str(RESULTS_ROOT / namespace),
             ]
-        api_version = str(config.get("api_version") or "").strip()
-        if api_version:
-            command.extend(["--api-version", api_version])
+            api_version = str(config.get("api_version") or "").strip()
+            if api_version:
+                command.extend(["--api-version", api_version])
+            command_cwd = HERE.parents[1]
+            command_env = sample_environment(config)
         started = time.monotonic()
         with log_path.open("w", encoding="utf-8") as log:
+            if is_arvo:
+                log.write("ADAPTER_COMMAND " + json.dumps(adapter_command.redacted(), ensure_ascii=False) + "\n")
+                log.flush()
             returncode = subprocess.run(
                 command,
-                cwd=HERE.parents[1],
-                env=sample_environment(config),
+                cwd=command_cwd,
+                env=command_env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
             ).returncode

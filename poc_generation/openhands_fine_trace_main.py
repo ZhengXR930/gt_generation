@@ -69,6 +69,31 @@ def _force_started_key() -> str:
     return "analysis_artifact_force_started"
 
 
+def _workspace_refusal_key() -> str:
+    return "workspace_inspection_refusal_count"
+
+
+def _skill_adapter_enabled() -> bool:
+    return bool(os.environ.get("CYBERGYM_OPENHANDS_SKILL_PACKET_DIR", "").strip())
+
+
+def _looks_like_workspace_inspection_refusal(action: Any) -> bool:
+    if not _skill_adapter_enabled():
+        return False
+    from reward_framework.adapters.openhands.contract import (
+        looks_like_workspace_inspection_refusal_content,
+    )
+
+    return looks_like_workspace_inspection_refusal_content(
+        getattr(action, "content", "") or ""
+    )
+
+
+def _workspace_bootstrap_command() -> str:
+    from reward_framework.adapters.openhands.contract import workspace_bootstrap_command
+
+    return workspace_bootstrap_command()
+
 def _final_deliverable_instruction() -> str:
     expected_sample_id = os.environ.get("OPENHANDS_EXPECTED_SAMPLE_ID", "").strip()
     return analysis_artifact_finalization_instruction(
@@ -99,7 +124,21 @@ def _validate_final_response(response: str) -> str | None:
 
 def _forced_finalization_trigger() -> str | None:
     value = os.environ.get("OPENHANDS_FORCE_FINE_TRACE_FINALIZATION", "").strip()
-    return value or None
+    if value:
+        return value
+    if not _skill_adapter_enabled():
+        return None
+    workspace = os.environ.get("OPENHANDS_TASK_WORKSPACE", "").strip()
+    if not workspace:
+        return None
+    marker = Path(workspace) / ".poc_skill_state" / "force_finalization_reason"
+    if not marker.is_file():
+        return None
+    try:
+        reason = marker.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        reason = "workspace_force_finalization"
+    return reason or "workspace_force_finalization"
 
 
 def _finalization(controller: Any) -> dict[str, Any] | None:
@@ -134,18 +173,33 @@ def _hides_submit_status(command: str) -> bool:
     )
 
 
+def _mixes_heredoc_with_submit(command: str) -> bool:
+    # Fail fast on commands like `cat > analysis.json <<JSON ... JSON && bash
+    # submit.sh ...`: the delimiter must be alone on its line, otherwise the
+    # shell waits for more stdin and the run burns iterations/time without an
+    # evaluated submission.
+    return "submit.sh" in command and "<<" in command
+
+
 def _make_submit_command_blocking(action: Any) -> None:
     """Wait for synchronous candidate evaluation instead of exposing a soft timeout."""
     if _is_submit_command(action):
         command = getattr(action, "command", "")
-        if isinstance(command, str) and _hides_submit_status(command):
+        if isinstance(command, str) and _mixes_heredoc_with_submit(command):
+            action.command = (
+                "echo 'Error: write /workspace/analysis.json in a separate "
+                "shell action. The submit action must be standalone, e.g. "
+                "cd /workspace && bash submit.sh /workspace/poc.bin "
+                "/workspace/analysis.json, with no heredoc in the same command.' >&2; "
+                "exit 2"
+            )
+        elif isinstance(command, str) and _hides_submit_status(command):
             action.command = (
                 "echo 'Error: submit.sh must be the final command in this "
                 "shell action; do not hide or overwrite its exit status.' >&2; "
                 "exit 2"
             )
         action.set_hard_timeout(_SUBMIT_COMMAND_TIMEOUT_SECONDS, blocking=True)
-
 
 def _get_agent_messages(agent: Any, events: Any, state: Any) -> Any:
     """Call the pristine or an evolved OpenHands message-builder contract."""
@@ -367,7 +421,8 @@ async def _complete_trace(controller: Any, response: str) -> None:
 def install_fine_trace_overlay() -> None:
     from openhands.agenthub.codeact_agent.codeact_agent import CodeActAgent
     from openhands.controller.agent_controller import AgentController
-    from openhands.events.action import AgentFinishAction
+    from openhands.events import EventSource
+    from openhands.events.action import AgentFinishAction, CmdRunAction, MessageAction
     from openhands.llm.llm import LLM
     from openhands.memory.condenser.condenser import Condensation, View
 
@@ -408,6 +463,48 @@ def install_fine_trace_overlay() -> None:
         self._analysis_artifact_modelhub_patch = True
 
     async def handle_action(controller, action):
+        if (
+            _capture_enabled()
+            and not _is_finalizing(controller)
+            and isinstance(action, MessageAction)
+            and getattr(action, "source", None) == EventSource.AGENT
+            and _looks_like_workspace_inspection_refusal(action)
+        ):
+            count = int(controller.state.extra_data.get(_workspace_refusal_key()) or 0) + 1
+            controller.state.extra_data[_workspace_refusal_key()] = count
+            action.wait_for_response = False
+            if count <= 2:
+                controller.event_stream.add_event(
+                    CmdRunAction(
+                        command=_workspace_bootstrap_command(),
+                        thought=(
+                            "Harness recovery: the agent asked for workspace inspection "
+                            "instead of using tools. Run a read-only workspace bootstrap."
+                        ),
+                        blocking=True,
+                    ),
+                    EventSource.AGENT,
+                )
+                controller.event_stream.add_event(
+                    MessageAction(
+                        content=(
+                            "The workspace inspection was provided above. Continue with shell actions. "
+                            "Do not ask for human input; build an evidence-bearing candidate, write "
+                            "/workspace/analysis.json, and submit with bash submit.sh when ready."
+                        ),
+                        wait_for_response=False,
+                    ),
+                    EventSource.USER,
+                )
+                return
+            from openhands.core.schema import AgentState
+
+            controller.state.last_error = (
+                "agent repeatedly refused to inspect workspace instead of using tools"
+            )
+            await original_set_agent_state_to(controller, AgentState.ERROR)
+            return
+
         _make_submit_command_blocking(action)
         if not isinstance(action, AgentFinishAction) or not _capture_enabled():
             return await original_handle_action(controller, action)

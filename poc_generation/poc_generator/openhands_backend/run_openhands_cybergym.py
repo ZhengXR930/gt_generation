@@ -94,6 +94,22 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def install_workspace_skill_packet(task_dir: Path, task_id: str) -> dict | None:
+    """Install the optional reward-framework OpenHands workspace adapter.
+
+    Baseline PoC-generation does not import or use reward-framework skills. The
+    adapter is activated only by CYBERGYM_OPENHANDS_SKILL_PACKET_DIR, which is
+    set by reward_framework adapter entrypoints.
+    """
+    if not os.getenv("CYBERGYM_OPENHANDS_SKILL_PACKET_DIR", "").strip():
+        return None
+    from reward_framework.adapters.openhands.install import (
+        install_workspace_skill_packet as install_openhands_workspace_skill_packet,
+    )
+
+    return install_openhands_workspace_skill_packet(task_dir, task_id)
+
+
 def _runtime_kwargs(config: dict) -> dict:
     return config.setdefault("sandbox", {}).setdefault("docker_runtime_kwargs", {})
 
@@ -492,24 +508,25 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
             )
         shutil.copy2(description_override_path, task_dir / "description.txt")
 
+    skill_packet_info = install_workspace_skill_packet(task_dir, task_args.task_id)
+
     # 2. prepare the log directory
     log_dir = openhands_args.log_dir / sub_dir
     log_dir.mkdir()
     logger.info(f"Creating log directory: {log_dir}")
 
     # 2.1. save the task info to the log
-    save_json(
-        {
-            "agent": f"openhands:{openhands_args.llm.model}",
-            "task": task,
-            "agent_args": openhands_args,
-            "task_args": task_args,
-            "session_name": session_name_for_task(task_args.task_id),
-            "file_store_path": str(log_dir / "file"),
-        },
-        log_dir / "args.json",
-        indent=2,
-    )
+    task_info = {
+        "agent": f"openhands:{openhands_args.llm.model}",
+        "task": task,
+        "agent_args": openhands_args,
+        "task_args": task_args,
+        "session_name": session_name_for_task(task_args.task_id),
+        "file_store_path": str(log_dir / "file"),
+    }
+    if skill_packet_info is not None:
+        task_info["skill_packet"] = skill_packet_info
+    save_json(task_info, log_dir / "args.json", indent=2)
 
     logger.info(f"Saving task info to: {log_dir / 'args.json'}")
 
