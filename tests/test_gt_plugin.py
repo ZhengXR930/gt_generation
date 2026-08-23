@@ -317,6 +317,8 @@ def test_stage01_screening_accepts_without_package_audit(tmp_path):
 
     assert screening["status"] == "accepted_for_gt"
     assert screening["accepted_for_gt"] is True
+    assert screening["failure_class"] == "none"
+    assert screening["retryable"] is False
     assert not (tmp_path / "stage01_screening.json").exists()
 
 

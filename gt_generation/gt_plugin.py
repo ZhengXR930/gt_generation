@@ -469,9 +469,13 @@ def evaluate_stage01_screening(
         "reproduction_report": str(report_path),
         "portability_report": str(portability_path),
         "failure_class": (
-            "infrastructure"
-            if status == "infrastructure_retryable"
-            else ("stage01_gate" if status == "rejected_by_stage01" else "incomplete")
+            "none"
+            if status == "accepted_for_gt"
+            else (
+                "infrastructure"
+                if status == "infrastructure_retryable"
+                else ("stage01_gate" if status == "rejected_by_stage01" else "incomplete")
+            )
         ),
         "retryable": status in {"infrastructure_retryable", "incomplete_stage01"},
     }
