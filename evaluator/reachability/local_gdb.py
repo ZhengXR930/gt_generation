@@ -8,7 +8,12 @@ import subprocess
 from pathlib import Path
 
 from reachability.engine import CommandResult, load_hits, write_breakpoint_spec
-from reachability.runtime_spec import RuntimeSpec, container_path_on_host
+from reachability.runtime_spec import (
+    RuntimeSpec,
+    RuntimeSpecError,
+    container_path_on_host,
+    ensure_source_workspace,
+)
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -39,14 +44,26 @@ def run_local_gdb(
     except FileNotFoundError:
         pass
 
+    _ensure_runtime_prepared(
+        spec=spec,
+        gt_dir=gt_dir,
+        repo_root=repo_root,
+        output_dir=output_dir,
+        timeout=max(timeout, 1800),
+    )
     executable = spec.executable
     # Relative executables are intentionally retained relative to the exact
     # recorded container workdir; validation already proved the mapped file exists.
-    container_path_on_host(gt_dir, executable, spec.workdir)
+    executable_host = container_path_on_host(gt_dir, executable, spec.workdir)
     candidate = str(poc_path.resolve())
     if not _is_relative_to(Path(candidate), repo_root.resolve()):
         raise RuntimeError("PoC path must be inside the mounted repository")
     arguments = [item.replace(spec.input_placeholder, candidate) for item in spec.arguments]
+    gdb_executable, gdb_arguments = _gdb_invocation_for_runtime(
+        executable=executable,
+        executable_host=executable_host,
+        arguments=arguments,
+    )
     gdb_script = repo_root / "evaluator" / "reachability" / "gdb_reachability.py"
     command = [
         "docker", "run", "--rm", "--platform", "linux/amd64",
@@ -65,7 +82,7 @@ def run_local_gdb(
         "-w", spec.workdir,
         spec.image,
         "gdb", "--batch", "-q", "-x", str(gdb_script), "--args",
-        executable, *arguments,
+        gdb_executable, *gdb_arguments,
     ])
     try:
         proc = subprocess.run(
@@ -95,3 +112,90 @@ def run_local_gdb(
         and not any(hit.get("run_error") for hit in hits)
     )
     return result, hits, checked
+
+
+def _gdb_invocation_for_runtime(
+    *, executable: str, executable_host: Path, arguments: list[str]
+) -> tuple[str, list[str]]:
+    """Return the program argv GDB should launch for a RuntimeSpec.
+
+    Runtime validation is allowed to use a small shell wrapper, because it only
+    needs to execute the candidate.  Reachability needs debug symbols from the
+    real target binary.  For generated non-ARVO specs the wrapper usually ends
+    in `exec "$target" ...`; launching it as `/bin/bash wrapper ...` lets GDB
+    follow the fork/exec into that target while keeping pending source
+    breakpoints.
+    """
+    try:
+        with executable_host.open("rb") as handle:
+            is_script = handle.read(2) == b"#!"
+    except OSError:
+        is_script = False
+    if not is_script:
+        return executable, arguments
+    return "/bin/bash", [executable, *arguments]
+
+
+def _ensure_runtime_prepared(
+    *,
+    spec: RuntimeSpec,
+    gt_dir: Path,
+    repo_root: Path,
+    output_dir: Path,
+    timeout: int,
+) -> None:
+    if spec.backend != "local_workspace":
+        return
+    ensure_source_workspace(gt_dir, spec, timeout=timeout)
+    executable = container_path_on_host(gt_dir, spec.executable, spec.workdir)
+    if executable.is_file() and executable.stat().st_mode & 0o111:
+        return
+    if not spec.build_commands:
+        raise RuntimeSpecError(f"runtime executable is missing: {executable}")
+    build_script = "set -e\n" + "\n".join(spec.build_commands)
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--platform",
+        "linux/amd64",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        "-e",
+        "HOME=/tmp",
+        "-v",
+        f"{repo_root}:{repo_root}:ro",
+        "-v",
+        f"{gt_dir.resolve()}:/gt",
+        "-w",
+        spec.build_workdir,
+        spec.image,
+        "bash",
+        "-lc",
+        build_script,
+    ]
+    proc = subprocess.run(
+        command,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    (output_dir / "runtime_build_stdout.txt").write_text(
+        proc.stdout, encoding="utf-8"
+    )
+    (output_dir / "runtime_build_stderr.txt").write_text(
+        proc.stderr, encoding="utf-8"
+    )
+    (output_dir / "runtime_build_command.json").write_text(
+        json.dumps({"command": command, "returncode": proc.returncode}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if proc.returncode != 0:
+        raise RuntimeSpecError(f"runtime build failed with exit code {proc.returncode}")
+    if not executable.is_file():
+        raise RuntimeSpecError(f"runtime build did not create executable: {executable}")
+    if not executable.stat().st_mode & 0o111:
+        raise RuntimeSpecError(f"runtime executable is not executable: {executable}")

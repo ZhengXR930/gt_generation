@@ -154,6 +154,18 @@ def _write_output():
 def main():
     gdb.execute('set pagination off')
     gdb.execute('set breakpoint pending on')
+    for command in (
+        'set follow-exec-mode same',
+        # Shell wrappers often run helper commands such as `find` before
+        # finally `exec`-ing the project binary.  Stay with the wrapper process
+        # and follow its final exec instead of following the helper child.
+        'set follow-fork-mode parent',
+        'set detach-on-fork on',
+    ):
+        try:
+            gdb.execute(command)
+        except gdb.error:
+            pass
     checkpoints = _load_breakpoints()
     breakpoint_groups = []
     for checkpoint in checkpoints:
