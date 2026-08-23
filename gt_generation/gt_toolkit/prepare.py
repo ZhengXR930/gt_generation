@@ -118,6 +118,40 @@ def _commitish_exists(repo: Path, commitish: str) -> bool:
     return _sh(["git", "-C", str(repo), "cat-file", "-e", f"{commitish}^{{commit}}"], timeout=30).returncode == 0
 
 
+def _remove_checkout_tree(path: Path) -> None:
+    """Remove a checkout tree before cloning, including root-owned leftovers."""
+    path = path.resolve()
+    if not path.exists():
+        return
+    shutil.rmtree(path, ignore_errors=True)
+    if not path.exists():
+        return
+    if shutil.which("docker"):
+        parent = path.parent
+        image = os.environ.get("GT_REPO_DOCKER_IMAGE", "gt-memory-env:latest")
+        proc = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{parent}:/gt-parent",
+                image,
+                "sh", "-c", 'rm -rf -- "$1"', "sh", f"/gt-parent/{path.name}",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=300,
+            check=False,
+        )
+        if not path.exists():
+            return
+        raise RuntimeError(
+            "source checkout cleanup incomplete: "
+            f"{path} (docker rc={proc.returncode}, stderr="
+            f"{(proc.stderr or '')[-500:]})"
+        )
+    raise RuntimeError(f"source checkout cleanup incomplete: {path}")
+
+
 def _ensure_repo_commit(repo: Path, remote: str, commitish: str) -> dict[str, Any]:
     status: dict[str, Any] = {"commit": commitish}
     shallow = _sh(["git", "-C", str(repo), "rev-parse", "--is-shallow-repository"], timeout=30)
@@ -198,7 +232,7 @@ def _materialize_repo_checkout(
             })
             continue
 
-        shutil.rmtree(src, ignore_errors=True)
+        _remove_checkout_tree(src)
         cloned = _sh(["git", "clone", "--no-checkout", str(cache), str(src)], timeout=600)
         if cloned.returncode != 0:
             clone_errors.append({
@@ -225,7 +259,7 @@ def _materialize_repo_checkout(
                     "commit": commit,
                     "stderr": (fetched_local.stderr or "")[-2000:],
                 })
-                shutil.rmtree(src, ignore_errors=True)
+                _remove_checkout_tree(src)
                 break
         if not src.is_dir():
             continue
@@ -240,7 +274,7 @@ def _materialize_repo_checkout(
                     "commit": first_commit,
                     "stderr": (checked.stderr or "")[-2000:],
                 })
-                shutil.rmtree(src, ignore_errors=True)
+                _remove_checkout_tree(src)
                 continue
             cache_status["checked_out"] = first_commit
         return clone_repo, clone_errors, cache_status

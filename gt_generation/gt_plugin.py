@@ -299,6 +299,94 @@ def _setup_command_masks_failures(command: str) -> bool:
     return False
 
 
+_STAGE01_INFRA_PATTERNS = (
+    "clone failed",
+    "required commit fetch failed",
+    "cache init failed",
+    "cache remote add failed",
+    "local clone from cache failed",
+    "local fetch from cache failed",
+    "checkout required commit failed",
+    "could not resolve host",
+    "could not resolve hostname",
+    "name or service not known",
+    "failed to connect",
+    "connection timed out",
+    "connection reset",
+    "connection refused",
+    "network is unreachable",
+    "temporary failure",
+    "tls handshake",
+    "gnutls",
+    "ssl_connect",
+    "rpc failed",
+    "early eof",
+    "remote end hung up",
+    "http/2 stream",
+    "operation timed out",
+    "timeout was reached",
+    "permission denied",
+    "operation not permitted",
+    "build did not complete",
+    "build failed",
+    "dependency",
+    "/install/",
+)
+
+
+def _json_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for key, item in value.items():
+            out.extend(_json_strings(key))
+            out.extend(_json_strings(item))
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            out.extend(_json_strings(item))
+        return out
+    return []
+
+
+def _has_stage01_infra_text(*values: Any) -> bool:
+    text = "\n".join(
+        piece.lower()
+        for value in values
+        for piece in _json_strings(value)
+    )
+    return any(pattern in text for pattern in _STAGE01_INFRA_PATTERNS)
+
+
+def _stage01_infrastructure_reason(
+    prepare: Any, report: Any, portability: Any
+) -> str:
+    if isinstance(prepare, dict) and prepare.get("prepared") is not True:
+        if _has_stage01_infra_text(prepare):
+            return "source_materialization_infrastructure_failure"
+    if isinstance(portability, dict):
+        if portability.get("vulnerable_build_ok") is False and _has_stage01_infra_text(
+            report, portability
+        ):
+            return "vulnerable_build_infrastructure_failure"
+        if portability.get("fixed_build_ok") is False and _has_stage01_infra_text(
+            report, portability
+        ):
+            return "fixed_build_infrastructure_failure"
+        if portability.get("runtime_portable") is not True and _has_stage01_infra_text(
+            portability
+        ):
+            return "runtime_portability_infrastructure_failure"
+    if isinstance(report, dict):
+        if report.get("vulnerable_reproduced") is not True and _has_stage01_infra_text(
+            report
+        ):
+            return "vulnerable_reproduction_infrastructure_failure"
+    return ""
+
+
 def _repo_fixed_oracle_required(result_dir: Path, sample: dict[str, Any]) -> bool:
     prepare = _load_json_or_none(result_dir / "prepare_report.json")
     info = _load_json_or_none(result_dir / "sample_info.json")
@@ -327,8 +415,13 @@ def evaluate_stage01_screening(
     accepted = False
     portability_path = result_dir / "portability_report.json"
     portability = _load_json_or_none(portability_path)
+    prepare = _load_json_or_none(result_dir / "prepare_report.json")
+    infra_reason = _stage01_infrastructure_reason(prepare, report, portability)
 
-    if isinstance(report, dict):
+    if infra_reason:
+        status = "infrastructure_retryable"
+        reason = infra_reason
+    elif isinstance(report, dict):
         reproduced = report.get("vulnerable_reproduced") is True
         matches_issue = report.get("matches_issue") is True
         fixed = report.get("fixed_oracle")
@@ -375,6 +468,12 @@ def evaluate_stage01_screening(
         "runner_returncode": runner_returncode,
         "reproduction_report": str(report_path),
         "portability_report": str(portability_path),
+        "failure_class": (
+            "infrastructure"
+            if status == "infrastructure_retryable"
+            else ("stage01_gate" if status == "rejected_by_stage01" else "incomplete")
+        ),
+        "retryable": status in {"infrastructure_retryable", "incomplete_stage01"},
     }
     return screening
 
@@ -908,6 +1007,15 @@ def main(argv: list[str] | None = None) -> int:
         "run_mode": cfg["run_mode"],
         "requested": len(cfg["samples"]),
         "succeeded": sum(1 for r in results if r.get("succeeded")),
+        "infrastructure_retryable": (
+            sum(
+                1
+                for r in results
+                if (r.get("stage01_screening") or {}).get("status")
+                == "infrastructure_retryable"
+            )
+            if cfg["run_mode"] == "stage01_screening" else None
+        ),
         "accepted_for_gt": (
             sum(1 for r in results if (r.get("stage01_screening") or {}).get("accepted_for_gt"))
             if cfg["run_mode"] == "stage01_screening" else None

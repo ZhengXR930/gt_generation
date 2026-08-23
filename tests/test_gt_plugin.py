@@ -347,3 +347,119 @@ def test_stage01_screening_rejects_unclean_fixed_oracle(tmp_path):
     assert screening["status"] == "rejected_by_stage01"
     assert screening["accepted_for_gt"] is False
     assert screening["reason"] == "fixed_oracle_not_clean"
+
+
+def test_stage01_screening_marks_clone_failure_as_infra_retryable(tmp_path):
+    (tmp_path / "prepare_report.json").write_text(
+        json.dumps(
+            {
+                "track": "repo/osv",
+                "prepared": False,
+                "reason": "clone failed: https://github.com/net-snmp/net-snmp",
+                "clone_errors": [
+                    {
+                        "reason": "required commit fetch failed",
+                        "stderr": "fatal: unable to access repo: Could not resolve host: github.com",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    screening = gt_plugin.evaluate_stage01_screening(
+        tmp_path, {"sample_id": "osv_ossfuzz_OSV-2025-133"}, 1
+    )
+
+    assert screening["status"] == "infrastructure_retryable"
+    assert screening["accepted_for_gt"] is False
+    assert screening["failure_class"] == "infrastructure"
+    assert screening["retryable"] is True
+    assert screening["reason"] == "source_materialization_infrastructure_failure"
+
+
+def test_stage01_screening_marks_dependency_build_failure_as_infra_retryable(tmp_path):
+    (tmp_path / "prepare_report.json").write_text(
+        json.dumps({"track": "repo/osv", "prepared": True}), encoding="utf-8"
+    )
+    (tmp_path / "sample_info.json").write_text(
+        json.dumps({"fix_commit": "fixed"}), encoding="utf-8"
+    )
+    (tmp_path / "reproduction_report.json").write_text(
+        json.dumps(
+            {
+                "vulnerable_reproduced": False,
+                "matches_issue": False,
+                "crash_summary": (
+                    "authoritative OSS-Fuzz build did not complete because "
+                    "/install/ruzzy is absent in gt-memory-env"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "portability_report.json").write_text(
+        json.dumps(
+            {
+                "runtime_portable": False,
+                "clean_replay_ok": False,
+                "vulnerable_build_ok": False,
+                "reason": "vulnerable reproduction was not established",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    screening = gt_plugin.evaluate_stage01_screening(
+        tmp_path, {"sample_id": "osv_ossfuzz_OSV-2025-1001"}, 1
+    )
+
+    assert screening["status"] == "infrastructure_retryable"
+    assert screening["accepted_for_gt"] is False
+    assert screening["failure_class"] == "infrastructure"
+    assert screening["reason"] == "vulnerable_build_infrastructure_failure"
+
+
+def test_stage01_screening_marks_fixed_build_failure_as_infra_retryable(tmp_path):
+    (tmp_path / "prepare_report.json").write_text(
+        json.dumps({"track": "repo/osv", "prepared": True}), encoding="utf-8"
+    )
+    (tmp_path / "sample_info.json").write_text(
+        json.dumps({"fix_commit": "fixed"}), encoding="utf-8"
+    )
+    (tmp_path / "reproduction_report.json").write_text(
+        json.dumps(
+            {
+                "vulnerable_reproduced": True,
+                "matches_issue": True,
+                "fixed_oracle_checked": True,
+                "fixed_oracle_acceptable": False,
+                "fixed_oracle": {
+                    "checked": True,
+                    "acceptable": False,
+                    "summary": "fixed build failed: Failed to connect to github.com",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "portability_report.json").write_text(
+        json.dumps(
+            {
+                "runtime_portable": False,
+                "clean_replay_ok": False,
+                "vulnerable_build_ok": True,
+                "fixed_build_ok": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    screening = gt_plugin.evaluate_stage01_screening(
+        tmp_path, {"sample_id": "osv_ossfuzz_OSV-2025-133"}, 1
+    )
+
+    assert screening["status"] == "infrastructure_retryable"
+    assert screening["accepted_for_gt"] is False
+    assert screening["failure_class"] == "infrastructure"
+    assert screening["reason"] == "fixed_build_infrastructure_failure"

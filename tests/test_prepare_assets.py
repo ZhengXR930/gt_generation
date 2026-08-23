@@ -21,6 +21,34 @@ def test_non_arvo_memory_env_uses_configured_image_and_context(tmp_path, monkeyp
     assert calls[-1] == ["docker", "build", "-t", "custom-memory:latest", str(context)]
 
 
+def test_repo_checkout_cleanup_uses_container_fallback(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "leftover").write_text("root-owned build output")
+    calls = []
+
+    monkeypatch.setenv("GT_REPO_DOCKER_IMAGE", "custom-memory:latest")
+    monkeypatch.setattr(prepare.shutil, "rmtree", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prepare.shutil, "which", lambda name: "/usr/bin/docker")
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command[:3] == ["docker", "run", "--rm"]:
+            for child in src.iterdir():
+                child.unlink()
+            src.rmdir()
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(prepare.subprocess, "run", fake_run)
+
+    prepare._remove_checkout_tree(src)
+
+    assert not src.exists()
+    assert calls
+    assert calls[0][:3] == ["docker", "run", "--rm"]
+    assert "custom-memory:latest" in calls[0]
+
+
 def test_prepare_preserves_input_as_sample_info(tmp_path, monkeypatch):
     sample = tmp_path / "input.json"
     sample.write_text(
