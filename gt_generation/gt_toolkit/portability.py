@@ -307,15 +307,22 @@ def _command_for_version(
     # Source selection belongs to the deterministic gate.  Leaving checkout or
     # reset commands in an agent-authored build recipe can switch the fixed
     # replay back to vulnerable or make the recipe depend on current state.
-    lines = []
-    for line in command.splitlines():
-        if re.match(
-            r"^\s*git\s+(?:checkout|reset\s+--hard|clean\s+-)[^\n]*$",
-            line,
-        ):
-            continue
-        lines.append(line)
-    return "\n".join(lines)
+    # A setup recipe is often written as one fail-closed chain, for example
+    # ``git checkout <sha> && rm -rf build && make``.  Do not discard that
+    # entire line merely because its first command selects a revision.  Remove
+    # only the leading source-mutation command and its following separator.
+    # Stage 01 performs the authoritative checkout immediately before this
+    # recipe is executed.
+    source_mutation = re.compile(
+        r"(?m)^[ \t]*git[ \t]+"
+        r"(?:checkout(?:[ \t]+-f)?|reset[ \t]+--hard|clean[ \t]+-[^\s;&]+)"
+        r"[^\n;&]*(?:[ \t]*(?:&&|;)[ \t]*|[ \t]*$\n?)"
+    )
+    previous = None
+    while command != previous:
+        previous = command
+        command = source_mutation.sub("", command)
+    return command.strip()
 
 
 def _checkout(result_path: Path, commit: str) -> dict[str, Any]:

@@ -107,6 +107,39 @@ def test_frozen_evaluator_build_command_drops_source_mutation(tmp_path, monkeypa
     assert spec["build_commands"] == ["set -euo pipefail\nmake"]
 
 
+def test_frozen_evaluator_keeps_commands_after_inline_checkout(tmp_path, monkeypatch):
+    result = _stage01_result(tmp_path)
+    report = json.loads((result / "reproduction_report.json").read_text())
+    report["setup_command"] = (
+        "git checkout vulnerable && rm -rf build && "
+        "make CC=clang CFLAGS='-fsanitize=address'"
+    )
+    _write_json(result / "reproduction_report.json", report)
+
+    class FakeSpec:
+        def to_dict(self):
+            return {
+                "sample_id": result.name, "backend": "local_workspace",
+                "image": "gt-memory-env:latest", "workdir": "/gt/_work/src",
+                "executable": "./target", "arguments": ["{poc}"],
+                "environment": {}, "input_placeholder": "{poc}",
+                "source": "test",
+            }
+
+    class FakeRuntimeSpec:
+        compile_runtime_spec = staticmethod(lambda *_args, **_kwargs: FakeSpec())
+
+    monkeypatch.setattr(portability, "_runtime_spec_module", lambda: FakeRuntimeSpec)
+
+    frozen = portability.freeze_runtime_contract(result)
+    spec = json.loads((result / "runtime_spec.json").read_text())
+
+    assert frozen["ok"] is True
+    assert spec["build_commands"] == [
+        "rm -rf build && make CC=clang CFLAGS='-fsanitize=address'"
+    ]
+
+
 def test_portable_copy_excludes_work_outputs_archives_and_reports(tmp_path):
     result = _stage01_result(tmp_path)
     _write_json(result / "runtime_build.json", {

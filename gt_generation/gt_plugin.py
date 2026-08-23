@@ -476,6 +476,12 @@ def publish_stage01_migration(work_dir: Path, published_dir: Path) -> dict[str, 
             _remove_path(staging / name)
             for part in staging.glob(name + ".part-*"):
                 _remove_path(part)
+        # A migrated package is source-rebuildable.  Never retain a local
+        # checkout or compiled output merely because it existed in the legacy
+        # published directory (these paths are gitignored and otherwise linger
+        # invisibly on the migration host).
+        for name in ("_work", "_out", "runtime_build_logs"):
+            _remove_path(staging / name)
         for name, expected in protected_hashes.items():
             if _sha256_file(staging / name) != expected:
                 raise ValueError(f"semantic evidence changed during migration: {name}")
