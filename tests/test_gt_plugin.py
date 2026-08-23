@@ -78,6 +78,66 @@ def test_stage01_migration_copy_excludes_generated_runtime_roots(tmp_path):
     assert not (staging / "runtime_work_manifest.json").exists()
 
 
+def test_publish_stage01_migration_removes_stale_runtime_helper_roots(tmp_path, monkeypatch):
+    published = tmp_path / "published"
+    work = tmp_path / "work"
+    published.mkdir()
+    work.mkdir()
+    (published / "sample_info.json").write_text("same")
+    (work / "sample_info.json").write_text("same")
+    (published / "poc").write_text("poc")
+    (work / "poc").write_text("poc")
+    (published / "ground_truth.json").write_text(json.dumps({"sample_id": "sample"}))
+    (published / "runtime_support" / "old").mkdir(parents=True)
+    (published / "runtime_support" / "old" / "helper.c").write_text("old")
+
+    for name in ("build.sh", "runtime_build.json", "runtime_spec.json"):
+        (work / name).write_text(name)
+    (work / "oss_fuzz_project").mkdir()
+    (work / "oss_fuzz_project" / "build.sh").write_text("new")
+    material_files = [
+        "sample_info.json",
+        "poc",
+        "build.sh",
+        "runtime_build.json",
+        "runtime_spec.json",
+        "oss_fuzz_project/build.sh",
+    ]
+    (work / "runtime_materials.json").write_text(json.dumps({
+        "files": [
+            {
+                "path": name,
+                "sha256": gt_plugin._sha256_file(work / name),
+            }
+            for name in material_files
+        ]
+    }))
+    (work / "portability_report.json").write_text(json.dumps({
+        "runtime_portable": True,
+        "clean_replay_ok": True,
+    }))
+    (work / "reproduction_report.json").write_text("{}")
+
+    monkeypatch.setattr(
+        "gt_generation.gt_toolkit.portability.portability_gate_passes",
+        lambda path: path == work,
+    )
+    monkeypatch.setattr(
+        "gt_generation.gt_toolkit.evidence.COMMITMENT_FILES",
+        ("ground_truth.json",),
+    )
+    monkeypatch.setattr(
+        "gt_generation.gt_toolkit.package_audit.audit_package",
+        lambda path: {"ok": True, "warnings": [], "errors": []},
+    )
+
+    result = gt_plugin.publish_stage01_migration(work, published)
+
+    assert result["published"] is True
+    assert not (published / "runtime_support").exists()
+    assert (published / "oss_fuzz_project" / "build.sh").read_text() == "new"
+
+
 def test_partial_repair_does_not_skip_complete_samples(monkeypatch):
     monkeypatch.setitem(
         sys.modules,

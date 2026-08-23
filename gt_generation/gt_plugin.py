@@ -46,6 +46,14 @@ ADAPTERS = {
 MAX_PARALLEL = 6  # local Docker budget ceiling
 CODEX_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 CODEX_WIRE_APIS = {"responses"}
+STAGE01_RUNTIME_HELPER_ROOTS = {
+    "runtime_support",
+    "oss_fuzz_project",
+    "oss_fuzz_src",
+    "harness_downloads",
+    "oss_fuzz_build.sh",
+    "oss_fuzz_setup.sh",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -675,7 +683,7 @@ def publish_stage01_migration(work_dir: Path, published_dir: Path) -> dict[str, 
             relative.parts[0] for relative in material_paths
             if relative.parts[0] not in base_files
         }
-        for root in helper_roots:
+        for root in sorted(STAGE01_RUNTIME_HELPER_ROOTS | helper_roots):
             _remove_path(staging / root)
         for relative in material_paths:
             source = work_dir / relative
