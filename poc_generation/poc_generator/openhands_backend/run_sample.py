@@ -42,6 +42,35 @@ from poc_dedup import deduplicate_submission_attempts  # noqa: E402
 from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
 
 
+def _local_docker_chown_images():
+    """Return local-only images suitable for chown fallback cleanup.
+
+    Do not ask Docker to pull missing images here. Scratch cleanup must not turn
+    a finished benchmark run into an external Docker Hub dependency.
+    """
+    candidates = [
+        os.getenv("GT_CLEANUP_CHOWN_IMAGE"),
+        os.getenv("OPENHANDS_RUNTIME_CONTAINER_IMAGE"),
+        "gt-memory-env:latest",
+        "alpine:latest",
+        "alpine:3.17",
+        "alpine:3.23",
+    ]
+    client = docker.from_env()
+    available = []
+    seen = set()
+    for image in candidates:
+        if not image or image in seen:
+            continue
+        seen.add(image)
+        try:
+            client.images.get(image)
+        except Exception:
+            continue
+        available.append(image)
+    return available
+
+
 def cleanup_scratch(scratch: Path) -> None:
     """Remove an OpenHands scratch tree even when runtime files are root-owned."""
     scratch = scratch.resolve()
@@ -54,16 +83,27 @@ def cleanup_scratch(scratch: Path) -> None:
         return
     except PermissionError:
         pass
-    try:
-        docker.from_env().containers.run(
-            "alpine:3.23",
-            command=["chown", "-R", f"{os.getuid()}:{os.getgid()}", "/scratch"],
-            volumes={str(scratch): {"bind": "/scratch", "mode": "rw"}},
-            remove=True,
-        )
-        shutil.rmtree(scratch)
-    except Exception as exc:
-        logging.warning("Could not fully clean scratch %s: %s", scratch, exc)
+
+    last_exc = None
+    for image in _local_docker_chown_images():
+        try:
+            docker.from_env().containers.run(
+                image,
+                command=["chown", "-R", f"{os.getuid()}:{os.getgid()}", "/scratch"],
+                volumes={str(scratch): {"bind": "/scratch", "mode": "rw"}},
+                remove=True,
+            )
+            shutil.rmtree(scratch)
+            return
+        except Exception as exc:
+            last_exc = exc
+            logging.warning(
+                "Scratch cleanup chown failed with local image %s for %s: %s",
+                image,
+                scratch,
+                exc,
+            )
+    logging.warning("Could not fully clean scratch %s: %s", scratch, last_exc)
 
 
 def ensure_arvo_source(arvo_id: str) -> Path:
@@ -200,6 +240,16 @@ def default_api_key_env(model: str) -> str:
 
 def native_tool_calling_for_model(model: str) -> bool | None:
     """Override old OpenHands capability tables for newer official models."""
+    override = os.getenv("OPENHANDS_NATIVE_TOOL_CALLING", "").strip().lower()
+    if override:
+        if override in {"1", "true", "yes", "on"}:
+            return True
+        if override in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(
+            "OPENHANDS_NATIVE_TOOL_CALLING must be true/false when set; "
+            f"got {override!r}"
+        )
     normalized = model[len("openai/"):] if model.startswith("openai/") else model
     if normalized.startswith(("gpt-5.4", "gpt-5.5")):
         return True

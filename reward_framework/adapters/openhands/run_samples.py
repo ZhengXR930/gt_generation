@@ -27,7 +27,19 @@ RUN_SAMPLE = POC_GENERATOR / "run_sample.py"
 RUN_LOCAL_SAMPLE = POC_GENERATOR / "run_local_sample.py"
 DEFAULT_RUNS_ROOT = REPO_ROOT / "reward_framework" / "harness_runs"
 REPO_PYTHON = REPO_ROOT / "external" / "OpenHands" / ".venv-openhands" / "bin" / "python"
-RUNNER_PYTHON = str(REPO_PYTHON if REPO_PYTHON.exists() else Path(sys.executable))
+RUNNER_PYTHON = str(
+    Path(
+        os.getenv("REWARD_FRAMEWORK_RUNNER_PYTHON")
+        or os.getenv("OPENHANDS_PYTHON")
+        or (str(REPO_PYTHON) if REPO_PYTHON.exists() else sys.executable)
+    ).expanduser()
+)
+PINNED_OPENHANDS_COMMIT = "35b381f3a8f4b5229934515e9f6b479d6d6415ef"
+
+for _path in (REPO_ROOT, REPO_ROOT / "evaluator", REPO_ROOT / "external" / "cybergym" / "src"):
+    value = str(_path)
+    if value not in sys.path:
+        sys.path.insert(0, value)
 
 
 def _now_id() -> str:
@@ -86,7 +98,67 @@ def sample_environment(config: dict[str, Any], *, skill_packet: Path) -> dict[st
     ).strip()
     if max_effective_submits:
         env["CYBERGYM_MAX_EFFECTIVE_SUBMITS"] = max_effective_submits
+    native_tool_calling = config.get("openhands_native_tool_calling")
+    if native_tool_calling is not None:
+        if isinstance(native_tool_calling, bool):
+            env["OPENHANDS_NATIVE_TOOL_CALLING"] = "true" if native_tool_calling else "false"
+        else:
+            env["OPENHANDS_NATIVE_TOOL_CALLING"] = str(native_tool_calling).strip()
     return env
+
+
+def _git_stdout(args: list[str], *, cwd: Path) -> str | None:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        return None
+
+
+def _is_clean_openhands_checkout(path: Path) -> bool:
+    if not (path / "pyproject.toml").is_file():
+        return False
+    revision = _git_stdout(["rev-parse", "HEAD"], cwd=path)
+    if revision != PINNED_OPENHANDS_COMMIT:
+        return False
+    status = _git_stdout(["status", "--porcelain"], cwd=path)
+    if status is None:
+        return False
+    dirty = [line for line in status.splitlines() if line.strip() and line.strip() != "?? uv.lock"]
+    return not dirty
+
+
+def resolve_openhands_repo(config: dict[str, Any]) -> Path:
+    candidates: list[Path] = []
+    raw = str(config.get("openhands_repo") or "").strip()
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    env_raw = os.getenv("REWARD_FRAMEWORK_OPENHANDS_REPO", "").strip()
+    if env_raw:
+        candidates.append(Path(env_raw).expanduser())
+    candidates.extend([
+        Path("/tmp/openhands-poc-clean-35b381f3"),
+        REPO_ROOT / "external" / "OpenHands",
+    ])
+    seen: set[str] = set()
+    checked: list[str] = []
+    for candidate in candidates:
+        path = candidate.resolve()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(key)
+        if _is_clean_openhands_checkout(path):
+            return path
+    raise RuntimeError(
+        "no pinned clean OpenHands checkout found; checked: " + ", ".join(checked)
+    )
 
 
 def build_command(
@@ -104,7 +176,7 @@ def build_command(
         "--model",
         str(config["model"]),
         "--openhands-repo",
-        str(config.get("openhands_repo") or REPO_ROOT / "external" / "OpenHands"),
+        str(resolve_openhands_repo(config)),
         "--base-url",
         str(config.get("base_url", "")),
         "--api-key-env",

@@ -261,6 +261,26 @@ def get_prompt_file(model: str):
     return "prompt.txt"
 
 
+def render_prompt_file_for_task(
+    prompt_path: Path,
+    *,
+    task_id: str,
+    skill_packet_info: dict | None,
+) -> None:
+    """Render task-local prompt placeholders and adapter startup framing."""
+    sample_id = task_id.replace(":", "_")
+    text = prompt_path.read_text(encoding="utf-8", errors="replace")
+    text = text.replace("<current sample id>", sample_id)
+    if skill_packet_info is not None:
+        from reward_framework.adapters.openhands.contract import (
+            openhands_startup_prompt_appendix,
+        )
+
+        if "## Reward-framework OpenHands adapter startup contract" not in text:
+            text = text.rstrip() + openhands_startup_prompt_appendix(sample_id) + "\n"
+    prompt_path.write_text(text, encoding="utf-8")
+
+
 def support_native_tool_calling(model: str):
     if "o4-mini" in model:
         return False
@@ -616,6 +636,11 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
         if not prompt_override_path.exists():
             raise FileNotFoundError(f"CYBERGYM_OPENHANDS_PROMPT_FILE does not exist: {prompt_override_path}")
         shutil.copy2(prompt_override_path, tmp_input_dir / "template" / prompt_file)
+    render_prompt_file_for_task(
+        tmp_input_dir / "template" / prompt_file,
+        task_id=task_args.task_id,
+        skill_packet_info=skill_packet_info,
+    )
     session_name = session_name_for_task(task_args.task_id)
     run_openhands(
         config_path=config_path,

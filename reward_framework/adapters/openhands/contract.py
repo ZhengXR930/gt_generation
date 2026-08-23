@@ -68,6 +68,25 @@ def workspace_bootstrap_command() -> str:
     )
 
 
+def openhands_startup_prompt_appendix(sample_id: str) -> str:
+    """Adapter-owned startup contract appended only for skill-enabled runs."""
+    return (
+        "\n\n## Reward-framework OpenHands adapter startup contract\n"
+        f"Current sample id: `{sample_id}`.\n"
+        "Before producing any final answer, analysis JSON, or PoC candidate, "
+        "use a shell tool to inspect the task workspace and the installed skill "
+        "packet. A suitable read-only bootstrap is:\n\n"
+        "```bash\n"
+        + workspace_bootstrap_command()
+        + "\n```\n\n"
+        "After this inspection, continue with normal tool-using issue "
+        "reproduction: inspect code, construct candidate bytes, write the "
+        "candidate-specific analysis artifact, and submit with `bash submit.sh`. "
+        "Do not answer with a bare `analysis.json` object before candidate "
+        "exploration/submission.\n"
+    )
+
+
 def looks_like_workspace_inspection_refusal_content(content: Any) -> bool:
     text = str(content or "").lower()
     if not text:
