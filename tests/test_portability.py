@@ -236,6 +236,30 @@ def test_portable_materials_include_referenced_top_level_directory(tmp_path):
     assert "custom_helper" in paths
 
 
+def test_portable_materials_exclude_generated_logs_but_keep_text_inputs(tmp_path):
+    result = _stage01_result(tmp_path)
+    (result / "build_vulnerable.log").write_text("compiler output")
+    (result / "config.txt").write_text("required input")
+    _write_json(result / "runtime_build.json", {
+        "schema_version": "gt-runtime-build-v1",
+        "sample_id": result.name,
+        "commands": [{
+            "command": (
+                "tool --config /gt/config.txt "
+                "> /gt/build_vulnerable.log 2>&1"
+            )
+        }],
+    })
+
+    paths = {
+        path.relative_to(result).as_posix()
+        for path in portability.portable_material_paths(result)
+    }
+
+    assert "config.txt" in paths
+    assert "build_vulnerable.log" not in paths
+
+
 def test_contract_rejects_result_root_path_escape(tmp_path, monkeypatch):
     result = _stage01_result(tmp_path)
     report = json.loads((result / "reproduction_report.json").read_text())

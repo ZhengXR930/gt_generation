@@ -45,6 +45,18 @@ Read these staged files before choosing a build or run command:
 - `<result_dir>/oss_fuzz_project/`, `<result_dir>/oss_fuzz_src/`,
   `<result_dir>/oss_fuzz_build.sh`, and `<result_dir>/oss_fuzz_setup.sh` for
   OSS-Fuzz samples
+- `<result_dir>/stage01_candidate_runtime_spec.json`,
+  `<result_dir>/stage01_candidate_runtime_build.json`, and
+  `<result_dir>/stage01_candidate_reproduction_report.json` when present. These
+  are untrusted hints copied from the existing package during a portability
+  migration. Start with their harness, build, and run commands instead of
+  guessing a new entry point, but verify every command on the exact vulnerable
+  and fixed commits. Rewrite fresh official outputs; candidate files never count
+  as Stage 01 evidence by themselves.
+- `<result_dir>/stage01_retry_feedback.md` when present. A retry is a new agent
+  session, so read this first and continue from already completed builds and
+  logs. Do not repeat a successful vulnerable build merely to rediscover the
+  same finding; finish the missing fixed-oracle check and output files.
 
 When `bug_report.md` exists, it is the authoritative benchmark reproduction
 configuration. It names the fuzz target, fuzzing engine, job type, and sanitizer.

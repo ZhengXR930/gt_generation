@@ -390,6 +390,67 @@ def _remove_path(path: Path) -> None:
         path.unlink()
 
 
+def stage_existing_runtime_candidate(
+    published_dir: Path, migration_dir: Path
+) -> dict[str, Any]:
+    """Stage only lightweight legacy runtime hints for Stage 01 revalidation.
+
+    The hints deliberately use candidate-prefixed names: neither the runner nor
+    the evaluator can mistake them for fresh output.  The Stage 01 agent must
+    still write a new reproduction report, after which the deterministic gate
+    rebuilds and tests both revisions in empty workspaces.
+    """
+    if not published_dir.is_dir():
+        return {"staged": False, "reason": "published GT directory is missing"}
+    copied: list[str] = []
+    candidates = {
+        "runtime_spec.json": "stage01_candidate_runtime_spec.json",
+        "runtime_build.json": "stage01_candidate_runtime_build.json",
+        "reproduction_report.json": "stage01_candidate_reproduction_report.json",
+    }
+    for source_name, destination_name in candidates.items():
+        source = published_dir / source_name
+        if source.is_file():
+            shutil.copy2(source, migration_dir / destination_name)
+            copied.append(destination_name)
+
+    # Existing build commands may depend on small source-level helpers.  Copy
+    # those named roots only; never copy ignored checkouts, outputs, archives,
+    # binaries, or logs from the published package.
+    spec = _load_json_or_none(published_dir / "runtime_spec.json")
+    recipe = _load_json_or_none(published_dir / "runtime_build.json")
+    command_text: list[str] = []
+    if isinstance(spec, dict):
+        raw = spec.get("build_commands") or []
+        command_text.extend([raw] if isinstance(raw, str) else map(str, raw))
+    if isinstance(recipe, dict):
+        for item in recipe.get("commands") or []:
+            if isinstance(item, dict):
+                command_text.append(str(item.get("command") or ""))
+            elif isinstance(item, str):
+                command_text.append(item)
+    roots: set[str] = set()
+    for command in command_text:
+        for match in re.finditer(r"/gt/(?P<path>[^\s:'\";|&<>]+)", command):
+            relative = match.group("path").strip().rstrip("),]")
+            top = relative.split("/", 1)[0]
+            before = command[:match.start()].rstrip()
+            if before.endswith(">") or top.endswith(".log"):
+                continue
+            if top and top not in {"_work", "_out", "poc"}:
+                roots.add(top)
+    for root in sorted(roots):
+        source = published_dir / root
+        target = migration_dir / root
+        if source.is_file():
+            shutil.copy2(source, target)
+            copied.append(root)
+        elif source.is_dir() and not source.is_symlink():
+            shutil.copytree(source, target, symlinks=True)
+            copied.append(root + "/")
+    return {"staged": bool(copied), "files": copied}
+
+
 def publish_stage01_migration(work_dir: Path, published_dir: Path) -> dict[str, Any]:
     """Atomically merge a clean Stage 00-01 portability proof into full GT."""
     from gt_generation.gt_toolkit.evidence import COMMITMENT_FILES, write_commitment
@@ -480,7 +541,10 @@ def publish_stage01_migration(work_dir: Path, published_dir: Path) -> dict[str, 
         # checkout or compiled output merely because it existed in the legacy
         # published directory (these paths are gitignored and otherwise linger
         # invisibly on the migration host).
-        for name in ("_work", "_out", "runtime_build_logs"):
+        for name in (
+            "_work", "_out", "runtime_build_logs",
+            ".runtime_work_extracted",
+        ):
             _remove_path(staging / name)
         for name, expected in protected_hashes.items():
             if _sha256_file(staging / name) != expected:
@@ -576,6 +640,8 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
     if cfg.get("stage01_migration"):
         _remove_path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.get("stage01_migration"):
+        stage_existing_runtime_candidate(published_result_dir, result_dir)
     provenance_dir = result_dir
     if cfg.get("start_at") and all(
         (result_dir / name).is_file()

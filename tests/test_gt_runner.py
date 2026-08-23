@@ -631,6 +631,35 @@ def test_assertion_execute_incomplete_writes_execute_feedback(tmp_path):
     assert not (tmp_path / "assertion_plan_feedback.md").exists()
 
 
+def test_reproducer_retry_feedback_preserves_runtime_work(tmp_path):
+    (tmp_path / "_work").mkdir()
+    (tmp_path / "_work" / "repro").write_bytes(b"binary")
+    (tmp_path / "build_vulnerable.log").write_text("built\n")
+    result = runner.StageResult(
+        name="01_reproducer",
+        command="cmd",
+        returncode=1,
+        started_at="start",
+        ended_at="end",
+        stdout_path="",
+        stderr_path="",
+        required_outputs_ok=False,
+        success_check_ok=False,
+        failure_kind="stage_command_failed",
+    )
+
+    out = runner.write_stage_retry_feedback(
+        "01_reproducer", tmp_path, result=result
+    )
+    removed = runner.prepare_stage_retry("01_reproducer", tmp_path)
+
+    assert out == tmp_path / "stage01_retry_feedback.md"
+    assert "reproduction_report.json" in out.read_text()
+    assert removed == []
+    assert (tmp_path / "_work" / "repro").is_file()
+    assert (tmp_path / "build_vulnerable.log").is_file()
+
+
 def test_assertion_execute_guarded_without_perturbation_writes_execute_feedback(tmp_path):
     runner.write_json(
         tmp_path / "assertion_results.json",

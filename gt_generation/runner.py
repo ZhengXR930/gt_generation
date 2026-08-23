@@ -624,6 +624,28 @@ def write_stage_retry_feedback(
     result: StageResult | None = None,
 ) -> Path | None:
     """Write deterministic repair hints before retrying or stopping a stage."""
+    if stage_name == REPRODUCER_STAGE:
+        required = (
+            "sanitizer_trace.txt",
+            "sample_state.json",
+            "reproduction_report.json",
+        )
+        missing = [name for name in required if not (result_dir / name).is_file()]
+        lines = [
+            "# Stage 01 retry feedback",
+            "",
+            "The previous attempt did not complete the Stage 01 contract.",
+            "Continue from any existing checkout, build artifact, and logs in this result directory; do not restart successful work unnecessarily.",
+            "You must still verify the exact fixed commit with the same PoC and write all three fresh official outputs before returning.",
+            "Candidate-prefixed runtime files are hints only; do not rename them as proof without executing both sides.",
+            "",
+            "Missing required outputs: " + (", ".join(missing) if missing else "none (rewrite stale or invalid outputs)"),
+            "Prior failure kind: " + (result.failure_kind if result is not None else "unknown"),
+            "",
+        ]
+        out = result_dir / "stage01_retry_feedback.md"
+        out.write_text("\n".join(lines), encoding="utf-8")
+        return out
     if stage_name == VULNERABLE_INSTRUMENTATION_STAGE:
         return write_instrumentation_feedback(result_dir, "vulnerable")
     if stage_name == FIXED_INSTRUMENTATION_STAGE:

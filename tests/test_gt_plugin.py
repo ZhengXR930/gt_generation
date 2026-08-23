@@ -14,6 +14,42 @@ def _write_portability_ok(result_dir):
     }))
 
 
+def test_stage_existing_runtime_candidate_copies_only_lightweight_hints(tmp_path):
+    published = tmp_path / "published"
+    migration = tmp_path / "migration"
+    published.mkdir()
+    migration.mkdir()
+    (published / "runtime_support").mkdir()
+    (published / "runtime_support" / "harness.c").write_text("int main() {}\n")
+    (published / "_work").mkdir()
+    (published / "_work" / "binary").write_bytes(b"binary")
+    (published / "runtime_work.tar.gz").write_bytes(b"archive")
+    (published / "runtime_spec.json").write_text(json.dumps({
+        "build_commands": ["cc /gt/runtime_support/harness.c -o /gt/_work/repro"]
+    }))
+    (published / "runtime_build.json").write_text(json.dumps({
+        "commands": [{
+            "command": (
+                "cc /gt/runtime_support/harness.c "
+                "> /gt/build_vulnerable.log 2>&1"
+            )
+        }]
+    }))
+    (published / "reproduction_report.json").write_text("{}")
+    (published / "build_vulnerable.log").write_text("compiler output\n")
+
+    result = gt_plugin.stage_existing_runtime_candidate(published, migration)
+
+    assert result["staged"] is True
+    assert (migration / "stage01_candidate_runtime_spec.json").is_file()
+    assert (migration / "stage01_candidate_runtime_build.json").is_file()
+    assert (migration / "stage01_candidate_reproduction_report.json").is_file()
+    assert (migration / "runtime_support" / "harness.c").is_file()
+    assert not (migration / "build_vulnerable.log").exists()
+    assert not (migration / "_work").exists()
+    assert not (migration / "runtime_work.tar.gz").exists()
+
+
 def test_partial_repair_does_not_skip_complete_samples(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
