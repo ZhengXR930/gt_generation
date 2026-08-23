@@ -672,8 +672,13 @@ def _target_find_name_from_packaged_command(gt_dir: Path) -> str:
     command, _source = _runtime_command_from_packaged_artifacts(gt_dir)
     if not command:
         return ""
-    match = re.search(r"\bfind\s+/gt/_work\b[^;&|]*\s-name\s+(['\"]?)(?P<name>[^'\"\\s]+)\\1", command)
-    return match.group("name") if match else ""
+    match = re.search(
+        r"\bfind\s+/gt/_work\b[^;&|]*\s-name\s+(?P<name>'[^']+'|\"[^\"]+\"|[^\s;&|]+)",
+        command,
+    )
+    if not match:
+        return ""
+    return match.group("name").strip("'\"")
 
 
 def _is_system_executable(value: str) -> bool:
