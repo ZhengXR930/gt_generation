@@ -31,14 +31,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lld \
     llvm \
     libclang-rt-18-dev \
-    libc++-dev \
-    libc++abi-dev \
     # --- build drivers OSS-Fuzz recipes rely on (samples affected in comments)
     scons \
     meson \
     libtool-bin \
     autogen \
     gperf \
+    re2c \
     ragel \
     nasm \
     yasm \
@@ -97,12 +96,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libevent-dev \
     libncurses-dev \
     libtinfo6 \
+    libc++-dev \
+    libc++abi-dev \
+    libnl-3-dev \
+    libnl-genl-3-dev \
+    libnl-route-3-dev \
+    universal-ctags \
     zlib1g-dev \
     libxml2-dev \
     libpng-dev \
     libjpeg-dev \
     libtiff-dev \
     libzstd-dev \
+    libfreetype-dev \
+    libharfbuzz-dev \
+    libjbig2dec0-dev \
+    liblcms2-dev \
+    libgumbo-dev \
+    libopenjp2-7-dev \
+    libonig-dev \
     # --- declared by the remaining OSV backlog's OSS-Fuzz recipes
     # (dataset/ossfuzz_project_config/*.json; re-derive after a backlog change)
     libboost-dev \
@@ -119,7 +131,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcap-dev \
     libcap-ng-dev \
     libcunit1-dev \
-    libunwind-dev \
     luajit \
     libbrotli-dev \
     libexpat1-dev \
@@ -142,7 +153,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     #   coreutils, gzip, sed are in the base image.
     #   tshark, devscripts, equivs, cmake-curses-gui are test or packaging
     #     tooling, not build inputs.
-    && ln -sf /usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.fuzzer_no_main-x86_64.a /usr/lib/libFuzzingEngine.a \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
