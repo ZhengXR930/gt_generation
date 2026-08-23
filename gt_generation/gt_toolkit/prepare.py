@@ -58,6 +58,12 @@ DEFAULT_RUNTIME_ARCHIVE_MAX_PART_BYTES = 90 * 1024 * 1024
 RUNTIME_BUILD_RECIPE_NAME = "runtime_build.json"
 DEFAULT_RUNTIME_BUILD_TIMEOUT_SECONDS = 7200
 
+_OSS_FUZZ_PROJECT_ALIASES = {
+    "libdwarf-code": "libdwarf",
+    "php-src": "php",
+    "wasm-micro-runtime": "wamr",
+}
+
 RUNTIME_ARCHIVE_ROOTS = (
     "_work",
     "_out",
@@ -320,27 +326,28 @@ def prepare(sample_path: str, result_dir: str) -> dict[str, Any]:
 def hydrate_runtime(result_dir: str | Path, *, force: bool = False) -> dict[str, Any]:
     """Restore the local execution workspace for a compact GT package.
 
-    Prefer a committed runtime archive when present.  If the compact package has
-    no archive, rebuild the deterministic source/material scaffold from
-    `sample_info.json` so local PoC evaluation can run on another machine
-    without depending on stale absolute paths.
+    Prefer the lightweight rebuild contract when present.  Runtime archives are
+    only a fallback for rare packages that cannot be rebuilt deterministically
+    from `sample_info.json` plus `runtime_build.json`.
     """
     result_path = Path(result_dir)
-    # An archive is authoritative and extraction replaces every archived root.
-    # Without an archive, retain the staged OSS-Fuzz recipe/material while
-    # rebuilding only the generated workspace and frozen target artifacts.
+    has_build_recipe = (result_path / RUNTIME_BUILD_RECIPE_NAME).is_file()
     has_archive = runtime_archive_path(result_path) is not None
     if not has_archive:
         _archive_name, archive_parts = runtime_archive_parts(result_path)
         has_archive = bool(archive_parts)
-    if force and not has_archive:
+    # If a rebuild recipe exists, avoid extracting old runtime_work archives:
+    # the portable path is to recreate _work/src and rebuild in gt-memory-env.
+    use_archive = has_archive and not has_build_recipe
+    if force and not use_archive:
         generated_roots = {"_work", "_out", "host_libs"}
         generated_roots.update(_runtime_spec_root_paths(result_path))
         _remove_runtime_roots(result_path, generated_roots)
 
-    archive_report = extract_runtime_archive(result_path, force=force)
-    if archive_report.get("extracted") or archive_report.get("reused"):
-        return archive_report
+    if use_archive:
+        archive_report = extract_runtime_archive(result_path, force=force)
+        if archive_report.get("extracted") or archive_report.get("reused"):
+            return archive_report
 
     sample_info = result_path / "sample_info.json"
     if not sample_info.is_file():
@@ -358,10 +365,83 @@ def hydrate_runtime(result_dir: str | Path, *, force: bool = False) -> dict[str,
             "source": str(src),
         }
     preserved = _snapshot_existing_durable_files(result_path)
-    report = prepare(str(sample_info), str(result_path))
+    if has_build_recipe:
+        # A frozen rebuild contract must be replayable without consulting the
+        # generator's dataset checkout.  Recreate only the upstream source; all
+        # harnesses, helper repositories and build scripts must already be part
+        # of the compact package.
+        report = hydrate_repo_source(result_path)
+    else:
+        report = prepare(str(sample_info), str(result_path))
     _restore_existing_durable_files(result_path, preserved)
     report["hydrated"] = bool(report.get("prepared"))
     return report
+
+
+def hydrate_repo_source(result_dir: str | Path) -> dict[str, Any]:
+    """Clone the exact repo commits using only frozen sample metadata.
+
+    This intentionally does not call :func:`prepare`: a portability replay may
+    not borrow PoCs, OSS-Fuzz recipes, or helper sources from the generator's
+    local dataset.  Those inputs must already be present beside
+    ``runtime_build.json``.
+    """
+    result_path = Path(result_dir)
+    sample_path = result_path / "sample_info.json"
+    if not sample_path.is_file():
+        return {"prepared": False, "reason": "missing sample_info.json"}
+    try:
+        sample = json.loads(sample_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"prepared": False, "reason": f"invalid sample_info.json: {exc}"}
+    repo = str(sample.get("repo") or sample.get("repo_url") or "").strip()
+    vulnerable_commit = str(
+        sample.get("vulnerable_commit") or sample.get("vul_commit") or ""
+    ).strip()
+    fixed_commit = str(
+        sample.get("fix_commit") or sample.get("fixed_commit") or ""
+    ).strip()
+    if not repo or not vulnerable_commit:
+        return {
+            "prepared": False,
+            "reason": "sample_info.json needs repo and vulnerable_commit",
+        }
+    env_image = os.environ.get("GT_REPO_DOCKER_IMAGE", "gt-memory-env:latest")
+    env_context = Path(
+        os.environ.get("GT_REPO_DOCKER_CONTEXT", "")
+        or Path(__file__).resolve().parents[2] / "docker" / "gt-memory-env"
+    ).resolve()
+    if not _ensure_memory_env(env_image, env_context):
+        return {
+            "prepared": False,
+            "reason": f"runtime image unavailable: {env_image}",
+        }
+    src = result_path / "_work" / "src"
+    cloned_from, clone_errors, repo_cache = _materialize_repo_checkout(
+        repo, src, [vulnerable_commit, fixed_commit]
+    )
+    if not cloned_from:
+        return {
+            "prepared": False,
+            "reason": f"clone failed: {repo}",
+            "clone_errors": clone_errors,
+        }
+    checked = _sh(
+        ["git", "-C", str(src), "checkout", "-q", vulnerable_commit],
+        timeout=300,
+    )
+    prepared = checked.returncode == 0 and src.is_dir()
+    return {
+        "prepared": prepared,
+        "track": "repo/portable",
+        "repo": repo,
+        "clone_repo": cloned_from,
+        "vulnerable_commit": vulnerable_commit,
+        "fixed_commit": fixed_commit,
+        "repo_cache": repo_cache,
+        "source": str(src),
+        "reason": "" if prepared else (checked.stderr or "checkout failed")[-2000:],
+    }
 
 
 def build_runtime_artifacts(
@@ -1674,6 +1754,20 @@ def _poc_source_dir(sample: dict[str, Any], sid: str) -> Path | None:
 
 def _oss_fuzz_checkout_root() -> Path:
     return Path(__file__).resolve().parents[2] / "external" / "oss-fuzz"
+
+
+def _oss_fuzz_project_candidates(sample: dict[str, Any]) -> list[str]:
+    """Return possible google/oss-fuzz project names for this sample."""
+    candidates: list[str] = []
+    for raw in (sample.get("oss_fuzz_project"), sample.get("project")):
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        alias = _OSS_FUZZ_PROJECT_ALIASES.get(name, name)
+        for item in (name, alias):
+            if item and item not in candidates:
+                candidates.append(item)
+    return candidates
 
 
 def _ensure_oss_fuzz_project_dir(project: str) -> tuple[Path | None, dict[str, Any]]:
@@ -2998,11 +3092,21 @@ def _stage_reproduction_config(
     }
     # Repository names and OSS-Fuzz integration names are not always equal
     # (for example wasm-micro-runtime is integrated as projects/wamr).
-    project = str(sample.get("oss_fuzz_project") or sample.get("project") or "").strip()
-    if project:
-        staged["oss_fuzz_project"] = _stage_oss_fuzz_project_context(
-            d, project, reference_time
+    project_candidates = _oss_fuzz_project_candidates(sample)
+    project = project_candidates[0] if project_candidates else ""
+    project_statuses: list[dict[str, Any]] = []
+    for candidate_project in project_candidates:
+        project_status = _stage_oss_fuzz_project_context(
+            d, candidate_project, reference_time
         )
+        project_statuses.append(project_status)
+        if project_status.get("staged"):
+            project = candidate_project
+            break
+    if project_statuses:
+        staged["oss_fuzz_project"] = project_statuses[-1]
+        if len(project_statuses) > 1:
+            staged["oss_fuzz_project_candidates"] = project_statuses
     pocdir = _poc_source_dir(sample, sid)
     if pocdir is None or not pocdir.is_dir():
         if _synthesize_ossfuzz_bug_report(sample, d, sid):

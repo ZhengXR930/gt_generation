@@ -10,6 +10,7 @@ from typing import Any
 
 from .package_audit import audit_package
 from .evidence import write_commitment
+from .portability import portable_material_paths
 from .prepare import runtime_archive_artifact_names
 
 
@@ -37,16 +38,12 @@ KEEP_FILES = {
     # Small evaluator-private rebuild contract.  The workspace and binaries are
     # still removed; this recipe is required to reconstruct them at evaluation.
     "runtime_build.json",
+    "runtime_materials.json",
+    "portability_report.json",
     # Legacy packages may still keep this as a private command source; new
     # compact packages should prefer runtime_build.json.
     "reproduction_report.json",
     "runtime_spec.json",
-    "runtime_work.tar.gz",
-    "runtime_work.tgz",
-    "runtime_work.tar.xz",
-    "runtime_work.tar.bz2",
-    "runtime_work.tar",
-    "runtime_work_manifest.json",
 }
 
 
@@ -62,7 +59,11 @@ def compact_result(result_dir: Path) -> dict[str, Any]:
         }
 
     keep_files = set(KEEP_FILES)
-    keep_files.update(runtime_archive_artifact_names(result_dir))
+    # Archives remain a legacy fallback only.  Once a sample has passed the
+    # lightweight rebuild protocol, compaction must remove any stale archive.
+    if not (result_dir / "runtime_build.json").is_file():
+        keep_files.update(runtime_archive_artifact_names(result_dir))
+    keep_files.update(path.name for path in portable_material_paths(result_dir))
 
     # The report already contains resolved checkpoints, observed locations, and
     # assertion-event reachability.  Paths under `artifacts` point only to the

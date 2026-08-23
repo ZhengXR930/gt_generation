@@ -22,6 +22,13 @@ A sample may pass Stage 01 only when all required runtime evidence exists:
 4. `setup_command` can replay the build from a fresh staged checkout without masking
    failures.
 
+After this session writes the outputs, the runner freezes `runtime_build.json` and
+`runtime_spec.json` and independently repeats vulnerable build/run plus fixed
+build/run in an empty temporary workspace. Stage 01 passes only if that deterministic
+portability replay writes `portability_report.json` with `runtime_portable: true`.
+Do not write that report yourself and do not rely on files under `_work` or `_out`
+surviving this session.
+
 If any item is missing, false, unverified, or ambiguous, reject the sample in
 `reproduction_report.json`. Do not leave it as a "probably works" candidate for
 later stages.
@@ -172,3 +179,10 @@ only the final target invocation. The build recipe must fail closed: do not use
 `|| true`, `|| :`, `set +e`, or wrappers that allow failed dependency/build/compiler
 commands to return success. This also applies to cleanup commands; optional cleanup is
 not part of the reproducibility proof.
+
+Any non-upstream build input referenced by `setup_command` must be a small file or
+directory staged at the result root (for example `oss_fuzz_project/`,
+`oss_fuzz_src/`, `harness_downloads/`, `oss_fuzz_setup.sh`, or
+`oss_fuzz_build.sh`). Never reference a host-only absolute path. The portability
+gate copies only these publishable materials; it deliberately does not copy `_work`,
+`_out`, compiled binaries, logs, or runtime archives.

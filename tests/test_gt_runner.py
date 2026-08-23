@@ -45,6 +45,42 @@ def test_repo_fixed_oracle_gate_rejects_masked_setup_command(tmp_path):
     ) is False
 
 
+def test_workflow_requires_stage01_portability_gate():
+    workflow = json.loads(
+        (Path(__file__).parents[1] / "gt_generation" / "workflow.json").read_text()
+    )
+    stage = next(item for item in workflow["stages"] if item["name"] == "01_reproducer")
+
+    assert "{result_dir}/portability_report.json" not in stage["required_outputs"]
+    assert stage["success_check"]["portability_gate"] is True
+
+
+def test_repo_gate_rejects_missing_portability_report(tmp_path):
+    runner.write_json(tmp_path / "prepare_report.json", {"track": "repo/secbench"})
+    runner.write_json(
+        tmp_path / "sample_info.json",
+        {"sample_id": "sample", "fix_commit": "fixed"},
+    )
+    runner.write_json(
+        tmp_path / "reproduction_report.json",
+        {
+            "fixed_oracle_checked": True,
+            "fixed_oracle_acceptable": True,
+            "setup_command": "make",
+        },
+    )
+    stage = {
+        "success_check": {
+            "path": "{result_dir}/reproduction_report.json",
+            "repo_fixed_oracle_gate": True,
+            "portability_gate": True,
+            "all": [{"field": "fixed_oracle_checked", "equals": True}],
+        }
+    }
+
+    assert runner.check_success(stage, {"result_dir": str(tmp_path)}) is False
+
+
 def test_stage01_only_filter_does_not_select_final_validation():
     workflow = json.loads(
         (Path(__file__).parents[1] / "gt_generation" / "workflow.json").read_text()

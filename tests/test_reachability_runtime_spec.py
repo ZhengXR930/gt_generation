@@ -323,6 +323,21 @@ def test_runtime_spec_rebuilds_artifacts_from_runtime_build_recipe(tmp_path, mon
     assert spec.executable == "./bin/target"
 
 
+def test_runtime_spec_parses_multiline_build_wrapper_command(tmp_path):
+    sample = tmp_path / "secbench_case"
+    sample.mkdir()
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "reproduction_report.json").write_text(json.dumps({
+        "command": "/gt/build.sh 'set -euo pipefail\ncd /gt/_work/src\n./build/janet /gt/poc'",
+    }))
+
+    spec = compile_runtime_spec(sample, require_artifacts=False, prefer_frozen=False)
+
+    assert spec.workdir == "/gt/_work/src"
+    assert spec.executable == "./build/janet"
+    assert spec.arguments == ["{poc}"]
+
+
 def test_runtime_checkpoint_line_is_remapped_by_frozen_statement(tmp_path):
     sample = tmp_path / "secbench_case"
     source = sample / "_work" / "src" / "src" / "parser.c"

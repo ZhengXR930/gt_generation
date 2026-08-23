@@ -39,6 +39,8 @@ OPTIONAL_PROJECTION_FILES = (
     "assertion_reward_spec.json",
     "context_trace.json",
     "runtime_build.json",
+    "runtime_materials.json",
+    "portability_report.json",
     "runtime_work_manifest.json",
 )
 
@@ -595,10 +597,10 @@ def _runtime_archive_errors(result_dir: Path, sample_id: str) -> list[str]:
 def _runtime_contract_errors(result_dir: Path, sample_id: str) -> list[str]:
     has_archive_manifest = (result_dir / "runtime_work_manifest.json").is_file()
     has_build_recipe = (result_dir / RUNTIME_BUILD_RECIPE_NAME).is_file()
-    if has_archive_manifest:
-        return _runtime_archive_errors(result_dir, sample_id)
     if has_build_recipe:
         return _runtime_build_recipe_errors(result_dir, sample_id)
+    if has_archive_manifest:
+        return _runtime_archive_errors(result_dir, sample_id)
     return [
         "missing non-ARVO runtime contract: provide runtime_build.json "
         "for rebuildable samples or runtime_work_manifest.json plus archive "
@@ -639,6 +641,47 @@ def _runtime_build_recipe_errors(result_dir: Path, sample_id: str) -> list[str]:
             for key, value in environment.items()
         ):
             errors.append(f"runtime_build.json commands[{index}].environment must be an object of strings")
+    portability_path = result_dir / "portability_report.json"
+    materials_path = result_dir / "runtime_materials.json"
+    if not portability_path.is_file():
+        errors.append("missing non-ARVO Stage 01 portability_report.json")
+    else:
+        portability = _load_json(portability_path, errors)
+        if portability.get("schema_version") != "gt-stage01-portability-v1":
+            errors.append("portability_report.json has unsupported schema_version")
+        if portability.get("sample_id") != sample_id:
+            errors.append("portability_report.json sample_id mismatch")
+        if portability.get("runtime_portable") is not True:
+            errors.append("portability_report.json runtime_portable must be true")
+        if portability.get("clean_replay_ok") is not True:
+            errors.append("portability_report.json clean_replay_ok must be true")
+    if not materials_path.is_file():
+        errors.append("missing non-ARVO runtime_materials.json")
+    else:
+        materials = _load_json(materials_path, errors)
+        if materials.get("schema_version") != "gt-runtime-materials-v1":
+            errors.append("runtime_materials.json has unsupported schema_version")
+        if materials.get("sample_id") != sample_id:
+            errors.append("runtime_materials.json sample_id mismatch")
+        entries = materials.get("files")
+        if not isinstance(entries, list) or not entries:
+            errors.append("runtime_materials.json files must be a non-empty array")
+        else:
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    errors.append(f"runtime_materials.json files[{index}] must be an object")
+                    continue
+                relative = str(entry.get("path") or "")
+                path = result_dir / relative
+                try:
+                    path.resolve().relative_to(result_dir.resolve())
+                except ValueError:
+                    errors.append(f"runtime_materials.json path escapes package: {relative}")
+                    continue
+                if not path.is_file():
+                    errors.append(f"runtime material is missing: {relative}")
+                elif entry.get("sha256") != "sha256:" + _sha256_file(path):
+                    errors.append(f"runtime material hash mismatch: {relative}")
     return errors
 
 

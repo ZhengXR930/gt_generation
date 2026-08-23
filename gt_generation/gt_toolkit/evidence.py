@@ -30,6 +30,8 @@ OPTIONAL_COMMITMENT_FILES = (
     "assertion_reward_spec.json",
     "context_trace.json",
     "runtime_build.json",
+    "runtime_materials.json",
+    "portability_report.json",
     "runtime_work.tar.gz",
     "runtime_work.tgz",
     "runtime_work.tar.xz",

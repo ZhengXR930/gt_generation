@@ -19,6 +19,51 @@ def _remove_prefix(value: str, prefix: str) -> str:
     return value[len(prefix):] if value.startswith(prefix) else value
 
 
+def _split_shell_sequence(command: str) -> list[str]:
+    """Split top-level shell sequences without splitting quoted content."""
+    pieces: list[str] = []
+    current: list[str] = []
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            current.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char in {";", "\n"} or command[index:index + 2] == "&&":
+            piece = "".join(current).strip()
+            if piece:
+                pieces.append(piece)
+            current = []
+            index += 2 if command[index:index + 2] == "&&" else 1
+            continue
+        current.append(char)
+        index += 1
+    piece = "".join(current).strip()
+    if piece:
+        pieces.append(piece)
+    return pieces
+
+
 class RuntimeSpecError(RuntimeError):
     """The frozen package cannot currently reconstruct its target runtime."""
 
@@ -45,7 +90,7 @@ class RuntimeSpec:
 
 
 def compile_runtime_spec(
-    gt_dir: Path, *, require_artifacts: bool = True
+    gt_dir: Path, *, require_artifacts: bool = True, prefer_frozen: bool = True
 ) -> RuntimeSpec:
     """Compile a minimal runtime contract without exposing it to the agent."""
     gt_dir = gt_dir.resolve()
@@ -65,7 +110,7 @@ def compile_runtime_spec(
         )
 
     frozen_path = gt_dir / "runtime_spec.json"
-    if frozen_path.is_file():
+    if prefer_frozen and frozen_path.is_file():
         spec = _load_frozen_spec(
             frozen_path, sample_id, require_artifacts=require_artifacts
         )
@@ -406,7 +451,7 @@ def _unwrap_reproduction_command(command: str) -> str:
 
 def _select_invocation(command: str) -> tuple[str, str]:
     workdir = "/gt/_work/src"
-    pieces = [piece.strip() for piece in re.split(r"\s+&&\s+|;\s*", command)]
+    pieces = _split_shell_sequence(command)
     selected_index = -1
     for index, piece in enumerate(pieces):
         if "/gt/poc" in piece or "{poc}" in piece:

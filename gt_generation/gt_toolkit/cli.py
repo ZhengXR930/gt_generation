@@ -15,6 +15,7 @@ Subcommands:
   hydrate-runtime Restore compact non-ARVO runtime material before local testing.
   build-runtime Hydrate and rebuild non-ARVO runtime artifacts from recipe.
   write-runtime-build Write a durable non-ARVO runtime build recipe.
+  portability   Freeze and clean-replay the Stage 01 runtime contract.
   package-runtime Create a portable non-ARVO runtime workspace archive.
   arvo-workspace Reuse one ARVO container across vulnerable/fixed validation.
   repo-workspace Run repo-track instrumentation gates through build.sh.
@@ -39,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         "prepare", "validate", "state", "reachability", "assertions",
         "assertion-preflight", "audit-package", "bind-evidence",
         "macro-aliases", "context", "compact-result", "hydrate-runtime",
-        "build-runtime", "write-runtime-build", "package-runtime",
+        "build-runtime", "write-runtime-build", "portability", "package-runtime",
         "arvo-workspace", "repo-workspace", "gdb-watch", "schema-path",
     ]
     parser = argparse.ArgumentParser(prog="gt-toolkit", description=__doc__)
@@ -100,6 +101,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "write-runtime-build":
         from . import prepare
         return prepare.write_runtime_build_main(rest)
+    if ns.command == "portability":
+        from . import portability
+        return portability.main(rest)
     if ns.command == "package-runtime":
         from . import prepare
         return prepare.package_runtime_main(rest)

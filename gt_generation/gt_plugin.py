@@ -304,6 +304,8 @@ def evaluate_stage01_screening(
     status = "incomplete_stage01"
     reason = "missing_or_invalid_reproduction_report"
     accepted = False
+    portability_path = result_dir / "portability_report.json"
+    portability = _load_json_or_none(portability_path)
 
     if isinstance(report, dict):
         reproduced = report.get("vulnerable_reproduced") is True
@@ -331,6 +333,13 @@ def evaluate_stage01_screening(
         elif fixed_required and masked_setup:
             status = "rejected_by_stage01"
             reason = "setup_command_masks_build_failures"
+        elif not str(result_dir.name).startswith("arvo_") and not (
+            isinstance(portability, dict)
+            and portability.get("runtime_portable") is True
+            and portability.get("clean_replay_ok") is True
+        ):
+            status = "rejected_by_stage01"
+            reason = "runtime_portability_not_established"
         else:
             status = "accepted_for_gt"
             reason = "vulnerable_crash_and_fixed_oracle_confirmed" if fixed_required else "vulnerable_crash_confirmed"
@@ -344,6 +353,7 @@ def evaluate_stage01_screening(
         "fixed_oracle_required": fixed_required,
         "runner_returncode": runner_returncode,
         "reproduction_report": str(report_path),
+        "portability_report": str(portability_path),
     }
     return screening
 

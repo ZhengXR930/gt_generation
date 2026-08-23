@@ -7,6 +7,13 @@ import pytest
 from gt_generation import gt_plugin
 
 
+def _write_portability_ok(result_dir):
+    (result_dir / "portability_report.json").write_text(json.dumps({
+        "runtime_portable": True,
+        "clean_replay_ok": True,
+    }))
+
+
 def test_partial_repair_does_not_skip_complete_samples(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
@@ -203,6 +210,7 @@ def test_stage01_screening_accepts_without_package_audit(tmp_path):
         ),
         encoding="utf-8",
     )
+    _write_portability_ok(tmp_path)
 
     screening = gt_plugin.evaluate_stage01_screening(
         tmp_path, {"sample_id": "nvd_CVE-2026-2241"}, 0

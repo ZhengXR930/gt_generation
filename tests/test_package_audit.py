@@ -68,6 +68,21 @@ def test_package_audit_accepts_runtime_build_contract_without_archive(tmp_path):
             "environment": {"GT_BUILD_JOBS": "1"},
         }],
     }))
+    (tmp_path / "portability_report.json").write_text(json.dumps({
+        "schema_version": "gt-stage01-portability-v1",
+        "sample_id": sample_id,
+        "runtime_portable": True,
+        "clean_replay_ok": True,
+    }))
+    build_sha = package_audit._sha256_file(tmp_path / "runtime_build.json")
+    (tmp_path / "runtime_materials.json").write_text(json.dumps({
+        "schema_version": "gt-runtime-materials-v1",
+        "sample_id": sample_id,
+        "files": [{
+            "path": "runtime_build.json",
+            "sha256": "sha256:" + build_sha,
+        }],
+    }))
 
     errors = package_audit._runtime_contract_errors(tmp_path, sample_id)
 

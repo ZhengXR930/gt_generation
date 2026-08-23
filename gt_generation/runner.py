@@ -38,6 +38,7 @@ CODE_ROOT = Path(__file__).resolve().parent          # gt_generation/ (roles, wo
 REPO_ROOT = CODE_ROOT.parent                          # repo root (gt_results, dataset, evaluator)
 DEFAULT_CONFIG = CODE_ROOT / "workflow.json"
 FINAL_STAGE = "05_validate"
+REPRODUCER_STAGE = "01_reproducer"
 ASSERTION_PLAN_STAGE = "04_assertion_plan"
 VULNERABLE_INSTRUMENTATION_STAGE = "04_instrument_vulnerable"
 FIXED_INSTRUMENTATION_STAGE = "04_instrument_fixed"
@@ -1237,6 +1238,14 @@ def run_stage(
         )
 
     returncode = proc.returncode
+    if name == REPRODUCER_STAGE and not dry_run and proc.returncode == 0:
+        portability_code = finalize_stage01_portability(
+            result_dir=result_dir,
+            logs_dir=logs_dir,
+            timeout=int(stage.get("portability_timeout") or 7200),
+        )
+        if portability_code != 0:
+            returncode = portability_code or returncode
     if name == ASSERTION_EXECUTE_STAGE:
         mutation_report = restore_modified_assertion_plan_inputs(
             result_dir, frozen_inputs
@@ -1287,6 +1296,39 @@ def run_stage(
 
 def sha256_file(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def finalize_stage01_portability(
+    *, result_dir: Path, logs_dir: Path, timeout: int
+) -> int:
+    """Freeze and independently replay Stage 01's non-ARVO runtime contract."""
+    if result_dir.name.startswith("arvo_"):
+        return 0
+
+    try:
+        from gt_toolkit.portability import materialize_stage01_portability
+    except ImportError:
+        from gt_generation.gt_toolkit.portability import (
+            materialize_stage01_portability,
+        )
+
+    stdout_path = logs_dir / f"{REPRODUCER_STAGE}.portability.stdout.txt"
+    stderr_path = logs_dir / f"{REPRODUCER_STAGE}.portability.stderr.txt"
+    try:
+        report = materialize_stage01_portability(result_dir, timeout=timeout)
+        stdout_path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        stderr_path.write_text("", encoding="utf-8")
+        return 0 if report.get("runtime_portable") is True else 1
+    except Exception as exc:
+        stdout_path.write_text("", encoding="utf-8")
+        stderr_path.write_text(
+            f"Stage 01 portability gate failed: {type(exc).__name__}: {exc}\n",
+            encoding="utf-8",
+        )
+        return 1
 
 
 def snapshot_assertion_plan_inputs(result_dir: Path) -> dict[str, dict[str, Any]]:
@@ -1604,6 +1646,14 @@ def check_success(stage: dict[str, Any], variables: dict[str, str]) -> bool:
     if check.get("repo_fixed_oracle_gate"):
         path_text = str(check.get("path") or "")
         if not repo_fixed_oracle_gate_passes(variables, path_text):
+            return False
+    if check.get("portability_gate"):
+        try:
+            from gt_toolkit.portability import portability_gate_passes
+        except ImportError:
+            from gt_generation.gt_toolkit.portability import portability_gate_passes
+
+        if not portability_gate_passes(variables["result_dir"]):
             return False
     if check.get("reachability_gate"):
         path_text = str(check.get("path") or "")

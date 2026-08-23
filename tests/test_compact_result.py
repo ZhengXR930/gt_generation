@@ -14,6 +14,9 @@ def test_compact_result_keeps_only_durable_files(tmp_path, monkeypatch):
     (tmp_path / "vulnerable_assertion_trace.txt").write_text("trace")
     (tmp_path / "role_logs").mkdir()
     (tmp_path / "role_logs" / "stage.log").write_text("log")
+    (tmp_path / "runtime_work.tar.gz").write_bytes(b"stale archive")
+    (tmp_path / "oss_fuzz_src").mkdir()
+    (tmp_path / "oss_fuzz_src" / "unused-helper").write_text("unused")
 
     monkeypatch.setattr(
         compact_result,
