@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .prepare import runtime_archive_artifact_names
+except ImportError:  # pragma: no cover - direct script compatibility
+    from gt_toolkit.prepare import runtime_archive_artifact_names
+
 
 COMMITMENT_FILES = (
     "ground_truth.json",
@@ -24,6 +29,12 @@ COMMITMENT_FILES = (
 OPTIONAL_COMMITMENT_FILES = (
     "assertion_reward_spec.json",
     "context_trace.json",
+    "runtime_work.tar.gz",
+    "runtime_work.tgz",
+    "runtime_work.tar.xz",
+    "runtime_work.tar.bz2",
+    "runtime_work.tar",
+    "runtime_work_manifest.json",
 )
 
 
@@ -39,6 +50,13 @@ def build_commitment(result_dir: Path) -> dict[str, Any]:
     ground_truth = json.loads(
         (result_dir / "ground_truth.json").read_text(encoding="utf-8")
     )
+    optional_names = [
+        optional
+        for optional in OPTIONAL_COMMITMENT_FILES
+        if (result_dir / optional).is_file()
+    ]
+    optional_names.extend(runtime_archive_artifact_names(result_dir))
+    optional_names = sorted(dict.fromkeys(optional_names))
     return {
         "schema_version": "gt-evidence-commitment-v1",
         "sample_id": str(ground_truth.get("sample_id") or ""),
@@ -47,11 +65,7 @@ def build_commitment(result_dir: Path) -> dict[str, Any]:
             name: file_sha256(result_dir / name)
             for name in (
                 *COMMITMENT_FILES,
-                *(
-                    optional
-                    for optional in OPTIONAL_COMMITMENT_FILES
-                    if (result_dir / optional).is_file()
-                ),
+                *optional_names,
             )
         },
     }
@@ -81,7 +95,9 @@ def commitment_errors(result_dir: Path, commitment: dict[str, Any]) -> list[str]
             errors.append(f"committed evidence file is missing: {name}")
         elif declared != file_sha256(path):
             errors.append(f"committed evidence hash does not match {name}")
-    for name in OPTIONAL_COMMITMENT_FILES:
+    optional_names = set(OPTIONAL_COMMITMENT_FILES)
+    optional_names.update(runtime_archive_artifact_names(result_dir))
+    for name in sorted(optional_names):
         if name not in files:
             continue
         path = result_dir / name

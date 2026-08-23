@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from .assertions import (
 )
 from .context_trace import context_trace_errors
 from .evidence import commitment_errors
+from .prepare import RUNTIME_ARCHIVE_NAMES
 from .validate import harness_location_reason, validate_data
 
 
@@ -36,6 +38,7 @@ REQUIRED_FILES = (
 OPTIONAL_PROJECTION_FILES = (
     "assertion_reward_spec.json",
     "context_trace.json",
+    "runtime_work_manifest.json",
 )
 
 REACHABILITY_FIELDS = (
@@ -405,6 +408,7 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         else:
             runtime_spec = _load_json(runtime_spec_path, errors)
             errors.extend(_runtime_spec_errors(runtime_spec, expected_sample_id))
+            errors.extend(_runtime_archive_errors(result_dir, expected_sample_id))
 
     gt = documents["ground_truth.json"]
     gt_report = validate_data(gt, ground_truth=str(result_dir / "ground_truth.json"))
@@ -519,6 +523,80 @@ def main(argv: list[str] | None = None) -> int:
     report = audit_package(args.result_dir)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0 if report["ok"] else 1
+
+
+def _runtime_archive_errors(result_dir: Path, sample_id: str) -> list[str]:
+    errors: list[str] = []
+    manifest_path = result_dir / "runtime_work_manifest.json"
+    if not manifest_path.is_file():
+        errors.append("missing required file for non-ARVO sample: runtime_work_manifest.json")
+        return errors
+    manifest = _load_json(manifest_path, errors)
+    if manifest.get("sample_id") != sample_id:
+        errors.append(
+            f"runtime_work_manifest.json sample_id mismatch: {manifest.get('sample_id')!r} != {sample_id!r}"
+        )
+    archive_name = str(manifest.get("archive") or "")
+    if archive_name not in RUNTIME_ARCHIVE_NAMES:
+        errors.append("runtime_work_manifest.json archive does not match packaged archive")
+    archive = result_dir / archive_name if archive_name else result_dir / "runtime_work.tar.gz"
+    parts = manifest.get("parts")
+    if archive.is_file() and parts:
+        errors.append("runtime package cannot contain both full archive and split parts")
+    if archive.is_file():
+        if int(manifest.get("bytes") or -1) != archive.stat().st_size:
+            errors.append("runtime_work_manifest.json bytes does not match packaged archive")
+        actual_sha = _sha256_file(archive)
+    elif isinstance(parts, list) and parts:
+        actual_bytes = 0
+        digest = hashlib.sha256()
+        for index, part in enumerate(parts):
+            if not isinstance(part, dict):
+                errors.append("runtime_work_manifest.json part entries must be objects")
+                continue
+            name = str(part.get("name") or "")
+            if not name.startswith(f"{archive_name}.part-"):
+                errors.append(f"runtime archive part has unexpected name: {name}")
+                continue
+            path = result_dir / name
+            if not path.is_file():
+                errors.append(f"runtime archive part is missing: {name}")
+                continue
+            expected_size = int(part.get("bytes") or -1)
+            if expected_size != path.stat().st_size:
+                errors.append(f"runtime archive part bytes mismatch: {name}")
+            expected_part_sha = str(part.get("sha256") or "")
+            actual_part_sha = _sha256_file(path)
+            if expected_part_sha != actual_part_sha:
+                errors.append(f"runtime archive part sha256 mismatch: {name}")
+            actual_bytes += path.stat().st_size
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            expected_index = f"{archive_name}.part-{index:03d}"
+            if name != expected_index:
+                errors.append(f"runtime archive part order mismatch: {name} != {expected_index}")
+        if int(manifest.get("bytes") or -1) != actual_bytes:
+            errors.append("runtime_work_manifest.json bytes does not match split archive bytes")
+        actual_sha = digest.hexdigest()
+    else:
+        errors.append("missing required file for non-ARVO sample: runtime_work archive")
+        return errors
+    expected_sha = str(manifest.get("sha256") or "")
+    if expected_sha:
+        if actual_sha != expected_sha:
+            errors.append("runtime_work_manifest.json sha256 does not match packaged archive")
+    else:
+        errors.append("runtime_work_manifest.json missing sha256")
+    return errors
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 if __name__ == "__main__":

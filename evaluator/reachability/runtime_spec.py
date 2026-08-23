@@ -113,26 +113,48 @@ def compile_runtime_spec(
             source="arvo_image_convention",
         )
 
+    if require_artifacts:
+        hydrate_runtime_workspace(gt_dir)
+
     frozen_path = gt_dir / "runtime_spec.json"
     if prefer_frozen and frozen_path.is_file():
         spec = _load_frozen_spec(
             frozen_path, sample_id, require_artifacts=require_artifacts
         )
+        if _frozen_spec_needs_reparse(spec):
+            reparsed = _compile_spec_from_packaged_command(gt_dir, sample_id)
+            if reparsed is not None:
+                spec = reparsed
+        if require_artifacts:
+            spec = _resolve_runtime_artifact_spec(spec, gt_dir)
         return (
             _unwrap_libtool_executable(spec, gt_dir)
             if require_artifacts
             else spec
         )
 
+    spec = _compile_spec_from_packaged_command(gt_dir, sample_id)
+    if spec is None:
+        raise RuntimeSpecError("runtime recipe is missing after GT compaction")
+    spec = _normalize_local_workspace_spec(spec)
+    if require_artifacts:
+        spec = _unwrap_libtool_executable(spec, gt_dir)
+    validate_runtime_spec(spec, gt_dir, require_artifacts=require_artifacts)
+    return spec
+
+
+def _compile_spec_from_packaged_command(
+    gt_dir: Path, sample_id: str
+) -> RuntimeSpec | None:
     command, source = _runtime_command_from_packaged_artifacts(gt_dir)
     if not command:
-        raise RuntimeSpecError("runtime recipe is missing after GT compaction")
+        return None
     workdir, invocation = _select_invocation(command)
     environment, executable, arguments = _parse_invocation(invocation)
     if not any("{poc}" in item for item in arguments):
         raise RuntimeSpecError("runtime invocation does not consume the PoC")
     image = _image_from_build_script(gt_dir / "build.sh")
-    spec = RuntimeSpec(
+    return RuntimeSpec(
         sample_id=sample_id,
         backend="local_workspace",
         image=image,
@@ -143,11 +165,21 @@ def compile_runtime_spec(
         input_placeholder="{poc}",
         source=source,
     )
-    spec = _normalize_local_workspace_spec(spec)
-    if require_artifacts:
-        spec = _unwrap_libtool_executable(spec, gt_dir)
-    validate_runtime_spec(spec, gt_dir, require_artifacts=require_artifacts)
-    return spec
+
+
+def hydrate_runtime_workspace(gt_dir: Path) -> dict[str, Any]:
+    """Materialize a compact local-workspace package before artifact checks."""
+    src = gt_dir / "_work" / "src"
+    if src.is_dir() and any(src.iterdir()):
+        return {"prepared": True, "reused": True, "source": str(src)}
+    try:
+        from gt_toolkit.prepare import hydrate_runtime
+    except ImportError:
+        from gt_generation.gt_toolkit.prepare import hydrate_runtime
+    report = hydrate_runtime(gt_dir)
+    if not report.get("prepared"):
+        raise RuntimeSpecError(str(report.get("reason") or "runtime hydration failed"))
+    return report
 
 
 def validate_runtime_spec(
@@ -163,6 +195,8 @@ def validate_runtime_spec(
         return
     if not (gt_dir / "_work" / "src").is_dir():
         raise RuntimeSpecError("source workspace is missing after GT compaction")
+    if _is_system_executable(spec.executable):
+        return
     executable = container_path_on_host(gt_dir, spec.executable, spec.workdir)
     if not executable.is_file():
         raise RuntimeSpecError(f"runtime executable is missing: {executable}")
@@ -279,9 +313,10 @@ def _load_frozen_spec(
         )
     except (KeyError, TypeError) as exc:
         raise RuntimeSpecError(f"invalid frozen runtime spec: {exc}") from exc
-    validate_runtime_spec(
-        spec, path.parent, require_artifacts=require_artifacts
-    )
+    spec = _unwrap_env_executable(spec)
+    validate_runtime_spec(spec, path.parent, require_artifacts=False)
+    if require_artifacts:
+        _resolve_runtime_artifact_spec(spec, path.parent)
     return spec
 
 
@@ -401,10 +436,11 @@ def _unwrap_reproduction_command(command: str) -> str:
 def _select_invocation(command: str) -> tuple[str, str]:
     workdir = "/gt/_work/src"
     pieces = _split_shell_sequence(command)
-    selected_index = -1
-    for index, piece in enumerate(pieces):
-        if "/gt/poc" in piece or "{poc}" in piece:
-            selected_index = index
+    selected_indexes = [
+        index for index, piece in enumerate(pieces)
+        if "/gt/poc" in piece or "{poc}" in piece
+    ]
+    selected_index = selected_indexes[-1] if selected_indexes else -1
     if selected_index < 0:
         raise RuntimeSpecError("reproduction command has no /gt/poc invocation")
     for prior in reversed(pieces[:selected_index]):
@@ -412,8 +448,61 @@ def _select_invocation(command: str) -> tuple[str, str]:
         if match:
             workdir = shlex.split(match.group(1))[0]
             break
-    invocation = pieces[selected_index].split("|", 1)[0].strip()
+    invocation = _select_real_invocation_after_poc_copy(pieces, selected_index)
+    if not invocation:
+        invocation = _select_real_invocation(pieces[selected_index])
     return workdir, invocation
+
+
+def _select_real_invocation_after_poc_copy(
+    pieces: list[str], selected_index: int
+) -> str:
+    """Handle `cp /gt/poc tmp && real_target tmp` style repro commands."""
+    selected = pieces[selected_index]
+    try:
+        copy_tokens = shlex.split(selected)
+    except ValueError:
+        return ""
+    if len(copy_tokens) < 3 or copy_tokens[0] != "cp":
+        return ""
+    if not any(token in {"/gt/poc", "{poc}"} for token in copy_tokens[1:-1]):
+        return ""
+    copied_to = copy_tokens[-1]
+    for piece in pieces[selected_index + 1:]:
+        if _looks_like_setup_piece(piece):
+            continue
+        rewritten = piece.replace(shlex.quote(copied_to), "/gt/poc").replace(
+            copied_to, "/gt/poc"
+        )
+        if "/gt/poc" in rewritten or "{poc}" in rewritten:
+            return rewritten.split("|", 1)[0].strip()
+    return ""
+
+
+def _select_real_invocation(command: str) -> str:
+    command = command.split("|", 1)[0].strip()
+    pieces = _split_shell_sequence(command)
+    selected = ""
+    for piece in pieces:
+        if "/gt/poc" not in piece and "{poc}" not in piece:
+            continue
+        try:
+            tokens = shlex.split(piece)
+        except ValueError:
+            selected = piece
+            continue
+        if tokens and tokens[0] in {"cp", "cat", "printf", "echo"}:
+            continue
+        selected = piece
+    return selected or command
+
+
+def _looks_like_setup_piece(piece: str) -> bool:
+    try:
+        tokens = shlex.split(piece)
+    except ValueError:
+        return False
+    return bool(tokens and tokens[0] in {"cp", "cat", "printf", "echo", "mkdir", "rm"})
 
 
 def _parse_invocation(command: str) -> tuple[dict[str, str], str, list[str]]:
@@ -446,7 +535,157 @@ def _parse_invocation(command: str) -> tuple[dict[str, str], str, list[str]]:
         raise RuntimeSpecError("runtime invocation has no executable")
     executable = tokens.pop(0)
     arguments = [token.replace("/gt/poc", "{poc}") for token in tokens]
-    return environment, executable, arguments
+    spec = RuntimeSpec(
+        sample_id="",
+        backend="local_workspace",
+        image="",
+        workdir="",
+        executable=executable,
+        arguments=arguments,
+        environment=environment,
+        input_placeholder="{poc}",
+        source="",
+    )
+    spec = _unwrap_env_executable(spec)
+    return spec.environment, spec.executable, spec.arguments
+
+
+def _unwrap_env_executable(spec: RuntimeSpec) -> RuntimeSpec:
+    """Turn `env A=B target ...` into target plus environment entries."""
+    if spec.executable != "env":
+        return spec
+    environment = dict(spec.environment)
+    arguments = list(spec.arguments)
+    while arguments and "=" in arguments[0]:
+        key, value = arguments.pop(0).split("=", 1)
+        if not _ENV_NAME.fullmatch(key):
+            break
+        environment[key] = value
+    if not arguments:
+        return spec
+    executable = arguments.pop(0)
+    return replace(spec, executable=executable, arguments=arguments, environment=environment)
+
+
+def _resolve_runtime_artifact_spec(spec: RuntimeSpec, gt_dir: Path) -> RuntimeSpec:
+    """Resolve shell-derived executable placeholders against materialized artifacts."""
+    if spec.backend != "local_workspace":
+        return spec
+    spec = _unwrap_env_executable(spec)
+    executable = spec.executable
+    if executable.startswith("$"):
+        resolved = _resolve_shell_variable_executable(executable, gt_dir)
+        if resolved:
+            executable = resolved
+    resolved_spec = replace(spec, executable=executable)
+    try:
+        validate_runtime_spec(resolved_spec, gt_dir, require_artifacts=True)
+    except RuntimeSpecError:
+        relocated = _unique_packaged_executable_with_basename(
+            gt_dir, Path(executable).name, workdir=resolved_spec.workdir
+        )
+        if relocated is None:
+            target_name = _oss_fuzz_target_name(gt_dir)
+            if target_name and target_name != Path(executable).name:
+                relocated = _unique_packaged_executable_with_basename(
+                    gt_dir, target_name, workdir=resolved_spec.workdir
+                )
+        if relocated is None:
+            raise
+        relative = relocated.resolve().relative_to(gt_dir.resolve()).as_posix()
+        resolved_spec = replace(
+            resolved_spec,
+            executable=f"/gt/{relative}",
+            source=resolved_spec.source + "+basename_relocated",
+        )
+        validate_runtime_spec(resolved_spec, gt_dir, require_artifacts=True)
+    return resolved_spec
+
+
+def _unique_packaged_executable_with_basename(
+    gt_dir: Path, basename: str, *, workdir: str = ""
+) -> Path | None:
+    """Find a moved frozen target only when the match is unambiguous."""
+    if not basename or basename in {".", ".."}:
+        return None
+    candidates: list[Path] = []
+    for root in (gt_dir / "_work", gt_dir / "_out"):
+        if not root.exists():
+            continue
+        candidates.extend(
+            path for path in root.rglob(basename)
+            if path.is_file() and path.stat().st_mode & 0o111
+        )
+    root_candidate = gt_dir / basename
+    if root_candidate.is_file() and root_candidate.stat().st_mode & 0o111:
+        candidates.append(root_candidate)
+    unique = sorted({path.resolve() for path in candidates})
+    if workdir.startswith("/gt/"):
+        workdir_host = (gt_dir / _remove_prefix(workdir, "/gt/")).resolve()
+        in_workdir = []
+        for path in unique:
+            try:
+                path.relative_to(workdir_host)
+            except ValueError:
+                continue
+            in_workdir.append(path)
+        if len(in_workdir) == 1:
+            return in_workdir[0]
+    return unique[0] if len(unique) == 1 else None
+
+
+def _oss_fuzz_target_name(gt_dir: Path) -> str:
+    """Return the sample-local official OSS-Fuzz target, when recorded."""
+    sample_info = gt_dir / "sample_info.json"
+    if not sample_info.is_file():
+        return ""
+    try:
+        value = str(_load_json(sample_info).get("oss_fuzz_target") or "")
+    except (OSError, json.JSONDecodeError, RuntimeSpecError):
+        return ""
+    value = Path(value).name
+    return value if value not in {"", ".", ".."} else ""
+
+
+def _resolve_shell_variable_executable(variable: str, gt_dir: Path) -> str:
+    variable_name = variable.lstrip("${}").lstrip("$")
+    if variable_name != "target":
+        return ""
+    name = _target_find_name_from_packaged_command(gt_dir)
+    if not name:
+        return ""
+    for root in (gt_dir / "_work", gt_dir / "_out"):
+        if not root.exists():
+            continue
+        matches = sorted(
+            path for path in root.rglob(name)
+            if path.is_file() and path.stat().st_mode & 0o111
+        )
+        if matches:
+            match = matches[0].resolve()
+            relative = match.relative_to(gt_dir.resolve()).as_posix()
+            return f"/gt/{relative}"
+    return ""
+
+
+def _target_find_name_from_packaged_command(gt_dir: Path) -> str:
+    command, _source = _runtime_command_from_packaged_artifacts(gt_dir)
+    if not command:
+        return ""
+    match = re.search(r"\bfind\s+/gt/_work\b[^;&|]*\s-name\s+(['\"]?)(?P<name>[^'\"\\s]+)\\1", command)
+    return match.group("name") if match else ""
+
+
+def _is_system_executable(value: str) -> bool:
+    if not value or value.startswith(("/", "./", "../", "$")):
+        return False
+    return "/" not in value
+
+
+def _frozen_spec_needs_reparse(spec: RuntimeSpec) -> bool:
+    if spec.executable.startswith("$"):
+        return True
+    return spec.executable in {"cp", "cat", "printf", "echo", "mkdir", "rm"}
 
 
 def _image_from_build_script(path: Path) -> str:

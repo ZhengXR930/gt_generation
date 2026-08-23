@@ -13,6 +13,7 @@ Subcommands:
   context       Collect PoC execution context as context_trace.json.
   compact-result Remove generation-only files from a validated result directory.
   hydrate-runtime Restore compact non-ARVO runtime material before local testing.
+  package-runtime Create a portable non-ARVO runtime workspace archive.
   arvo-workspace Reuse one ARVO container across vulnerable/fixed validation.
   repo-workspace Run repo-track instrumentation gates through build.sh.
   gdb-watch      Emit / run the GDB python recorder for watchpoint coverage.
@@ -36,7 +37,8 @@ def main(argv: list[str] | None = None) -> int:
         "prepare", "validate", "state", "reachability", "assertions",
         "assertion-preflight", "audit-package", "bind-evidence",
         "macro-aliases", "context", "compact-result", "hydrate-runtime",
-        "arvo-workspace", "repo-workspace", "gdb-watch", "schema-path",
+        "package-runtime", "arvo-workspace", "repo-workspace", "gdb-watch",
+        "schema-path",
     ]
     parser = argparse.ArgumentParser(prog="gt-toolkit", description=__doc__)
     parser.add_argument("--version", action="version", version=f"gt-toolkit {__version__}")
@@ -90,6 +92,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "hydrate-runtime":
         from . import prepare
         return prepare.hydrate_main(rest)
+    if ns.command == "package-runtime":
+        from . import prepare
+        return prepare.package_runtime_main(rest)
     if ns.command == "arvo-workspace":
         from . import arvo_workspace
         return arvo_workspace.main(rest)

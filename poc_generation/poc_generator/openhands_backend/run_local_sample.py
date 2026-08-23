@@ -339,6 +339,9 @@ def command_from_runtime_spec(spec: dict, sample_id: str) -> str:
     if not isinstance(environment, dict):
         raise RuntimeError(f"{sample_id} runtime_spec.json has invalid environment")
 
+    environment, executable, arguments = unwrap_env_runtime_spec(
+        environment, executable, arguments
+    )
     env_parts = []
     for key, value in sorted(environment.items()):
         key = str(key)
@@ -352,6 +355,24 @@ def command_from_runtime_spec(spec: dict, sample_id: str) -> str:
     if workdir != "/gt/_work/src":
         command = f"cd {shlex.quote(workdir)} && {command}"
     return normalize_submission_command(command)
+
+
+def unwrap_env_runtime_spec(
+    environment: dict, executable: str, arguments: list
+) -> tuple[dict, str, list]:
+    if executable != "env":
+        return environment, executable, arguments
+    environment = dict(environment)
+    arguments = [str(item) for item in arguments]
+    while arguments and "=" in arguments[0]:
+        key, value = arguments.pop(0).split("=", 1)
+        if not _ENV_NAME.fullmatch(key):
+            break
+        environment[key] = value
+    if not arguments:
+        return environment, executable, arguments
+    executable = arguments.pop(0)
+    return environment, executable, arguments
 
 
 def normalize_submission_command(command: str) -> str:
@@ -809,6 +830,27 @@ PUBLIC_RUNTIME_ITEMS = (
 )
 
 
+def runtime_spec_root_items(sample_dir: Path) -> list[str]:
+    spec_path = sample_dir / "runtime_spec.json"
+    if not spec_path.is_file():
+        return []
+    try:
+        spec = load_json(spec_path)
+    except Exception:
+        return []
+    values = [spec.get("executable")]
+    values.extend(spec.get("arguments") or [])
+    roots: list[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        for match in re.finditer(r"/gt/(?P<path>[^\s:'\";|&]+)", raw):
+            first = match.group("path").split("/", 1)[0]
+            if first and first != "poc" and first not in roots:
+                roots.append(first)
+    return roots
+
+
 def copy_source(sample_dir: Path, workspace: Path, sample_info: dict) -> None:
     hydrate_runtime_workspace(sample_dir)
     work = sample_dir / "_work"
@@ -817,7 +859,12 @@ def copy_source(sample_dir: Path, workspace: Path, sample_info: dict) -> None:
     if not src.is_dir():
         raise RuntimeError(f"{sample_dir.name} runtime hydration produced no _work/src")
     _copy_tree_or_file(work, staged_work)
-    for name in PUBLIC_RUNTIME_ITEMS:
+    runtime_items = list(PUBLIC_RUNTIME_ITEMS)
+    runtime_items.extend(
+        name for name in runtime_spec_root_items(sample_dir)
+        if name not in runtime_items
+    )
+    for name in runtime_items:
         item = sample_dir / name
         if item.exists():
             _copy_tree_or_file(item, workspace / name)

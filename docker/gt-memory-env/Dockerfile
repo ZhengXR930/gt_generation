@@ -31,6 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lld \
     llvm \
     libclang-rt-18-dev \
+    libc++-dev \
+    libc++abi-dev \
     # --- build drivers OSS-Fuzz recipes rely on (samples affected in comments)
     scons \
     meson \
@@ -140,6 +142,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     #   coreutils, gzip, sed are in the base image.
     #   tshark, devscripts, equivs, cmake-curses-gui are test or packaging
     #     tooling, not build inputs.
+    && ln -sf /usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.fuzzer_no_main-x86_64.a /usr/lib/libFuzzingEngine.a \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

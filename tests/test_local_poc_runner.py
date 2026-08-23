@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+import tarfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "external" / "cyber
 from poc_generation.poc_generator.run_local_sample import (
     LocalExecutionBridge,
     check_runtime_readiness,
+    command_from_runtime_spec,
     copy_source,
     load_runtime_spec,
     minimize_submission_command,
@@ -163,6 +165,89 @@ def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
     assert readiness["runtime_image"] == "gt-memory-env:latest"
     assert readiness["runtime_workdir"] == "/gt/_work/src"
     assert readiness["required_images"] == ["gt-memory-env:latest", "alpine:3.23"]
+
+
+def test_runtime_readiness_extracts_packaged_runtime_archive(tmp_path, monkeypatch):
+    sample_dir = tmp_path / "secbench_case"
+    sample_dir.mkdir()
+    (sample_dir / "ground_truth.json").write_text(json.dumps({
+        "poc": {"trigger": "./build.sh './bin/target /gt/poc'"},
+    }))
+    (sample_dir / "sample_info.json").write_text(json.dumps({
+        "repo": "https://example.test/project.git",
+        "vulnerable_commit": "deadbeef",
+    }))
+    staged = tmp_path / "staged" / "_work" / "src" / "bin"
+    staged.mkdir(parents=True)
+    target = staged / "target"
+    target.write_bytes(b"\x7fELF")
+    target.chmod(0o755)
+    with tarfile.open(sample_dir / "runtime_work.tar.gz", "w:gz") as tar:
+        tar.add(tmp_path / "staged" / "_work", arcname="_work")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stderr=""),
+    )
+
+    readiness = check_runtime_readiness(sample_dir)
+
+    assert readiness["ready"] is True
+    assert readiness["hydration"]["extracted"] is True
+    assert (sample_dir / "_work" / "src" / "bin" / "target").is_file()
+
+
+def test_copy_source_includes_runtime_spec_root_artifact(tmp_path, monkeypatch):
+    sample_dir = tmp_path / "secbench_case"
+    sample_dir.mkdir()
+    (sample_dir / "sample_info.json").write_text(json.dumps({
+        "repo": "https://example.test/project.git",
+        "vulnerable_commit": "deadbeef",
+    }))
+    (sample_dir / "runtime_spec.json").write_text(json.dumps({
+        "sample_id": "secbench_case",
+        "backend": "local_workspace",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+        "executable": "/gt/root_fuzzer",
+        "arguments": ["{poc}"],
+        "environment": {},
+        "input_placeholder": "{poc}",
+        "source": "runtime_spec.json",
+    }))
+    src = sample_dir / "_work" / "src"
+    src.mkdir(parents=True)
+    (src / "main.c").write_text("int main(void) { return 0; }\n")
+    root_fuzzer = sample_dir / "root_fuzzer"
+    root_fuzzer.write_bytes(b"\x7fELF")
+    root_fuzzer.chmod(0o755)
+    monkeypatch.setattr(
+        "poc_generation.poc_generator.openhands_backend.run_local_sample.hydrate_runtime_workspace",
+        lambda sample_dir: {"prepared": True, "reused": True, "source": str(src)},
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    copy_source(sample_dir, workspace, load_json(sample_dir / "sample_info.json"))
+
+    assert (workspace / "_work" / "src" / "main.c").is_file()
+    assert (workspace / "root_fuzzer").is_file()
+
+
+def test_runtime_spec_command_unwraps_env_before_rendering():
+    command = command_from_runtime_spec({
+        "backend": "local_workspace",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+        "executable": "env",
+        "arguments": ["ASAN_OPTIONS=detect_leaks=0", "./target", "{poc}"],
+        "environment": {"LD_LIBRARY_PATH": "/gt/_work/src/.libs"},
+    }, "secbench_case")
+
+    assert command == (
+        "ASAN_OPTIONS=detect_leaks=0 LD_LIBRARY_PATH=/gt/_work/src/.libs "
+        "./target /gt/poc"
+    )
 
 
 def test_runtime_readiness_rejects_missing_runtime_images(tmp_path, monkeypatch):

@@ -20,6 +20,7 @@ import html
 import io
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -43,6 +44,27 @@ _CRASH_MARKER_RE = re.compile(
     r"|use-of-uninitialized-value"
     r"|heap-use-after-free|heap-buffer-overflow|stack-buffer-overflow",
     re.IGNORECASE,
+)
+
+RUNTIME_ARCHIVE_NAMES = (
+    "runtime_work.tar.gz",
+    "runtime_work.tgz",
+    "runtime_work.tar.xz",
+    "runtime_work.tar.bz2",
+    "runtime_work.tar",
+)
+RUNTIME_ARCHIVE_PART_PREFIXES = tuple(name + ".part-" for name in RUNTIME_ARCHIVE_NAMES)
+DEFAULT_RUNTIME_ARCHIVE_MAX_PART_BYTES = 90 * 1024 * 1024
+
+RUNTIME_ARCHIVE_ROOTS = (
+    "_work",
+    "_out",
+    "host_libs",
+    "oss_fuzz_project",
+    "oss_fuzz_src",
+    "harness_downloads",
+    "oss_fuzz_build.sh",
+    "oss_fuzz_setup.sh",
 )
 
 
@@ -295,12 +317,28 @@ def prepare(sample_path: str, result_dir: str) -> dict[str, Any]:
 def hydrate_runtime(result_dir: str | Path, *, force: bool = False) -> dict[str, Any]:
     """Restore the local execution workspace for a compact GT package.
 
-    Compact GT packages intentionally do not commit `_work/` or compiled output.
-    This helper rebuilds the deterministic source/material scaffold from the
-    package's `sample_info.json` so local PoC evaluation can run on another
-    machine without depending on stale absolute paths.
+    Prefer a committed runtime archive when present.  If the compact package has
+    no archive, rebuild the deterministic source/material scaffold from
+    `sample_info.json` so local PoC evaluation can run on another machine
+    without depending on stale absolute paths.
     """
     result_path = Path(result_dir)
+    # An archive is authoritative and extraction replaces every archived root.
+    # Without an archive, retain the staged OSS-Fuzz recipe/material while
+    # rebuilding only the generated workspace and frozen target artifacts.
+    has_archive = runtime_archive_path(result_path) is not None
+    if not has_archive:
+        _archive_name, archive_parts = runtime_archive_parts(result_path)
+        has_archive = bool(archive_parts)
+    if force and not has_archive:
+        generated_roots = {"_work", "_out", "host_libs"}
+        generated_roots.update(_runtime_spec_root_paths(result_path))
+        _remove_runtime_roots(result_path, generated_roots)
+
+    archive_report = extract_runtime_archive(result_path, force=force)
+    if archive_report.get("extracted") or archive_report.get("reused"):
+        return archive_report
+
     sample_info = result_path / "sample_info.json"
     if not sample_info.is_file():
         return {
@@ -323,6 +361,399 @@ def hydrate_runtime(result_dir: str | Path, *, force: bool = False) -> dict[str,
     return report
 
 
+def runtime_archive_path(result_dir: str | Path) -> Path | None:
+    result_path = Path(result_dir)
+    for name in RUNTIME_ARCHIVE_NAMES:
+        archive = result_path / name
+        if archive.is_file():
+            return archive
+    return None
+
+
+def runtime_archive_artifact_names(result_dir: str | Path) -> list[str]:
+    """Return committed runtime archive files for evidence/compaction."""
+    result_path = Path(result_dir)
+    names: list[str] = []
+    archive = runtime_archive_path(result_path)
+    if archive is not None:
+        names.append(archive.name)
+    _archive_name, parts = runtime_archive_parts(result_path)
+    names.extend(part.name for part in parts)
+    return sorted(dict.fromkeys(names))
+
+
+def runtime_archive_parts(result_dir: str | Path) -> tuple[str, list[Path]]:
+    result_path = Path(result_dir)
+    manifest_path = result_path / "runtime_work_manifest.json"
+    if not manifest_path.is_file():
+        return "", []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return "", []
+    archive_name = str(manifest.get("archive") or "")
+    parts = manifest.get("parts")
+    if not archive_name or not isinstance(parts, list):
+        return "", []
+    paths: list[Path] = []
+    for part in parts:
+        name = str((part or {}).get("name") or "")
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            return "", []
+        path = result_path / name
+        if not path.is_file():
+            return "", []
+        paths.append(path)
+    return archive_name, paths
+
+
+def extract_runtime_archive(
+    result_dir: str | Path, *, force: bool = False
+) -> dict[str, Any]:
+    """Extract a committed runtime workspace archive into the sample directory."""
+    result_path = Path(result_dir)
+    archive = runtime_archive_path(result_path)
+    archive_name = ""
+    part_paths: list[Path] = []
+    if archive is None:
+        archive_name, part_paths = runtime_archive_parts(result_path)
+    if archive is None and not part_paths:
+        return {
+            "prepared": False,
+            "hydrated": False,
+            "archive": None,
+            "reason": "missing runtime_work archive",
+        }
+    marker = result_path / ".runtime_work_extracted"
+    src = result_path / "_work" / "src"
+    if (
+        not force
+        and marker.is_file()
+        and src.is_dir()
+        and any(src.iterdir())
+    ):
+        return {
+            "prepared": True,
+            "hydrated": False,
+            "reused": True,
+            "archive": archive.name if archive is not None else archive_name,
+            "source": str(src),
+        }
+    if archive is not None:
+        extract_path = archive
+        archive_label = archive.name
+        cleanup_extract_path = False
+    else:
+        extract_path = result_path / f".{archive_name}.extracting"
+        with extract_path.open("wb") as output:
+            for part in part_paths:
+                with part.open("rb") as input_file:
+                    shutil.copyfileobj(input_file, output)
+        archive_label = archive_name
+        cleanup_extract_path = True
+    try:
+        _safe_extract_runtime_archive(extract_path, result_path)
+    finally:
+        if cleanup_extract_path:
+            try:
+                extract_path.unlink()
+            except FileNotFoundError:
+                pass
+    marker.write_text(
+        json.dumps(
+            {
+                "archive": archive_label,
+                "sha256": _sha256_path(archive) if archive is not None else _sha256_path_from_parts(part_paths),
+                "extracted_at": "runtime",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "prepared": True,
+        "hydrated": True,
+        "extracted": True,
+        "archive": archive_label,
+        "source": str(src),
+    }
+
+
+def _safe_extract_runtime_archive(archive: Path, destination: Path) -> None:
+    destination = destination.resolve()
+    allowed_files = _runtime_archive_allowed_toplevel(destination)
+    allowed = tuple(name + "/" for name in allowed_files)
+    with tarfile.open(archive, "r:*") as tar:
+        members = tar.getmembers()
+        for member in members:
+            if member.issym() or member.islnk():
+                raise RuntimeError(f"runtime archive links are not allowed: {member.name}")
+            name = member.name.replace("\\\\", "/")
+            normalized = posixpath.normpath(name)
+            if normalized in {"", "."} or normalized.startswith("../") or normalized.startswith("/"):
+                raise RuntimeError(f"unsafe runtime archive member: {member.name}")
+            if not (
+                normalized in allowed_files
+                or any(normalized.startswith(prefix) for prefix in allowed)
+            ):
+                raise RuntimeError(f"unexpected runtime archive member: {member.name}")
+            target = (destination / normalized).resolve()
+            try:
+                target.relative_to(destination)
+            except ValueError as exc:
+                raise RuntimeError(f"runtime archive member escapes sample: {member.name}") from exc
+        _remove_runtime_roots(
+            destination, _runtime_archive_allowed_toplevel(destination)
+        )
+        tar.extractall(destination, members)
+
+
+def _remove_runtime_roots(destination: Path, names: set[str]) -> None:
+    """Remove exact evaluator-runtime roots and reject partial cleanup.
+
+    Builds can leave root-owned files behind.  Silently continuing in that
+    state makes the following repository clone fail with an opaque
+    "destination is not empty" error.  Retry the exact roots through the
+    runtime container, then fail early if anything remains.
+    """
+    destination = destination.resolve()
+    safe_names = sorted(
+        name for name in names
+        if name and name not in {".", ".."} and "/" not in name and "\\" not in name
+    )
+    for name in safe_names:
+        path = destination / name
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists() or path.is_symlink():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    remaining = [name for name in safe_names if (destination / name).exists()]
+    if remaining and shutil.which("docker"):
+        command = [
+            "docker", "run", "--rm",
+            "-v", f"{destination}:/gt",
+            "gt-memory-env:latest",
+            "sh", "-c", 'for path do rm -rf -- "$path"; done',
+            "sh",
+        ]
+        command.extend(f"/gt/{name}" for name in remaining)
+        _sh(command, timeout=300)
+        remaining = [name for name in remaining if (destination / name).exists()]
+    if remaining:
+        raise RuntimeError(
+            "runtime workspace cleanup incomplete: " + ", ".join(remaining)
+        )
+
+
+def create_runtime_archive(
+    result_dir: str | Path,
+    *,
+    output_name: str = "runtime_work.tar.gz",
+    force: bool = False,
+    max_part_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Package the material needed to run local-workspace PoCs on another host."""
+    result_path = Path(result_dir)
+    archive = result_path / output_name
+    existing_parts = _runtime_archive_part_paths(result_path, output_name)
+    if (archive.exists() or existing_parts) and not force:
+        return {
+            "ok": False,
+            "archive": str(archive),
+            "reason": "archive already exists; pass --force to replace it",
+        }
+    if force:
+        for part in existing_parts:
+            part.unlink()
+    roots = _runtime_artifact_roots(result_path)
+    if not roots:
+        return {
+            "ok": False,
+            "archive": str(archive),
+            "reason": "no runtime workspace files to package",
+        }
+    tmp = archive.with_suffix(archive.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    mode = _tar_write_mode(archive)
+    with tarfile.open(tmp, mode, dereference=True) as tar:
+        for root in roots:
+            _tar_add_without_symlinks(tar, root, root.name)
+    tmp.replace(archive)
+    archive_sha256 = _sha256_path(archive)
+    archive_bytes = archive.stat().st_size
+    parts = _split_runtime_archive_if_needed(
+        archive,
+        max_part_bytes=max_part_bytes,
+    )
+    manifest = {
+        "sample_id": result_path.name,
+        "archive": archive.name,
+        "sha256": archive_sha256,
+        "bytes": archive_bytes,
+        "roots": [root.name for root in roots],
+    }
+    if parts:
+        manifest["parts"] = [
+            {
+                "name": part.name,
+                "sha256": _sha256_path(part),
+                "bytes": part.stat().st_size,
+            }
+            for part in parts
+        ]
+    manifest_path = result_path / "runtime_work_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return {"ok": True, **manifest}
+
+
+def _runtime_archive_part_paths(result_path: Path, archive_name: str) -> list[Path]:
+    return sorted(result_path.glob(f"{archive_name}.part-*"))
+
+
+def _split_runtime_archive_if_needed(
+    archive: Path, *, max_part_bytes: int | None
+) -> list[Path]:
+    if max_part_bytes is None:
+        max_part_bytes = int(
+            os.environ.get(
+                "GT_RUNTIME_ARCHIVE_MAX_PART_BYTES",
+                str(DEFAULT_RUNTIME_ARCHIVE_MAX_PART_BYTES),
+            )
+        )
+    if max_part_bytes <= 0 or archive.stat().st_size <= max_part_bytes:
+        return []
+    for old_part in _runtime_archive_part_paths(archive.parent, archive.name):
+        old_part.unlink()
+    parts: list[Path] = []
+    with archive.open("rb") as input_file:
+        index = 0
+        while True:
+            chunk = input_file.read(max_part_bytes)
+            if not chunk:
+                break
+            part = archive.parent / f"{archive.name}.part-{index:03d}"
+            part.write_bytes(chunk)
+            parts.append(part)
+            index += 1
+    archive.unlink()
+    return parts
+
+
+def _runtime_artifact_roots(result_path: Path) -> list[Path]:
+    roots: list[Path] = [
+        result_path / name
+        for name in RUNTIME_ARCHIVE_ROOTS
+        if (result_path / name).exists()
+    ]
+    seen = {root.name for root in roots}
+    for name in _runtime_spec_root_paths(result_path):
+        if name in seen:
+            continue
+        path = result_path / name
+        if path.exists():
+            roots.append(path)
+            seen.add(name)
+    return roots
+
+
+def _tar_add_without_symlinks(tar: tarfile.TarFile, root: Path, arcname: str) -> None:
+    """Add runtime material while skipping symlinks and local VCS metadata."""
+    if root.is_symlink():
+        return
+    if root.is_file():
+        tar.add(root, arcname=arcname, recursive=False)
+        return
+    if not root.is_dir():
+        return
+    tar.add(root, arcname=arcname, recursive=False)
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in {".git", "__pycache__", ".pytest_cache"}
+            and not (Path(current) / name).is_symlink()
+        ]
+        current_path = Path(current)
+        for dirname in dirnames:
+            path = current_path / dirname
+            rel = path.relative_to(root).as_posix()
+            tar.add(path, arcname=f"{arcname}/{rel}", recursive=False)
+        for filename in filenames:
+            path = current_path / filename
+            if path.is_symlink():
+                continue
+            rel = path.relative_to(root).as_posix()
+            tar.add(path, arcname=f"{arcname}/{rel}", recursive=False)
+
+
+def _runtime_spec_root_paths(result_path: Path) -> list[str]:
+    spec_path = result_path / "runtime_spec.json"
+    if not spec_path.is_file():
+        return []
+    try:
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    values = [spec.get("executable")]
+    values.extend(spec.get("arguments") or [])
+    roots: list[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        for match in re.finditer(r"/gt/(?P<path>[^\s:'\";|&]+)", raw):
+            first = match.group("path").split("/", 1)[0]
+            if first and first != "poc" and first not in roots:
+                roots.append(first)
+    return roots
+
+
+def _runtime_archive_allowed_toplevel(destination: Path) -> set[str]:
+    allowed = set(RUNTIME_ARCHIVE_ROOTS)
+    allowed.update(_runtime_spec_root_paths(destination))
+    # Extraction may leave this marker next to the ignored runtime tree.
+    allowed.add(".runtime_work_extracted")
+    return allowed
+
+
+def _tar_write_mode(path: Path) -> str:
+    name = path.name
+    if name.endswith((".tar.gz", ".tgz")):
+        return "w:gz"
+    if name.endswith(".tar.xz"):
+        return "w:xz"
+    if name.endswith(".tar.bz2"):
+        return "w:bz2"
+    if name.endswith(".tar"):
+        return "w:"
+    raise ValueError(f"unsupported runtime archive format: {path.name}")
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_path_from_parts(parts: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in parts:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 _HYDRATE_PRESERVED_FILES = (
     "build.sh",
     "poc",
@@ -342,12 +773,23 @@ _HYDRATE_PRESERVED_FILES = (
     "sanitizer_trace.txt",
     "reproduction_report.json",
     "runtime_spec.json",
+    "runtime_work.tar.gz",
+    "runtime_work.tgz",
+    "runtime_work.tar.xz",
+    "runtime_work.tar.bz2",
+    "runtime_work.tar",
+    "runtime_work.tar.gz.part-000",
+    "runtime_work_manifest.json",
 )
 
 
 def _snapshot_existing_durable_files(result_path: Path) -> dict[str, bytes]:
     saved: dict[str, bytes] = {}
-    for name in _HYDRATE_PRESERVED_FILES:
+    names = set(_HYDRATE_PRESERVED_FILES)
+    names.update(runtime_archive_artifact_names(result_path))
+    for prefix in RUNTIME_ARCHIVE_PART_PREFIXES:
+        names.update(path.name for path in result_path.glob(f"{prefix}*"))
+    for name in sorted(names):
         path = result_path / name
         if path.is_file():
             saved[name] = path.read_bytes()
@@ -1217,12 +1659,68 @@ def _oss_fuzz_runtime_workdir(d: Path, fallback: str = "$SRC") -> str:
     }
     for old, new in replacements.items():
         if workdir == old:
+            if old in {"${SRC}", "$SRC", "/src"}:
+                return "/gt/_work/src"
             return new
         if workdir.startswith(old + "/"):
             return new + workdir[len(old):]
     if workdir and not workdir.startswith("/"):
         return "/gt/_work/" + workdir.strip("/")
     return workdir
+
+
+def _oss_fuzz_project_layout_commands(project: str, workdir: str) -> list[str]:
+    """Recreate common OSS-Fuzz source layout aliases in /gt/_work."""
+    commands = [
+        'mkdir -p "$SRC" "$OUT" "$WORK"',
+        'if [[ -d /gt/_work/src ]]; then',
+        f'  if [[ ! -e "$SRC/{project}" ]]; then ln -s /gt/_work/src "$SRC/{project}"; fi',
+        f'  if [[ ! -e /gt/_work/{project} ]]; then ln -s /gt/_work/src /gt/_work/{project}; fi',
+        "fi",
+    ]
+    if workdir and workdir != "/gt/_work/src" and workdir.startswith("/gt/_work/"):
+        commands.extend([
+            f"if [[ ! -e {shlex.quote(workdir)} && -d /gt/_work/src ]]; then",
+            f"  ln -s /gt/_work/src {shlex.quote(workdir)}",
+            "fi",
+        ])
+    commands.extend([
+        'if [[ -d /gt/oss_fuzz_src ]]; then',
+        '  cp -a -n /gt/oss_fuzz_src/. "$SRC"/',
+        "fi",
+    ])
+    return commands
+
+
+def _oss_fuzz_default_toolchain_exports() -> list[str]:
+    """Defaults normally supplied by OSS-Fuzz base-builder images."""
+    return [
+        'export CC="${CC:-clang}"',
+        'export CXX="${CXX:-clang++}"',
+        'export CFLAGS="${CFLAGS:--O1 -fno-omit-frame-pointer -gline-tables-only -fsanitize=address}"',
+        'export CXXFLAGS="${CXXFLAGS:--O1 -fno-omit-frame-pointer -gline-tables-only -fsanitize=address}"',
+        'export SANITIZER="${SANITIZER:-address}"',
+        'export FUZZING_ENGINE="${FUZZING_ENGINE:-libfuzzer}"',
+        'export ARCHITECTURE="${ARCHITECTURE:-x86_64}"',
+        'export LIB_FUZZING_ENGINE="${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}"',
+        'export FUZZER_LIB="${FUZZER_LIB:-$LIB_FUZZING_ENGINE}"',
+    ]
+
+
+def _oss_fuzz_runtime_compat_commands() -> list[str]:
+    """Small compatibility shims for gt-memory-env vs OSS-Fuzz base-builder."""
+    return [
+        'if [[ ! -e /usr/lib/libFuzzingEngine.a ]]; then',
+        '  _gt_fuzzer_lib="$(find /usr/lib /usr/local/lib -path "*/lib/clang/*/lib/linux/libclang_rt.fuzzer_no_main-x86_64.a" -print -quit 2>/dev/null || true)"',
+        '  if [[ -n "$_gt_fuzzer_lib" ]]; then ln -sf "$_gt_fuzzer_lib" /usr/lib/libFuzzingEngine.a 2>/dev/null || true; fi',
+        '  unset _gt_fuzzer_lib',
+        'fi',
+        'if ! ldconfig -p 2>/dev/null | grep -q "libc++\\.so" && [[ ! -e /usr/lib/x86_64-linux-gnu/libc++.so ]]; then',
+        '  _gt_stdlib="$(ldconfig -p 2>/dev/null | awk \'/libstdc\\+\\+\\.so/{print $NF; exit}\')"',
+        '  if [[ -n "$_gt_stdlib" ]]; then ln -sf "$_gt_stdlib" /usr/lib/x86_64-linux-gnu/libc++.so 2>/dev/null || true; fi',
+        '  unset _gt_stdlib',
+        'fi',
+    ]
 
 
 def _setup_command_local_scripts(d: Path, project: str, command: str) -> list[Path]:
@@ -1303,11 +1801,23 @@ def _translate_oss_fuzz_path(path: str) -> str:
 
 
 def _dockerfile_env_exports(dockerfile: Path) -> list[str]:
-    """Return shell exports for Dockerfile ENV instructions."""
+    """Return shell exports for Dockerfile ENV and defaulted ARG values."""
     exports: list[str] = []
     if not dockerfile.is_file():
         return exports
     for line in _dockerfile_logical_lines(dockerfile):
+        if line.upper().startswith("ARG "):
+            raw = line[4:].strip()
+            key, separator, value = raw.partition("=")
+            if (
+                separator
+                and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key)
+                and value
+            ):
+                exports.append(
+                    f'export {key}="${{{key}:-{value}}}"'
+                )
+            continue
         if not line.upper().startswith("ENV "):
             continue
         raw = line[4:].strip()
@@ -1555,6 +2065,7 @@ def _stage_oss_fuzz_dockerfile_setup_script(
         if commands
         else "# No extra RUN setup commands; layout only.\n"
     )
+    layout_block = "\n".join(_oss_fuzz_project_layout_commands(project, workdir)) + "\n\n"
     setup_parts = [
         "#!/usr/bin/env bash\n",
         "set -euo pipefail\n\n",
@@ -1563,15 +2074,12 @@ def _stage_oss_fuzz_dockerfile_setup_script(
         'export WORK="${WORK:-/gt/_work}"\n',
         'export PATH="${HOME:-/tmp}/.cargo/bin:$PATH"\n',
         'export PIP_BREAK_SYSTEM_PACKAGES="${PIP_BREAK_SYSTEM_PACKAGES:-1}"\n',
-        'mkdir -p "$SRC" "$OUT" "$WORK"\n\n',
+        "\n".join(_oss_fuzz_default_toolchain_exports()),
+        "\n\n",
+        "\n".join(_oss_fuzz_runtime_compat_commands()),
+        "\n\n",
         "# Recreate the official OSS-Fuzz /src layout from prepared local material.\n",
-        f'if [[ ! -e "$SRC/{project}" && -d /gt/_work/src ]]; then\n',
-        f'  ln -s /gt/_work/src "$SRC/{project}"\n',
-        "fi\n",
-        'if [[ -d /gt/oss_fuzz_src ]]; then\n',
-        '  cp -a -n /gt/oss_fuzz_src/. "$SRC"/\n',
-        "fi\n",
-        f'mkdir -p {shlex.quote(workdir)} 2>/dev/null || true\n\n',
+        layout_block,
         "# Make official dependency scripts retry-safe in the persistent /gt/_work.\n",
         "_gt_real_git() { command git \"$@\"; }\n",
         "git() {\n",
@@ -1596,10 +2104,12 @@ def _stage_oss_fuzz_dockerfile_setup_script(
         "      _gt_dest=\"${_gt_dest%.git}\"\n",
         "    fi\n",
         "    if [[ -n \"$_gt_dest\" ]]; then\n",
-        "      case \"$_gt_dest\" in\n",
-        f"        \"$SRC/{project}\"|\"$SRC/{project}/\"*) ;;\n",
-        "        /gt/_work/*|\"$SRC\"/*|\"$WORK\"/*) rm -rf \"$_gt_dest\" ;;\n",
-        "      esac\n",
+        "      local _gt_dest_path=\"$_gt_dest\"\n",
+        "      [[ \"$_gt_dest_path\" = /* ]] || _gt_dest_path=\"$PWD/$_gt_dest_path\"\n",
+        "      if [[ -e \"$_gt_dest_path\" ]] && [[ -n \"$(find \"$_gt_dest_path\" -mindepth 1 -print -quit 2>/dev/null)\" ]]; then\n",
+        "        echo \"Using staged dependency at $_gt_dest_path instead of cloning $_gt_url\" >&2\n",
+        "        return 0\n",
+        "      fi\n",
         "    fi\n",
         "  fi\n",
         "  _gt_real_git \"$@\"\n",
@@ -1611,6 +2121,7 @@ def _stage_oss_fuzz_dockerfile_setup_script(
         copy_block,
         rustup_bootstrap,
         f"# Official non-clone RUN commands from projects/{project}/Dockerfile.\n",
+        'cd "$SRC"\n',
         run_block,
     ]
     setup_text = "".join(setup_parts)
@@ -1978,6 +2489,11 @@ def _write_oss_fuzz_build_wrapper(d: Path, body: str, workdir: str) -> bool:
         'export SRC="${SRC:-/gt/_work}"\n'
         'export OUT="${OUT:-/gt/_out}"\n'
         'export WORK="${WORK:-/gt/_work}"\n'
+        + "\n".join(_oss_fuzz_default_toolchain_exports())
+        + "\n"
+        + "\n".join(_oss_fuzz_runtime_compat_commands())
+        + "\n"
+        'git config --global --add safe.directory /gt/_work/src 2>/dev/null || true\n'
         f'cd "${{GT_OSS_FUZZ_WORKDIR:-{workdir}}}"\n'
         "\n"
         + body
@@ -2071,7 +2587,9 @@ def _stage_reproduction_config(
         "harness_downloads": 0,
         "oss_fuzz_build_recipe": False,
     }
-    project = str(sample.get("project") or sample.get("oss_fuzz_project") or "").strip()
+    # Repository names and OSS-Fuzz integration names are not always equal
+    # (for example wasm-micro-runtime is integrated as projects/wamr).
+    project = str(sample.get("oss_fuzz_project") or sample.get("project") or "").strip()
     if project:
         staged["oss_fuzz_project"] = _stage_oss_fuzz_project_context(
             d, project, reference_time
@@ -2353,6 +2871,31 @@ def hydrate_main(argv: list[str] | None = None) -> int:
     res = hydrate_runtime(ns.result_dir, force=ns.force)
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("prepared") else 1
+
+
+def package_runtime_main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="gt-toolkit package-runtime",
+        description="Create a portable runtime_work archive for a local-workspace GT package.",
+    )
+    ap.add_argument("--result-dir", required=True)
+    ap.add_argument("--output-name", default="runtime_work.tar.gz")
+    ap.add_argument(
+        "--max-part-bytes",
+        type=int,
+        default=None,
+        help="Split archives larger than this many bytes; default 90MiB.",
+    )
+    ap.add_argument("--force", action="store_true")
+    ns = ap.parse_args(argv)
+    res = create_runtime_archive(
+        ns.result_dir,
+        output_name=ns.output_name,
+        force=ns.force,
+        max_part_bytes=ns.max_part_bytes,
+    )
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
 
 
 if __name__ == "__main__":

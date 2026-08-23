@@ -1,4 +1,5 @@
 import json
+import tarfile
 
 from reachability.runtime_spec import (
     compile_runtime_spec,
@@ -113,6 +114,169 @@ def test_runtime_spec_normalizes_gt_workdir_executable(tmp_path):
     assert spec.workdir == "/gt/_work/src"
     assert spec.executable == "./bin/gcc/MP4Box"
     assert spec.arguments == ["-dash", "1000", "{poc}"]
+
+
+def test_runtime_spec_hydrates_from_runtime_archive(tmp_path):
+    sample = tmp_path / "secbench_case"
+    sample.mkdir()
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "sample_info.json").write_text(json.dumps({
+        "sample_id": "secbench_case",
+        "repo": "https://example.test/project.git",
+        "vulnerable_commit": "deadbeef",
+    }))
+    (sample / "runtime_spec.json").write_text(json.dumps({
+        "sample_id": "secbench_case",
+        "backend": "local_workspace",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+        "executable": "./bin/target",
+        "arguments": ["{poc}"],
+        "environment": {},
+        "input_placeholder": "{poc}",
+        "source": "runtime_spec.json",
+    }))
+    staged = tmp_path / "staged" / "_work" / "src" / "bin"
+    staged.mkdir(parents=True)
+    target = staged / "target"
+    target.write_bytes(b"\x7fELF")
+    target.chmod(0o755)
+    with tarfile.open(sample / "runtime_work.tar.gz", "w:gz") as tar:
+        tar.add(tmp_path / "staged" / "_work", arcname="_work")
+
+    spec = compile_runtime_spec(sample)
+
+    assert spec.executable == "./bin/target"
+    assert (sample / "_work" / "src" / "bin" / "target").is_file()
+
+
+def test_runtime_spec_unwraps_env_executable(tmp_path):
+    sample = tmp_path / "secbench_case"
+    target = sample / "_work" / "src" / "build" / "cjpeg"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"\x7fELF")
+    target.chmod(0o755)
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "ground_truth.json").write_text(json.dumps({
+        "poc": {
+            "trigger": (
+                "./build.sh 'env ASAN_OPTIONS=detect_leaks=0 "
+                "LD_LIBRARY_PATH=/gt/_work/src/build "
+                "/gt/_work/src/build/cjpeg -outfile /tmp/out.jpg /gt/poc'"
+            ),
+        },
+    }))
+
+    spec = compile_runtime_spec(sample)
+
+    assert spec.executable == "/gt/_work/src/build/cjpeg"
+    assert spec.arguments == ["-outfile", "/tmp/out.jpg", "{poc}"]
+    assert spec.environment == {
+        "ASAN_OPTIONS": "detect_leaks=0",
+        "LD_LIBRARY_PATH": "/gt/_work/src/build",
+    }
+
+
+def test_runtime_spec_relocates_unique_executable_with_same_basename(tmp_path):
+    sample = tmp_path / "secbench_case"
+    target = sample / "_work" / "bin" / "cjpeg"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"\x7fELF")
+    target.chmod(0o755)
+    (sample / "_work" / "src").mkdir()
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "runtime_spec.json").write_text(json.dumps({
+        "sample_id": "secbench_case",
+        "backend": "local_workspace",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+        "executable": "/gt/_work/src/build/cjpeg",
+        "arguments": ["{poc}"],
+        "environment": {},
+        "input_placeholder": "{poc}",
+        "source": "runtime_spec.json",
+    }))
+
+    spec = compile_runtime_spec(sample)
+
+    assert spec.executable == "/gt/_work/bin/cjpeg"
+    assert spec.source.endswith("+basename_relocated")
+
+
+def test_runtime_spec_does_not_guess_between_duplicate_basenames(tmp_path):
+    sample = tmp_path / "secbench_case"
+    (sample / "_work" / "src").mkdir(parents=True)
+    for parent in (sample / "_work" / "bin1", sample / "_out"):
+        parent.mkdir(parents=True)
+        target = parent / "target"
+        target.write_bytes(b"\x7fELF")
+        target.chmod(0o755)
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "runtime_spec.json").write_text(json.dumps({
+        "sample_id": "secbench_case",
+        "backend": "local_workspace",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+        "executable": "./missing/target",
+        "arguments": ["{poc}"],
+        "environment": {},
+        "input_placeholder": "{poc}",
+        "source": "runtime_spec.json",
+    }))
+
+    import pytest
+    from reachability.runtime_spec import RuntimeSpecError
+
+    with pytest.raises(RuntimeSpecError, match="runtime executable is missing"):
+        compile_runtime_spec(sample)
+
+
+def test_runtime_spec_prefers_unique_workdir_match(tmp_path):
+    sample = tmp_path / "secbench_case"
+    (sample / "_work" / "src").mkdir(parents=True)
+    for target in (
+        sample / "_work" / "src" / "cjpeg",
+        sample / "_work" / "bin" / "cjpeg",
+    ):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x7fELF")
+        target.chmod(0o755)
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "runtime_spec.json").write_text(json.dumps({
+        "sample_id": "secbench_case", "backend": "local_workspace",
+        "image": "gt-memory-env:latest", "workdir": "/gt/_work/src",
+        "executable": "/gt/_work/src/build/cjpeg",
+        "arguments": ["{poc}"], "environment": {},
+        "input_placeholder": "{poc}", "source": "runtime_spec.json",
+    }))
+
+    spec = compile_runtime_spec(sample)
+
+    assert spec.executable == "/gt/_work/src/cjpeg"
+
+
+def test_runtime_spec_uses_recorded_oss_fuzz_target(tmp_path):
+    sample = tmp_path / "osv_case"
+    (sample / "_work" / "src").mkdir(parents=True)
+    target = sample / "_out" / "fuzz"
+    target.parent.mkdir()
+    target.write_bytes(b"\x7fELF")
+    target.chmod(0o755)
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "sample_info.json").write_text(json.dumps({
+        "sample_id": "osv_case", "oss_fuzz_target": "fuzz"
+    }))
+    (sample / "runtime_spec.json").write_text(json.dumps({
+        "sample_id": "osv_case", "backend": "local_workspace",
+        "image": "gt-memory-env:latest", "workdir": "/gt/_work/src",
+        "executable": "./test/fuzzer", "arguments": ["{poc}"],
+        "environment": {}, "input_placeholder": "{poc}",
+        "source": "runtime_spec.json",
+    }))
+
+    spec = compile_runtime_spec(sample)
+
+    assert spec.executable == "/gt/_out/fuzz"
 
 
 def test_runtime_checkpoint_line_is_remapped_by_frozen_statement(tmp_path):

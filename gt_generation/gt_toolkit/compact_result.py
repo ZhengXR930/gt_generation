@@ -10,6 +10,7 @@ from typing import Any
 
 from .package_audit import audit_package
 from .evidence import write_commitment
+from .prepare import runtime_archive_artifact_names
 
 
 KEEP_FILES = {
@@ -37,6 +38,12 @@ KEEP_FILES = {
     # still removed; this recipe is required to reconstruct them at evaluation.
     "reproduction_report.json",
     "runtime_spec.json",
+    "runtime_work.tar.gz",
+    "runtime_work.tgz",
+    "runtime_work.tar.xz",
+    "runtime_work.tar.bz2",
+    "runtime_work.tar",
+    "runtime_work_manifest.json",
 }
 
 
@@ -51,6 +58,9 @@ def compact_result(result_dir: Path) -> dict[str, Any]:
             "errors": ["pre-compaction package audit failed", *before["errors"]],
         }
 
+    keep_files = set(KEEP_FILES)
+    keep_files.update(runtime_archive_artifact_names(result_dir))
+
     # The report already contains resolved checkpoints, observed locations, and
     # assertion-event reachability.  Paths under `artifacts` point only to the
     # generation-time debugger/spec/trace inputs that are removed below.
@@ -64,7 +74,7 @@ def compact_result(result_dir: Path) -> dict[str, Any]:
 
     removed: list[str] = []
     for path in sorted(result_dir.iterdir(), key=lambda item: item.name):
-        if path.name in KEEP_FILES:
+        if path.name in keep_files:
             continue
         removed.append(path.name)
         if path.is_dir() and not path.is_symlink():
