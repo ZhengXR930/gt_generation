@@ -2274,6 +2274,45 @@ def write_repair_context(source: Path, staging: Path) -> dict[str, Any]:
     return context
 
 
+def _remove_tree_or_path(path: Path) -> None:
+    path = path.resolve()
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_dir() and not path.is_symlink():
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            pass
+    elif path.exists() or path.is_symlink():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if not path.exists() and not path.is_symlink():
+        return
+    if shutil.which("docker"):
+        parent = path.parent
+        proc = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{parent}:/gt-parent",
+                "gt-memory-env:latest",
+                "sh", "-c", 'rm -rf -- "$1"', "sh", f"/gt-parent/{path.name}",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=300,
+        )
+        if not path.exists() and not path.is_symlink():
+            return
+        raise RuntimeError(
+            f"failed to remove {path} with docker rc={proc.returncode}: "
+            f"{(proc.stderr or '')[-500:]}"
+        )
+    raise RuntimeError(f"failed to remove {path}")
+
+
 def install_generation_provenance(result_dir: Path) -> None:
     source_text = os.environ.get("GT_GENERATION_PROVENANCE_SOURCE", "").strip()
     if not source_text:
@@ -2305,14 +2344,14 @@ def publish_repair_staging(staging: Path, published: Path) -> None:
     """Replace a completed package only after the staged package passes Stage 05."""
     backup = published.with_name(published.name + ".repair-backup")
     if backup.exists():
-        shutil.rmtree(backup)
+        _remove_tree_or_path(backup)
     os.replace(published, backup)
     try:
         os.replace(staging, published)
     except BaseException:
         os.replace(backup, published)
         raise
-    shutil.rmtree(backup)
+    _remove_tree_or_path(backup)
 
 
 def clear_stale_feedback_control_files(logs_dir: Path) -> list[Path]:

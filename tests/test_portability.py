@@ -357,6 +357,50 @@ def test_portability_gate_requires_all_four_oracles(tmp_path, monkeypatch):
     assert portability.portability_gate_passes(result) is True
 
 
+def test_portability_gate_cleans_replay_tree_between_versions(tmp_path, monkeypatch):
+    result = _stage01_result(tmp_path)
+    monkeypatch.setattr(
+        portability,
+        "freeze_runtime_contract",
+        lambda _path: {"ok": True},
+    )
+    replay_dirs = []
+
+    def fake_copy(_source, destination):
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "copied").write_text("ok")
+
+    def fake_build(result_path, version, _timeout):
+        replay_dirs.append(result_path)
+        if version == "vulnerable":
+            (result_path / "_work").mkdir()
+            (result_path / "_work" / "root-owned-placeholder").write_text("x")
+        assert (result_path / "copied").is_file()
+        if version == "fixed":
+            assert not (result_path / "_work").exists()
+        return {"ok": True}
+
+    monkeypatch.setattr(portability, "_copy_portable_materials", fake_copy)
+    monkeypatch.setattr(portability, "_build_side", fake_build)
+    runs = iter([
+        {
+            "execution_valid": True,
+            "finding_present": True,
+            "finding_signature": {
+                "sanitizer": "AddressSanitizer",
+                "crash_type": "heap-buffer-overflow",
+            },
+        },
+        {"execution_valid": True, "finding_present": False},
+    ])
+    monkeypatch.setattr(portability, "_run_frozen_spec", lambda *_args: next(runs))
+
+    report = portability.run_portability_gate(result, timeout=1)
+
+    assert report["runtime_portable"] is True
+    assert len(replay_dirs) == 2
+
+
 def test_portability_gate_rejects_fixed_execution_failure(tmp_path, monkeypatch):
     result = _stage01_result(tmp_path)
     monkeypatch.setattr(portability, "freeze_runtime_contract", lambda _path: {"ok": True})

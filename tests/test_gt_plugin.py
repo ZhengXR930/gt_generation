@@ -50,6 +50,34 @@ def test_stage_existing_runtime_candidate_copies_only_lightweight_hints(tmp_path
     assert not (migration / "runtime_work.tar.gz").exists()
 
 
+def test_stage01_migration_copy_excludes_generated_runtime_roots(tmp_path):
+    published = tmp_path / "published"
+    staging = tmp_path / "staging"
+    published.mkdir()
+    (published / "ground_truth.json").write_text("{}")
+    (published / "_work" / "src").mkdir(parents=True)
+    (published / "_work" / "src" / "object.o").write_bytes(b"object")
+    (published / "_out").mkdir()
+    (published / "_out" / "target").write_bytes(b"binary")
+    (published / "runtime_build_logs").mkdir()
+    (published / "runtime_build_logs" / "build.log").write_text("log")
+    (published / "runtime_work.tar.gz").write_bytes(b"archive")
+    (published / "runtime_work.tar.gz.part-000").write_bytes(b"part")
+    (published / "runtime_work_manifest.json").write_text("{}")
+
+    gt_plugin._copy_published_package_for_migration(
+        published, staging, ("runtime_work.tar.gz",)
+    )
+
+    assert (staging / "ground_truth.json").is_file()
+    assert not (staging / "_work").exists()
+    assert not (staging / "_out").exists()
+    assert not (staging / "runtime_build_logs").exists()
+    assert not (staging / "runtime_work.tar.gz").exists()
+    assert not (staging / "runtime_work.tar.gz.part-000").exists()
+    assert not (staging / "runtime_work_manifest.json").exists()
+
+
 def test_partial_repair_does_not_skip_complete_samples(monkeypatch):
     monkeypatch.setitem(
         sys.modules,

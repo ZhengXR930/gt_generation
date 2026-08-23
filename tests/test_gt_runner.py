@@ -1055,6 +1055,30 @@ def test_successful_repair_staging_atomically_replaces_package(tmp_path):
     assert not published.with_name("sample.repair-backup").exists()
 
 
+def test_publish_repair_staging_uses_cleanup_helper_for_backup(tmp_path, monkeypatch):
+    published = tmp_path / "sample"
+    published.mkdir()
+    (published / "ground_truth.json").write_text("published")
+    staging = runner.repair_staging_dir(published)
+    staging.mkdir()
+    (staging / "ground_truth.json").write_text("validated repair")
+    removed = []
+
+    def fake_remove(path):
+        removed.append(path.name)
+        if path.exists():
+            for child in path.iterdir():
+                child.unlink()
+            path.rmdir()
+
+    monkeypatch.setattr(runner, "_remove_tree_or_path", fake_remove)
+
+    runner.publish_repair_staging(staging, published)
+
+    assert (published / "ground_truth.json").read_text() == "validated repair"
+    assert removed == ["sample.repair-backup"]
+
+
 def test_repair_publish_gate_requires_commitment(tmp_path):
     assert runner.repair_package_ready_to_publish(tmp_path) is False
 

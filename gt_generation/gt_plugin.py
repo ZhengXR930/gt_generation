@@ -384,10 +384,67 @@ def _sha256_file(path: Path) -> str:
 
 
 def _remove_path(path: Path) -> None:
+    path = path.resolve()
+    if not path.exists() and not path.is_symlink():
+        return
     if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            pass
     elif path.exists() or path.is_symlink():
-        path.unlink()
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if not path.exists() and not path.is_symlink():
+        return
+    if shutil.which("docker"):
+        parent = path.parent
+        target = f"/gt-parent/{path.name}"
+        proc = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{parent}:/gt-parent",
+                "gt-memory-env:latest",
+                "sh", "-c", 'rm -rf -- "$1"', "sh", target,
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=300,
+        )
+        if not path.exists():
+            return
+        raise RuntimeError(
+            f"failed to remove {path} with docker rc={proc.returncode}: "
+            f"{(proc.stderr or '')[-500:]}"
+        )
+    raise RuntimeError(f"failed to remove {path}")
+
+
+def _copy_published_package_for_migration(
+    published_dir: Path, staging: Path, legacy_archive_names: tuple[str, ...]
+) -> None:
+    ignored = {
+        "_work",
+        "_out",
+        "runtime_build_logs",
+        ".runtime_work_extracted",
+        "runtime_work_manifest.json",
+        *legacy_archive_names,
+    }
+
+    def ignore_generated(_directory: str, names: list[str]) -> set[str]:
+        ignored_names = set()
+        for name in names:
+            if name in ignored:
+                ignored_names.add(name)
+            elif any(name.startswith(archive + ".part-") for archive in legacy_archive_names):
+                ignored_names.add(name)
+        return ignored_names
+
+    shutil.copytree(published_dir, staging, symlinks=True, ignore=ignore_generated)
 
 
 def stage_existing_runtime_candidate(
@@ -489,12 +546,9 @@ def publish_stage01_migration(work_dir: Path, published_dir: Path) -> dict[str, 
             raise ValueError("runtime_materials.json has no files")
         staging = published_dir.with_name(published_dir.name + ".portability-staging")
         _remove_path(staging)
-        copied = subprocess.run(
-            ["cp", "--reflink=auto", "-a", str(published_dir), str(staging)],
-            capture_output=True, text=True, errors="replace",
+        _copy_published_package_for_migration(
+            published_dir, staging, LEGACY_RUNTIME_ARCHIVE_NAMES
         )
-        if copied.returncode != 0:
-            shutil.copytree(published_dir, staging, symlinks=True)
 
         material_paths: list[Path] = []
         for index, entry in enumerate(entries):

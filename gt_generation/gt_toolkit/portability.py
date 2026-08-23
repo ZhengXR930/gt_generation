@@ -294,6 +294,44 @@ def _copy_portable_materials(source: Path, destination: Path) -> None:
             shutil.copy2(path, target)
 
 
+def _remove_replay_tree(path: Path) -> None:
+    path = path.resolve()
+    if not path.exists():
+        return
+    shutil.rmtree(path, ignore_errors=True)
+    if not path.exists():
+        return
+    if shutil.which("docker"):
+        parent = path.parent
+        target = f"/gt-parent/{path.name}"
+        proc = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{parent}:/gt-parent",
+                "gt-memory-env:latest",
+                "sh", "-c", 'rm -rf -- "$1"', "sh", target,
+            ],
+            text=True,
+            capture_output=True,
+            errors="replace",
+            timeout=300,
+            check=False,
+        )
+        if path.exists():
+            raise RuntimeError(
+                "runtime replay cleanup incomplete: "
+                f"{path} (docker rc={proc.returncode}, stderr="
+                f"{(proc.stderr or '')[-500:]})"
+            )
+        return
+    raise RuntimeError(f"runtime replay cleanup incomplete: {path}")
+
+
+def _reset_replay_dir(source: Path, replay: Path) -> None:
+    _remove_replay_tree(replay)
+    _copy_portable_materials(source, replay)
+
+
 def _target_commit(sample: dict[str, Any], version: str) -> str:
     if version == "fixed":
         return str(
@@ -575,11 +613,10 @@ def run_portability_gate(
             report["reason"] = "Stage 01 sanitizer_trace has no sanitizer finding"
             return _write_report(source, report)
         baseline_signature = _finding_signature(baseline)
-        with tempfile.TemporaryDirectory(
-            prefix=f"gt-portability-{source.name}-"
-        ) as temporary:
-            replay = Path(temporary) / source.name
-            _copy_portable_materials(source, replay)
+        temporary = Path(tempfile.mkdtemp(prefix=f"gt-portability-{source.name}-"))
+        try:
+            replay = temporary / source.name
+            _reset_replay_dir(source, replay)
             vulnerable = _build_side(replay, "vulnerable", timeout)
             report["vulnerable"] = vulnerable
             report["vulnerable_build_ok"] = vulnerable.get("ok") is True
@@ -590,8 +627,7 @@ def run_portability_gate(
                     baseline, run.get("finding_signature") or {}
                 )
 
-            shutil.rmtree(replay, ignore_errors=True)
-            _copy_portable_materials(source, replay)
+            _reset_replay_dir(source, replay)
             fixed = _build_side(replay, "fixed", timeout)
             report["fixed"] = fixed
             report["fixed_build_ok"] = fixed.get("ok") is True
@@ -605,6 +641,8 @@ def run_portability_gate(
                         baseline_signature, fixed_signature
                     )
                 )
+        finally:
+            _remove_replay_tree(temporary)
         report["clean_replay_ok"] = all(
             report[key]
             for key in (
