@@ -26,6 +26,13 @@ from .repo_workspace import command_masks_failures
 
 PORTABILITY_REPORT_NAME = "portability_report.json"
 RUNTIME_MATERIALS_NAME = "runtime_materials.json"
+LEGACY_RUNTIME_ARCHIVE_NAMES = (
+    "runtime_work.tar.gz",
+    "runtime_work.tgz",
+    "runtime_work.tar.xz",
+    "runtime_work.tar.bz2",
+    "runtime_work.tar",
+)
 BASE_PORTABLE_FILES = (
     "sample_info.json",
     "build.sh",
@@ -641,6 +648,17 @@ def materialize_stage01_portability(
             shutil.rmtree(path)
         elif path.exists() or path.is_symlink():
             path.unlink()
+    # A successful lightweight rebuild proof supersedes old committed runtime
+    # bundles.  Remove both whole archives and split parts so packages cannot
+    # accidentally carry two competing runtime contracts.
+    for name in (*LEGACY_RUNTIME_ARCHIVE_NAMES, "runtime_work_manifest.json"):
+        path = result_path / name
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+    for prefix in LEGACY_RUNTIME_ARCHIVE_NAMES:
+        for path in result_path.glob(prefix + ".part-*"):
+            if path.is_file() or path.is_symlink():
+                path.unlink()
     return report
 
 

@@ -330,6 +330,9 @@ def test_materialize_stage01_portability_removes_generated_workspace_on_success(
     (result / "_work" / "src").mkdir(parents=True)
     (result / "_out").mkdir()
     (result / "runtime_build_logs").mkdir()
+    (result / "runtime_work.tar.gz").write_bytes(b"legacy")
+    (result / "runtime_work.tar.gz.part-000").write_bytes(b"legacy part")
+    _write_json(result / "runtime_work_manifest.json", {"archive": "runtime_work.tar.gz"})
     monkeypatch.setattr(
         portability,
         "run_portability_gate",
@@ -342,3 +345,6 @@ def test_materialize_stage01_portability_removes_generated_workspace_on_success(
     assert not (result / "_work").exists()
     assert not (result / "_out").exists()
     assert not (result / "runtime_build_logs").exists()
+    assert not (result / "runtime_work.tar.gz").exists()
+    assert not (result / "runtime_work.tar.gz.part-000").exists()
+    assert not (result / "runtime_work_manifest.json").exists()

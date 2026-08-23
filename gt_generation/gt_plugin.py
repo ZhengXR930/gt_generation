@@ -254,6 +254,20 @@ def completed_samples_to_skip(
     """Ordinary batches skip complete GT; explicit partial reruns repair it."""
     if cfg.get("start_at"):
         return []
+    if cfg.get("run_mode") == "stage01_screening":
+        # Audit-complete legacy packages still need the new deterministic
+        # portability proof.  A Stage-01 migration skips only packages that
+        # already passed that proof, not every package with complete semantics.
+        try:
+            from gt_toolkit.portability import portability_gate_passes
+        except ImportError:
+            from gt_generation.gt_toolkit.portability import portability_gate_passes
+
+        return [
+            sample_id
+            for sample_id in samples
+            if portability_gate_passes(REPO_ROOT / "gt_results" / sample_id)
+        ]
     import gt_status
 
     return [

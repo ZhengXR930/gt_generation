@@ -29,6 +29,23 @@ def test_partial_repair_does_not_skip_complete_samples(monkeypatch):
     ) == ["arvo_1"]
 
 
+def test_stage01_migration_skips_only_portability_complete_samples(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gt_plugin, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "gt_generation.gt_toolkit.portability.portability_gate_passes",
+        lambda path: path.name == "portable",
+    )
+
+    skipped = gt_plugin.completed_samples_to_skip(
+        ["legacy_complete", "portable"],
+        {"start_at": "", "run_mode": "stage01_screening"},
+    )
+
+    assert skipped == ["portable"]
+
+
 def test_config_loads_partial_repair_bounds(tmp_path):
     config = {
         "cli": "codex",
