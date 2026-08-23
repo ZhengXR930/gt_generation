@@ -49,6 +49,54 @@ def test_repo_checkout_cleanup_uses_container_fallback(tmp_path, monkeypatch):
     assert "custom-memory:latest" in calls[0]
 
 
+def test_git_retries_transient_network_errors(monkeypatch):
+    calls = []
+    responses = [
+        subprocess.CompletedProcess(
+            ["git", "fetch"],
+            128,
+            "",
+            "fatal: unable to access repository: RPC failed; early EOF",
+        ),
+        subprocess.CompletedProcess(["git", "fetch"], 0, "", ""),
+    ]
+
+    def fake_sh(command, timeout=None):
+        calls.append(command)
+        return responses.pop(0)
+
+    monkeypatch.setattr(prepare, "_sh", fake_sh)
+    monkeypatch.setattr(prepare.time, "sleep", lambda _seconds: None)
+
+    result, attempts = prepare._sh_git_with_retries(["git", "fetch"], timeout=30)
+
+    assert result.returncode == 0
+    assert len(calls) == 2
+    assert [attempt["returncode"] for attempt in attempts] == [128, 0]
+
+
+def test_git_retry_stops_on_non_retryable_errors(monkeypatch):
+    calls = []
+
+    def fake_sh(command, timeout=None):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            128,
+            "",
+            "remote: Repository not found.",
+        )
+
+    monkeypatch.setattr(prepare, "_sh", fake_sh)
+    monkeypatch.setattr(prepare.time, "sleep", lambda _seconds: None)
+
+    result, attempts = prepare._sh_git_with_retries(["git", "fetch"], timeout=30)
+
+    assert result.returncode == 128
+    assert len(calls) == 1
+    assert attempts[0]["returncode"] == 128
+
+
 def test_prepare_preserves_input_as_sample_info(tmp_path, monkeypatch):
     sample = tmp_path / "input.json"
     sample.write_text(

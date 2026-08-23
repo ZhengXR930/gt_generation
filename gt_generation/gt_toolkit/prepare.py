@@ -26,6 +26,7 @@ import shlex
 import shutil
 import subprocess
 import tarfile
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -81,6 +82,76 @@ def _sh(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProce
     return subprocess.run(
         cmd, capture_output=True, text=True, errors="replace", timeout=timeout
     )
+
+
+_GIT_RETRYABLE_PATTERNS = (
+    "could not resolve host",
+    "failed to connect",
+    "connection timed out",
+    "connection reset",
+    "connection refused",
+    "network is unreachable",
+    "temporary failure",
+    "tls handshake",
+    "gnutls",
+    "ssl_connect",
+    "rpc failed",
+    "early eof",
+    "remote end hung up",
+    "http/2 stream",
+    "operation timed out",
+    "timeout was reached",
+    "empty reply",
+    "unable to access",
+)
+
+_GIT_NON_RETRYABLE_PATTERNS = (
+    "repository not found",
+    "authentication failed",
+    "could not read username",
+    "permission denied",
+)
+
+
+def _git_retry_attempts(default: int = 3) -> int:
+    raw = os.environ.get("GT_GIT_RETRIES", "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _is_retryable_git_result(result: subprocess.CompletedProcess) -> bool:
+    text = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    if any(pattern in text for pattern in _GIT_NON_RETRYABLE_PATTERNS):
+        return False
+    return any(pattern in text for pattern in _GIT_RETRYABLE_PATTERNS)
+
+
+def _sh_git_with_retries(
+    cmd: list[str], timeout: int | None = None, retries: int = 3
+) -> tuple[subprocess.CompletedProcess, list[dict[str, Any]]]:
+    """Run a git network/materialization command with bounded transient retries."""
+    attempts = _git_retry_attempts(retries)
+    history: list[dict[str, Any]] = []
+    result: subprocess.CompletedProcess | None = None
+    for attempt in range(1, attempts + 1):
+        result = _sh(cmd, timeout=timeout)
+        history.append({
+            "attempt": attempt,
+            "returncode": result.returncode,
+            "stdout": (result.stdout or "")[-1000:],
+            "stderr": (result.stderr or "")[-2000:],
+        })
+        if result.returncode == 0:
+            break
+        if attempt >= attempts or not _is_retryable_git_result(result):
+            break
+        time.sleep(min(10, attempt * 2))
+    assert result is not None
+    return result, history
 
 
 def _repo_clone_candidates(repo: str) -> list[str]:
@@ -157,8 +228,12 @@ def _ensure_repo_commit(repo: Path, remote: str, commitish: str) -> dict[str, An
     shallow = _sh(["git", "-C", str(repo), "rev-parse", "--is-shallow-repository"], timeout=30)
     status["was_shallow"] = shallow.stdout.strip() == "true"
     if status["was_shallow"]:
-        unshallow = _sh(["git", "-C", str(repo), "fetch", "--unshallow", "--no-tags", "origin"], timeout=2400)
+        unshallow, unshallow_attempts = _sh_git_with_retries(
+            ["git", "-C", str(repo), "fetch", "--unshallow", "--no-tags", "origin"],
+            timeout=2400,
+        )
         status["unshallow_returncode"] = unshallow.returncode
+        status["unshallow_attempts"] = unshallow_attempts
         if unshallow.returncode != 0:
             status["unshallow_stderr"] = (unshallow.stderr or "")[-2000:]
     status["present"] = _commitish_exists(repo, commitish)
@@ -166,8 +241,12 @@ def _ensure_repo_commit(repo: Path, remote: str, commitish: str) -> dict[str, An
         if commitish:
             _sh(["git", "-C", str(repo), "update-ref", f"refs/gt-cache/{commitish}", commitish], timeout=30)
         return status
-    fetched = _sh(["git", "-C", str(repo), "fetch", "--no-tags", "origin", commitish], timeout=1800)
+    fetched, fetch_attempts = _sh_git_with_retries(
+        ["git", "-C", str(repo), "fetch", "--no-tags", "origin", commitish],
+        timeout=1800,
+    )
     status["fetch_returncode"] = fetched.returncode
+    status["fetch_attempts"] = fetch_attempts
     status["present"] = _commitish_exists(repo, commitish)
     if status["present"]:
         _sh(["git", "-C", str(repo), "update-ref", f"refs/gt-cache/{commitish}", commitish], timeout=30)
@@ -233,18 +312,22 @@ def _materialize_repo_checkout(
             continue
 
         _remove_checkout_tree(src)
-        cloned = _sh(["git", "clone", "--no-checkout", str(cache), str(src)], timeout=600)
+        cloned, clone_attempts = _sh_git_with_retries(
+            ["git", "clone", "--no-checkout", str(cache), str(src)],
+            timeout=600,
+        )
         if cloned.returncode != 0:
             clone_errors.append({
                 "repo": clone_repo,
                 "reason": "local clone from cache failed",
                 "cache": str(cache),
+                "attempts": clone_attempts,
                 "stderr": (cloned.stderr or "")[-2000:],
             })
             continue
         _sh(["git", "-C", str(src), "remote", "set-url", "origin", clone_repo], timeout=60)
         for commit in [c for c in commits if c]:
-            fetched_local = _sh(
+            fetched_local, local_fetch_attempts = _sh_git_with_retries(
                 [
                     "git", "-C", str(src), "fetch", "--no-tags", str(cache),
                     f"refs/gt-cache/{commit}:refs/gt-cache/{commit}",
@@ -257,6 +340,7 @@ def _materialize_repo_checkout(
                     "reason": "local fetch from cache failed",
                     "cache": str(cache),
                     "commit": commit,
+                    "attempts": local_fetch_attempts,
                     "stderr": (fetched_local.stderr or "")[-2000:],
                 })
                 _remove_checkout_tree(src)
