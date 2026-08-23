@@ -55,6 +55,8 @@ RUNTIME_ARCHIVE_NAMES = (
 )
 RUNTIME_ARCHIVE_PART_PREFIXES = tuple(name + ".part-" for name in RUNTIME_ARCHIVE_NAMES)
 DEFAULT_RUNTIME_ARCHIVE_MAX_PART_BYTES = 90 * 1024 * 1024
+RUNTIME_BUILD_RECIPE_NAME = "runtime_build.json"
+DEFAULT_RUNTIME_BUILD_TIMEOUT_SECONDS = 7200
 
 RUNTIME_ARCHIVE_ROOTS = (
     "_work",
@@ -63,6 +65,7 @@ RUNTIME_ARCHIVE_ROOTS = (
     "oss_fuzz_project",
     "oss_fuzz_src",
     "harness_downloads",
+    "oss_fuzz_downloads",
     "oss_fuzz_build.sh",
     "oss_fuzz_setup.sh",
 )
@@ -359,6 +362,411 @@ def hydrate_runtime(result_dir: str | Path, *, force: bool = False) -> dict[str,
     _restore_existing_durable_files(result_path, preserved)
     report["hydrated"] = bool(report.get("prepared"))
     return report
+
+
+def build_runtime_artifacts(
+    result_dir: str | Path,
+    *,
+    force_hydrate: bool = False,
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    """Hydrate and rebuild the local runtime artifacts for a non-ARVO package.
+
+    This is the runtime-spec-only path: compact GT packages may carry only
+    sample metadata plus a reproducible build recipe.  The evaluator calls this
+    when `_work/src` exists but the executable named by `runtime_spec.json` is
+    missing.  Existing runtime archives still win during hydration.
+    """
+    result_path = Path(result_dir)
+    timeout = int(
+        timeout
+        if timeout is not None
+        else os.environ.get(
+            "GT_RUNTIME_BUILD_TIMEOUT",
+            str(DEFAULT_RUNTIME_BUILD_TIMEOUT_SECONDS),
+        )
+    )
+    report: dict[str, Any] = {
+        "sample_id": result_path.name,
+        "prepared": False,
+        "built": False,
+    }
+    hydration = hydrate_runtime(result_path, force=force_hydrate)
+    report["hydration"] = hydration
+    if not hydration.get("prepared"):
+        report["reason"] = hydration.get("reason") or "runtime hydration failed"
+        return report
+
+    build_commands = runtime_build_commands(result_path)
+    if not build_commands and hydration.get("reused") and not force_hydrate:
+        # A compact package produced before runtime recipes were preserved may
+        # still have a stale local checkout but no staged OSS-Fuzz scripts.  A
+        # forced hydrate replays current deterministic prepare() and can recover
+        # the small build recipe without relying on the old _work tree.
+        refreshed_hydration = hydrate_runtime(result_path, force=True)
+        report["recipe_refresh_hydration"] = refreshed_hydration
+        if refreshed_hydration.get("prepared"):
+            build_commands = runtime_build_commands(result_path)
+    report["build_command_count"] = len(build_commands)
+    if not build_commands:
+        report["prepared"] = True
+        report["reason"] = "no runtime build recipe available"
+        return report
+
+    attempts: list[dict[str, Any]] = []
+    for item in build_commands:
+        command = str(item.get("command") or "").strip()
+        if not command:
+            continue
+        staged_inputs = _stage_missing_root_build_inputs(result_path, command)
+        build_report = _run_runtime_build(
+            result_path,
+            command,
+            build_as_root=bool(item.get("run_as_root")),
+            extra_env=item.get("environment"),
+            timeout=timeout,
+        )
+        build_report["source"] = str(item.get("source") or "runtime_build")
+        if staged_inputs:
+            build_report["staged_build_inputs"] = staged_inputs
+        attempts.append(build_report)
+        if build_report["returncode"] == 0:
+            report.update({
+                "prepared": True,
+                "built": True,
+                "build_attempts": attempts,
+            })
+            return report
+
+    report.update({
+        "prepared": True,
+        "built": False,
+        "build_attempts": attempts,
+        "reason": "runtime build commands failed",
+    })
+    return report
+
+
+def runtime_build_commands(result_dir: str | Path) -> list[dict[str, Any]]:
+    """Return deterministic commands that can rebuild the runtime target."""
+    result_path = Path(result_dir)
+    commands: list[dict[str, Any]] = []
+    commands.extend(_commands_from_runtime_build_recipe(result_path))
+    report = result_path / "reproduction_report.json"
+    if report.is_file():
+        try:
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        inner, as_root = _inner_build_command(str(data.get("setup_command") or ""))
+        if inner:
+            commands.append({
+                "source": "reproduction_report.setup_command",
+                "command": inner,
+                "run_as_root": as_root,
+            })
+    if (result_path / "oss_fuzz_setup.sh").is_file() or (result_path / "oss_fuzz_build.sh").is_file():
+        parts = []
+        if (result_path / "oss_fuzz_setup.sh").is_file():
+            # Source setup so exported environment and retry-safe git wrapper
+            # remain active while the official build script runs.
+            parts.append("source /gt/oss_fuzz_setup.sh")
+        if (result_path / "oss_fuzz_build.sh").is_file():
+            parts.append("bash /gt/oss_fuzz_build.sh")
+        commands.append({
+            "source": "oss_fuzz_staged_recipe",
+            "command": " && ".join(parts),
+            "run_as_root": True,
+        })
+    return _dedupe_runtime_build_commands(commands)
+
+
+def write_runtime_build_recipe(
+    result_dir: str | Path,
+    commands: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write the portable runtime rebuild recipe when commands are known."""
+    result_path = Path(result_dir)
+    commands = _dedupe_runtime_build_commands(
+        commands if commands is not None else runtime_build_commands(result_path)
+    )
+    if not commands:
+        return {"written": False, "reason": "no runtime build commands"}
+    recipe = {
+        "schema_version": "gt-runtime-build-v1",
+        "sample_id": result_path.name,
+        "description": (
+            "Evaluator-private deterministic commands for rebuilding the "
+            "runtime target in gt-memory-env. These commands build artifacts "
+            "only; PoC execution is described by runtime_spec.json."
+        ),
+        "commands": commands,
+    }
+    path = result_path / RUNTIME_BUILD_RECIPE_NAME
+    path.write_text(
+        json.dumps(recipe, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "written": True,
+        "path": str(path),
+        "commands": len(commands),
+    }
+
+
+def _commands_from_runtime_build_recipe(result_path: Path) -> list[dict[str, Any]]:
+    """Load the small durable rebuild contract for runtime-spec-only packages."""
+    path = result_path / RUNTIME_BUILD_RECIPE_NAME
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw_commands = data.get("commands")
+    if raw_commands is None and data.get("command"):
+        raw_commands = [data]
+    if not isinstance(raw_commands, list):
+        return []
+    commands: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_commands, 1):
+        if isinstance(raw, str):
+            command = raw.strip()
+            item: dict[str, Any] = {}
+        elif isinstance(raw, dict):
+            command = str(raw.get("command") or "").strip()
+            item = raw
+        else:
+            continue
+        if not command:
+            continue
+        environment = item.get("environment") if isinstance(item, dict) else None
+        if not isinstance(environment, dict):
+            environment = {}
+        commands.append({
+            "source": str(item.get("source") or f"{RUNTIME_BUILD_RECIPE_NAME}:commands[{index}]"),
+            "command": command,
+            "run_as_root": bool(item.get("run_as_root")),
+            "environment": {
+                str(key): str(value)
+                for key, value in environment.items()
+                if isinstance(key, str) and isinstance(value, (str, int, float, bool))
+            },
+        })
+    return commands
+
+
+def _dedupe_runtime_build_commands(commands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, bool, tuple[tuple[str, str], ...]]] = set()
+    for item in commands:
+        command = str(item.get("command") or "").strip()
+        if not command:
+            continue
+        environment = item.get("environment")
+        if not isinstance(environment, dict):
+            environment = {}
+        env_items = tuple(sorted((str(k), str(v)) for k, v in environment.items()))
+        key = (command, bool(item.get("run_as_root")), env_items)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({
+            "source": str(item.get("source") or "runtime_build"),
+            "command": command,
+            "run_as_root": bool(item.get("run_as_root")),
+            "environment": dict(env_items),
+        })
+    return deduped
+
+
+def _inner_build_command(raw: str) -> tuple[str, bool]:
+    raw = raw.strip()
+    if not raw:
+        return "", False
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        parts = []
+    build_as_root = (
+        "/usr/" in raw
+        or " apt-get " in f" {raw} "
+        or " make install" in f" {raw} "
+        or " ldconfig" in f" {raw} "
+    )
+    for index, item in enumerate(parts):
+        if item.endswith("build.sh") and index + 1 < len(parts):
+            return parts[index + 1], build_as_root
+    for index in range(len(parts) - 2):
+        if parts[index:index + 2] == ["bash", "-lc"]:
+            return parts[index + 2], build_as_root
+    return raw, build_as_root
+
+
+def _limit_build_parallelism(command: str) -> str:
+    """Keep runtime rebuilds from using every host core."""
+    jobs = "${GT_BUILD_JOBS:-1}"
+    replacements = {
+        '$(nproc)': jobs,
+        '"$(nproc)"': f'"{jobs}"',
+        "'$(nproc)'": f"'{jobs}'",
+        '`nproc`': jobs,
+        '$(getconf _NPROCESSORS_ONLN)': jobs,
+        '"$(getconf _NPROCESSORS_ONLN)"': f'"{jobs}"',
+        "'$(getconf _NPROCESSORS_ONLN)'": f"'{jobs}'",
+    }
+    limited = command
+    for old, new in replacements.items():
+        limited = limited.replace(old, new)
+    limited = re.sub(r"(?<!\S)-j\s*([0-9]+)", f"-j {jobs}", limited)
+    limited = re.sub(r"(?<!\S)-j([0-9]+)", f"-j{jobs}", limited)
+    return limited
+
+
+def _gt_root_paths_in_command(command: str) -> list[str]:
+    paths: list[str] = []
+    for match in re.finditer(r"/gt/(?P<path>[^\s:'\";|&]+)", command):
+        path = match.group("path").strip()
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _is_build_input_path(path: str) -> bool:
+    suffix = Path(path).suffix.lower()
+    return suffix in {
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+        ".m", ".mm", ".S", ".s",
+    }
+
+
+def _stage_missing_root_build_inputs(result_path: Path, command: str) -> list[dict[str, str]]:
+    """Restore root-level harness files referenced by older build recipes."""
+    staged: list[dict[str, str]] = []
+    search_roots = [
+        result_path / "oss_fuzz_project",
+        result_path / "harness_downloads",
+        result_path / "_work" / "src" / "fuzz",
+        result_path / "_work" / "src",
+    ]
+    for relative in _gt_root_paths_in_command(command):
+        if "/" in relative or not _is_build_input_path(relative):
+            continue
+        destination = result_path / relative
+        if destination.exists():
+            continue
+        candidates = [relative]
+        if relative.startswith("repro_"):
+            candidates.append(relative[len("repro_"):])
+        source = None
+        for root in search_roots:
+            if not root.exists():
+                continue
+            for name in candidates:
+                direct = root / name
+                if direct.is_file():
+                    source = direct
+                    break
+            if source is not None:
+                break
+            basenames = {Path(name).name for name in candidates}
+            matches = sorted(
+                path for path in root.rglob("*")
+                if path.is_file() and path.name in basenames
+            )
+            if matches:
+                source = matches[0]
+                break
+        if source is None:
+            continue
+        shutil.copy2(source, destination)
+        staged.append({"path": relative, "source": str(source)})
+    return staged
+
+
+def _run_runtime_build(
+    result_path: Path,
+    command: str,
+    *,
+    build_as_root: bool,
+    extra_env: Any = None,
+    timeout: int,
+) -> dict[str, Any]:
+    env = os.environ.copy()
+    if build_as_root:
+        env["GT_BUILD_AS_ROOT"] = "1"
+    env.setdefault("GT_BUILD_JOBS", "1")
+    if isinstance(extra_env, dict):
+        for key, value in extra_env.items():
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key)):
+                env[str(key)] = str(value)
+    limited_command = _limit_build_parallelism(command)
+    log_dir = result_path / "runtime_build_logs"
+    log_dir.mkdir(exist_ok=True)
+    digest = hashlib.sha256(limited_command.encode("utf-8")).hexdigest()[:12]
+    stdout_path = log_dir / f"{digest}.stdout.txt"
+    stderr_path = log_dir / f"{digest}.stderr.txt"
+    try:
+        proc = subprocess.run(
+            [str(result_path / "build.sh"), limited_command],
+            cwd=str(result_path),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+        stdout_path.write_text(proc.stdout, encoding="utf-8")
+        stderr_path.write_text(proc.stderr, encoding="utf-8")
+        return {
+            "returncode": proc.returncode,
+            "build_as_root": build_as_root,
+            "command": limited_command,
+            "stdout_tail": proc.stdout[-2000:],
+            "stderr_tail": proc.stderr[-2000:],
+            "stdout_path": str(stdout_path.relative_to(result_path)),
+            "stderr_path": str(stderr_path.relative_to(result_path)),
+            "failure_markers": _runtime_build_failure_markers(proc.stdout + proc.stderr),
+        }
+    except subprocess.TimeoutExpired as exc:
+        output = _decode_timeout_output(exc.stdout) + _decode_timeout_output(exc.stderr)
+        stdout_path.write_text(output, encoding="utf-8")
+        return {
+            "returncode": 124,
+            "build_as_root": build_as_root,
+            "command": limited_command,
+            "stdout_tail": output[-2000:],
+            "stderr_tail": f"runtime build timed out after {exc.timeout}s",
+            "stdout_path": str(stdout_path.relative_to(result_path)),
+            "failure_markers": ["timeout"],
+        }
+
+
+def _runtime_build_failure_markers(output: str) -> list[str]:
+    if not output:
+        return []
+    markers = []
+    for pattern, label in (
+        (r"\bfatal error:", "fatal_error"),
+        (r"\bconfigure: error:", "configure_error"),
+        (r"\bCMake Error\b", "cmake_error"),
+        (r"\bninja: build stopped\b", "ninja_stopped"),
+        (r"\bNo rule to make target\b", "make_no_rule"),
+    ):
+        if re.search(pattern, output, re.IGNORECASE):
+            markers.append(label)
+    return markers
+
+
+def _decode_timeout_output(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
 
 
 def runtime_archive_path(result_dir: str | Path) -> Path | None:
@@ -773,6 +1181,7 @@ _HYDRATE_PRESERVED_FILES = (
     "sanitizer_trace.txt",
     "reproduction_report.json",
     "runtime_spec.json",
+    "runtime_build.json",
     "runtime_work.tar.gz",
     "runtime_work.tgz",
     "runtime_work.tar.xz",
@@ -2698,6 +3107,7 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
     repro_config = _stage_reproduction_config(sample, d, sid, reference_time)
     (d / "build.sh").write_text(repo_track_build_sh(env_image))
     (d / "build.sh").chmod(0o755)
+    runtime_build = write_runtime_build_recipe(d)
     _init_state(sid, d)
     report = {"track": "repo/secbench", "sample_id": sid, "env": env_image,
               "env_context": str(env_context), "env_ok": env_ok,
@@ -2709,6 +3119,7 @@ def _prepare_repo(sample: dict[str, Any], d: Path) -> dict[str, Any]:
               "harness_downloads": repro_config["harness_downloads"],
               "oss_fuzz_project": repro_config.get("oss_fuzz_project"),
               "oss_fuzz_build_recipe": repro_config.get("oss_fuzz_build_recipe", False),
+              "runtime_build": runtime_build,
               "patch": (d / "patch.diff").exists(),
               "prepared": bool(src.exists())}
     for key in (
@@ -2871,6 +3282,36 @@ def hydrate_main(argv: list[str] | None = None) -> int:
     res = hydrate_runtime(ns.result_dir, force=ns.force)
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("prepared") else 1
+
+
+def build_runtime_main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="gt-toolkit build-runtime",
+        description="Hydrate and rebuild non-ARVO runtime artifacts from runtime_build.json.",
+    )
+    ap.add_argument("--result-dir", required=True)
+    ap.add_argument("--force-hydrate", action="store_true")
+    ap.add_argument("--timeout", type=int, default=None)
+    ns = ap.parse_args(argv)
+    res = build_runtime_artifacts(
+        ns.result_dir,
+        force_hydrate=ns.force_hydrate,
+        timeout=ns.timeout,
+    )
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("built") else 1
+
+
+def write_runtime_build_main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="gt-toolkit write-runtime-build",
+        description="Write runtime_build.json from staged deterministic build material.",
+    )
+    ap.add_argument("--result-dir", required=True)
+    ns = ap.parse_args(argv)
+    res = write_runtime_build_recipe(ns.result_dir)
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("written") else 1
 
 
 def package_runtime_main(argv: list[str] | None = None) -> int:

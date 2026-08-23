@@ -36,6 +36,9 @@ KEEP_FILES = {
     "evidence_commitment.json",
     # Small evaluator-private rebuild contract.  The workspace and binaries are
     # still removed; this recipe is required to reconstruct them at evaluation.
+    "runtime_build.json",
+    # Legacy packages may still keep this as a private command source; new
+    # compact packages should prefer runtime_build.json.
     "reproduction_report.json",
     "runtime_spec.json",
     "runtime_work.tar.gz",

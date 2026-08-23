@@ -51,6 +51,10 @@ sys.path.insert(0, str(GT_ROOT / "gt_generation"))
 from poc_generation.analysis_artifact_prompt import (  # noqa: E402
     analysis_artifact_task_readme_section,
 )
+from evaluator.reachability.runtime_spec import (  # noqa: E402
+    RuntimeSpecError,
+    compile_runtime_spec,
+)
 
 
 def unlink_if_exists(path: Path) -> None:
@@ -214,8 +218,23 @@ def split_shell_sequence(command: str) -> list[str]:
     return pieces
 
 
-def load_runtime_spec(sample_dir: Path) -> tuple[str, dict]:
+def load_runtime_spec(
+    sample_dir: Path, *, require_artifacts: bool = False
+) -> tuple[str, dict]:
     """Load the packaged private oracle without inferring commands at runtime."""
+    try:
+        spec = compile_runtime_spec(sample_dir, require_artifacts=require_artifacts)
+    except RuntimeSpecError:
+        if require_artifacts:
+            raise
+        spec = None
+    if spec is not None:
+        spec_dict = spec.to_dict()
+        inner_command = command_from_runtime_spec(spec_dict, sample_dir.name)
+        return inner_command, runtime_metadata(
+            sample_dir, spec.source, spec_dict
+        )
+
     gt_path = sample_dir / "ground_truth.json"
     if not gt_path.is_file():
         raise RuntimeError(f"{sample_dir.name} has no packaged ground truth")
@@ -439,7 +458,6 @@ def hydrate_runtime_workspace(sample_dir: Path) -> dict:
 
 def check_runtime_readiness(sample_dir: Path) -> dict:
     """Fail before an agent run when the private local runtime cannot be restored."""
-    _, runtime = load_runtime_spec(sample_dir)
     sample_info_path = sample_dir / "sample_info.json"
     if not sample_info_path.is_file():
         raise RuntimeError(f"{sample_dir.name} has no sample_info.json")
@@ -451,7 +469,17 @@ def check_runtime_readiness(sample_dir: Path) -> dict:
         raise RuntimeError(
             f"{sample_dir.name} has neither cached source nor repo@vulnerable_commit"
         )
-    hydration = hydrate_runtime_workspace(sample_dir)
+    try:
+        _inner_command, runtime = load_runtime_spec(
+            sample_dir, require_artifacts=True
+        )
+        hydration = {
+            "prepared": True,
+            "runtime_spec_ready": True,
+            "source": "compile_runtime_spec",
+        }
+    except RuntimeSpecError as exc:
+        raise RuntimeError(f"{sample_dir.name} runtime spec unavailable: {exc}") from exc
 
     required_images = tuple(
         dict.fromkeys(
@@ -823,6 +851,7 @@ PUBLIC_RUNTIME_ITEMS = (
     "oss_fuzz_project",
     "oss_fuzz_src",
     "harness_downloads",
+    "oss_fuzz_downloads",
     "host_libs",
     "_out",
     "oss_fuzz_build.sh",
@@ -876,7 +905,7 @@ def copy_source(sample_dir: Path, workspace: Path, sample_info: dict) -> None:
 def prepare_workspace(sample_id: str, scratch: Path) -> tuple[Path, str, dict]:
     sample_dir = GT_ROOT / "gt_results" / sample_id
     sample_info = load_json(sample_dir / "sample_info.json")
-    inner_command, repro = load_runtime_spec(sample_dir)
+    inner_command, repro = load_runtime_spec(sample_dir, require_artifacts=True)
 
     workspace = scratch / "workspace"
     workspace.mkdir(parents=True)

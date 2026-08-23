@@ -13,6 +13,8 @@ Subcommands:
   context       Collect PoC execution context as context_trace.json.
   compact-result Remove generation-only files from a validated result directory.
   hydrate-runtime Restore compact non-ARVO runtime material before local testing.
+  build-runtime Hydrate and rebuild non-ARVO runtime artifacts from recipe.
+  write-runtime-build Write a durable non-ARVO runtime build recipe.
   package-runtime Create a portable non-ARVO runtime workspace archive.
   arvo-workspace Reuse one ARVO container across vulnerable/fixed validation.
   repo-workspace Run repo-track instrumentation gates through build.sh.
@@ -37,8 +39,8 @@ def main(argv: list[str] | None = None) -> int:
         "prepare", "validate", "state", "reachability", "assertions",
         "assertion-preflight", "audit-package", "bind-evidence",
         "macro-aliases", "context", "compact-result", "hydrate-runtime",
-        "package-runtime", "arvo-workspace", "repo-workspace", "gdb-watch",
-        "schema-path",
+        "build-runtime", "write-runtime-build", "package-runtime",
+        "arvo-workspace", "repo-workspace", "gdb-watch", "schema-path",
     ]
     parser = argparse.ArgumentParser(prog="gt-toolkit", description=__doc__)
     parser.add_argument("--version", action="version", version=f"gt-toolkit {__version__}")
@@ -92,6 +94,12 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "hydrate-runtime":
         from . import prepare
         return prepare.hydrate_main(rest)
+    if ns.command == "build-runtime":
+        from . import prepare
+        return prepare.build_runtime_main(rest)
+    if ns.command == "write-runtime-build":
+        from . import prepare
+        return prepare.write_runtime_build_main(rest)
     if ns.command == "package-runtime":
         from . import prepare
         return prepare.package_runtime_main(rest)

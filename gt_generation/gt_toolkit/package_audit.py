@@ -17,7 +17,7 @@ from .assertions import (
 )
 from .context_trace import context_trace_errors
 from .evidence import commitment_errors
-from .prepare import RUNTIME_ARCHIVE_NAMES
+from .prepare import RUNTIME_ARCHIVE_NAMES, RUNTIME_BUILD_RECIPE_NAME
 from .validate import harness_location_reason, validate_data
 
 
@@ -38,6 +38,7 @@ REQUIRED_FILES = (
 OPTIONAL_PROJECTION_FILES = (
     "assertion_reward_spec.json",
     "context_trace.json",
+    "runtime_build.json",
     "runtime_work_manifest.json",
 )
 
@@ -408,7 +409,7 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
         else:
             runtime_spec = _load_json(runtime_spec_path, errors)
             errors.extend(_runtime_spec_errors(runtime_spec, expected_sample_id))
-            errors.extend(_runtime_archive_errors(result_dir, expected_sample_id))
+            errors.extend(_runtime_contract_errors(result_dir, expected_sample_id))
 
     gt = documents["ground_truth.json"]
     gt_report = validate_data(gt, ground_truth=str(result_dir / "ground_truth.json"))
@@ -588,6 +589,56 @@ def _runtime_archive_errors(result_dir: Path, sample_id: str) -> list[str]:
             errors.append("runtime_work_manifest.json sha256 does not match packaged archive")
     else:
         errors.append("runtime_work_manifest.json missing sha256")
+    return errors
+
+
+def _runtime_contract_errors(result_dir: Path, sample_id: str) -> list[str]:
+    has_archive_manifest = (result_dir / "runtime_work_manifest.json").is_file()
+    has_build_recipe = (result_dir / RUNTIME_BUILD_RECIPE_NAME).is_file()
+    if has_archive_manifest:
+        return _runtime_archive_errors(result_dir, sample_id)
+    if has_build_recipe:
+        return _runtime_build_recipe_errors(result_dir, sample_id)
+    return [
+        "missing non-ARVO runtime contract: provide runtime_build.json "
+        "for rebuildable samples or runtime_work_manifest.json plus archive "
+        "for non-rebuildable samples"
+    ]
+
+
+def _runtime_build_recipe_errors(result_dir: Path, sample_id: str) -> list[str]:
+    errors: list[str] = []
+    recipe = _load_json(result_dir / RUNTIME_BUILD_RECIPE_NAME, errors)
+    if recipe.get("schema_version") != "gt-runtime-build-v1":
+        errors.append("runtime_build.json schema_version must be gt-runtime-build-v1")
+    if recipe.get("sample_id") != sample_id:
+        errors.append(
+            f"runtime_build.json sample_id mismatch: {recipe.get('sample_id')!r} != {sample_id!r}"
+        )
+    commands = recipe.get("commands")
+    if not isinstance(commands, list) or not commands:
+        errors.append("runtime_build.json commands must be a non-empty array")
+        return errors
+    for index, item in enumerate(commands):
+        if not isinstance(item, dict):
+            errors.append(f"runtime_build.json commands[{index}] must be an object")
+            continue
+        command = item.get("command")
+        if not isinstance(command, str) or not command.strip():
+            errors.append(f"runtime_build.json commands[{index}].command must be non-empty")
+        elif "\x00" in command:
+            errors.append(f"runtime_build.json commands[{index}].command contains NUL")
+        source = item.get("source")
+        if source is not None and not isinstance(source, str):
+            errors.append(f"runtime_build.json commands[{index}].source must be a string")
+        if "run_as_root" in item and not isinstance(item.get("run_as_root"), bool):
+            errors.append(f"runtime_build.json commands[{index}].run_as_root must be boolean")
+        environment = item.get("environment", {})
+        if not isinstance(environment, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            errors.append(f"runtime_build.json commands[{index}].environment must be an object of strings")
     return errors
 
 

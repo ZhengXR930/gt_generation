@@ -126,21 +126,40 @@ def compile_runtime_spec(
             if reparsed is not None:
                 spec = reparsed
         if require_artifacts:
-            spec = _resolve_runtime_artifact_spec(spec, gt_dir)
-        return (
-            _unwrap_libtool_executable(spec, gt_dir)
-            if require_artifacts
-            else spec
-        )
+            spec = _resolve_runtime_artifact_spec_with_rebuild(spec, gt_dir)
+            spec = _unwrap_libtool_executable(spec, gt_dir)
+            validate_runtime_spec(spec, gt_dir, require_artifacts=True)
+        return spec
 
     spec = _compile_spec_from_packaged_command(gt_dir, sample_id)
     if spec is None:
         raise RuntimeSpecError("runtime recipe is missing after GT compaction")
     spec = _normalize_local_workspace_spec(spec)
     if require_artifacts:
+        spec = _resolve_runtime_artifact_spec_with_rebuild(spec, gt_dir)
         spec = _unwrap_libtool_executable(spec, gt_dir)
     validate_runtime_spec(spec, gt_dir, require_artifacts=require_artifacts)
     return spec
+
+
+def _resolve_runtime_artifact_spec_with_rebuild(
+    spec: RuntimeSpec, gt_dir: Path
+) -> RuntimeSpec:
+    try:
+        return _resolve_runtime_artifact_spec(spec, gt_dir)
+    except RuntimeSpecError as first_error:
+        if spec.backend != "local_workspace":
+            raise
+        build_report = build_runtime_workspace(gt_dir)
+        if not build_report.get("built"):
+            reason = build_report.get("reason") or "runtime build failed"
+            raise RuntimeSpecError(f"{first_error}; rebuild failed: {reason}") from first_error
+        try:
+            return _resolve_runtime_artifact_spec(spec, gt_dir)
+        except RuntimeSpecError as second_error:
+            raise RuntimeSpecError(
+                f"{second_error}; rebuild report: {json.dumps(build_report, ensure_ascii=False)[:2000]}"
+            ) from second_error
 
 
 def _compile_spec_from_packaged_command(
@@ -180,6 +199,15 @@ def hydrate_runtime_workspace(gt_dir: Path) -> dict[str, Any]:
     if not report.get("prepared"):
         raise RuntimeSpecError(str(report.get("reason") or "runtime hydration failed"))
     return report
+
+
+def build_runtime_workspace(gt_dir: Path) -> dict[str, Any]:
+    """Hydrate source and rebuild runtime artifacts from the packaged contract."""
+    try:
+        from gt_toolkit.prepare import build_runtime_artifacts
+    except ImportError:
+        from gt_generation.gt_toolkit.prepare import build_runtime_artifacts
+    return build_runtime_artifacts(gt_dir)
 
 
 def validate_runtime_spec(
@@ -315,8 +343,6 @@ def _load_frozen_spec(
         raise RuntimeSpecError(f"invalid frozen runtime spec: {exc}") from exc
     spec = _unwrap_env_executable(spec)
     validate_runtime_spec(spec, path.parent, require_artifacts=False)
-    if require_artifacts:
-        _resolve_runtime_artifact_spec(spec, path.parent)
     return spec
 
 

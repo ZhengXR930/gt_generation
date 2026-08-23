@@ -15,6 +15,7 @@ from poc_generation.poc_generator.run_local_sample import (
     check_runtime_readiness,
     command_from_runtime_spec,
     copy_source,
+    load_json,
     load_runtime_spec,
     minimize_submission_command,
     render_readme,
@@ -22,6 +23,7 @@ from poc_generation.poc_generator.run_local_sample import (
     unwrap_nested_docker_command,
 )
 from poc_generation.poc_generator.rerun_model_batches import local_result_is_complete
+from reachability.runtime_spec import RuntimeSpec
 
 
 def test_readme_exposes_issue_but_not_saved_crash_evidence():
@@ -155,13 +157,27 @@ def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
             "source": str(sample_dir / "_work" / "src"),
         },
     )
+    monkeypatch.setattr(
+        "poc_generation.poc_generator.openhands_backend.run_local_sample.compile_runtime_spec",
+        lambda sample_dir, require_artifacts: RuntimeSpec(
+            sample_id=sample_dir.name,
+            backend="local_workspace",
+            image="gt-memory-env:latest",
+            workdir="/gt/_work/src",
+            executable="./target",
+            arguments=["{poc}"],
+            environment={},
+            input_placeholder="{poc}",
+            source="ground_truth.poc.trigger",
+        ),
+    )
 
     readiness = check_runtime_readiness(tmp_path)
 
     assert readiness["ready"] is True
     assert readiness["source_strategy"] == "hydrated_from_sample_info"
-    assert readiness["hydration"]["hydrated"] is True
-    assert readiness["runtime_source"] == "normalized_private_gt_trigger"
+    assert readiness["hydration"]["runtime_spec_ready"] is True
+    assert readiness["runtime_source"] == "ground_truth.poc.trigger"
     assert readiness["runtime_image"] == "gt-memory-env:latest"
     assert readiness["runtime_workdir"] == "/gt/_work/src"
     assert readiness["required_images"] == ["gt-memory-env:latest", "alpine:3.23"]
@@ -170,6 +186,7 @@ def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
 def test_runtime_readiness_extracts_packaged_runtime_archive(tmp_path, monkeypatch):
     sample_dir = tmp_path / "secbench_case"
     sample_dir.mkdir()
+    (sample_dir / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
     (sample_dir / "ground_truth.json").write_text(json.dumps({
         "poc": {"trigger": "./build.sh './bin/target /gt/poc'"},
     }))
@@ -193,7 +210,7 @@ def test_runtime_readiness_extracts_packaged_runtime_archive(tmp_path, monkeypat
     readiness = check_runtime_readiness(sample_dir)
 
     assert readiness["ready"] is True
-    assert readiness["hydration"]["extracted"] is True
+    assert readiness["hydration"]["runtime_spec_ready"] is True
     assert (sample_dir / "_work" / "src" / "bin" / "target").is_file()
 
 
@@ -272,6 +289,20 @@ def test_runtime_readiness_rejects_missing_runtime_images(tmp_path, monkeypatch)
             "hydrated": True,
             "source": str(sample_dir / "_work" / "src"),
         },
+    )
+    monkeypatch.setattr(
+        "poc_generation.poc_generator.openhands_backend.run_local_sample.compile_runtime_spec",
+        lambda sample_dir, require_artifacts: RuntimeSpec(
+            sample_id=sample_dir.name,
+            backend="local_workspace",
+            image="gt-memory-env:latest",
+            workdir="/gt/_work/src",
+            executable="./target",
+            arguments=["{poc}"],
+            environment={},
+            input_placeholder="{poc}",
+            source="ground_truth.poc.trigger",
+        ),
     )
 
     with pytest.raises(RuntimeError, match="runtime images are missing"):

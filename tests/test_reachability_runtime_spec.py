@@ -184,6 +184,7 @@ def test_runtime_spec_relocates_unique_executable_with_same_basename(tmp_path):
     target.write_bytes(b"\x7fELF")
     target.chmod(0o755)
     (sample / "_work" / "src").mkdir()
+    (sample / "_work" / "src" / "parser.c").write_text("int main(void) { return 0; }\n")
     (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
     (sample / "runtime_spec.json").write_text(json.dumps({
         "sample_id": "secbench_case",
@@ -206,6 +207,7 @@ def test_runtime_spec_relocates_unique_executable_with_same_basename(tmp_path):
 def test_runtime_spec_does_not_guess_between_duplicate_basenames(tmp_path):
     sample = tmp_path / "secbench_case"
     (sample / "_work" / "src").mkdir(parents=True)
+    (sample / "_work" / "src" / "parser.c").write_text("int main(void) { return 0; }\n")
     for parent in (sample / "_work" / "bin1", sample / "_out"):
         parent.mkdir(parents=True)
         target = parent / "target"
@@ -258,6 +260,7 @@ def test_runtime_spec_prefers_unique_workdir_match(tmp_path):
 def test_runtime_spec_uses_recorded_oss_fuzz_target(tmp_path):
     sample = tmp_path / "osv_case"
     (sample / "_work" / "src").mkdir(parents=True)
+    (sample / "_work" / "src" / "parser.c").write_text("int main(void) { return 0; }\n")
     target = sample / "_out" / "fuzz"
     target.parent.mkdir()
     target.write_bytes(b"\x7fELF")
@@ -277,6 +280,47 @@ def test_runtime_spec_uses_recorded_oss_fuzz_target(tmp_path):
     spec = compile_runtime_spec(sample)
 
     assert spec.executable == "/gt/_out/fuzz"
+
+
+def test_runtime_spec_rebuilds_artifacts_from_runtime_build_recipe(tmp_path, monkeypatch):
+    sample = tmp_path / "secbench_case"
+    (sample / "_work" / "src").mkdir(parents=True)
+    (sample / "_work" / "src" / "parser.c").write_text("int main(void) { return 0; }\n")
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "runtime_spec.json").write_text(json.dumps({
+        "sample_id": "secbench_case",
+        "backend": "local_workspace",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+        "executable": "./bin/target",
+        "arguments": ["{poc}"],
+        "environment": {},
+        "input_placeholder": "{poc}",
+        "source": "runtime_spec.json",
+    }))
+    (sample / "runtime_build.json").write_text(json.dumps({
+        "schema_version": "gt-runtime-build-v1",
+        "sample_id": "secbench_case",
+        "commands": [{
+            "source": "test",
+            "command": "make -j8",
+            "run_as_root": False,
+        }],
+    }))
+
+    def fake_build(gt_dir):
+        assert gt_dir == sample.resolve()
+        target = sample / "_work" / "src" / "bin" / "target"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x7fELF")
+        target.chmod(0o755)
+        return {"prepared": True, "built": True}
+
+    monkeypatch.setattr("reachability.runtime_spec.build_runtime_workspace", fake_build)
+
+    spec = compile_runtime_spec(sample)
+
+    assert spec.executable == "./bin/target"
 
 
 def test_runtime_checkpoint_line_is_remapped_by_frozen_statement(tmp_path):

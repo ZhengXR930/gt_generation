@@ -56,6 +56,34 @@ def test_package_audit_accepts_string_issue_description():
     assert package_audit._public_issue({"issue_description": "exact issue"}) == "exact issue"
 
 
+def test_package_audit_accepts_runtime_build_contract_without_archive(tmp_path):
+    sample_id = "secbench_case"
+    (tmp_path / "runtime_build.json").write_text(json.dumps({
+        "schema_version": "gt-runtime-build-v1",
+        "sample_id": sample_id,
+        "commands": [{
+            "source": "oss_fuzz_staged_recipe",
+            "command": "source /gt/oss_fuzz_setup.sh && bash /gt/oss_fuzz_build.sh",
+            "run_as_root": True,
+            "environment": {"GT_BUILD_JOBS": "1"},
+        }],
+    }))
+
+    errors = package_audit._runtime_contract_errors(tmp_path, sample_id)
+
+    assert errors == []
+
+
+def test_package_audit_rejects_non_arvo_without_runtime_contract(tmp_path):
+    errors = package_audit._runtime_contract_errors(tmp_path, "secbench_case")
+
+    assert errors == [
+        "missing non-ARVO runtime contract: provide runtime_build.json "
+        "for rebuildable samples or runtime_work_manifest.json plus archive "
+        "for non-rebuildable samples"
+    ]
+
+
 def test_package_audit_requires_root_obligation_assertion(tmp_path, monkeypatch):
     sample_id = "sample"
     assertion = {
@@ -100,6 +128,8 @@ def test_package_audit_requires_root_obligation_assertion(tmp_path, monkeypatch)
             "sample_id": sample_id,
             "all_needed_witnessed": True,
         },
+        "field_bindings.json": {"sample_id": sample_id},
+        "event_locations.json": {"sample_id": sample_id},
         "reachability_report.json": {
             "sample_id": sample_id,
             **{field: True for field in package_audit.REACHABILITY_FIELDS},
@@ -121,7 +151,7 @@ def test_package_audit_requires_root_obligation_assertion(tmp_path, monkeypatch)
     assert any("no required root-obligation" in error for error in report["errors"])
 
 
-def test_package_audit_rejects_legacy_assertions_even_when_legacy_checks_pass(
+def test_package_audit_rejects_artifact_level_schema_version_even_when_legacy_checks_pass(
     tmp_path, monkeypatch
 ):
     sample_id = "sample"
@@ -167,6 +197,8 @@ def test_package_audit_rejects_legacy_assertions_even_when_legacy_checks_pass(
             "sample_id": sample_id,
             "all_needed_witnessed": True,
         },
+        "field_bindings.json": {"sample_id": sample_id},
+        "event_locations.json": {"sample_id": sample_id},
         "reachability_report.json": {
             "sample_id": sample_id,
             **{field: True for field in package_audit.REACHABILITY_FIELDS},
@@ -188,7 +220,10 @@ def test_package_audit_rejects_legacy_assertions_even_when_legacy_checks_pass(
     report = package_audit.audit_package(tmp_path)
 
     assert report["ok"] is False
-    assert any("must use verified-assertions-v3" in error for error in report["errors"])
+    assert any(
+        "verified_assertions.json must not contain artifact-level schema_version" in error
+        for error in report["errors"]
+    )
 
 
 def test_package_audit_validates_context_trace_when_present(tmp_path, monkeypatch):
