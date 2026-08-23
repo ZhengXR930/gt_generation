@@ -67,6 +67,24 @@ def test_config_loads_partial_repair_bounds(tmp_path):
     assert loaded["stop_after"] == "05_validate"
 
 
+def test_stage01_migration_requires_stage01_only_mode(tmp_path):
+    config = {
+        "cli": "codex",
+        "model": "gpt-5.4-2026-03-05",
+        "parallel_dockers": 1,
+        "repo_docker_context": str(
+            gt_plugin.REPO_ROOT / "docker" / "gt-memory-env"
+        ),
+        "samples": ["nvd_CVE-2026-2241"],
+        "stage01_migration": True,
+    }
+    path = tmp_path / "invalid-migration.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="requires stop_after='01_reproducer'"):
+        gt_plugin.load_config(path)
+
+
 def test_config_forces_partial_repair_through_validation(tmp_path):
     config = {
         "cli": "codex",

@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -126,6 +127,11 @@ def load_config(path: Path) -> dict[str, Any]:
     run_mode = "stage01_screening" if (
         not start_at and stop_after == "01_reproducer"
     ) else "full_gt_generation"
+    stage01_migration = bool(raw.get("stage01_migration", False))
+    if stage01_migration and run_mode != "stage01_screening":
+        raise SystemExit(
+            "stage01_migration requires stop_after='01_reproducer' and no start_at"
+        )
 
     return {
         "cli": cli,
@@ -146,6 +152,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "start_at": start_at,
         "stop_after": stop_after,
         "run_mode": run_mode,
+        "stage01_migration": stage01_migration,
     }
 
 
@@ -372,6 +379,126 @@ def evaluate_stage01_screening(
     return screening
 
 
+def _sha256_file(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def publish_stage01_migration(work_dir: Path, published_dir: Path) -> dict[str, Any]:
+    """Atomically merge a clean Stage 00-01 portability proof into full GT."""
+    from gt_generation.gt_toolkit.evidence import COMMITMENT_FILES, write_commitment
+    from gt_generation.gt_toolkit.package_audit import audit_package
+    from gt_generation.gt_toolkit.portability import (
+        LEGACY_RUNTIME_ARCHIVE_NAMES,
+        portability_gate_passes,
+    )
+
+    if not published_dir.is_dir():
+        return {"published": False, "reason": "published GT directory is missing"}
+    if not portability_gate_passes(work_dir):
+        return {"published": False, "reason": "portability proof did not pass"}
+    for immutable in ("sample_info.json", "poc"):
+        source = work_dir / immutable
+        target = published_dir / immutable
+        if not source.is_file() or not target.is_file():
+            return {"published": False, "reason": f"missing immutable {immutable}"}
+        if _sha256_file(source) != _sha256_file(target):
+            return {
+                "published": False,
+                "reason": f"Stage 00-01 changed immutable {immutable}",
+            }
+
+    protected_names = [
+        name for name in (*COMMITMENT_FILES, "context_trace.json")
+        if (published_dir / name).is_file()
+    ]
+    protected_hashes = {
+        name: _sha256_file(published_dir / name) for name in protected_names
+    }
+    try:
+        materials = _load_json_or_none(work_dir / "runtime_materials.json")
+        entries = materials.get("files") if isinstance(materials, dict) else None
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("runtime_materials.json has no files")
+        staging = published_dir.with_name(published_dir.name + ".portability-staging")
+        _remove_path(staging)
+        copied = subprocess.run(
+            ["cp", "--reflink=auto", "-a", str(published_dir), str(staging)],
+            capture_output=True, text=True, errors="replace",
+        )
+        if copied.returncode != 0:
+            shutil.copytree(published_dir, staging, symlinks=True)
+
+        material_paths: list[Path] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ValueError(f"runtime material {index} is not an object")
+            relative = Path(str(entry.get("path") or ""))
+            if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+                raise ValueError(f"unsafe runtime material path: {relative}")
+            source = work_dir / relative
+            if not source.is_file() or _sha256_file(source) != entry.get("sha256"):
+                raise ValueError(f"runtime material hash mismatch: {relative}")
+            material_paths.append(relative)
+
+        # Remove each referenced helper root first so stale files cannot survive
+        # beside the exact manifest contents. Base files are replaced directly.
+        base_files = {
+            "sample_info.json", "build.sh", "poc",
+            "runtime_build.json", "runtime_spec.json",
+        }
+        helper_roots = {
+            relative.parts[0] for relative in material_paths
+            if relative.parts[0] not in base_files
+        }
+        for root in helper_roots:
+            _remove_path(staging / root)
+        for relative in material_paths:
+            source = work_dir / relative
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        for name in (
+            "runtime_materials.json", "portability_report.json",
+            "reproduction_report.json",
+        ):
+            source = work_dir / name
+            if source.is_file():
+                shutil.copy2(source, staging / name)
+
+        for name in (*LEGACY_RUNTIME_ARCHIVE_NAMES, "runtime_work_manifest.json"):
+            _remove_path(staging / name)
+            for part in staging.glob(name + ".part-*"):
+                _remove_path(part)
+        for name, expected in protected_hashes.items():
+            if _sha256_file(staging / name) != expected:
+                raise ValueError(f"semantic evidence changed during migration: {name}")
+
+        write_commitment(staging)
+        audit = audit_package(staging)
+        if not audit.get("ok") or audit.get("warnings"):
+            raise ValueError(
+                "migrated package audit failed: "
+                + "; ".join([*(audit.get("errors") or []), *(audit.get("warnings") or [])])
+            )
+        from gt_generation.runner import publish_repair_staging
+
+        publish_repair_staging(staging, published_dir)
+        return {
+            "published": True,
+            "material_files": len(material_paths),
+            "protected_files": len(protected_hashes),
+        }
+    except Exception as exc:
+        return {"published": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def audit_completed_package(result_dir: Path) -> bool:
     audit = subprocess.run(
         [sys.executable, "-m", "gt_toolkit", "audit-package", "--result-dir", str(result_dir)],
@@ -432,9 +559,16 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
             running_lock: threading.Lock) -> dict[str, Any]:
     input_path = inputs_dir / f"{sample_id}.json"
     input_path.write_text(json.dumps(sample, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    result_dir = REPO_ROOT / "gt_results" / sample_id
+    published_result_dir = REPO_ROOT / "gt_results" / sample_id
+    result_dir = (
+        inputs_dir.parent / "results" / sample_id
+        if cfg.get("stage01_migration")
+        else published_result_dir
+    )
     log_path = logs_dir / f"{sample_id}.log"
     track = docker_track(sample)
+    if cfg.get("stage01_migration"):
+        _remove_path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     provenance_dir = result_dir
     if cfg.get("start_at") and all(
@@ -512,10 +646,13 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
         running.pop(sample_id, None)
 
     screening: dict[str, Any] | None = None
+    migration: dict[str, Any] | None = None
     audit_ok = False
     if completed.returncode == 0:
         if cfg["run_mode"] == "stage01_screening":
             screening = evaluate_stage01_screening(result_dir, sample, completed.returncode)
+            if screening.get("accepted_for_gt") and cfg.get("stage01_migration"):
+                migration = publish_stage01_migration(result_dir, published_result_dir)
         else:
             audit_ok = audit_completed_package(result_dir)
     elif cfg["run_mode"] == "stage01_screening":
@@ -526,6 +663,10 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
         if cfg["run_mode"] == "stage01_screening"
         else completed.returncode == 0 and audit_ok
     )
+    if cfg.get("stage01_migration"):
+        succeeded = succeeded and bool(migration and migration.get("published"))
+        if succeeded:
+            _remove_path(result_dir)
 
     result = {
         "sample_id": sample_id,
@@ -536,8 +677,9 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
         "succeeded": succeeded,
         "audit_ok": audit_ok,
         "stage01_screening": screening,
+        "stage01_migration": migration,
         "duration_seconds": round(time.monotonic() - started, 3),
-        "result_dir": str(result_dir),
+        "result_dir": str(published_result_dir),
         "log": str(log_path),
     }
     print("RESULT " + json.dumps(result, ensure_ascii=False), flush=True)
