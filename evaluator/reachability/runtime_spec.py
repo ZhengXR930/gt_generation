@@ -441,8 +441,16 @@ def _unwrap_reproduction_command(command: str) -> str:
         parts = shlex.split(command)
     except ValueError as exc:
         raise RuntimeSpecError(f"invalid reproduction shell quoting: {exc}") from exc
-    if parts and parts[0].endswith("build.sh") and len(parts) >= 2:
-        return parts[1]
+    index = 0
+    if parts and parts[0] == "env":
+        index = 1
+    while index < len(parts) and "=" in parts[index]:
+        key, _value = parts[index].split("=", 1)
+        if not _ENV_NAME.fullmatch(key):
+            break
+        index += 1
+    if index < len(parts) and parts[index].endswith("build.sh") and index + 1 < len(parts):
+        return parts[index + 1]
     for index in range(len(parts) - 2):
         if parts[index : index + 2] == ["bash", "-lc"]:
             return parts[index + 2]

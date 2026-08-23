@@ -338,6 +338,30 @@ def test_runtime_spec_parses_multiline_build_wrapper_command(tmp_path):
     assert spec.arguments == ["{poc}"]
 
 
+def test_runtime_spec_parses_build_wrapper_after_env_prefix(tmp_path):
+    sample = tmp_path / "secbench_case"
+    sample.mkdir()
+    (sample / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
+    (sample / "reproduction_report.json").write_text(json.dumps({
+        "command": (
+            "GT_REPO_ROOT=/repo /gt/build.sh "
+            "'set -euo pipefail\n"
+            "cd /gt/_work/src\n"
+            "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 "
+            "./build/janet /gt/poc'"
+        ),
+    }))
+
+    spec = compile_runtime_spec(sample, require_artifacts=False, prefer_frozen=False)
+
+    assert spec.workdir == "/gt/_work/src"
+    assert spec.executable == "./build/janet"
+    assert spec.arguments == ["{poc}"]
+    assert spec.environment == {
+        "ASAN_OPTIONS": "detect_leaks=0:halt_on_error=1",
+    }
+
+
 def test_runtime_checkpoint_line_is_remapped_by_frozen_statement(tmp_path):
     sample = tmp_path / "secbench_case"
     source = sample / "_work" / "src" / "src" / "parser.c"
