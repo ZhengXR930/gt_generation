@@ -18,6 +18,7 @@ from reward_framework.adapters.agent_skill_export import (
 )
 
 from reward_framework.adapters.claude.contract import ADAPTER_NAME, INTERFACE_VERSION, resolve_skills_dir
+from reward_framework.adapters.base import SKILL_PACKET_ENV
 
 
 def install_skill_packet(
@@ -40,8 +41,8 @@ def install_skill_packet(
             marker = "<!-- reward-framework-poc-skills -->"
             block = (
                 f"\n{marker}\n"
-                "Use the installed `poc-vulnerability-reproduction` and "
-                "`poc-submission-verification` skills for benchmark PoC "
+                "Use the installed `poc-reproduction` and "
+                "`poc-submission` skills for benchmark PoC "
                 "reproduction tasks. Details: `.claude/reward_framework_poc_skills.md`.\n"
                 f"{marker.replace('<!--', '<!-- /')}\n"
             )
@@ -49,6 +50,24 @@ def install_skill_packet(
             if marker not in existing:
                 claude_md.write_text(existing.rstrip() + block, encoding="utf-8")
             manifest["claude_md"] = str(claude_md)
+    return manifest
+
+
+def install_workspace_skill_packet(
+    *,
+    harness: str,
+    workspace: Path,
+    sample_id: str,
+    scratch: Path,
+    env: dict[str, str],
+) -> dict:
+    del harness, sample_id
+    packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
+    config_dir = scratch / "claude_config"
+    skills_dir = config_dir / "skills"
+    manifest = install_skill_packet(packet, skills_dir, project_dir=workspace)
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    manifest["workspace"] = str(workspace)
     return manifest
 
 

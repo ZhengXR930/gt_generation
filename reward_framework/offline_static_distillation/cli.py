@@ -157,32 +157,29 @@ def build_curator_prompt(args):
     rd=Path(args.run_dir); parts=[prompt("evolver_curator_prompt.txt")]; append_tree(parts,"Current skill packet",Path(args.skill_packet),args.max_skill_file_chars)
     proposal=Path(args.proposal) if args.proposal else rd/"global_teacher_report.md"; parts += ["\n# Teacher proposal\n",read_text(proposal,args.max_report_chars)]
     (rd/"evolver_curator.prompt.md").write_text("\n".join(parts),encoding="utf-8"); print(f"wrote {rd/'evolver_curator.prompt.md'}")
-def build_audit_prompt(args):
-    rd=Path(args.run_dir); parts=[prompt("audit_prompt.txt")]; append_tree(parts,"Candidate skill packet",Path(args.skill_packet),args.max_skill_file_chars)
-    if args.curator_decision: parts += ["\n# Curator decision\n",read_text(Path(args.curator_decision),args.max_report_chars)]
-    (rd/"audit.prompt.md").write_text("\n".join(parts),encoding="utf-8"); print(f"wrote {rd/'audit.prompt.md'}")
 
 EXPECTED_CHUNKS = {
-    "level1_submission_verification/SKILL.md": [
-        "L1.A-submit-loop",
-        "L1.B-evidence-gain-gate",
-        "L1.C-analysis-history-state",
-        "L1.D-helper-safety",
+    "submission_skill/SKILL.md": [
+        "S.A-submit-loop",
+        "S.B-evidence-gain-gate",
+        "S.C-analysis-history-state",
+        "S.D-helper-safety",
     ],
-    "level2_vulnerability_reproduction/SKILL.md": [
-        "L2.A-reproduction-loop",
-        "L2.B-five-part-working-representation",
-        "L2.C-candidate-feedback-repair",
-        "L2.D-learned-reproduction-lessons",
-        "L2.E-helper-safety",
+    "reproduction_skill/SKILL.md": [
+        "R.A-reproduction-loop",
+        "R.B-five-part-working-representation",
+        "R.C-candidate-feedback-repair",
+        "R.D-learned-reproduction-lessons",
+        "R.E-helper-safety",
     ],
 }
 EXPECTED_HELPERS = [
-    "level1_submission_verification/helpers/candidate_diff.py",
-    "level1_submission_verification/helpers/submit_history.py",
-    "level1_submission_verification/helpers/submit_preflight.py",
-    "level2_vulnerability_reproduction/helpers/candidate_plan.py",
-    "level2_vulnerability_reproduction/helpers/issue_code_alignment.py",
+    "submission_skill/helpers/candidate_diff.py",
+    "submission_skill/helpers/submit_command_lint.py",
+    "submission_skill/helpers/submit_history.py",
+    "submission_skill/helpers/submit_preflight.py",
+    "reproduction_skill/helpers/candidate_plan.py",
+    "reproduction_skill/helpers/issue_code_alignment.py",
 ]
 
 def validate_skill_packet(args):
@@ -242,7 +239,6 @@ def main():
     p=sub.add_parser("build-shard-prompts"); p.add_argument("--run-dir",required=True); p.add_argument("--shard-size",type=int,default=10); p.add_argument("--include-missing",action="store_true"); p.add_argument("--max-observation-chars",type=int,default=60000); p.set_defaults(func=build_shard_prompts)
     p=sub.add_parser("build-global-prompt"); p.add_argument("--run-dir",required=True); p.add_argument("--shard-reports-dir"); p.add_argument("--max-report-chars",type=int,default=120000); p.set_defaults(func=build_global_prompt)
     p=sub.add_parser("build-curator-prompt"); p.add_argument("--run-dir",required=True); p.add_argument("--skill-packet",required=True); p.add_argument("--proposal"); p.add_argument("--max-skill-file-chars",type=int,default=50000); p.add_argument("--max-report-chars",type=int,default=120000); p.set_defaults(func=build_curator_prompt)
-    p=sub.add_parser("build-audit-prompt"); p.add_argument("--run-dir",required=True); p.add_argument("--skill-packet",required=True); p.add_argument("--curator-decision"); p.add_argument("--max-skill-file-chars",type=int,default=50000); p.add_argument("--max-report-chars",type=int,default=120000); p.set_defaults(func=build_audit_prompt)
     p=sub.add_parser("scaffold-skill-packet"); p.add_argument("--out",required=True); p.add_argument("--overwrite",action="store_true"); p.set_defaults(func=scaffold_skill_packet)
     p=sub.add_parser("validate-skill-packet"); p.add_argument("--skill-packet",required=True); p.add_argument("--out"); p.set_defaults(func=validate_skill_packet)
     a=ap.parse_args(); a.func(a); return 0

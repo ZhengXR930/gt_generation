@@ -5,15 +5,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = (
     ROOT
-    / "poc_generation"
-    / "poc_generator"
-    / "run_openhands_cybergym.py"
+    / "harness_runtime"
+    / "openhands"
+    / "runtime.py"
 )
 SAMPLE_RUNNER = (
     ROOT
-    / "poc_generation"
-    / "poc_generator"
-    / "run_sample.py"
+    / "harness_runtime"
+    / "openhands"
+    / "arvo.py"
 )
 
 
@@ -58,6 +58,7 @@ def test_native_provider_mapping_remains_unchanged_without_proxy():
     model_map = _load_model_map()
 
     assert model_map("claude-opus-4-7") == "claude-opus-4-7"
+    assert model_map("claude-sonnet-5") == "claude-sonnet-5"
     assert model_map("deepseek/deepseek-chat") == "deepseek/deepseek-chat"
 
 

@@ -1,7 +1,6 @@
 import json
 import subprocess
 import sys
-import tarfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "external" / "cybergym" / "src"))
 
-from poc_generation.poc_generator.run_local_sample import (
+from harness_runtime.openhands.local import (
     LocalExecutionBridge,
     check_runtime_readiness,
     command_from_runtime_spec,
@@ -22,8 +21,8 @@ from poc_generation.poc_generator.run_local_sample import (
     runtime_triggered,
     unwrap_nested_docker_command,
 )
-from poc_generation.poc_generator.rerun_model_batches import local_result_is_complete
-from reachability.runtime_spec import RuntimeSpec
+from poc_generation.run_harness import result_is_complete
+from evaluator.reachability.runtime_spec import RuntimeSpec
 
 
 def test_readme_exposes_issue_but_not_saved_crash_evidence():
@@ -150,7 +149,7 @@ def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stderr=""),
     )
     monkeypatch.setattr(
-        "poc_generation.poc_generator.openhands_backend.run_local_sample.hydrate_runtime_workspace",
+        "harness_runtime.openhands.local.hydrate_runtime_workspace",
         lambda sample_dir: {
             "prepared": True,
             "hydrated": True,
@@ -158,7 +157,7 @@ def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
         },
     )
     monkeypatch.setattr(
-        "poc_generation.poc_generator.openhands_backend.run_local_sample.compile_runtime_spec",
+        "harness_runtime.openhands.local.compile_runtime_spec",
         lambda sample_dir, require_artifacts: RuntimeSpec(
             sample_id=sample_dir.name,
             backend="local_workspace",
@@ -183,24 +182,30 @@ def test_runtime_readiness_accepts_cloneable_source(tmp_path, monkeypatch):
     assert readiness["required_images"] == ["gt-memory-env:latest", "alpine:3.23"]
 
 
-def test_runtime_readiness_extracts_packaged_runtime_archive(tmp_path, monkeypatch):
+def test_runtime_readiness_accepts_packaged_runtime_workspace(tmp_path, monkeypatch):
     sample_dir = tmp_path / "secbench_case"
     sample_dir.mkdir()
     (sample_dir / "build.sh").write_text("IMAGE=gt-memory-env:latest\n")
-    (sample_dir / "ground_truth.json").write_text(json.dumps({
-        "poc": {"trigger": "./build.sh './bin/target /gt/poc'"},
+    (sample_dir / "runtime_spec.json").write_text(json.dumps({
+        "sample_id": "secbench_case",
+        "backend": "local_workspace",
+        "image": "gt-memory-env:latest",
+        "workdir": "/gt/_work/src",
+        "executable": "./bin/target",
+        "arguments": ["{poc}"],
+        "environment": {},
+        "input_placeholder": "{poc}",
+        "source": "runtime_spec.json",
     }))
     (sample_dir / "sample_info.json").write_text(json.dumps({
         "repo": "https://example.test/project.git",
         "vulnerable_commit": "deadbeef",
     }))
-    staged = tmp_path / "staged" / "_work" / "src" / "bin"
-    staged.mkdir(parents=True)
-    target = staged / "target"
+    target_dir = sample_dir / "_work" / "src" / "bin"
+    target_dir.mkdir(parents=True)
+    target = target_dir / "target"
     target.write_bytes(b"\x7fELF")
     target.chmod(0o755)
-    with tarfile.open(sample_dir / "runtime_work.tar.gz", "w:gz") as tar:
-        tar.add(tmp_path / "staged" / "_work", arcname="_work")
     monkeypatch.setattr(
         subprocess,
         "run",
@@ -211,7 +216,7 @@ def test_runtime_readiness_extracts_packaged_runtime_archive(tmp_path, monkeypat
 
     assert readiness["ready"] is True
     assert readiness["hydration"]["runtime_spec_ready"] is True
-    assert (sample_dir / "_work" / "src" / "bin" / "target").is_file()
+    assert target.is_file()
 
 
 def test_copy_source_includes_runtime_spec_root_artifact(tmp_path, monkeypatch):
@@ -239,7 +244,7 @@ def test_copy_source_includes_runtime_spec_root_artifact(tmp_path, monkeypatch):
     root_fuzzer.write_bytes(b"\x7fELF")
     root_fuzzer.chmod(0o755)
     monkeypatch.setattr(
-        "poc_generation.poc_generator.openhands_backend.run_local_sample.hydrate_runtime_workspace",
+        "harness_runtime.openhands.local.hydrate_runtime_workspace",
         lambda sample_dir: {"prepared": True, "reused": True, "source": str(src)},
     )
 
@@ -283,7 +288,7 @@ def test_runtime_readiness_rejects_missing_runtime_images(tmp_path, monkeypatch)
         ),
     )
     monkeypatch.setattr(
-        "poc_generation.poc_generator.openhands_backend.run_local_sample.hydrate_runtime_workspace",
+        "harness_runtime.openhands.local.hydrate_runtime_workspace",
         lambda sample_dir: {
             "prepared": True,
             "hydrated": True,
@@ -291,7 +296,7 @@ def test_runtime_readiness_rejects_missing_runtime_images(tmp_path, monkeypatch)
         },
     )
     monkeypatch.setattr(
-        "poc_generation.poc_generator.openhands_backend.run_local_sample.compile_runtime_spec",
+        "harness_runtime.openhands.local.compile_runtime_spec",
         lambda sample_dir, require_artifacts: RuntimeSpec(
             sample_id=sample_dir.name,
             backend="local_workspace",
@@ -389,7 +394,7 @@ def test_copy_source_hydrates_and_copies_public_runtime_scaffold(tmp_path, monke
         return {"prepared": True, "hydrated": True, "source": str(source)}
 
     monkeypatch.setattr(
-        "poc_generation.poc_generator.openhands_backend.run_local_sample.hydrate_runtime_workspace",
+        "harness_runtime.openhands.local.hydrate_runtime_workspace",
         hydrate,
     )
 
@@ -406,8 +411,8 @@ def test_trigger_requires_runtime_detector_evidence():
     assert not runtime_triggered("ordinary parser rejection", 1)
 
 
-def test_local_complete_requires_checkpoint_trace_and_submission_artifacts(tmp_path):
-    result = tmp_path / "sample"
+def test_local_complete_requires_checkpoint_analysis_and_manifest(tmp_path):
+    result = tmp_path / "sample_1"
     attempt = result / "submissions" / "a1"
     attempt.mkdir(parents=True)
     (result / "checkpoint").mkdir()
@@ -473,4 +478,4 @@ def test_local_complete_requires_checkpoint_trace_and_submission_artifacts(tmp_p
         "status": "iteration_cap",
         "submission_attempts": [{"attempt_id": "a1"}],
     }))
-    assert local_result_is_complete(result)
+    assert result_is_complete(result)

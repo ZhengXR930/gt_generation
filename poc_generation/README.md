@@ -1,4 +1,53 @@
-# PoC generation environment
+# PoC Generation
+
+`poc_generation` is the baseline evaluation frontend for harness plus model PoC
+generation. It owns the baseline prompt, the result namespace under
+`poc_results/`, and the four harness adapters:
+
+- `poc_generation.adapters.openhands`
+- `poc_generation.adapters.codex`
+- `poc_generation.adapters.claude`
+- `poc_generation.adapters.deepseek_harness`
+
+All shared execution code lives in `harness_runtime/`. The baseline frontend
+does not import `reward_framework` and does not install reward skill packets.
+
+Run samples through the unified entrypoint:
+
+```bash
+python -m poc_generation.run_harness \
+  --harness openhands \
+  --model deepseek/deepseek-chat \
+  --namespace deepseek-v4-flash \
+  --sample-selector valid_gt_arvo \
+  --parallel 3
+```
+
+Use `--sample` or `--samples-file` for explicit sample lists. Use
+`--sample-selector valid_gt`, `valid_gt_arvo`, or `valid_gt_non_arvo` to read
+the authoritative denominator from `gt_results/valid_gt.json`. Each sample writes
+to `poc_results/<namespace>/<sample_id>/` with `manifest.json`,
+`analysis.json`, checkpoint data, and `submissions/` when the harness submitted
+candidate inputs.
+
+## Harness Runtime
+
+`harness_runtime/` is the neutral runtime used by both baseline and reward
+frontends. It owns only shared mechanics: task workspace creation, OpenHands
+launching, Codex/Claude CLI launching, DeepSeek Harness launching,
+submission-ledger persistence, deduplication, and reachability evaluation.
+
+The local CyberGym submission server is shared by all ARVO harnesses. Start it
+from the neutral runtime wrapper:
+
+```bash
+./harness_runtime/start_server.sh
+```
+
+The physical server state is stored under `harness_runtime/server/`; database
+and log files there are local runtime artifacts and are ignored by Git.
+
+## OpenHands Checkout
 
 The subject-agent runner uses upstream OpenHands 0.33.0. The checkout is a
 reproducible external dependency and is intentionally not stored in Git.
@@ -9,67 +58,15 @@ After cloning this repository, prepare it with:
 ./scripts/setup_openhands.sh
 ```
 
-This clones the pinned OpenHands revision into `external/OpenHands` and runs
-its Poetry installation. To use an already prepared environment, clone only
-the source and select its interpreter explicitly:
+To use an already prepared environment, clone only the source and select its
+interpreter explicitly:
 
 ```bash
 ./scripts/setup_openhands.sh --checkout-only
 export OPENHANDS_PYTHON=/path/to/openhands-venv/bin/python
 ```
 
-Both `poc_generator/run_sample.py` and `poc_generator/run_local_sample.py`
-remain supported compatibility entrypoints and accept
-`--openhands-repo /path/to/OpenHands`. Their implementations live under
-`poc_generator/openhands_backend/`. No runner depends on a machine-local
-`/tmp/openhands-poc-smoke` directory.
-
 Do not edit `external/OpenHands` directly. It is the pinned pristine baseline
 used by PoC-generation evaluation. For experiments that require OpenHands source
-changes, first create a separate editable copy:
-
-```bash
-./scripts/create_openhands_copy.sh my-experiment
-```
-
-Then pass that copy to an independent experiment or reward-framework launcher
-with `--openhands-repo external/OpenHands-experiments/my-experiment`.
-Baseline and remote-equivalent PoC evaluation should continue to use the
-pristine checkout.
-
-## CyberGym validation server and data
-
-The local CyberGym submission server is shared by all PoC-generation backends.
-It is intentionally kept at `poc_generator/start_server.sh`, with runtime
-state under `poc_generator/server/`, rather than inside either backend-specific
-directory. Both the OpenHands and DeepSeek Harness ARVO runners submit PoCs to
-this server during local evaluation.
-
-`external/cybergym_data_subset` is benchmark fixture data, not PoC generator
-source code. The runners pass its `data/` directory to CyberGym task
-materialization so ARVO samples can be expanded into workspaces with task
-descriptions, source trees, and submit scripts. Large hydrated source artifacts
-under that tree are ignored and can be regenerated.
-
-## DeepSeek Harness backend
-
-The DeepSeek Harness evaluation glue lives under `poc_generator/dsh/`:
-
-- `run_deepseek_harness_arvo_sample.py` for ARVO/CyberGym samples
-- `run_deepseek_harness_local_sample.py` for non-ARVO local samples
-- `run_dsh_arvo_batch.py` and `run_dsh_local_batch.py` for direct backend
-  batches
-- `finalize_dsh_analysis_*.py` and `recover_dsh_analysis_from_checkpoint.py`
-  for DSH-specific artifact recovery
-
-The top-level scripts with the same names are compatibility shims. Configured
-batch runs should use the shared launcher plus the stable DSH config:
-
-The DeepSeek Harness source checkout itself is a third-party dependency and is
-not tracked here. Install or clone it at `external/deepseek-harness`, build its
-CLI, and keep the local Node runtime path in the config's `dsh_node_root`.
-
-```bash
-python poc_generation/poc_generator/run_config_batch.py \
-  poc_config.deepseek_harness_strict_gt_all.json
-```
+changes, first create a separate editable copy and pass it with
+`--openhands-repo`.

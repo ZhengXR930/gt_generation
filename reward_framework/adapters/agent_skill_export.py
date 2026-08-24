@@ -11,22 +11,23 @@ from typing import Iterable
 
 LEVEL_SPECS = (
     {
-        "source_dir": "level1_submission_verification",
-        "native_name": "poc-submission-verification",
+        "source_dir": "reproduction_skill",
+        "native_name": "poc-reproduction",
+        "description": (
+            "Use when reproducing a vulnerability or bug from an issue description "
+            "and code evidence: identify the target input contract, maintain the "
+            "parser/source/root-cause/sink/trigger hypothesis, and plan the next "
+            "candidate PoC revision."
+        ),
+    },
+    {
+        "source_dir": "submission_skill",
+        "native_name": "poc-submission",
         "description": (
             "Use when reproducing a vulnerability or bug from an issue description "
             "and the agent needs disciplined PoC submission/verification behavior: "
             "meaningful evidence-bearing submits, candidate history, duplicate "
             "avoidance, and analysis-as-diagnostic rather than a runtime gate."
-        ),
-    },
-    {
-        "source_dir": "level2_vulnerability_reproduction",
-        "native_name": "poc-vulnerability-reproduction",
-        "description": (
-            "Use when constructing PoC inputs for vulnerability or bug reproduction "
-            "from issue description and code evidence, including parser/admission, "
-            "source, root cause, sink, trigger reasoning and candidate-plan repair."
         ),
     },
 )
@@ -91,7 +92,7 @@ def export_native_agent_skills(
     adapter_name: str,
     overwrite: bool = True,
 ) -> dict:
-    """Export Level 1 and Level 2 packet folders as native Agent Skills."""
+    """Export the Reproduction and Submission packet folders as native Agent Skills."""
     packet = packet.resolve()
     destination = destination.expanduser().resolve()
     _validate_source_packet(packet)
@@ -181,8 +182,8 @@ def write_bridge_file(path: Path, *, adapter_name: str, skills_dir: Path) -> Non
         "# Reward Framework PoC Skills\n\n"
         f"Adapter: `{adapter_name}`\n\n"
         f"Native skills directory: `{skills_dir}`\n\n"
-        "Use `poc-vulnerability-reproduction` to plan issue-aligned PoC candidates, "
-        "then use `poc-submission-verification` to decide and record meaningful "
+        "Use `poc-reproduction` to plan issue-aligned PoC candidates, "
+        "then use `poc-submission` to decide and record meaningful "
         "submits. Do not treat training reasoning/reachability diagnostics as "
         "test-time oracle feedback.\n",
         encoding="utf-8",

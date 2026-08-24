@@ -1,0 +1,116 @@
+# Reproduction Skill
+
+<!-- block-id: R.A-reproduction-loop -->
+## R.A Static reproduction loop
+
+Purpose: generate PoC candidates by aligning issue description, codebase evidence, and the agent's own trajectory. Test-time Reproduction Skill is primarily static reasoning; it should not require dynamic instrumentation, debugger setup, or hidden-oracle feedback.
+
+Default loop:
+
+1. Read the issue description and inspect code paths relevant to constructing the next candidate.
+2. Maintain a working hypothesis about the vulnerability mechanism.
+3. Before revising a PoC, identify the main unresolved gap in the current reproduction strategy.
+4. Make one candidate change that is expected to close that gap.
+5. Explain why the candidate is informative enough to hand to Submission Skill for submit decision.
+6. If a candidate fails, revise the hypothesis by comparing issue/code evidence with the submitted candidate and analysis.
+
+Reasoning/reachability diagnostics are training materials for updating this skill, not runtime inputs for frozen test runs.
+
+Before crafting a PoC, identify the target input contract: file format, protocol/message, config/script text, archive/container, raw byte stream, stdin/file argument, mode selector, or harness operation. The candidate must be the artifact consumed by that path; source code, traces, and analysis are evidence, not the PoC, unless the target explicitly consumes them.
+
+After a non-crashing candidate, classify the miss before generating another file: wrong artifact, parser/admission miss, source/root-cause miss, sink miss, trigger miss, artifact validity failure, infrastructure failure, or unknown. Use ordinary output and static inspection; do not require reachability diagnostics.
+
+Update rule: edit this chunk only for recurring failures in the overall static reproduce-plan-submit-repair loop.
+
+<!-- block-id: R.B-five-part-working-representation -->
+## R.B Five-part working representation
+
+Use parser/admission, source, root cause, sink, and trigger as a cognitive scaffold when they are relevant to constructing the next candidate.
+
+These components mean:
+
+- Parser / admission path: how input is accepted and routed.
+- Source: where attacker-controlled bytes become relevant state.
+- Root cause: what semantic condition creates the vulnerability.
+- Sink: where vulnerable state is consumed.
+- Trigger: concrete bytes/state transitions that make the bug observable.
+
+This is a working representation, not a mandatory checklist. Do not ceremonially fill all five fields before every PoC. If the issue already clearly identifies one component, reuse that fact and focus on unresolved components that affect the next candidate.
+
+Good use: "The sink is explicit in the issue; the unresolved gap is how input must pass parser admission and shape the root-cause condition."
+
+Bad use: rewriting five empty headings for every candidate without changing the PoC strategy.
+
+For each relevant component, name the candidate feature intended to exercise it: outer envelope, mode flag, section, command, nested record, length/count field, offset table, state transition, delimiter, encoded payload, object reference, or trigger bytes. A representation that names code locations but cannot say what bytes or structured fields reach them is incomplete for candidate construction.
+
+Harness or driver routing can explain parser/admission. Source, root cause, sink, and trigger should be grounded in vulnerable project logic whenever identifiable.
+
+Update rule: this chunk is for lightweight issue/code grounding. It should reduce drift, not create ceremonial reasoning.
+
+<!-- block-id: R.C-candidate-feedback-repair -->
+## R.C Candidate, feedback, and repair policy
+
+Before each PoC revision, write a short natural-language candidate plan:
+
+- Current hypothesis.
+- Evidence supporting it.
+- Target-consumed artifact and admission requirements.
+- Candidate artifact check.
+- Previous result and repair class.
+- Preserved admission/source structure.
+- One changed mechanism dimension.
+- Concrete trigger feature.
+- Main unresolved gap.
+- Next candidate change.
+- Why this candidate is informative.
+
+The five-part representation can be referenced inside this plan when useful, but the plan should stay focused on the next candidate rather than forcing a full parser/source/root-cause/sink/trigger table.
+
+Repair policy:
+
+- wrong artifact rebuilds the target-consumed input instead of editing traces, notes, helper output, or source;
+- admission failure repairs envelope, framing, mode selector, syntax, archive/container shape, or harness operation;
+- first make admission/parser plausible from code inspection when admission is uncertain;
+- once parser/source progress appears plausible, preserve it while changing deeper semantics;
+- if source is plausible but root cause is missing, mutate the semantic relation while preserving admission/source structure;
+- if root cause or sink is plausible but no crash occurs, mutate the final trigger only;
+- artifact validity failure repairs the required artifact without changing promising candidate bytes;
+- corpus or fixture inputs are only admission-preserving bases and need a named preserved component plus one mutated field or state;
+- do not rely on debugger/instrumentation availability as the main planning mechanism.
+
+If ordinary execution output is available, use it. If not, continue with static issue/code alignment rather than building a heavy instrumentation workflow.
+
+Update rule: this is the main chunk for lessons about candidate planning, preserving progress, and using available feedback without making dynamic instrumentation mandatory.
+
+<!-- block-id: R.D-learned-reproduction-lessons -->
+## R.D Learned reproduction lessons
+
+This chunk is intentionally initially sparse. Teacher may add vulnerability-type or failure-pattern lessons distilled from train trajectories, submitted analyses, submitted candidates, reasoning diagnostics, and reachability diagnostics.
+
+Candidate categories may include parser confusion, length/count mismatch, state-machine/order bugs, integer boundary bugs, memory lifetime bugs, and format-specific semantic constraints. Add a category only with evidence, and keep it reusable.
+
+Every learned lesson should state:
+
+- when it applies;
+- what issue/code/candidate evidence should activate it;
+- which vulnerability-mechanism component it affects, if any;
+- what candidate mutation it suggests;
+- what must be preserved.
+
+Update rule: this is the main merge target for distilled vulnerability understanding. Reject sample ids, file names, CVE ids, magic constants, hidden-oracle trace details, and vague generic advice.
+
+<!-- block-id: R.E-helper-safety -->
+## R.E Helper usage and safety
+
+Use helpers when available:
+
+```bash
+python3 helpers/candidate_plan.py --issue-file issue.md --code-notes code_notes.md --previous-plan .poc_skill_state/previous_candidate_plan.md --out .poc_skill_state/candidate_plan.md
+python3 helpers/issue_code_alignment.py --issue-file issue.md --code-notes code_notes.md --plan .poc_skill_state/candidate_plan.md --out .poc_skill_state/issue_code_alignment.json
+```
+
+Helpers may organize target artifact, admission, preserved-structure, one-changed-dimension, and repair-class notes. They must not infer exploit correctness, use hidden oracle traces or reachability labels at test time, or overfit to benchmark-specific names, constants, sample ids, or CVEs.
+
+Safety constraints: do not use hidden oracle traces or reachability labels at test time. Do not overfit to a benchmark sample, file name, constant, or CVE. Do not repair a later hypothesis by destroying working parser/admission.
+
+Update rule: helper command changes must match actual helper scripts. Safety constraints should be preserved unless the Curator explicitly strengthens them.

@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from reward_framework.adapters.agent_skill_export import export_native_agent_skills
 
 from reward_framework.adapters.deepseek_harness.contract import ADAPTER_NAME, INTERFACE_VERSION, resolve_bundle_dir
+from reward_framework.adapters.base import SKILL_PACKET_ENV
 
 
 PLUGIN_TS = """import { readFileSync } from 'node:fs'
@@ -39,7 +40,7 @@ export function apply(ctx) {
       properties: {
         skill: {
           type: 'string',
-          enum: ['poc-submission-verification', 'poc-vulnerability-reproduction'],
+          enum: ['poc-reproduction', 'poc-submission'],
           description: 'Skill to read.',
         },
       },
@@ -55,13 +56,6 @@ export function apply(ctx) {
     },
   })
 
-  ctx.on('tools/result', (exec, result) => {
-    if (String(exec.name).startsWith('reward_framework_')) return
-    const text = result.content.map(block => block.type === 'text' ? block.text : '').join('')
-    if (text.includes('submit') || text.includes('analysis.json')) {
-      console.log(`[reward-framework] observed tool result from ${exec.name}`)
-    }
-  })
 }
 """
 
@@ -109,9 +103,8 @@ def export_bundle(packet: Path, destination: Path | None = None) -> dict:
         "This directory is a DeepSeek Harness bundle scaffold. Mount it as a "
         "Cordis/DSH bundle or patch overlay according to the local DSH profile. "
         "It does not patch DeepSeek Harness core.\n\n"
-        "The plugin exposes a model-callable skill reader tool and observes tool "
-        "results for telemetry hooks. Benchmark submit tools should be supplied "
-        "by the surrounding evaluation harness.\n",
+        "The plugin exposes a model-callable skill reader tool. Benchmark submit "
+        "tools should be supplied by the surrounding evaluation harness.\n",
         encoding="utf-8",
     )
     manifest = {
@@ -126,6 +119,21 @@ def export_bundle(packet: Path, destination: Path | None = None) -> dict:
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    return manifest
+
+
+def install_workspace_skill_packet(
+    *,
+    harness: str,
+    workspace: Path,
+    sample_id: str,
+    scratch: Path,
+    env: dict[str, str],
+) -> dict:
+    del harness, workspace, sample_id
+    packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
+    manifest = export_bundle(packet, scratch / "dsh_bundle")
+    env["HARNESS_DSH_PATCH_FILE"] = str(manifest["patch_file"])
     return manifest
 
 

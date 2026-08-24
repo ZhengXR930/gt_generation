@@ -37,7 +37,7 @@ def validate_bundle(bundle_dir: Path) -> dict:
         if needle not in patch_text:
             raise ValueError(f"cordis.patch.yml missing expected insert syntax {needle!r}")
     plugin = (bundle_dir / "plugin/index.ts").read_text(encoding="utf-8")
-    for needle in ["ctx.tools.register", "reward_framework_read_poc_skill", "tools/result"]:
+    for needle in ["ctx.tools.register", "reward_framework_read_poc_skill"]:
         if needle not in plugin:
             raise ValueError(f"plugin missing expected DSH/Cordis hook {needle!r}")
     for needle in ["type: 'object'", "required: ['skill']", "additionalProperties: false"]:

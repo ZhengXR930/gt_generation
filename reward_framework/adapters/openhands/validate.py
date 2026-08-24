@@ -16,24 +16,24 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from reward_framework.adapters.openhands.contract import (  # noqa: E402
-    LEVEL1_REL,
-    LEVEL2_REL,
-    REQUIRED_LEVEL1_HELPERS,
-    REQUIRED_LEVEL2_HELPERS,
+    REPRODUCTION_SKILL_REL,
+    REQUIRED_REPRODUCTION_HELPERS,
+    REQUIRED_SUBMISSION_HELPERS,
+    SUBMISSION_SKILL_REL,
     WORKSPACE_STATE_DIR,
 )
 
 
 REQUIRED = {
-    LEVEL1_REL: ("Issue Reproduction", WORKSPACE_STATE_DIR),
-    LEVEL2_REL: ("Vulnerability Reproduction", WORKSPACE_STATE_DIR),
+    REPRODUCTION_SKILL_REL: ("Reproduction Skill", WORKSPACE_STATE_DIR),
+    SUBMISSION_SKILL_REL: ("Submission Skill", WORKSPACE_STATE_DIR),
     **{
-        f"level1_submission_verification/helpers/{name}": ()
-        for name in REQUIRED_LEVEL1_HELPERS
+        f"submission_skill/helpers/{name}": ()
+        for name in REQUIRED_SUBMISSION_HELPERS
     },
     **{
-        f"level2_vulnerability_reproduction/helpers/{name}": ()
-        for name in REQUIRED_LEVEL2_HELPERS
+        f"reproduction_skill/helpers/{name}": ()
+        for name in REQUIRED_REPRODUCTION_HELPERS
     },
 }
 
@@ -47,9 +47,9 @@ FORBIDDEN_TEXT = (
 )
 
 PROMPT_REQUIRED = (
-    "issue-reproduction submission/verification",
-    "not submit count",
-    "not raw trajectories",
+    "Reproduction Skill",
+    "Submission Skill",
+    "TRAIN evidence",
 )
 
 
@@ -95,7 +95,7 @@ def check_packet(packet: Path) -> list[str]:
         commands = [
             [
                 "python3",
-                str(packet / "level1_submission_verification/helpers/candidate_diff.py"),
+                str(packet / "submission_skill/helpers/candidate_diff.py"),
                 "--current",
                 "candidate.bin",
                 "--history-jsonl",
@@ -105,7 +105,7 @@ def check_packet(packet: Path) -> list[str]:
             ],
             [
                 "python3",
-                str(packet / "level1_submission_verification/helpers/submit_preflight.py"),
+                str(packet / "submission_skill/helpers/submit_preflight.py"),
                 "--candidate",
                 "candidate.bin",
                 "--artifact-kind",
@@ -121,7 +121,7 @@ def check_packet(packet: Path) -> list[str]:
             ],
             [
                 "python3",
-                str(packet / "level1_submission_verification/helpers/submit_command_lint.py"),
+                str(packet / "submission_skill/helpers/submit_command_lint.py"),
                 "--command",
                 "bash submit.sh candidate.bin analysis.json",
                 "--out",
@@ -129,7 +129,7 @@ def check_packet(packet: Path) -> list[str]:
             ],
             [
                 "python3",
-                str(packet / "level1_submission_verification/helpers/submit_history.py"),
+                str(packet / "submission_skill/helpers/submit_history.py"),
                 "record",
                 "--candidate",
                 "candidate.bin",
@@ -148,14 +148,14 @@ def check_packet(packet: Path) -> list[str]:
             ],
             [
                 "python3",
-                str(packet / "level1_submission_verification/helpers/submit_history.py"),
+                str(packet / "submission_skill/helpers/submit_history.py"),
                 "summarize",
                 "--out",
                 f"{WORKSPACE_STATE_DIR}/summary.md",
             ],
             [
                 "python3",
-                str(packet / "level2_vulnerability_reproduction/helpers/candidate_plan.py"),
+                str(packet / "reproduction_skill/helpers/candidate_plan.py"),
                 "--issue-file",
                 "note.md",
                 "--code-notes",
@@ -167,7 +167,7 @@ def check_packet(packet: Path) -> list[str]:
             ],
             [
                 "python3",
-                str(packet / "level2_vulnerability_reproduction/helpers/issue_code_alignment.py"),
+                str(packet / "reproduction_skill/helpers/issue_code_alignment.py"),
                 "--issue-file",
                 "note.md",
                 "--code-notes",

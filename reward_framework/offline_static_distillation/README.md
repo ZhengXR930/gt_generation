@@ -20,31 +20,31 @@ python3 reward_framework/offline_static_distillation/cli.py validate-skill-packe
 
 The scaffolded packet uses coarse skill chunks:
 
-Level 1:
-- L1.A-submit-loop
-- L1.B-evidence-gain-gate
-- L1.C-analysis-history-state
-- L1.D-helper-safety
+Submission Skill:
+- S.A-submit-loop
+- S.B-evidence-gain-gate
+- S.C-analysis-history-state
+- S.D-helper-safety
 
-Level 2:
-- L2.A-reproduction-loop
-- L2.B-five-part-working-representation
-- L2.C-candidate-feedback-repair
-- L2.D-learned-reproduction-lessons
-- L2.E-helper-safety
+Reproduction Skill:
+- R.A-reproduction-loop
+- R.B-five-part-working-representation
+- R.C-candidate-feedback-repair
+- R.D-learned-reproduction-lessons
+- R.E-helper-safety
 
 Initial helper scripts:
 
 ```text
-level1_submission_verification/helpers/submit_preflight.py
-level1_submission_verification/helpers/submit_history.py
-level1_submission_verification/helpers/candidate_diff.py
-level2_vulnerability_reproduction/helpers/candidate_plan.py
-level2_vulnerability_reproduction/helpers/issue_code_alignment.py
+submission_skill/helpers/submit_preflight.py
+submission_skill/helpers/submit_history.py
+submission_skill/helpers/candidate_diff.py
+reproduction_skill/helpers/candidate_plan.py
+reproduction_skill/helpers/issue_code_alignment.py
 ```
 
 Deliberately absent from the initial packet:
 
 - no `analysis_writer_check.py` hard schema gate;
 - no fixed `initial_repro_spec.py` helper, because the five-part hypothesis is a skill stage;
-- no `runtime_evidence_summary.py`, because test-time Level 2 should not require dynamic instrumentation.
+- no `runtime_evidence_summary.py`, because the test-time Reproduction Skill should not require dynamic instrumentation.

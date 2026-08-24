@@ -11,10 +11,11 @@ sys.path.insert(0, str(ROOT / "external" / "cybergym" / "src"))
 
 from cybergym.server.__main__ import validate_candidate_trace
 from cybergym.server.pocdb import create_submission_attempt, init_engine
-from poc_generation.poc_generator.run_sample import runtime_server_url
-from poc_generation.poc_generator.poc_dedup import (
+from harness_runtime.dedup import (
     deduplicate_submission_attempts,
 )
+from harness_runtime.openhands.arvo import runtime_server_url
+from harness_runtime.workspace import validate_candidate_input_bytes
 from sqlalchemy.orm import Session
 
 
@@ -46,6 +47,33 @@ def test_candidate_trace_validator_rejects_explicit_dependency_edges():
     error = validate_candidate_trace(json.dumps(trace).encode())
 
     assert "must not contain depends_on" in error
+
+
+def test_candidate_input_guard_rejects_analysis_artifacts():
+    payload = {
+        "sample_id": "arvo_1",
+        "fine_trace": VALID_TRACE,
+        "vuln_logic": {"source": {}, "root_cause": {}, "sink": {}, "propagation": []},
+    }
+
+    error = validate_candidate_input_bytes(json.dumps(payload).encode())
+
+    assert "analysis artifact" in error
+
+
+def test_candidate_input_guard_rejects_prompt_text():
+    content = b"""# PoC generation task: arvo_1
+Workspace layout:
+Use /workspace/submit.sh after writing analysis.json artifact.
+"""
+
+    error = validate_candidate_input_bytes(content)
+
+    assert "prompt/report text" in error
+
+
+def test_candidate_input_guard_allows_raw_binary_input():
+    assert validate_candidate_input_bytes(b"\xff\x00candidate") is None
 
 
 def test_submission_attempts_do_not_deduplicate(tmp_path):
@@ -105,21 +133,15 @@ def test_evaluation_deduplication_keeps_last_trace_and_reports_ratios():
     by_hash = {item["poc_sha256"]: item for item in representatives}
     assert by_hash["hash-a"]["representative_attempt_id"] == "last-a"
     assert (
-        by_hash["hash-a"]["representative_trace_path"]
-        == "submissions/last-a/candidate_trace.json"
+        by_hash["hash-a"]["representative_analysis_path"]
+        == "submissions/last-a/analysis.json"
     )
 
 
 def test_prompt_binds_each_poc_to_candidate_trace():
-    prompt = (
-        ROOT
-        / "poc_generation"
-        / "poc_generator"
-        / "template"
-        / "prompt.txt"
-    ).read_text(encoding="utf-8")
-    assert "submit.sh /path/to/poc /workspace/candidate_trace.json" in prompt
-    assert "If you never submitted any PoC" in prompt
+    prompt = (ROOT / "poc_generation" / "prompt.txt").read_text(encoding="utf-8")
+    assert "bash /workspace/submit.sh /path/to/candidate /workspace/analysis.json" in prompt
+    assert "A task may finish without a submission" in prompt
     assert "R1" not in prompt
 
 
@@ -127,7 +149,7 @@ def test_linux_runtime_server_falls_back_to_default_docker_bridge(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("OPENHANDS_EVAL_HOST_GATEWAY", raising=False)
     monkeypatch.setattr(
-        "poc_generation.poc_generator.run_sample.docker.from_env",
+        "harness_runtime.openhands.arvo.docker.from_env",
         lambda: (_ for _ in ()).throw(DockerException("unavailable")),
     )
     assert (

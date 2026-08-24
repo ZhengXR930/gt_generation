@@ -1,42 +1,69 @@
-import importlib
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
-POC_GENERATOR = ROOT / "poc_generation" / "poc_generator"
-sys.path.insert(0, str(POC_GENERATOR))
+sys.path.insert(0, str(ROOT))
 
-run_config_batch = importlib.import_module("run_config_batch")
-rerun_model_batches = importlib.import_module("rerun_model_batches")
-run_sample = importlib.import_module("run_sample")
+from harness_runtime.openhands import arvo as openhands_arvo
+from poc_generation import run_harness
 
 
 def test_gpt54_mini_strict_config_uses_modelhub_endpoint():
-    config = rerun_model_batches.load_config("poc_config.gpt54_mini_strict_gt.json")
-
-    assert config["model"] == "gpt-5.4-mini-2026-03-17"
-    assert config["api_key_env"] == "OPENAI_API_KEY"
-    assert config["base_url"] == (
-        "https://aidp.bytedance.net/api/modelhub/online/v2/crawl/openai/"
-        "deployments/gpt-5.4-mini-2026-03-17/chat/completions"
-        "?api-version=2024-03-01-preview"
+    config = {
+        "harness": "codex",
+        "model": "gpt-5.4-mini-2026-03-17",
+        "namespace": "codex-gpt54-mini",
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": (
+            "https://aidp.bytedance.net/api/modelhub/online/v2/crawl/openai/"
+            "deployments/gpt-5.4-mini-2026-03-17/chat/completions"
+        ),
+        "api_version": "2024-03-01-preview",
+        "openhands_repo": str(ROOT / "external" / "OpenHands"),
+    }
+    args = SimpleNamespace(
+        harness=None,
+        model=None,
+        namespace=None,
+        base_url=None,
+        api_key_env=None,
+        api_version=None,
+        max_iter=None,
+        max_attempts=3,
+        timeout=None,
+        server=None,
+        difficulty=None,
     )
-    assert config["openhands_repo"] == str(ROOT / "external" / "OpenHands")
+    request = run_harness.build_request(args, config, "arvo_1")
+    assert config["model"] == "gpt-5.4-mini-2026-03-17"
+    assert request.api_key_env == "OPENAI_API_KEY"
+    assert request.base_url.endswith("/chat/completions")
+    assert request.api_version == "2024-03-01-preview"
+    assert request.openhands_repo == ROOT / "external" / "OpenHands"
 
 
-def test_strict_gt_selector_reads_only_complete_section(tmp_path, monkeypatch):
-    status = tmp_path / "GT_STATUS.md"
-    status.write_text(
-        "# Status\n\n## Complete\n- arvo_1\n- osv_2\n\n## Incomplete\n- arvo_3\n",
+def test_valid_gt_selector_reads_authoritative_manifest(tmp_path, monkeypatch):
+    valid_gt_dir = tmp_path / "gt_results"
+    valid_gt_dir.mkdir()
+    valid_gt = valid_gt_dir / "valid_gt.json"
+    valid_gt.write_text(
+        json.dumps({"samples": ["arvo_1", "osv_2", "arvo_3"]}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(run_config_batch, "GT_ROOT", tmp_path)
+    monkeypatch.setattr(run_harness, "REPO_ROOT", tmp_path)
 
-    assert run_config_batch.select_samples(
-        {"sample_selector": "strict_gt_complete"}
-    ) == ["arvo_1", "osv_2"]
+    args = SimpleNamespace(
+        sample=[],
+        samples_file=None,
+        sample_selector="valid_gt_arvo",
+        start_index=1,
+        limit=1,
+    )
+
+    assert run_harness.load_samples(args, {}) == ["arvo_3"]
 
 
 def test_batch_runner_passes_api_version(tmp_path, monkeypatch):
@@ -52,9 +79,29 @@ def test_batch_runner_passes_api_version(tmp_path, monkeypatch):
         "difficulty": "level1",
         "openhands_repo": str(ROOT / "external" / "OpenHands"),
     }
-    monkeypatch.setattr(rerun_model_batches, "RESULTS_ROOT", tmp_path / "results")
-    monkeypatch.setattr(rerun_model_batches, "LOG_ROOT", tmp_path / "logs")
-    monkeypatch.setattr(rerun_model_batches, "LOCK_ROOT", tmp_path / "locks")
+    config["harness"] = "codex"
+    config["samples"] = ["arvo_1"]
+    args = SimpleNamespace(
+        sample=[],
+        samples_file=None,
+        sample_selector=None,
+        start_index=0,
+        limit=0,
+        harness=None,
+        model=None,
+        namespace=None,
+        base_url=None,
+        api_key_env=None,
+        api_version=None,
+        max_iter=None,
+        max_attempts=1,
+        timeout=None,
+        server=None,
+        difficulty=None,
+        overwrite=True,
+        dry_run=False,
+    )
+    monkeypatch.setattr(run_harness, "LOG_ROOT", tmp_path / "logs")
     captured = {}
 
     class Completed:
@@ -64,8 +111,9 @@ def test_batch_runner_passes_api_version(tmp_path, monkeypatch):
         captured["command"] = command
         return Completed()
 
-    monkeypatch.setattr(rerun_model_batches.subprocess, "run", fake_run)
-    result = rerun_model_batches.run_one(config, "arvo_1")
+    monkeypatch.setattr(run_harness.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_harness, "maybe_run_reachability", lambda *args, **kwargs: {"status": "disabled"})
+    result = run_harness.run_one(args, config, "arvo_1")
 
     command = captured["command"]
     assert command[command.index("--api-version") + 1] == "2024-03-01-preview"
@@ -80,8 +128,8 @@ def test_runtime_server_url_uses_active_docker_bridge_gateway(monkeypatch):
         networks=SimpleNamespace(get=lambda name: bridge)
     )
     monkeypatch.delenv("OPENHANDS_EVAL_HOST_GATEWAY", raising=False)
-    monkeypatch.setattr(run_sample.docker, "from_env", lambda: client)
+    monkeypatch.setattr(openhands_arvo.docker, "from_env", lambda: client)
 
-    assert run_sample.runtime_server_url(
+    assert openhands_arvo.runtime_server_url(
         "http://host.docker.internal:8666"
     ) == "http://172.20.0.1:8666"

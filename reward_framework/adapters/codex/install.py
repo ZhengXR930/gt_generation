@@ -18,6 +18,7 @@ from reward_framework.adapters.agent_skill_export import (
 )
 
 from reward_framework.adapters.codex.contract import ADAPTER_NAME, INTERFACE_VERSION, resolve_skills_dir
+from reward_framework.adapters.base import SKILL_PACKET_ENV
 
 
 def install_skill_packet(
@@ -33,6 +34,24 @@ def install_skill_packet(
         bridge = Path(project_dir) / "reward_framework_codex_skills.md"
         write_bridge_file(bridge, adapter_name=ADAPTER_NAME, skills_dir=dest)
         manifest["project_bridge"] = str(bridge)
+    return manifest
+
+
+def install_workspace_skill_packet(
+    *,
+    harness: str,
+    workspace: Path,
+    sample_id: str,
+    scratch: Path,
+    env: dict[str, str],
+) -> dict:
+    del harness, sample_id
+    packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
+    config_home = scratch / "codex_home"
+    skills_dir = config_home / "skills"
+    manifest = install_skill_packet(packet, skills_dir, project_dir=workspace)
+    env["CODEX_HOME"] = str(config_home)
+    manifest["workspace"] = str(workspace)
     return manifest
 
 

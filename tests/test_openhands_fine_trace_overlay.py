@@ -1,8 +1,30 @@
 import json
+import sys
+import types
 from collections import deque
 from types import SimpleNamespace
 
-from poc_generation import openhands_fine_trace_main as overlay
+from harness_runtime.openhands import overlay
+
+
+def _install_openhands_event_stubs(monkeypatch):
+    openhands = types.ModuleType("openhands")
+    events = types.ModuleType("openhands.events")
+    action = types.ModuleType("openhands.events.action")
+
+    class EventSource:
+        USER = "user"
+
+    class MessageAction:
+        def __init__(self, content, wait_for_response=False):
+            self.content = content
+            self.wait_for_response = wait_for_response
+
+    events.EventSource = EventSource
+    action.MessageAction = MessageAction
+    monkeypatch.setitem(sys.modules, "openhands", openhands)
+    monkeypatch.setitem(sys.modules, "openhands.events", events)
+    monkeypatch.setitem(sys.modules, "openhands.events.action", action)
 
 
 def test_iteration_limit_checkpoints_before_finalization(tmp_path, monkeypatch):
@@ -19,6 +41,7 @@ def test_iteration_limit_checkpoints_before_finalization(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("OPENHANDS_HARNESS_MODE", "evaluation")
     monkeypatch.setenv("OPENHANDS_CAPTURE_FINE_TRACE", "1")
+    _install_openhands_event_stubs(monkeypatch)
     monkeypatch.setattr(
         overlay,
         "_write_pre_finalization_checkpoint",
@@ -28,7 +51,7 @@ def test_iteration_limit_checkpoints_before_finalization(tmp_path, monkeypatch):
     assert overlay._start_finalization(controller, "iteration_limit")
     assert calls == ["checkpoint", "marker"]
     assert controller._pending_action is None
-    assert controller.state.extra_data["fine_trace_finalization"] == {
+    assert controller.state.extra_data["analysis_artifact_finalization"] == {
         "status": "answering",
         "trigger": "iteration_limit",
         "tool_access": "disabled",
@@ -51,6 +74,7 @@ def test_agent_finish_checkpoints_before_finalization(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("OPENHANDS_HARNESS_MODE", "evaluation")
     monkeypatch.setenv("OPENHANDS_CAPTURE_FINE_TRACE", "1")
+    _install_openhands_event_stubs(monkeypatch)
     monkeypatch.setattr(
         overlay,
         "_write_pre_finalization_checkpoint",
@@ -59,7 +83,7 @@ def test_agent_finish_checkpoints_before_finalization(tmp_path, monkeypatch):
 
     assert overlay._start_finalization(controller, "agent_finished")
     assert calls == ["checkpoint", "marker"]
-    assert controller.state.extra_data["fine_trace_finalization"][
+    assert controller.state.extra_data["analysis_artifact_finalization"][
         "pre_finalization_checkpoint"
     ] == str(tmp_path / "checkpoint")
 
@@ -150,5 +174,5 @@ def test_pre_finalization_checkpoint_captures_state_cache_and_trajectory(
     metadata = json.loads(
         (destination / "metadata.json").read_text(encoding="utf-8")
     )
-    assert metadata["phase"] == "pre_fine_trace_finalization"
+    assert metadata["phase"] == "pre_analysis_artifact_finalization"
     assert metadata["iteration"] == 100

@@ -2,7 +2,7 @@
 
 Two-layer packet:
 
-- Level 1: evidence-bearing submission / verification discipline.
-- Level 2: static vulnerability reproduction planning around parser/source/root-cause/sink/trigger.
+- Reproduction Skill: static vulnerability reproduction planning around parser/source/root-cause/sink/trigger.
+- Submission Skill: evidence-bearing submission / verification discipline.
 
 Helpers are deterministic and workspace-local. They do not use hidden oracle traces or judge exploit correctness.
