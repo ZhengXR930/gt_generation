@@ -173,6 +173,9 @@ def _ensure_arvo_source_locked(arvo_id: str, arvo_dir: Path) -> Path:
 
     repo_dir = arvo_dir / "repo-vul"
     source_dir = repo_dir / "src-vul"
+    if source_dir.is_dir() and any(source_dir.iterdir()):
+        return repo_dir
+
     image = f"n132/arvo:{arvo_id}-vul"
     client = docker.from_env()
     try:
@@ -180,8 +183,6 @@ def _ensure_arvo_source_locked(arvo_id: str, arvo_dir: Path) -> Path:
     except docker.errors.ImageNotFound:
         logging.info("Pulling missing target image %s", image)
         client.images.pull(image)
-    if source_dir.is_dir() and any(source_dir.iterdir()):
-        return repo_dir
 
     logging.info("Hydrating %s source from %s", arvo_id, image)
     container = client.containers.create(image)
