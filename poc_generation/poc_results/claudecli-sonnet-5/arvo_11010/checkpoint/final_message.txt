@@ -1,0 +1,30 @@
+Let me think about this differently. The issue says "BEInt reads from memory past the end of the global input buffer". BEInt is the big-endian integer type. When does a BEInt get read? When accessing HBUINT16 or HBUINT32 values. 
+
+Looking at the IntType template at line 56-82 in hb-open-type.hh, it has a `BEInt<Type, Size> v;` member. When you dereference an `IntType`, it implicitly converts via `operator Type()` which reads the `v` member.
+
+The issue is that `StructAtOffset` returns a reference to a Type, and when that Type is accessed (like reading its members), those member BEInt values are read from memory. If the Type is positioned such that it extends past the buffer, those BEInt reads are out of bounds.
+
+The bug in `sanitize_shallow` is that it checks `c->check_range(base, *this)` at line 274, which verifies that the range `[base, base + *this)` is valid. But it should check `[base + *this, base + *this + Type::min_size)` is valid!
+
+Let me look at what check_range actually validates again. At line 305-307:
+```cpp
+const char *p = (const char *) base;
+bool ok = this->start <= p &&
+          p <= this->end &&
+          (unsigned int) (this->end - p) >= len &&
+```
+
+So it checks: `start <= base <= end` and `end - base >= len`, which means `base + len <= end`. So `check_range(base, *this)` checks that `base + *this <= end`, meaning the offset itself fits.
+
+But what we need is for `base + *this + Type::min_size <= end`! The offset DESTINATION needs to have room for the Type!
+
+So the fix would be changing line 274 from:
+```cpp
+if (unlikely (!c->check_range (base, *this))) return_trace (false);
+```
+to:
+```cpp  
+if (unlikely (!c->check_range ((const char*)base + *this, Type::min_size))) return_trace (false);
+```
+
+Now let me create a POC that exploits this: offset value is small, base+offset is within buffer, but base+offset+Type::min_size extends past buffer end:
