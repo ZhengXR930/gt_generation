@@ -10,27 +10,17 @@ to the calling frontend.  This module is deliberately policy-neutral.
 """
 
 def _ensure_repo_python() -> None:
-    import os as _os
     import sys as _sys
     from pathlib import Path as _Path
 
-    if _sys.version_info >= (3, 10):
+    if _sys.version_info >= (3, 11):
         return
     repo_root = _Path(__file__).resolve().parents[1]
-    candidates = [
-        repo_root / "external" / "OpenHands" / ".venv-openhands" / "bin" / "python",
-        *sorted(
-            _Path.home().glob(".cache/pypoetry/virtualenvs/openhands-ai-*/bin/python"),
-            reverse=True,
-        ),
-    ]
-    for candidate in candidates:
-        if candidate.exists() and _os.access(candidate, _os.X_OK):
-            _os.execv(str(candidate), [str(candidate), *_sys.argv])
-    raise RuntimeError(
-        "Python >=3.10 required; no OpenHands Python environment found. "
-        "Run scripts/setup_openhands.sh or set PATH to a Python 3.10+ runtime."
-    )
+    runtime_root = _Path(__file__).resolve().parent
+    _sys.path.insert(0, str(runtime_root.parent))
+    from harness_runtime.python_env import ensure_repo_python as _ensure  # noqa: PLC0415
+
+    _ensure(repo_root, min_version=(3, 11))
 
 
 _ensure_repo_python()
@@ -58,14 +48,14 @@ sys.path.insert(0, str(GT_ROOT / "external" / "cybergym" / "src"))
 
 from cybergym.task.arvo_task import generate_arvo_task  # noqa: E402
 from cybergym.task.types import TaskConfig, TaskDifficulty  # noqa: E402
+from harness_runtime.auth import default_api_key_env, load_env_key  # noqa: E402
+from harness_runtime.failure_artifact import write_failure_artifact  # noqa: E402
 from harness_runtime.submission_db import check as check_success  # noqa: E402
 from harness_runtime.dedup import deduplicate_submission_attempts  # noqa: E402
 from harness_runtime.openhands.arvo import (  # noqa: E402
     cleanup_scratch,
     clear_previous_result,
-    default_api_key_env,
     ensure_arvo_source,
-    load_env_key,
     persist_analysis_artifact,
     persist_submission_attempts,
 )
@@ -397,6 +387,8 @@ def _prepare_claude_runtime(
 def _claude_command(args: argparse.Namespace, workspace: Path, prompt: str, env: dict[str, str]) -> tuple[list[str], None]:
     key_env = args.api_key_env or "ANTHROPIC_AUTH_TOKEN"
     _load_api_key(env, key_env)
+    if key_env == "ANTHROPIC_AUTH_TOKEN" and not env.get("ANTHROPIC_AUTH_TOKEN"):
+        _load_api_key(env, "ANTHROPIC_API_KEY")
     if key_env != "ANTHROPIC_AUTH_TOKEN" and env.get(key_env) and not env.get("ANTHROPIC_AUTH_TOKEN"):
         env["ANTHROPIC_AUTH_TOKEN"] = env[key_env]
     if env.get("ANTHROPIC_AUTH_TOKEN") and not env.get("ANTHROPIC_API_KEY"):
@@ -442,6 +434,14 @@ def _agent_command(args: argparse.Namespace, workspace: Path, prompt: str, env: 
     if harness == "claude":
         return _claude_command(args, workspace, prompt, env)
     raise ValueError(f"unsupported CLI harness: {args.harness}")
+
+
+def _manifest_api_key_env(args: argparse.Namespace) -> str:
+    if args.api_key_env:
+        return args.api_key_env
+    if normalize_harness_name(args.harness) == "claude":
+        return "ANTHROPIC_AUTH_TOKEN"
+    return default_api_key_env(args.model)
 
 
 def _copy_latest_analysis(workspace: Path, sample_dir: Path) -> tuple[bool, str]:
@@ -885,6 +885,7 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
     agent_started_wall: float | None = None
     workspace_artifacts: list[dict[str, Any]] = []
     prompt = ""
+    command: list[str] | None = None
     task_payload: dict[str, Any] = {
         "sample_id": sample_id,
         "task_id": task_id,
@@ -1053,7 +1054,7 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
             "cybergym_agent_id": task.agent_id,
             "model": args.model,
             "harness": harness,
-            "api_key_env": args.api_key_env or default_api_key_env(args.model),
+            "api_key_env": _manifest_api_key_env(args),
             "base_url_configured": bool(args.base_url),
             "max_iter": args.max_iter,
             "timeout": args.timeout,
@@ -1116,50 +1117,46 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
                     )
         except Exception as checkpoint_exc:  # noqa: BLE001
             logging.warning("Could not write failure checkpoint for %s: %s", sample_id, checkpoint_exc)
-        manifest = {
-            "evaluation_protocol": "poc_analysis_artifact_per_submission_v3_cli",
-            "arvo_id": args.arvo_id,
-            "task_id": task_id,
-            "sample_id": sample_id,
-            "model": args.model,
-            "harness": harness,
-            "api_key_env": args.api_key_env or default_api_key_env(args.model),
-            "base_url_configured": bool(args.base_url),
-            "max_iter": args.max_iter,
-            "timeout": args.timeout,
-            "status": "error",
-            "returncode": returncode,
-            "timed_out": timed_out,
-            "stop_reason": "runner_exception",
-            "seconds": round(time.monotonic() - started, 3),
-            "workspace_adapter": None,
-            "cli_runtime": cli_runtime,
-            "cli_telemetry": cli_telemetry,
-            "error": error,
-            "poc_generation": {"ok": False, "success": False, "submission_attempts": []},
-            "num_submission_attempts": 0,
-            "submission_attempts": [],
-            "poc_deduplication": {"input_attempts": 0, "unique_pocs": 0},
-            "deduplicated_pocs": [],
-            "analysis": {
-                "produced": False,
-                "source": "none",
-                "path": "analysis.json",
-                "format": "JSON object with sample_id, fine_trace, and vuln_logic",
+        manifest = write_failure_artifact(
+            sample_dir,
+            sample_id=sample_id,
+            harness=harness,
+            model=args.model,
+            framework=(
+                "reward_framework"
+                if os.getenv("REWARD_FRAMEWORK_RUN_ID")
+                else "poc_generation"
+            ),
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_cli",
+            status="error",
+            stop_reason="runner_exception",
+            error=error,
+            returncode=returncode,
+            timed_out=timed_out,
+            seconds=round(time.monotonic() - started, 3),
+            command=command,
+            log_path=log_path if log_path.is_file() else None,
+            extra={
+                "arvo_id": args.arvo_id,
+                "task_id": task_id,
+                "api_key_env": _manifest_api_key_env(args),
+                "base_url_configured": bool(args.base_url),
+                "max_iter": args.max_iter,
+                "timeout": args.timeout,
+                "workspace_adapter": None,
+                "cli_runtime": cli_runtime,
+                "cli_telemetry": cli_telemetry,
+                "cli_checkpoint": {
+                    "dir": "checkpoint/",
+                    "phase": "runner_exception",
+                    "contains_workspace_listing": (checkpoint / "workspace_listing.txt").is_file(),
+                    "contains_claude_stdout_jsonl": (checkpoint / "claude_stdout.jsonl").is_file(),
+                    "contains_claude_transcript": (checkpoint / "claude_transcript.txt").is_file(),
+                    "workspace_artifacts": workspace_artifacts,
+                    "note": "Failure manifest written by harness_runtime before cleanup.",
+                },
             },
-            "checkpoint": {
-                "dir": "checkpoint/",
-                "phase": "runner_exception",
-                "contains_workspace_listing": (checkpoint / "workspace_listing.txt").is_file(),
-                "contains_claude_stdout_jsonl": (checkpoint / "claude_stdout.jsonl").is_file(),
-                "contains_claude_transcript": (checkpoint / "claude_transcript.txt").is_file(),
-                "workspace_artifacts": workspace_artifacts,
-                "note": "Failure manifest written by harness_runtime before cleanup.",
-            },
-        }
-        (sample_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, default=str) + "\n",
-            encoding="utf-8",
+            overwrite_manifest=True,
         )
         _write_status(
             sample_dir,
@@ -1217,8 +1214,30 @@ def main() -> int:
 
     task_id = f"arvo:{args.arvo_id}"
     sample_id = f"arvo_{args.arvo_id}"
-    ensure_arvo_source(args.arvo_id)
     sample_dir = results_dir / sample_id
+    try:
+        ensure_arvo_source(args.arvo_id)
+    except Exception as exc:  # noqa: BLE001
+        clear_previous_result(sample_dir)
+        manifest = write_failure_artifact(
+            sample_dir,
+            sample_id=sample_id,
+            harness=args.harness,
+            model=args.model,
+            framework=(
+                "reward_framework"
+                if os.getenv("REWARD_FRAMEWORK_RUN_ID")
+                else "poc_generation"
+            ),
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_cli",
+            status="error",
+            stop_reason="arvo_source_unavailable",
+            error=f"{type(exc).__name__}: {exc}",
+            extra={"arvo_id": args.arvo_id, "task_id": task_id},
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str), flush=True)
+        return 1
 
     last_status = None
     for attempt in range(1, args.max_attempts + 1):

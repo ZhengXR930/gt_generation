@@ -17,28 +17,44 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
-import docker
+RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+GT_ROOT = RUNTIME_ROOT.parent
+sys.path.insert(0, str(GT_ROOT))
+
+from harness_runtime.python_env import ensure_repo_python  # noqa: E402
+
+ensure_repo_python(GT_ROOT, min_version=(3, 11))
 
 BACKEND_ROOT = Path(__file__).resolve().parent
 RUNTIME_ROOT = BACKEND_ROOT.parent
 GT_ROOT = RUNTIME_ROOT.parent
-sys.path.insert(0, str(RUNTIME_ROOT))
-sys.path.insert(0, str(GT_ROOT))
+if str(RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_ROOT))
+if str(GT_ROOT) not in sys.path:
+    sys.path.insert(0, str(GT_ROOT))
 sys.path.insert(0, str(GT_ROOT / "external" / "cybergym" / "src"))
 
-from harness_runtime.openhands.runtime import (  # noqa: E402
-    configure_harness_profile,
-    run_with_configs,
-    OpenhandsArgs,
-    LLMArgs,
-    TaskArgs,
-)
 from cybergym.task.types import TaskDifficulty  # noqa: E402
+from harness_runtime.auth import (  # noqa: E402
+    default_api_key_env,
+    load_env_key,
+)
 from harness_runtime.submission_db import check as check_success  # noqa: E402
 from harness_runtime.dedup import deduplicate_submission_attempts  # noqa: E402
+from harness_runtime.failure_artifact import write_failure_artifact  # noqa: E402
 from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
+
+
+def _docker_sdk():
+    try:
+        import docker as docker_module  # noqa: PLC0415
+        import docker.errors as docker_error_module  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("Docker Python SDK is required for ARVO workspace hydration") from exc
+    return docker_module, docker_error_module
 
 
 def _local_docker_chown_images():
@@ -55,7 +71,16 @@ def _local_docker_chown_images():
         "alpine:3.17",
         "alpine:3.23",
     ]
-    client = docker.from_env()
+    try:
+        docker_module, _docker_error_module = _docker_sdk()
+    except RuntimeError as exc:
+        logging.warning("%s", exc)
+        return []
+    try:
+        client = docker_module.from_env()
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask run status.
+        logging.warning("Could not initialize Docker cleanup client: %s", exc)
+        return []
     available = []
     seen = set()
     for image in candidates:
@@ -86,7 +111,8 @@ def cleanup_scratch(scratch: Path) -> None:
     last_exc = None
     for image in _local_docker_chown_images():
         try:
-            docker.from_env().containers.run(
+            docker_module, _docker_error_module = _docker_sdk()
+            docker_module.from_env().containers.run(
                 image,
                 command=["chown", "-R", f"{os.getuid()}:{os.getgid()}", "/scratch"],
                 volumes={str(scratch): {"bind": "/scratch", "mode": "rw"}},
@@ -177,10 +203,11 @@ def _ensure_arvo_source_locked(arvo_id: str, arvo_dir: Path) -> Path:
         return repo_dir
 
     image = f"n132/arvo:{arvo_id}-vul"
-    client = docker.from_env()
+    docker_module, docker_error_module = _docker_sdk()
+    client = docker_module.from_env()
     try:
         client.images.get(image)
-    except docker.errors.ImageNotFound:
+    except docker_error_module.ImageNotFound:
         logging.info("Pulling missing target image %s", image)
         client.images.pull(image)
 
@@ -214,28 +241,6 @@ def _ensure_arvo_source_locked(arvo_id: str, arvo_dir: Path) -> Path:
             container.remove(force=True)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-
-
-def load_env_key(var_name: str) -> str:
-    if os.environ.get(var_name):
-        return os.environ[var_name]
-    cfg = GT_ROOT / "config.txt"
-    for line in cfg.read_text().splitlines():
-        line = line.strip()
-        if line.startswith(f"{var_name}="):
-            return line.split("=", 1)[1].strip().strip('"')
-    raise RuntimeError(f"{var_name} not found in env or {cfg}")
-
-
-def default_api_key_env(model: str) -> str:
-    normalized = model[len("openai/"):] if model.startswith("openai/") else model
-    if normalized.startswith("deepseek"):
-        return "DEEPSEEK_API_KEY"
-    if normalized.startswith("claude-"):
-        return "ANTHROPIC_API_KEY"
-    if normalized.startswith(("gpt-", "o3", "o4")):
-        return "OPENAI_API_KEY"
-    return "LLM_API_KEY"
 
 
 def native_tool_calling_for_model(model: str) -> bool | None:
@@ -316,14 +321,15 @@ def runtime_server_url(server: str) -> str:
         gateway = os.getenv("OPENHANDS_EVAL_HOST_GATEWAY", "").strip()
         if not gateway:
             try:
-                bridge = docker.from_env().networks.get("bridge")
+                docker_module, _docker_error_module = _docker_sdk()
+                bridge = docker_module.from_env().networks.get("bridge")
                 configs = (bridge.attrs.get("IPAM") or {}).get("Config") or []
                 gateway = next(
                     str(item.get("Gateway") or "").strip()
                     for item in configs
                     if str(item.get("Gateway") or "").strip()
                 )
-            except (docker.errors.DockerException, StopIteration, TypeError):
+            except (Exception, StopIteration, TypeError):
                 gateway = "172.17.0.1"
         return server.replace("host.docker.internal", gateway)
     return server
@@ -484,6 +490,41 @@ def run_attempt(
 
     Only 'success'/'iteration_cap' reach a normal endpoint with a valid final
     fine trace; 'incomplete' means the episode should be re-run (see main)."""
+    sample_dir = results_dir / sample_id
+    started = time.monotonic()
+    framework = (
+        "reward_framework"
+        if os.getenv("REWARD_FRAMEWORK_RUN_ID")
+        else "poc_generation"
+    )
+    try:
+        from harness_runtime.openhands.runtime import (  # noqa: PLC0415
+            LLMArgs,
+            OpenhandsArgs,
+            TaskArgs,
+            configure_harness_profile,
+            run_with_configs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        manifest = write_failure_artifact(
+            sample_dir,
+            sample_id=sample_id,
+            harness="openhands",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3",
+            status="error",
+            stop_reason="openhands_runtime_import_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            seconds=round(time.monotonic() - started, 3),
+            extra={
+                "arvo_id": args.arvo_id,
+                "task_id": task_id,
+            },
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return "error"
     requested_profile = getattr(args, "harness_profile", None)
     if requested_profile is not None:
         harness_profile = requested_profile
@@ -507,6 +548,7 @@ def run_attempt(
     scratch_tmp_dir = scratch / "tmp"
     scratch_log_dir.mkdir()
     scratch_tmp_dir.mkdir()
+    run_dir = scratch_log_dir / "no_run_dir"
 
     openhands_args = OpenhandsArgs(
         log_dir=scratch_log_dir,
@@ -545,8 +587,33 @@ def run_attempt(
 
         run_dir = find_run_dir(openhands_args.log_dir, task_id_safe, returned_agent_id)
         if run_dir is None:
-            print(json.dumps({"arvo_id": args.arvo_id, "status": "no_run_dir_found"}, indent=2))
-            return None
+            manifest = write_failure_artifact(
+                sample_dir,
+                sample_id=sample_id,
+                harness="openhands",
+                model=args.model,
+                framework=framework,
+                evaluation_protocol="poc_analysis_artifact_per_submission_v3",
+                status="error",
+                stop_reason="no_run_dir_found",
+                seconds=round(time.monotonic() - started, 3),
+                extra={
+                    "arvo_id": args.arvo_id,
+                    "task_id": task_id,
+                    "harness_profile": harness_profile,
+                    "scratch": str(scratch),
+                    "scratch_log_dir": str(scratch_log_dir),
+                    "returned_agent_id": returned_agent_id,
+                    "candidate_run_dirs": [
+                        str(path)
+                        for path in sorted(scratch_log_dir.glob("*"))
+                        if path.is_dir()
+                    ],
+                },
+                overwrite_manifest=True,
+            )
+            print(json.dumps(manifest, indent=2, default=str))
+            return "error"
 
         args_json = json.loads((run_dir / "args.json").read_text())
         cybergym_agent_id = args_json["task"]["agent_id"]
@@ -739,6 +806,39 @@ def run_attempt(
         print(f"\n[*] Wrote checkpoint to {checkpoint_dir}")
         print(f"[*] Wrote manifest to {manifest_path}")
         return status
+    except Exception as exc:  # noqa: BLE001
+        checkpoint_files = {}
+        for name, path in (
+            ("trajectory", run_dir / "trajectory"),
+            ("args.json", run_dir / "args.json"),
+            ("config.toml", scratch_tmp_dir / run_dir.name / "template" / "config.toml"),
+            ("prompt.txt", scratch_tmp_dir / run_dir.name / "template" / "prompt.txt"),
+        ):
+            if path.is_file():
+                checkpoint_files[name] = path
+        manifest = write_failure_artifact(
+            sample_dir,
+            sample_id=sample_id,
+            harness="openhands",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3",
+            status="error",
+            stop_reason="runner_exception",
+            error=f"{type(exc).__name__}: {exc}",
+            seconds=round(time.monotonic() - started, 3),
+            checkpoint_files=checkpoint_files,
+            extra={
+                "arvo_id": args.arvo_id,
+                "task_id": task_id,
+                "harness_profile": harness_profile,
+                "scratch": str(scratch),
+                "scratch_log_dir": str(scratch_log_dir),
+            },
+        )
+        logging.exception("%s OpenHands runner failed", sample_id)
+        print(json.dumps(manifest, indent=2, default=str))
+        return "error"
     finally:
         cleanup_scratch(scratch)
 
@@ -821,7 +921,6 @@ def main():
     task_id = f"arvo:{args.arvo_id}"
     task_id_safe = task_id.replace(":", "_")
     sample_id = f"arvo_{args.arvo_id}"
-    ensure_arvo_source(args.arvo_id)
 
     # The remote PoC evaluation protocol requires the lifecycle-only artifact
     # overlay. It wraps the pinned checkout at process entry without editing
@@ -830,6 +929,30 @@ def main():
     sample_output_dir = results_dir / sample_id
     analysis_output = sample_output_dir / "analysis.json"
     sample_output_dir.mkdir(parents=True, exist_ok=True)
+    framework = (
+        "reward_framework"
+        if os.getenv("REWARD_FRAMEWORK_RUN_ID")
+        else "poc_generation"
+    )
+    try:
+        ensure_arvo_source(args.arvo_id)
+    except Exception as exc:  # noqa: BLE001
+        clear_previous_result(sample_output_dir)
+        manifest = write_failure_artifact(
+            sample_output_dir,
+            sample_id=sample_id,
+            harness="openhands",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3",
+            status="error",
+            stop_reason="arvo_source_unavailable",
+            error=f"{type(exc).__name__}: {exc}",
+            extra={"arvo_id": args.arvo_id, "task_id": task_id},
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        sys.exit(1)
     os.environ["OPENHANDS_HARNESS_MODE"] = "evaluation"
     os.environ["OPENHANDS_CAPTURE_FINE_TRACE"] = "1"
     os.environ.pop("OPENHANDS_ANALYSIS_ARTIFACT_OUTPUT", None)

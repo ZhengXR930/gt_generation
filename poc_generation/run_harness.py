@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from harness_runtime.failure_artifact import write_failure_artifact
 from poc_generation.adapters import HARNESSES, Request, build_command
 
 LOG_ROOT = REPO_ROOT / "poc_generation" / "poc_results" / "_batch_logs"
@@ -146,8 +147,8 @@ def build_request(args: argparse.Namespace, config: dict[str, Any], sample_id: s
 
 
 def run_one(args: argparse.Namespace, config: dict[str, Any], sample_id: str) -> dict[str, Any]:
+    started = time.monotonic()
     request = build_request(args, config, sample_id)
-    command = build_command(request)
     sample_dir = request.results_dir / sample_id
     if sample_dir.exists() and not args.overwrite and result_is_complete(sample_dir):
         record: dict[str, Any] = {"sample": sample_id, "status": "skipped", "results_dir": str(sample_dir)}
@@ -156,6 +157,43 @@ def run_one(args: argparse.Namespace, config: dict[str, Any], sample_id: str) ->
                 config, namespace=request.namespace, sample_id=sample_id, sample_dir=sample_dir
             )
         return record
+    try:
+        command = build_command(request)
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+        if args.dry_run:
+            return {
+                "sample": sample_id,
+                "status": "failed",
+                "returncode": None,
+                "seconds": round(time.monotonic() - started, 1),
+                "results_dir": str(sample_dir),
+                "error": error,
+            }
+        write_failure_artifact(
+            sample_dir,
+            sample_id=sample_id,
+            harness=request.harness,
+            model=request.model,
+            framework="poc_generation",
+            status="error",
+            stop_reason="build_command_failed",
+            error=error,
+            seconds=round(time.monotonic() - started, 1),
+            extra={
+                "namespace": request.namespace,
+                "results_dir": str(sample_dir),
+            },
+            overwrite_manifest=True,
+        )
+        return {
+            "sample": sample_id,
+            "status": "failed",
+            "returncode": None,
+            "seconds": round(time.monotonic() - started, 1),
+            "results_dir": str(sample_dir),
+            "error": error,
+        }
     if args.dry_run:
         return {"sample": sample_id, "status": "planned", "command": command.redacted()}
 
@@ -163,32 +201,130 @@ def run_one(args: argparse.Namespace, config: dict[str, Any], sample_id: str) ->
     log_dir = LOG_ROOT / request.namespace
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{sample_id}.log"
-    started = time.monotonic()
+    proc: subprocess.CompletedProcess[str] | None = None
+    run_error: str | None = None
     with log_path.open("w", encoding="utf-8") as log:
         log.write("COMMAND " + json.dumps(command.redacted(), ensure_ascii=False) + "\n")
         log.flush()
-        proc = subprocess.run(
-            command.command,
-            cwd=command.cwd,
-            env=dict(command.env),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                command.command,
+                cwd=command.cwd,
+                env=dict(command.env),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            run_error = f"{type(exc).__name__}: {exc}"
+            log.write(f"\n[batch-runner] adapter launch failed: {run_error}\n")
     record = {
         "sample": sample_id,
-        "status": "complete" if proc.returncode == 0 else "failed",
-        "returncode": proc.returncode,
+        "status": "complete" if proc is not None and proc.returncode == 0 else "failed",
+        "returncode": proc.returncode if proc is not None else None,
         "seconds": round(time.monotonic() - started, 1),
         "results_dir": str(sample_dir),
         "log": str(log_path),
     }
-    if proc.returncode == 0:
+    if run_error:
+        record["error"] = run_error
+    has_sample_artifact = (
+        (sample_dir / "manifest.json").is_file()
+        and (sample_dir / "checkpoint").is_dir()
+    )
+    if proc is not None and proc.returncode == 0 and has_sample_artifact:
         record["reachability"] = maybe_run_reachability(
             config, namespace=request.namespace, sample_id=sample_id, sample_dir=sample_dir
         )
+    else:
+        if proc is not None and proc.returncode == 0:
+            record["status"] = "failed"
+            record["error"] = "adapter returned 0 without manifest/checkpoint"
+        if not has_sample_artifact:
+            checkpoint_files = {}
+            partial_manifest = sample_dir / "manifest.json"
+            if partial_manifest.is_file():
+                checkpoint_files["partial_manifest.json"] = partial_manifest
+            write_failure_artifact(
+                sample_dir,
+                sample_id=sample_id,
+                harness=request.harness,
+                model=request.model,
+                framework="poc_generation",
+                status="error",
+                stop_reason=(
+                    "adapter_launch_failed"
+                    if proc is None
+                    else (
+                        "adapter_returned_zero_without_sample_artifact"
+                        if proc.returncode == 0
+                        else "adapter_returned_nonzero_without_manifest"
+                    )
+                ),
+                error=(
+                    run_error
+                    or (
+                        "adapter returned 0 without manifest/checkpoint"
+                        if proc is not None and proc.returncode == 0
+                        else f"adapter exited with returncode {proc.returncode}"
+                    )
+                ),
+                returncode=proc.returncode if proc is not None else None,
+                seconds=record["seconds"],
+                command=command.redacted(),
+                log_path=log_path,
+                checkpoint_files=checkpoint_files,
+                extra={
+                    "namespace": request.namespace,
+                    "results_dir": str(sample_dir),
+                },
+                overwrite_manifest=True,
+            )
     return record
+
+
+def record_unhandled_sample_failure(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    sample_id: str,
+    exc: BaseException,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    harness = str(_config_value(args, config, "harness", "unknown") or "unknown")
+    model = str(_config_value(args, config, "model", "") or "")
+    namespace = str(
+        _config_value(args, config, "namespace")
+        or config.get("results_namespace")
+        or model
+        or "unknown"
+    )
+    sample_dir = (REPO_ROOT / "poc_generation" / "poc_results" / namespace) / sample_id
+    error = f"{type(exc).__name__}: {exc}"
+    write_failure_artifact(
+        sample_dir,
+        sample_id=sample_id,
+        harness=harness,
+        model=model,
+        framework="poc_generation",
+        status="error",
+        stop_reason="batch_runner_exception",
+        error=error,
+        seconds=round(time.monotonic() - started, 1),
+        extra={
+            "namespace": namespace,
+            "results_dir": str(sample_dir),
+        },
+        overwrite_manifest=True,
+    )
+    return {
+        "sample": sample_id,
+        "status": "failed",
+        "returncode": None,
+        "seconds": round(time.monotonic() - started, 1),
+        "results_dir": str(sample_dir),
+        "error": error,
+    }
 
 
 def main() -> int:
@@ -221,7 +357,11 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=max(1, int(args.parallel))) as executor:
         futures = {executor.submit(run_one, args, config, sample): sample for sample in samples}
         for future in as_completed(futures):
-            record = future.result()
+            sample = futures[future]
+            try:
+                record = future.result()
+            except Exception as exc:  # noqa: BLE001
+                record = record_unhandled_sample_failure(args, config, sample, exc)
             counts[record["status"]] = counts.get(record["status"], 0) + 1
             print(json.dumps(record, ensure_ascii=False), flush=True)
     print(json.dumps({"final_counts": counts}, ensure_ascii=False), flush=True)

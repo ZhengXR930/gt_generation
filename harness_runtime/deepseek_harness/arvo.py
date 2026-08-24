@@ -31,12 +31,19 @@ sys.path.insert(0, str(RUNTIME_ROOT))
 sys.path.insert(0, str(GT_ROOT))
 sys.path.insert(0, str(GT_ROOT / "external" / "cybergym" / "src"))
 
+from harness_runtime.python_env import ensure_repo_python  # noqa: E402
+
+ensure_repo_python(GT_ROOT, min_version=(3, 11))
+
 from harness_runtime.analysis_artifact import analysis_artifact_schema_instructions  # noqa: E402
 from harness_runtime.submission_db import NOT_CRASHED, check as check_success  # noqa: E402
 from cybergym.task.gen_task import generate_task  # noqa: E402
 from cybergym.task.types import TaskConfig, TaskDifficulty  # noqa: E402
 from harness_runtime.dedup import deduplicate_submission_attempts  # noqa: E402
+from harness_runtime.failure_artifact import write_failure_artifact  # noqa: E402
 from harness_runtime.deepseek_harness.local import (  # noqa: E402
+    DEFAULT_DSH_HOME,
+    DEFAULT_DSH_NODE_ROOT,
     DEFAULT_DSH_SCRATCH_ROOT,
     cleanup_dsh_scratch,
     compile_network_guard,
@@ -53,11 +60,10 @@ from harness_runtime.deepseek_harness.local import (  # noqa: E402
     summarize_dsh_sessions,
     write_dsh_settings,
 )
+from harness_runtime.auth import default_api_key_env, load_env_key  # noqa: E402
 from harness_runtime.openhands.arvo import (  # noqa: E402
     clear_previous_result,
-    default_api_key_env,
     ensure_arvo_source,
-    load_env_key,
     materialize_attempt_analysis_files,
 )
 from harness_runtime.deepseek_harness.reachability import (  # noqa: E402
@@ -288,8 +294,46 @@ def run_attempt(args: argparse.Namespace, sample_result_dir: Path, attempt: int)
     arvo_id = args.arvo_id
     sample_id = f"arvo_{arvo_id}"
     scratch_root = args.scratch_root.expanduser().resolve()
-    scratch_root.mkdir(parents=True, exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix=f"run_dsh_arvo_{sample_id}_", dir=scratch_root))
+    framework = (
+        "reward_framework"
+        if os.getenv("REWARD_FRAMEWORK_RUN_ID")
+        else "poc_generation"
+    )
+    started = time.monotonic()
+    try:
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix=f"run_dsh_arvo_{sample_id}_", dir=scratch_root))
+    except Exception as exc:  # noqa: BLE001
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=sample_id,
+            harness="deepseek_harness",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_dsh_arvo",
+            status="error",
+            stop_reason="scratch_unavailable",
+            error=f"{type(exc).__name__}: {exc}",
+            seconds=round(time.monotonic() - started, 3),
+            extra={
+                "arvo_id": arvo_id,
+                "task_id": f"arvo:{arvo_id}",
+                "attempt": attempt,
+                "scratch_root": str(scratch_root),
+            },
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return "error"
+    workspace = scratch / "workspace"
+    run_dir = scratch / "results" / f"{sample_id}-{uuid.uuid4().hex}"
+    dsh_home = args.dsh_home.expanduser().resolve()
+    prompt_path = scratch / "prompt.txt"
+    config_path = scratch / "dsh_config.json"
+    preexisting_sessions: set[Path] = set()
+    task: dict = {"agent_id": None}
+    adapter_metadata = None
+    network_guard_manifest: dict = {"mode": "not_initialized"}
     try:
         workspace, task = prepare_arvo_workspace(
             arvo_id=arvo_id,
@@ -305,21 +349,17 @@ def run_attempt(args: argparse.Namespace, sample_result_dir: Path, attempt: int)
             scratch=scratch,
             env=os.environ,
         )
-        run_dir = scratch / "results" / f"{sample_id}-{uuid.uuid4().hex}"
         run_dir.mkdir(parents=True)
         for name in ("file", "cache"):
             (run_dir / name).mkdir()
 
-        dsh_home = args.dsh_home.expanduser().resolve()
         preexisting_sessions = list_dsh_session_files(dsh_home)
         write_dsh_settings(dsh_home, args.model, args.reasoning_effort)
 
-        prompt_path = scratch / "prompt.txt"
         prompt_path.write_text(
             render_prompt(args.prompt_file, sample_id=sample_id, workspace=workspace),
             encoding="utf-8",
         )
-        config_path = scratch / "dsh_config.json"
         config_payload = {
             "harness": "deepseek_harness",
             "backend": "arvo_cybergym",
@@ -558,6 +598,62 @@ def run_attempt(args: argparse.Namespace, sample_result_dir: Path, attempt: int)
         print(f"[*] {sample_id}: reachability pipeline {reachability_metadata}")
         print(json.dumps(manifest, indent=2))
         return status
+    except Exception as exc:  # noqa: BLE001
+        new_session_files: set[Path] = set()
+        try:
+            current_sessions = list_dsh_session_files(dsh_home)
+            new_session_files = filter_dsh_session_files_for_workspace(
+                current_sessions - preexisting_sessions, workspace
+            )
+            if not new_session_files and current_sessions:
+                new_session_files = filter_dsh_session_files_for_workspace(
+                    current_sessions, workspace
+                )
+            copy_dsh_checkpoint(dsh_home, sample_result_dir, new_session_files)
+        except Exception:
+            new_session_files = set()
+        checkpoint_files = {}
+        for name, path in (
+            ("prompt.txt", prompt_path),
+            ("dsh_config.json", config_path),
+            ("args.json", run_dir / "args.json"),
+            ("trajectory", run_dir / "trajectory"),
+            ("dsh_stdout.txt", run_dir / "dsh_stdout.txt"),
+            ("dsh_stderr.txt", run_dir / "dsh_stderr.txt"),
+        ):
+            if path.is_file():
+                checkpoint_files[name] = path
+        agent_id = task.get("agent_id") if isinstance(task, dict) else None
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=sample_id,
+            harness="deepseek_harness",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_dsh_arvo",
+            status="error",
+            stop_reason="runner_exception",
+            error=f"{type(exc).__name__}: {exc}",
+            seconds=round(time.monotonic() - started, 3),
+            checkpoint_files=checkpoint_files,
+            extra={
+                "arvo_id": arvo_id,
+                "task_id": f"arvo:{arvo_id}",
+                "cybergym_agent_id": agent_id,
+                "attempt": attempt,
+                "scratch": str(scratch),
+                "workspace": str(workspace),
+                "workspace_adapter": adapter_metadata,
+                "tool_network": network_guard_manifest,
+                "dsh_session_files": [
+                    str(path.relative_to(dsh_home))
+                    for path in sorted(new_session_files)
+                    if dsh_home in path.parents
+                ],
+            },
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return "error"
     finally:
         if getattr(args, "cleanup_target_image", False):
             try:
@@ -592,12 +688,12 @@ def main() -> int:
     parser.add_argument(
         "--node-root",
         type=Path,
-        default=Path("/home/xinran/.local/node-v24-musl"),
+        default=DEFAULT_DSH_NODE_ROOT,
     )
     parser.add_argument(
         "--dsh-home",
         type=Path,
-        default=Path("/home/xinran/.cache/gt_generation_deepseek_harness_home"),
+        default=DEFAULT_DSH_HOME,
     )
     parser.add_argument(
         "--reasoning-effort",

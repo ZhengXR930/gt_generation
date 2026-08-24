@@ -47,9 +47,14 @@ GT_ROOT = RUNTIME_ROOT.parent
 sys.path.insert(0, str(GT_ROOT))
 sys.path.insert(0, str(GT_ROOT / "gt_generation"))
 
+from harness_runtime.python_env import ensure_repo_python  # noqa: E402
+
+ensure_repo_python(GT_ROOT, min_version=(3, 11))
+
 from harness_runtime.analysis_artifact import (  # noqa: E402
     analysis_artifact_task_readme_section,
 )
+from harness_runtime.failure_artifact import write_failure_artifact  # noqa: E402
 from harness_runtime.workspace import candidate_guard_shell_snippet  # noqa: E402
 from evaluator.reachability.runtime_spec import (  # noqa: E402
     RuntimeSpecError,
@@ -1282,22 +1287,6 @@ def persist_results(sample_dir: Path, workspace: Path, run_dir: Path, config_pat
 
 
 def main() -> int:
-    from harness_runtime.openhands.runtime import (  # noqa: PLC0415
-        configure_harness_profile,
-        run_openhands,
-        session_name_for_task,
-    )
-    from harness_runtime.openhands.arvo import (  # noqa: PLC0415
-        cleanup_scratch,
-        count_agent_actions,
-        default_api_key_env,
-        load_env_key,
-        native_tool_calling_for_model,
-        trajectory_has_finish_action,
-    )
-    from harness_runtime.dedup import deduplicate_submission_attempts  # noqa: PLC0415
-    from harness_runtime.workspace import run_workspace_installer  # noqa: PLC0415
-
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample-id", required=True)
     ap.add_argument("--max-iter", type=int, default=2)
@@ -1327,22 +1316,79 @@ def main() -> int:
         os.environ["HARNESS_WORKSPACE_INSTALLER"] = args.workspace_installer
     else:
         os.environ.pop("HARNESS_WORKSPACE_INSTALLER", None)
-    configure_harness_profile("standard", max_iterations=args.max_iter)
 
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     results_dir = args.results_dir.expanduser().resolve()
     sample_result_dir = results_dir / args.sample_id
     gt_sample_dir = GT_ROOT / "gt_results" / args.sample_id
-    runtime_readiness = check_runtime_readiness(gt_sample_dir)
     clear_previous_result(sample_result_dir)
     sample_result_dir.mkdir(parents=True, exist_ok=True)
+    framework = (
+        "reward_framework"
+        if os.getenv("REWARD_FRAMEWORK_RUN_ID")
+        else "poc_generation"
+    )
+    try:
+        from harness_runtime.openhands.arvo import (  # noqa: PLC0415
+            cleanup_scratch,
+            count_agent_actions,
+            default_api_key_env,
+            load_env_key,
+            native_tool_calling_for_model,
+            trajectory_has_finish_action,
+        )
+        from harness_runtime.openhands.runtime import (  # noqa: PLC0415
+            configure_harness_profile,
+            run_openhands,
+            session_name_for_task,
+        )
+        from harness_runtime.dedup import deduplicate_submission_attempts  # noqa: PLC0415
+        from harness_runtime.workspace import run_workspace_installer  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=args.sample_id,
+            harness="openhands",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_local",
+            status="error",
+            stop_reason="openhands_runtime_import_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return 1
+    configure_harness_profile("standard", max_iterations=args.max_iter)
+    try:
+        runtime_readiness = check_runtime_readiness(gt_sample_dir)
+    except Exception as exc:  # noqa: BLE001
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=args.sample_id,
+            harness="openhands",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_local",
+            status="error",
+            stop_reason="runtime_readiness_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            extra={"gt_sample_dir": str(gt_sample_dir)},
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return 1
 
     api_key_env = args.api_key_env or default_api_key_env(args.model)
     scratch = Path(tempfile.mkdtemp(prefix=f"run_arvo_local_{args.sample_id}_"))
+    workspace = scratch / "workspace"
+    run_dir = scratch / "results" / f"{args.sample_id}-{uuid.uuid4().hex}"
+    config_path = scratch / "config.toml"
+    prompt_path = scratch / "prompt.txt"
+    adapter_metadata = None
     try:
         workspace, inner_command, repro = prepare_workspace(args.sample_id, scratch)
         adapter_metadata = None
-        run_dir = scratch / "results" / f"{args.sample_id}-{uuid.uuid4().hex}"
         run_dir.mkdir(parents=True)
         args_json = {
             "agent": f"openhands:{args.model}",
@@ -1353,8 +1399,6 @@ def main() -> int:
         }
         (run_dir / "args.json").write_text(json.dumps(args_json, indent=2), encoding="utf-8")
 
-        config_path = scratch / "config.toml"
-        prompt_path = scratch / "prompt.txt"
         from harness_runtime.workspace import render_prompt  # noqa: PLC0415
         prompt_path.write_text(
             render_prompt(
@@ -1493,6 +1537,37 @@ def main() -> int:
         persist_results(sample_result_dir, workspace, run_dir, config_path, prompt_path, manifest)
         print(json.dumps(manifest, indent=2))
         return 0 if status in {"success", "iteration_cap", "agent_finished"} and analysis_produced else 1
+    except Exception as exc:  # noqa: BLE001
+        checkpoint_files = {}
+        for name, path in (
+            ("prompt.txt", prompt_path),
+            ("config.toml", config_path),
+            ("args.json", run_dir / "args.json"),
+            ("trajectory", run_dir / "trajectory"),
+        ):
+            if path.is_file():
+                checkpoint_files[name] = path
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=args.sample_id,
+            harness="openhands",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_local",
+            status="error",
+            stop_reason="runner_exception",
+            error=f"{type(exc).__name__}: {exc}",
+            checkpoint_files=checkpoint_files,
+            extra={
+                "gt_sample_dir": str(gt_sample_dir),
+                "scratch": str(scratch),
+                "workspace": str(workspace),
+                "workspace_adapter": adapter_metadata,
+                "runtime_readiness": runtime_readiness,
+            },
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return 1
     finally:
         cleanup_scratch(scratch)
 

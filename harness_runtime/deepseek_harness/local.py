@@ -39,14 +39,41 @@ DSH_ROOT = Path(__file__).resolve().parent
 RUNTIME_ROOT = DSH_ROOT.parent
 GT_ROOT = RUNTIME_ROOT.parent
 NETWORK_GUARD_SOURCE = DSH_ROOT / "network_guard.c"
-NETWORK_GUARD_CACHE = Path("/home/xinran/.cache/gt_generation_network_guard")
-DEFAULT_DSH_SCRATCH_ROOT = Path("/home/xinran/.cache/gt_generation_dsh_scratch")
+NETWORK_GUARD_CACHE = Path(
+    os.environ.get(
+        "GT_GENERATION_NETWORK_GUARD_CACHE",
+        str(Path.home() / ".cache" / "gt_generation_network_guard"),
+    )
+)
+DEFAULT_DSH_HOME = Path(
+    os.environ.get(
+        "GT_GENERATION_DSH_HOME",
+        str(Path.home() / ".cache" / "gt_generation_deepseek_harness_home"),
+    )
+)
+DEFAULT_DSH_NODE_ROOT = Path(
+    os.environ.get(
+        "GT_GENERATION_DSH_NODE_ROOT",
+        str(Path.home() / ".local" / "node-v24-musl"),
+    )
+)
+DEFAULT_DSH_SCRATCH_ROOT = Path(
+    os.environ.get(
+        "GT_GENERATION_DSH_SCRATCH_ROOT",
+        str(Path.home() / ".cache" / "gt_generation_dsh_scratch"),
+    )
+)
 
 sys.path.insert(0, str(RUNTIME_ROOT))
 sys.path.insert(0, str(GT_ROOT))
 
+from harness_runtime.python_env import ensure_repo_python  # noqa: E402
+
+ensure_repo_python(GT_ROOT, min_version=(3, 11))
+
 from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
 from harness_runtime.dedup import deduplicate_submission_attempts  # noqa: E402
+from harness_runtime.failure_artifact import write_failure_artifact  # noqa: E402
 from harness_runtime.openhands.local import (  # noqa: E402
     LocalExecutionBridge,
     check_runtime_readiness,
@@ -58,7 +85,7 @@ from harness_runtime.openhands.local import (  # noqa: E402
     write_build_sh,
     write_submit_sh,
 )
-from harness_runtime.openhands.arvo import load_env_key  # noqa: E402
+from harness_runtime.auth import load_env_key  # noqa: E402
 from harness_runtime.deepseek_harness.reachability import (  # noqa: E402
     DEFAULT_REACHABILITY_LOCK_DIR,
     run_reachability_pipeline,
@@ -777,12 +804,12 @@ def main() -> int:
     parser.add_argument(
         "--node-root",
         type=Path,
-        default=Path("/home/xinran/.local/node-v24-musl"),
+        default=DEFAULT_DSH_NODE_ROOT,
     )
     parser.add_argument(
         "--dsh-home",
         type=Path,
-        default=Path("/home/xinran/.cache/gt_generation_deepseek_harness_home"),
+        default=DEFAULT_DSH_HOME,
         help=(
             "Shared host-side DeepSeek Harness home.  Runtime dependencies live "
             "here; each result checkpoint copies only this run's session/config."
@@ -836,45 +863,103 @@ def main() -> int:
     if not args.prompt_file.is_file():
         parser.error(f"prompt file not found: {args.prompt_file}")
 
-    if args.sample_id.startswith("arvo_"):
-        raise RuntimeError(
-            "deepseek_harness backend currently supports local non-ARVO samples only"
-        )
-
     results_dir = args.results_dir.expanduser().resolve()
     sample_result_dir = results_dir / args.sample_id
     gt_sample_dir = GT_ROOT / "gt_results" / args.sample_id
-    runtime_readiness = check_runtime_readiness(gt_sample_dir)
     clear_previous_result(sample_result_dir)
     sample_result_dir.mkdir(parents=True, exist_ok=True)
+    framework = (
+        "reward_framework"
+        if os.getenv("REWARD_FRAMEWORK_RUN_ID")
+        else "poc_generation"
+    )
+
+    if args.sample_id.startswith("arvo_"):
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=args.sample_id,
+            harness="deepseek_harness",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_dsh_local",
+            status="error",
+            stop_reason="unsupported_sample_scope",
+            error="deepseek_harness local backend supports non-ARVO samples only",
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return 1
+
+    try:
+        runtime_readiness = check_runtime_readiness(gt_sample_dir)
+    except Exception as exc:  # noqa: BLE001
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=args.sample_id,
+            harness="deepseek_harness",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_dsh_local",
+            status="error",
+            stop_reason="runtime_readiness_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            extra={"gt_sample_dir": str(gt_sample_dir)},
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return 1
 
     scratch_root = args.scratch_root.expanduser().resolve()
-    scratch_root.mkdir(parents=True, exist_ok=True)
-    scratch = Path(
-        tempfile.mkdtemp(prefix=f"run_dsh_local_{args.sample_id}_", dir=scratch_root)
-    )
+    try:
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        scratch = Path(
+            tempfile.mkdtemp(prefix=f"run_dsh_local_{args.sample_id}_", dir=scratch_root)
+        )
+    except Exception as exc:  # noqa: BLE001
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=args.sample_id,
+            harness="deepseek_harness",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_dsh_local",
+            status="error",
+            stop_reason="scratch_unavailable",
+            error=f"{type(exc).__name__}: {exc}",
+            extra={
+                "gt_sample_dir": str(gt_sample_dir),
+                "scratch_root": str(scratch_root),
+                "runtime_readiness": runtime_readiness,
+            },
+            overwrite_manifest=True,
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return 1
+    workspace = scratch / "workspace"
+    run_dir = scratch / "results" / f"{args.sample_id}-{uuid.uuid4().hex}"
+    dsh_home = args.dsh_home.expanduser().resolve()
+    prompt_path = scratch / "prompt.txt"
+    config_path = scratch / "dsh_config.json"
+    preexisting_sessions: set[Path] = set()
+    adapter_metadata = None
+    public_testcase_scrub: dict = {}
     try:
         workspace, inner_command, repro = prepare_workspace(args.sample_id, scratch)
         adapt_readme_for_host_workspace(workspace)
         public_testcase_scrub = scrub_agent_visible_public_testcases(workspace)
-        adapter_metadata = None
-        run_dir = scratch / "results" / f"{args.sample_id}-{uuid.uuid4().hex}"
         run_dir.mkdir(parents=True)
         for name in ("file", "cache"):
             (run_dir / name).mkdir()
 
-        dsh_home = args.dsh_home.expanduser().resolve()
         preexisting_sessions = list_dsh_session_files(dsh_home)
         write_dsh_settings(dsh_home, args.model, args.reasoning_effort)
 
-        prompt_path = scratch / "prompt.txt"
         prompt_path.write_text(
             render_prompt(
                 args.prompt_file, sample_id=args.sample_id, workspace=workspace
             ),
             encoding="utf-8",
         )
-        config_path = scratch / "dsh_config.json"
         (run_dir / "args.json").write_text(
             json.dumps(
                 {
@@ -1097,6 +1182,58 @@ def main() -> int:
             and analysis_produced
             else 1
         )
+    except Exception as exc:  # noqa: BLE001
+        new_session_files: set[Path] = set()
+        try:
+            current_sessions = list_dsh_session_files(dsh_home)
+            new_session_files = filter_dsh_session_files_for_workspace(
+                current_sessions - preexisting_sessions, workspace
+            )
+            if not new_session_files and current_sessions:
+                new_session_files = filter_dsh_session_files_for_workspace(
+                    current_sessions, workspace
+                )
+            copy_dsh_checkpoint(dsh_home, sample_result_dir, new_session_files)
+        except Exception:
+            new_session_files = set()
+        checkpoint_files = {}
+        for name, path in (
+            ("prompt.txt", prompt_path),
+            ("dsh_config.json", config_path),
+            ("args.json", run_dir / "args.json"),
+            ("trajectory", run_dir / "trajectory"),
+            ("dsh_stdout.txt", run_dir / "dsh_stdout.txt"),
+            ("dsh_stderr.txt", run_dir / "dsh_stderr.txt"),
+        ):
+            if path.is_file():
+                checkpoint_files[name] = path
+        manifest = write_failure_artifact(
+            sample_result_dir,
+            sample_id=args.sample_id,
+            harness="deepseek_harness",
+            model=args.model,
+            framework=framework,
+            evaluation_protocol="poc_analysis_artifact_per_submission_v3_dsh_local",
+            status="error",
+            stop_reason="runner_exception",
+            error=f"{type(exc).__name__}: {exc}",
+            checkpoint_files=checkpoint_files,
+            extra={
+                "gt_sample_dir": str(gt_sample_dir),
+                "scratch": str(scratch),
+                "workspace": str(workspace),
+                "workspace_adapter": adapter_metadata,
+                "runtime_readiness": runtime_readiness,
+                "public_testcase_scrub": public_testcase_scrub,
+                "dsh_session_files": [
+                    str(path.relative_to(dsh_home))
+                    for path in sorted(new_session_files)
+                    if dsh_home in path.parents
+                ],
+            },
+        )
+        print(json.dumps(manifest, indent=2, default=str))
+        return 1
     finally:
         cleanup_dsh_scratch(scratch, scratch_root)
 
