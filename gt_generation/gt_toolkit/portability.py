@@ -79,44 +79,114 @@ def _runtime_spec_module():
     return runtime_spec
 
 
-def freeze_runtime_contract(result_dir: str | Path) -> dict[str, Any]:
-    """Freeze build/run contracts after the Stage 01 agent has succeeded."""
-    result_path = Path(result_dir).resolve()
-    if result_path.name.startswith("arvo_"):
-        return {"ok": True, "skipped": "ARVO uses immutable images"}
-    required = (
-        "sample_info.json", "build.sh", "poc", "reproduction_report.json"
-    )
-    missing = [name for name in required if not (result_path / name).is_file()]
-    if missing:
-        return {
-            "ok": False,
-            "reason": "missing Stage 01 inputs: " + ", ".join(missing),
-        }
-    reproduction = _load(result_path / "reproduction_report.json")
-    if reproduction.get("vulnerable_reproduced") is not True:
-        return {"ok": False, "reason": "vulnerable reproduction was not established"}
-    if reproduction.get("matches_issue") is not True:
-        return {"ok": False, "reason": "vulnerable finding does not match the issue"}
-    setup, run_as_root = _inner_build_command(
-        str(reproduction.get("setup_command") or "")
-    )
-    run_as_root = run_as_root or "GT_BUILD_AS_ROOT=1" in str(
-        reproduction.get("setup_command") or ""
-    )
-    if not setup:
-        return {"ok": False, "reason": "reproduction_report.setup_command is empty"}
-    if command_masks_failures(setup):
-        return {"ok": False, "reason": "setup_command masks build failures"}
-    recipe = write_runtime_build_recipe(
-        result_path,
-        [{
-            "source": "reproduction_report.setup_command",
-            "command": setup,
+def _shell_segment_for_match(command: str, start: int, end: int) -> str:
+    """Return the simple shell segment containing a regex match.
+
+    This is intentionally heuristic: it is only used to avoid treating obvious
+    generated /gt outputs as portable input materials. The conservative fallback
+    remains to validate a /gt path as an input.
+    """
+    left = 0
+    for marker in ("&&", "||", ";", "\n"):
+        index = command.rfind(marker, 0, start)
+        if index >= 0:
+            left = max(left, index + len(marker))
+    right = len(command)
+    for marker in ("&&", "||", ";", "\n"):
+        index = command.find(marker, end)
+        if index >= 0:
+            right = min(right, index)
+    return command[left:right].strip()
+
+
+def _is_generated_gt_path_reference(command: str, match: re.Match[str]) -> bool:
+    """True when a /gt path is clearly produced by the build command.
+
+    Portable materials validation should reject missing /gt inputs such as
+    scripts sourced by the recipe, but output binaries copied to /gt are rebuilt
+    during replay and must not be committed as inputs.
+    """
+    before = command[:match.start()].rstrip()
+    previous = before.rsplit(None, 1)[-1] if before.split() else ""
+    if previous in {"-o", "--output", "--output-file", "-MF", "-MT", "-MQ"}:
+        return True
+
+    target = "/gt/" + match.group("path").strip().rstrip(")")
+    target = target.rstrip("/")
+    segment = _shell_segment_for_match(command, match.start(), match.end())
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    positions = [
+        index for index, token in enumerate(tokens)
+        if token.rstrip("/") == target
+    ]
+    if not positions:
+        return False
+    index = positions[-1]
+    tool = Path(tokens[0]).name
+    if tool in {"cp", "mv", "install", "ln"} and index == len(tokens) - 1:
+        return True
+    if tool in {"mkdir", "touch", "truncate", "rm", "rmdir"}:
+        return True
+    if tool in {"chmod", "chown", "strip"} and index == len(tokens) - 1:
+        return True
+    return False
+
+
+def _runtime_spec_recipe_commands(
+    result_path: Path, sample: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return legacy frozen build commands, normalized as runtime_build entries."""
+    spec_path = result_path / "runtime_spec.json"
+    if not spec_path.is_file():
+        return []
+    try:
+        data = _load(spec_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    raw_commands = data.get("build_commands")
+    if not isinstance(raw_commands, list):
+        return []
+    commands: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_commands):
+        environment: dict[str, str] = {"GT_BUILD_JOBS": "1"}
+        run_as_root = False
+        if isinstance(item, dict):
+            command = str(item.get("command") or "").strip()
+            run_as_root = bool(item.get("run_as_root"))
+            raw_env = item.get("environment")
+            if isinstance(raw_env, dict):
+                environment.update({
+                    str(key): str(value)
+                    for key, value in raw_env.items()
+                    if isinstance(key, str)
+                })
+        else:
+            command = str(item or "").strip()
+        command = _command_for_version(command, sample, "vulnerable")
+        if not command or command_masks_failures(command):
+            continue
+        if re.search(r"(?:^|[;&|\s])(apt-get|apt|yum|dnf|apk)(?:\s|$)", command):
+            run_as_root = True
+        commands.append({
+            "source": f"runtime_spec.build_commands[{index}]",
+            "command": command,
             "run_as_root": run_as_root,
-            "environment": {"GT_BUILD_JOBS": "1"},
-        }],
-    )
+            "environment": environment,
+        })
+    return commands
+
+
+def _write_frozen_contract_with_commands(
+    result_path: Path,
+    sample: dict[str, Any],
+    recipe_commands: list[dict[str, Any]],
+) -> dict[str, Any]:
+    recipe = write_runtime_build_recipe(result_path, recipe_commands)
     if not recipe.get("written"):
         return {
             "ok": False,
@@ -127,13 +197,12 @@ def freeze_runtime_contract(result_dir: str | Path) -> dict[str, Any]:
         spec = runtime_spec.compile_runtime_spec(
             result_path, require_artifacts=False, prefer_frozen=False
         )
-        sample = _load(result_path / "sample_info.json")
-        portable_setup = _command_for_version(setup, sample, "vulnerable")
         spec_data = spec.to_dict()
         spec_data.update({
-            # The evaluator restores source_commit itself.  Keep agent-authored
-            # checkout/reset/clean commands out of the published build entry.
-            "build_commands": [portable_setup],
+            "sample_id": result_path.name,
+            # The evaluator restores source_commit itself. Keep agent-authored
+            # checkout/reset/clean commands out of the published build entries.
+            "build_commands": [str(item["command"]) for item in recipe_commands],
             "build_workdir": "/gt/_work/src",
             "source_repo": str(
                 sample.get("repo") or sample.get("repo_url") or ""
@@ -171,6 +240,70 @@ def freeze_runtime_contract(result_dir: str | Path) -> dict[str, Any]:
     }
 
 
+def freeze_runtime_contract(result_dir: str | Path) -> dict[str, Any]:
+    """Freeze build/run contracts after the Stage 01 agent has succeeded."""
+    result_path = Path(result_dir).resolve()
+    if result_path.name.startswith("arvo_"):
+        return {"ok": True, "skipped": "ARVO uses immutable images"}
+    required = (
+        "sample_info.json", "build.sh", "poc", "reproduction_report.json"
+    )
+    missing = [name for name in required if not (result_path / name).is_file()]
+    if missing:
+        return {
+            "ok": False,
+            "reason": "missing Stage 01 inputs: " + ", ".join(missing),
+        }
+    sample = _load(result_path / "sample_info.json")
+    reproduction = _load(result_path / "reproduction_report.json")
+    if reproduction.get("vulnerable_reproduced") is not True:
+        return {"ok": False, "reason": "vulnerable reproduction was not established"}
+    if reproduction.get("matches_issue") is not True:
+        return {"ok": False, "reason": "vulnerable finding does not match the issue"}
+
+    setup, run_as_root = _inner_build_command(
+        str(reproduction.get("setup_command") or "")
+    )
+    run_as_root = run_as_root or "GT_BUILD_AS_ROOT=1" in str(
+        reproduction.get("setup_command") or ""
+    )
+    spec_commands = _runtime_spec_recipe_commands(result_path, sample)
+    setup_commands: list[dict[str, Any]] = []
+    if setup and not command_masks_failures(setup):
+        setup_commands = [{
+            "source": "reproduction_report.setup_command",
+            "command": _command_for_version(setup, sample, "vulnerable"),
+            "run_as_root": run_as_root,
+            "environment": {"GT_BUILD_JOBS": "1"},
+        }]
+
+    if not setup_commands and not spec_commands:
+        if not setup:
+            return {"ok": False, "reason": "reproduction_report.setup_command is empty"}
+        return {"ok": False, "reason": "setup_command masks build failures"}
+
+    first_result: dict[str, Any] | None = None
+    if setup_commands:
+        first_result = _write_frozen_contract_with_commands(
+            result_path, sample, setup_commands
+        )
+        if first_result.get("ok"):
+            return first_result
+        if not spec_commands:
+            return first_result
+
+    fallback = _write_frozen_contract_with_commands(
+        result_path, sample, spec_commands
+    )
+    if fallback.get("ok"):
+        if first_result is not None:
+            fallback["fallback_from"] = first_result.get("reason")
+        return fallback
+    if first_result is not None:
+        fallback["fallback_from"] = first_result.get("reason")
+    return fallback
+
+
 def _root_materials_from_recipe(result_path: Path) -> list[Path]:
     recipe = _load(result_path / "runtime_build.json")
     paths: list[Path] = []
@@ -186,7 +319,11 @@ def _root_materials_from_recipe(result_path: Path) -> list[Path]:
             # logs merely because an agent redirected compiler output under
             # /gt.
             before = command[:match.start()].rstrip()
-            if before.endswith(">") or top.endswith(".log"):
+            if (
+                before.endswith(">")
+                or top.endswith(".log")
+                or _is_generated_gt_path_reference(command, match)
+            ):
                 continue
             path = result_path / top
             if path.is_file() and path not in paths:
@@ -220,7 +357,11 @@ def _validate_recipe_material_references(result_path: Path) -> list[str]:
             # Shell redirection targets and ordinary logs are generated outputs,
             # not portable build inputs.
             before = command[:match.start()].rstrip()
-            if before.endswith(">") or top.endswith(".log"):
+            if (
+                before.endswith(">")
+                or top.endswith(".log")
+                or _is_generated_gt_path_reference(command, match)
+            ):
                 continue
             material = result_path / top
             if material.is_symlink() or not material.exists():
