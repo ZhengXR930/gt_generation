@@ -1,0 +1,20 @@
+The POC triggered successfully. `"triggered": true`, exit code 1.
+
+The1486-byte binary works by exploiting the `unsafe_fuzz_authenticationToken` fuzzing hook in `ua_server_binary.c`, which automatically replaces auth tokens in request headers with the last token from `CreateSessionResponse`. This lets the fuzzer craft two valid session lifecycles sequentially without needing to know the randomly-generated tokens.
+
+The triggering sequence:
+1. HEL + OPN establish the secure channel
+2. Session 1: CreateSession →ActivateSession → CreateSubscription → CreateMonitoredItems → **CloseSession** (enqueues `sentry1->cleanupCallback` at HEAD)
+3. Session 2: CreateSession (updates `unsafe_fuzz_authenticationToken`) → ActivateSession → CreateSubscription → CreateMonitoredItems → **CloseSession** (enqueues `sentry2->cleanupCallback` at HEAD, pushing `sentry1->cb` to position 2)
+4. CLO
+
+Queue state entering `UA_Server_run_shutdown`: `[sentry2->cb → sentry1->cb → NULL]`
+
+First pass (`UA_WorkQueue_cleanup`):
+- Iter 1: `dc=sentry2->cb`, `dc_tmp=sentry1->cb`; `REMOVE_HEAD` removes `sentry2->cb`; callback inserts `sub2→mon2` at HEAD → queue becomes `[sub2→mon2→sentry1->cb]`; `UA_free(sentry2)`
+- Iter 2: `dc=sentry1->cb`, `dc_tmp=NULL` (captured before insertions); `REMOVE_HEAD` removes `sub2` (not `sentry1->cb`!); callback inserts `sub1→mon1` at HEAD → queue becomes `[sub1→mon1→mon2→sentry1->cb]`; **`UA_free(sentry1)`** — sentry1 freed but still in queue!
+
+Second pass (`UA_WorkQueue_cleanup` in `UA_Server_delete`):
+- Processes `sub1`, `mon1`, `mon2`...
+- When `dc=mon2`: `dc_tmp = SIMPLEQ_NEXT(mon2, next) = FREED_sentry1` → **heap-use-after-free read**
+- Continues into `dc=FREED_sentry1` → double-free
