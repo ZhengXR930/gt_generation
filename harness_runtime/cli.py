@@ -29,6 +29,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import selectors
 import signal
 import shutil
@@ -48,6 +49,7 @@ sys.path.insert(0, str(GT_ROOT / "external" / "cybergym" / "src"))
 
 from cybergym.task.arvo_task import generate_arvo_task  # noqa: E402
 from cybergym.task.types import TaskConfig, TaskDifficulty  # noqa: E402
+from evaluator.reasoning.analysis_artifact import validate_analysis_artifact_quality  # noqa: E402
 from harness_runtime.auth import default_api_key_env, load_env_key  # noqa: E402
 from harness_runtime.failure_artifact import write_failure_artifact  # noqa: E402
 from harness_runtime.submission_db import check as check_success  # noqa: E402
@@ -444,11 +446,126 @@ def _manifest_api_key_env(args: argparse.Namespace) -> str:
     return default_api_key_env(args.model)
 
 
-def _copy_latest_analysis(workspace: Path, sample_dir: Path) -> tuple[bool, str]:
-    for candidate in (workspace / ".latest_analysis.json", workspace / "analysis.json"):
-        if candidate.is_file() and persist_analysis_artifact(candidate, sample_dir):
-            return True, str(candidate.relative_to(workspace) if candidate.is_relative_to(workspace) else candidate)
-    return (sample_dir / "analysis.json").is_file(), "existing" if (sample_dir / "analysis.json").is_file() else "none"
+def _workspace_relative(path: Path, workspace: Path) -> str:
+    try:
+        return str(path.relative_to(workspace))
+    except ValueError:
+        return str(path)
+
+
+def _analysis_candidate_error(candidate_path: Path, sample_dir: Path) -> str | None:
+    try:
+        raw = candidate_path.read_text(encoding="utf-8")
+        artifact = json.loads(raw)
+    except OSError as exc:
+        return f"read_error:{type(exc).__name__}: {exc}"
+    except (TypeError, json.JSONDecodeError) as exc:
+        return f"json_error:{exc}"
+    if (
+        not isinstance(artifact, dict)
+        or not isinstance(artifact.get("sample_id"), str)
+        or not artifact["sample_id"].strip()
+        or not isinstance(artifact.get("fine_trace"), list)
+        or not isinstance(artifact.get("vuln_logic"), dict)
+    ):
+        return "schema_error: expected JSON object with sample_id, fine_trace, and vuln_logic"
+    if artifact.get("sample_id") != sample_dir.name:
+        return f"sample_id_mismatch: expected {sample_dir.name!r}, got {artifact.get('sample_id')!r}"
+    quality_error = validate_analysis_artifact_quality(raw)
+    if quality_error is not None:
+        return f"quality_error: {quality_error}"
+    return None
+
+
+def _copy_latest_analysis(workspace: Path, sample_dir: Path) -> tuple[bool, str, list[dict[str, Any]]]:
+    diagnostics: list[dict[str, Any]] = []
+    for candidate in _analysis_candidates(workspace):
+        if not candidate.is_file():
+            continue
+        rel = _workspace_relative(candidate, workspace)
+        error = _analysis_candidate_error(candidate, sample_dir)
+        if error is not None:
+            diagnostics.append({"path": rel, "accepted": False, "error": error})
+            continue
+        if persist_analysis_artifact(candidate, sample_dir):
+            diagnostics.append({"path": rel, "accepted": True})
+            return True, rel, diagnostics
+        diagnostics.append(
+            {
+                "path": rel,
+                "accepted": False,
+                "error": "persist_analysis_artifact returned false after validation",
+            }
+        )
+    existing = (sample_dir / "analysis.json").is_file()
+    return existing, "existing" if existing else "none", diagnostics
+
+
+def _analysis_candidates(workspace: Path) -> tuple[Path, ...]:
+    return (
+        workspace / ".latest_analysis.json",
+        workspace / "analysis.json",
+        workspace / ".final_analysis.json",
+    )
+
+
+def _select_valid_fallback_analysis(workspace: Path, sample_dir: Path) -> Path | None:
+    for candidate in _analysis_candidates(workspace):
+        if candidate.is_file() and _analysis_candidate_error(candidate, sample_dir) is None:
+            return candidate
+    return None
+
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+
+
+def _looks_like_analysis_artifact(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("sample_id"), str)
+        and isinstance(value.get("fine_trace"), list)
+        and isinstance(value.get("vuln_logic"), dict)
+    )
+
+
+def _json_objects_from_text(text: str) -> list[tuple[str, dict[str, Any]]]:
+    stripped = text.strip()
+    candidates: list[tuple[str, str]] = [("whole_message", stripped)]
+    candidates.extend(
+        (f"fenced_json_{index}", match.group(1).strip())
+        for index, match in enumerate(_JSON_FENCE_RE.finditer(stripped), 1)
+    )
+
+    decoder = json.JSONDecoder()
+    for index, match in enumerate(re.finditer(r"\{", stripped), 1):
+        try:
+            _value, end = decoder.raw_decode(stripped[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        candidates.append(
+            (
+                f"embedded_json_{index}",
+                stripped[match.start() : match.start() + end],
+            )
+        )
+
+    objects: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for source, candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        key = json.dumps(value, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        objects.append((source, value))
+    return objects
 
 
 def _write_checkpoint(sample_dir: Path, workspace: Path, prompt: str, task_payload: dict[str, Any], log_path: Path) -> None:
@@ -551,7 +668,7 @@ def _write_claude_transcript(checkpoint: Path) -> bool:
 def _candidate_artifact_name(path: Path) -> bool:
     name = path.name.lower()
     stem = path.stem.lower()
-    if name in {"analysis.json", ".latest_analysis.json"}:
+    if name in {"analysis.json", ".latest_analysis.json", ".final_analysis.json"}:
         return True
     prefixes = ("poc", "crash", "repro", "candidate", "payload", "testcase")
     suffixes = (".poc", ".crash", ".repro", ".input", ".bin", ".dat", ".ps")
@@ -834,25 +951,46 @@ def _copy_claude_runtime_artifacts(runtime: dict[str, Any] | None, checkpoint: P
         )
 
 
-def _persist_final_analysis_from_text(text: str | None, workspace: Path) -> bool:
+def _persist_final_analysis_from_text(
+    text: str | None,
+    workspace: Path,
+    sample_id: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "extracted": False,
+        "path": None,
+        "source": None,
+    }
     if not text:
-        return False
-    try:
-        artifact = json.loads(text.strip())
-    except json.JSONDecodeError:
-        return False
-    if (
-        not isinstance(artifact, dict)
-        or not isinstance(artifact.get("sample_id"), str)
-        or not isinstance(artifact.get("fine_trace"), list)
-        or not isinstance(artifact.get("vuln_logic"), dict)
-    ):
-        return False
-    (workspace / "analysis.json").write_text(
+        result["error"] = "empty_final_message"
+        return result
+    objects = [
+        (source, artifact)
+        for source, artifact in _json_objects_from_text(text)
+        if _looks_like_analysis_artifact(artifact)
+    ]
+    if not objects:
+        result["error"] = "no_analysis_json_object"
+        return result
+    source, artifact = next(
+        (
+            (candidate_source, candidate)
+            for candidate_source, candidate in objects
+            if candidate.get("sample_id") == sample_id
+        ),
+        objects[0],
+    )
+    output = workspace / ".final_analysis.json"
+    output.write_text(
         json.dumps(artifact, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    return True
+    result.update({"extracted": True, "path": ".final_analysis.json", "source": source})
+    if artifact.get("sample_id") != sample_id:
+        result["warning"] = (
+            f"sample_id_mismatch: expected {sample_id!r}, got {artifact.get('sample_id')!r}"
+        )
+    return result
 
 
 def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir: Path) -> str:
@@ -882,6 +1020,8 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
     returncode: int | None = None
     cli_runtime: dict[str, Any] | None = None
     cli_telemetry: dict[str, Any] | None = None
+    final_analysis_extraction: dict[str, Any] | None = None
+    analysis_candidates: list[dict[str, Any]] = []
     agent_started_wall: float | None = None
     workspace_artifacts: list[dict[str, Any]] = []
     prompt = ""
@@ -967,9 +1107,10 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
                     log_stream=stream,
                     checkpoint=checkpoint,
                 )
-                _persist_final_analysis_from_text(
+                final_analysis_extraction = _persist_final_analysis_from_text(
                     cli_telemetry.get("final_message") if cli_telemetry else None,
                     workspace,
+                    sample_id,
                 )
             else:
                 try:
@@ -999,14 +1140,12 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
         )
         db_path = args.server_root / "poc.db"
         success_info = check_success(db_path, task.agent_id) if db_path.exists() else {"ok": False, "error": "db not found", "submission_attempts": [], "success": False}
-        fallback_analysis = workspace / ".latest_analysis.json"
-        if not fallback_analysis.is_file():
-            fallback_analysis = workspace / "analysis.json"
+        fallback_analysis = _select_valid_fallback_analysis(workspace, sample_dir)
         persisted_attempts = persist_submission_attempts(
             sample_dir,
             task.agent_id,
             success_info.get("submission_attempts") or [],
-            fallback_analysis if fallback_analysis.is_file() else None,
+            fallback_analysis,
             args.server_root,
         )
         poc_deduplication, deduplicated_pocs = deduplicate_submission_attempts(persisted_attempts)
@@ -1022,9 +1161,21 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
             if candidate_path.is_file() and persist_analysis_artifact(candidate_path, sample_dir):
                 analysis_source = "last_valid_poc_submission"
         if analysis_source == "none":
-            produced, source = _copy_latest_analysis(workspace, sample_dir)
+            produced, source, analysis_candidates = _copy_latest_analysis(workspace, sample_dir)
             if produced:
                 analysis_source = source
+        (checkpoint / "analysis_candidates.json").write_text(
+            json.dumps(
+                {
+                    "candidates": analysis_candidates,
+                    "final_message_extraction": final_analysis_extraction,
+                },
+                indent=2,
+                default=str,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         analysis_produced = (sample_dir / "analysis.json").is_file()
         if success_info.get("success"):
             status = "success"
@@ -1076,6 +1227,8 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
                 "source": analysis_source,
                 "path": "analysis.json",
                 "format": "JSON object with sample_id, fine_trace, and vuln_logic",
+                "candidates": analysis_candidates,
+                "final_message_extraction": final_analysis_extraction,
             },
             "checkpoint": {
                 "dir": "checkpoint/",
@@ -1146,6 +1299,10 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
                 "workspace_adapter": None,
                 "cli_runtime": cli_runtime,
                 "cli_telemetry": cli_telemetry,
+                "analysis": {
+                    "candidates": analysis_candidates,
+                    "final_message_extraction": final_analysis_extraction,
+                },
                 "cli_checkpoint": {
                     "dir": "checkpoint/",
                     "phase": "runner_exception",
