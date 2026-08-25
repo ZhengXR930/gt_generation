@@ -1,10 +1,10 @@
-"""The four baseline PoC-generation harness adapters."""
+"""PoC-generation harness adapters."""
 
 from importlib import import_module
 
 from .base import Command, Request
 
-HARNESSES = ("openhands", "codex", "claude", "deepseek_harness")
+HARNESSES = ("openhands", "codex", "claude", "deepseek_harness", "sangfor_ai")
 
 def get_adapter(name: str):
     normalized = name.strip().lower().replace("-", "_")

@@ -21,13 +21,18 @@ def _imports(path: Path) -> set[str]:
     return names
 
 
-def test_baseline_and_reward_expose_the_same_four_harnesses():
-    assert POC_HARNESSES == REWARD_HARNESSES == (
-        "openhands",
-        "codex",
-        "claude",
-        "deepseek_harness",
-    )
+BASELINE_HARNESSES = (
+    "openhands",
+    "codex",
+    "claude",
+    "deepseek_harness",
+)
+
+
+def test_reward_exposes_baseline_harnesses_and_poc_can_add_wrappers():
+    assert REWARD_HARNESSES == BASELINE_HARNESSES
+    assert POC_HARNESSES[: len(BASELINE_HARNESSES)] == BASELINE_HARNESSES
+    assert POC_HARNESSES == BASELINE_HARNESSES + ("sangfor_ai",)
 
 
 def test_frontend_prompts_have_identical_content():

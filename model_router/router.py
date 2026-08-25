@@ -183,7 +183,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
                 "chat_completions",
                 "--bridge-disable-proxy",
             )
-        elif harness == "openhands":
+        elif harness in {"openhands", "sangfor_ai"}:
             extra_args = ("--provider-kind", "openai_compatible")
         return ModelRoute(
             route_id=canonical,
@@ -212,7 +212,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
                 "chat_completions",
                 "--bridge-disable-proxy",
             )
-        elif harness == "openhands":
+        elif harness in {"openhands", "sangfor_ai"}:
             extra_args = ("--provider-kind", "openai_compatible")
         return ModelRoute(
             route_id=canonical,
@@ -229,7 +229,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
 
     if canonical == "glm-5.2":
         extra_args: tuple[str, ...] = ()
-        if harness == "openhands":
+        if harness in {"openhands", "sangfor_ai"}:
             extra_args = ("--provider-kind", "openai_compatible")
         return ModelRoute(
             route_id=canonical,
@@ -245,7 +245,11 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
         )
 
     if canonical == "claude-opus-4.6":
-        extra_args = ("--provider-kind", "anthropic") if harness == "openhands" else ()
+        extra_args = (
+            ("--provider-kind", "anthropic")
+            if harness in {"openhands", "sangfor_ai"}
+            else ()
+        )
         namespace = "claudecli-claude-opus-4.6" if harness == "claude" else "claude-opus-4.6"
         return ModelRoute(
             route_id=canonical,
@@ -263,7 +267,11 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
         )
 
     if canonical == "claude-opus-4.8":
-        extra_args = ("--provider-kind", "anthropic") if harness == "openhands" else ()
+        extra_args = (
+            ("--provider-kind", "anthropic")
+            if harness in {"openhands", "sangfor_ai"}
+            else ()
+        )
         namespace = "claudecli-claude-opus-4.8" if harness == "claude" else "claude-opus-4.8"
         return ModelRoute(
             route_id=canonical,

@@ -183,6 +183,25 @@ def test_claude_opus48_compat_route_uses_sonnet5_but_keeps_old_namespaces():
     assert claude_route.results_namespace == "claudecli-claude-opus-4.8"
 
 
+def test_poc_sangfor_glm52_route_uses_openai_compatible_provider():
+    request = poc_run_harness.build_request(
+        _poc_args(
+            harness="sangfor_ai",
+            model_route="glm-5.2",
+            namespace="sangfor-glm-5.2",
+        ),
+        {"samples": ["arvo_1"]},
+        "arvo_1",
+    )
+
+    assert request.model == "glm_5.2"
+    assert request.api_key_env == MODELHUB_OPENAI_API_KEY_ENV
+    assert request.api_version == MODELHUB_OPENAI_API_VERSION
+    assert request.base_url == MODELHUB_OPENAI_BASE_URL
+    assert request.namespace == "sangfor-glm-5.2"
+    assert request.extra_args == ("--provider-kind", "openai_compatible")
+
+
 def test_reward_framework_uses_same_model_route_table(tmp_path):
     request = reward_run_harness.build_request(
         _reward_args(harness="openhands", model_route="glm-5.2"),
