@@ -5,7 +5,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -13,12 +12,28 @@ from uuid import uuid4
 BACKEND_DIR = Path(__file__).resolve().parent
 RUNTIME_ROOT = BACKEND_DIR.parent
 REPOSITORY_ROOT = RUNTIME_ROOT.parent
+
+
+def _ensure_repo_python() -> None:
+    if sys.version_info >= (3, 11):
+        return
+    if not sys.argv or sys.argv[0] in {"-c", "-", ""}:
+        return
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+    from harness_runtime.python_env import ensure_repo_python as _ensure  # noqa: PLC0415
+
+    _ensure(REPOSITORY_ROOT, min_version=(3, 11))
+
+
+_ensure_repo_python()
+
+import tomllib
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 CYBERGYM_SRC = REPOSITORY_ROOT / "external" / "cybergym" / "src"
 if str(CYBERGYM_SRC) not in sys.path:
     sys.path.insert(0, str(CYBERGYM_SRC))
 
-import docker
-import docker.errors
 import tomli_w
 from simple_parsing import ArgumentGenerationMode, ArgumentParser, flag
 
@@ -56,6 +71,22 @@ PROJECT_ROOT = REPOSITORY_ROOT
 
 # Setup logger
 logger = logging.getLogger(__name__)
+
+docker = None
+docker_errors = ()
+
+
+def _docker_sdk():
+    try:
+        import docker as docker_module  # noqa: PLC0415
+        import docker.errors as docker_error_module  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Docker Python SDK is required for OpenHands runtime cleanup"
+        ) from exc
+    globals()["docker"] = docker_module
+    globals()["docker_errors"] = (docker_error_module.APIError,)
+    return docker_module, docker_error_module
 
 
 class OpenHandsError(Exception):
@@ -137,6 +168,9 @@ class LLMArgs:
     api_version: str | None = None
     """Optional API version for Azure-style OpenAI-compatible endpoints."""
 
+    provider_kind: str = ""
+    """Optional provider wire override: openai_compatible, anthropic, or anthropic_messages."""
+
     native_tool_calling: bool | None = None
     """If None, use the default value. If True, use native tool calling."""
 
@@ -206,15 +240,21 @@ def validate_output(log_dir: Path):
     return True
 
 
-def model_map(model: str, *, openai_compatible: bool = False):
+def model_map(model: str, *, openai_compatible: bool = False, provider_kind: str = ""):
     if model.endswith("/thinking"):
         model = model[: -len("/thinking")]
+
+    kind = str(provider_kind or "").strip().lower().replace("-", "_")
+    if kind in {"anthropic", "anthropic_messages", "modelhub_messages"}:
+        if model.startswith("anthropic/") or model.startswith("claude-"):
+            return model
+        return f"anthropic/{model}"
 
     # Third-party /v1/chat/completions proxies expose models from several
     # families through the OpenAI wire protocol. Force LiteLLM's OpenAI adapter
     # in that case; otherwise a Claude-looking name selects the native
     # Anthropic /v1/messages protocol and never reaches the proxy correctly.
-    if openai_compatible:
+    if openai_compatible or kind in {"openai", "openai_compatible"}:
         return model if model.startswith("openai/") else f"openai/{model}"
     if model.startswith("claude-"):
         return model
@@ -268,24 +308,33 @@ def _cleanup_docker_container(log_dir: Path, session_name: str | None = None):
         logger.info("Keeping OpenHands runtime container for debugging.")
         return
 
-    client = docker.from_env()
+    try:
+        docker_module, _docker_error_module = _docker_sdk()
+        client = docker_module.from_env()
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask run status.
+        logger.warning("Could not initialize Docker cleanup client: %s", exc)
+        return
     # The durable log layout is not guaranteed to contain a top-level *.log.
     # A named evaluation session, however, is embedded verbatim in the runtime
     # container name before its generated suffix and is the most reliable key.
     if session_name:
         prefix = f"openhands-runtime-{session_name}-"
-        matches = [
-            container
-            for container in client.containers.list(
-                all=True, filters={"name": f"openhands-runtime-{session_name}"}
-            )
-            if container.name.startswith(prefix)
-        ]
+        try:
+            matches = [
+                container
+                for container in client.containers.list(
+                    all=True, filters={"name": f"openhands-runtime-{session_name}"}
+                )
+                if container.name.startswith(prefix)
+            ]
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask run status.
+            logger.warning("Could not list OpenHands runtime containers: %s", exc)
+            return
         for container in matches:
             try:
                 container.remove(force=True)
                 logger.info(f"Removed runtime container {container.name}")
-            except docker.errors.APIError as exc:
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask run status.
                 logger.warning(f"Container {container.name}, error: {exc}")
         if matches:
             return
@@ -311,7 +360,7 @@ def _cleanup_docker_container(log_dir: Path, session_name: str | None = None):
         container = client.containers.get(f"openhands-runtime-{container_id}")
         container.remove(force=True)
         logger.info(f"Removed container {container_id}")
-    except docker.errors.APIError as e:
+    except Exception as e:  # noqa: BLE001 - cleanup must not mask run status.
         logger.warning(f"Container {container_id}, error: {e}")
 
 
@@ -550,9 +599,15 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
     config["core"]["cache_dir"] = str(log_dir / "cache")
     config["core"]["file_store_path"] = str(log_dir / "file")
     config["core"]["save_trajectory_path"] = str(log_dir / "trajectory")
+    provider_kind = str(openhands_args.llm.provider_kind or "").strip().lower().replace("-", "_")
     config["llm"]["model"] = model_map(
         openhands_args.llm.model,
-        openai_compatible=bool(openhands_args.llm.base_url),
+        openai_compatible=bool(openhands_args.llm.base_url) and provider_kind not in {
+            "anthropic",
+            "anthropic_messages",
+            "modelhub_messages",
+        },
+        provider_kind=provider_kind,
     )
     config["llm"]["base_url"] = openhands_args.llm.base_url
     apply_sampling_config(

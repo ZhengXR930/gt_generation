@@ -87,7 +87,22 @@ def clean_environment() -> dict[str, str]:
         }:
             env.pop(name, None)
     env["HARNESS_TASK_PROMPT_FILE"] = str(PROMPT_FILE)
+    _extend_no_proxy(env, [".tiktok-row.net", "aidp-i18ntt-sg.tiktok-row.net"])
     return env
+
+
+def _extend_no_proxy(env: dict[str, str], hosts: list[str]) -> None:
+    existing = []
+    for key in ("NO_PROXY", "no_proxy"):
+        existing.extend(
+            item.strip()
+            for item in str(env.get(key) or "").split(",")
+            if item.strip()
+        )
+    values = list(dict.fromkeys([*existing, *hosts]))
+    joined = ",".join(values)
+    env["NO_PROXY"] = joined
+    env["no_proxy"] = joined
 
 
 def common_args(request: Request) -> list[str]:

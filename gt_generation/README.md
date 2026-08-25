@@ -19,18 +19,13 @@ a config file.
 `config.txt` is gitignored, so each person keeps their own):
 
 ```
-DEEPSEEK_API_KEY=<key>            # for OpenHands + a base model
-OPENAI_API_KEY_OFFICIAL=<sk-...>  # official OpenAI key, used by the codex CLI
+DEEPSEEK_API_KEY=<key>
+OPENAI_API_KEY=<key>
+OPENAI_API_KEY_oversea=<key>
+ANTHROPIC_AUTH_TOKEN=<key>
 ```
 
-The `codex` adapter auto-loads `OPENAI_API_KEY_OFFICIAL` from `config.txt` (an
-`OPENAI_API_KEY` already in the environment wins). No other setup is needed for
-codex to use the official OpenAI API.
-
-For a Codex custom provider, set the provider's key in the environment named by
-the config's `codex_provider.env_key`, or put that `KEY=value` in repo-root
-`config.txt`. The adapter passes that provider to `codex exec` without changing
-the GT harness.
+Model/provider settings are centralized in `model_router/`. Prefer `model_route` in the JSON config; raw `model` and `codex_provider` remain available for explicit overrides. Provider secrets must stay in the environment or repo-root `config.txt`; configs contain only environment variable names.
 
 **2. Copy the example config and edit it:**
 
@@ -41,10 +36,11 @@ cp gt_generation/gt_config.example.json gt_generation/gt_config.json
 | field | meaning |
 |-------|---------|
 | `cli` | which agent CLI drives generation: `claude` \| `codex` \| `coco` (Trae). Each maps to `adapters/<cli>/`. |
-| `model` | **one** model id used for every stage (no per-stage switching). Must be valid for the CLI: `claude` → `sonnet`, `claude-opus-4-6`; `codex` → an official OpenAI model, e.g. `gpt-5.4`; `coco` → any id from `coco models` (e.g. `gpt-5.4`, `openrouter-3o`). |
+| `model_route` | preferred named route from `model_router/`; for current Codex GT runs use `gt-codex-gpt-5.4`. |
+| `model` | optional concrete model override. Leave empty when `model_route` is set. |
 | `reasoning_effort` | Codex reasoning effort used for every agent stage: `minimal`, `low`, `medium`, `high`, or `xhigh` (default `high`). |
 | `strict_config` | Pass `--strict-config` to Codex so unknown config keys fail immediately (default `true`). |
-| `codex_provider` | optional Codex-native custom provider (`id`, `name`, `base_url`, `wire_api`, `env_key`, optional `bridge`). Current Codex CLI accepts `wire_api: "responses"`; omit this field for official OpenAI. |
+| `codex_provider` | optional explicit Codex custom provider. Usually leave null and let `model_route` fill it. Current Codex CLI accepts `wire_api: "responses"`; OpenAI-compatible ModelHub routes use the local Responses bridge when needed. |
 | `parallel_dockers` | how many samples to run at once (1–6); each holds one Docker workspace. |
 | `repo_docker_image` | Image tag used for non-ARVO samples (default `gt-memory-env:latest`). |
 | `repo_docker_context` | Build context used for non-ARVO samples (default `docker/gt-memory-env`). |
@@ -62,14 +58,16 @@ complete**, so finished work is never redone. Docker routing is automatic and
 printed up front: ARVO samples use the prebuilt `n132/arvo:<id>` images; every
 other source builds/clones in the shared `gt-memory-env` image.
 
-### Example — codex with the official GPT API, model GPT-5.4
+### Example — codex with the ModelHub GT route
 
 ```jsonc
-// config.txt:  OPENAI_API_KEY_OFFICIAL=sk-...
+// config.txt:  OPENAI_API_KEY_oversea=<key>
 // gt_generation/gt_config.json:
 {
   "cli": "codex",
-  "model": "gpt-5.4",
+  "model_route": "gt-codex-gpt-5.4",
+  "model": "",
+  "codex_provider": null,
   "reasoning_effort": "medium",
   "strict_config": true,
   "parallel_dockers": 2,
@@ -83,44 +81,7 @@ other source builds/clones in the shared `gt-memory-env` image.
 python3 gt_generation/gt_plugin.py --config gt_generation/gt_config.json
 ```
 
-### Example — codex with ModelHub
-
-`gt_generation/gt_config.modelhub_crawl.codex.json` keeps the same Codex
-harness but routes `codex exec` through a local Responses-to-Chat bridge:
-
-```jsonc
-{
-  "cli": "codex",
-  "model": "gpt-5.4-2026-03-05",
-  "codex_provider": {
-    "id": "gt-modelhub-crawl",
-    "name": "ModelHub crawl",
-    "base_url": "http://127.0.0.1:0",
-    "wire_api": "responses",
-    "env_key": "OPENAI_API_KEY",
-    "bridge": {
-      "enabled": true,
-      "target_url": "https://aidp-i18ntt-sg.byteintl.net/api/modelhub/online/v2/crawl?ak=${OPENAI_API_KEY}",
-      "max_tokens": 16384,
-      "timeout_seconds": 600
-    }
-  }
-}
-```
-
-The standalone Codex CLI version in this repo rejects `wire_api: "chat"` and
-requires `responses`. The adapter therefore starts
-`adapters/codex/modelhub_crawl_bridge.py` automatically for this config: Codex
-posts streaming Responses API requests to localhost, and the bridge forwards
-Chat Completions `messages + max_tokens` requests to the ModelHub crawl endpoint.
-The API key is read from `OPENAI_API_KEY` in the environment or repo-root
-`config.txt`; it is not written into the config.
-
-Run it with:
-
-```bash
-python3 gt_generation/gt_plugin.py --config gt_generation/gt_config.modelhub_crawl.codex.json
-```
+The `gt-codex-gpt-5.4` route expands to model `gpt-5.4-2026-03-05`, key env `OPENAI_API_KEY_oversea`, and a local Codex Responses bridge that forwards Chat Completions payloads to the oversea ModelHub OpenAI-compatible deployment.
 
 ### Coverage status (`GT_STATUS.md`)
 

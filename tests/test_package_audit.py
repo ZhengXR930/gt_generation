@@ -297,8 +297,8 @@ def test_package_audit_validates_context_trace_when_present(tmp_path, monkeypatc
             **{field: True for field in package_audit.REACHABILITY_FIELDS},
             "artifacts": {},
         },
-        "context_trace.json": {
-            "schema_version": "gt-context-trace-v1",
+        "context_gt.json": {
+            "schema_version": "gt-context-v1",
             "sample_id": sample_id,
             "collection": {},
             "context": [],
@@ -307,7 +307,7 @@ def test_package_audit_validates_context_trace_when_present(tmp_path, monkeypatc
     for name in package_audit.REQUIRED_FILES:
         path = tmp_path / name
         path.write_text(json.dumps(documents[name]) if name.endswith(".json") else "asset")
-    (tmp_path / "context_trace.json").write_text(json.dumps(documents["context_trace.json"]))
+    (tmp_path / "context_gt.json").write_text(json.dumps(documents["context_gt.json"]))
     monkeypatch.setattr(
         package_audit,
         "validate_data",
@@ -317,4 +317,4 @@ def test_package_audit_validates_context_trace_when_present(tmp_path, monkeypatc
     report = package_audit.audit_package(tmp_path)
 
     assert report["ok"] is False
-    assert "context_trace.json context is empty" in report["errors"]
+    assert "context_gt.json context is empty" in report["errors"]

@@ -21,7 +21,7 @@ export PKG_CONFIG_PATH="/usr/local/lib/"
 ./autogen.sh
 ./configure \
     --enable-fuzzing \
-    FUZZING_LIBS="${LIB_FUZZING_ENGINE} -lc++" \
+    FUZZING_LIBS="${LIB_FUZZING_ENGINE}" \
     LIBEVENT_LIBS="-Wl,-Bstatic -levent -Wl,-Bdynamic" \
     LIBTINFO_LIBS=" -l:libtinfo.a "
 

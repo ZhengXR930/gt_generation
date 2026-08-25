@@ -35,10 +35,31 @@ load_config_key() {
   local name="$1"
   local value=""
   if [[ -f "$REPO_ROOT/config.txt" ]]; then
-    value="$(grep -E "^${name}=" "$REPO_ROOT/config.txt" | head -1 | cut -d= -f2- | tr -d '"' | tr -d '[:space:]')"
+    value="$(python3 - "$REPO_ROOT/config.txt" "$name" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+name = sys.argv[2]
+for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    line = raw.strip().lstrip("﻿")
+    if not line or line.startswith("#"):
+        continue
+    if "=" in line:
+        key, value = line.split("=", 1)
+    elif ":" in line:
+        key, value = line.split(":", 1)
+    else:
+        continue
+    if key.strip() == name:
+        print(value.strip().strip('"').strip("'"), end="")
+        break
+PY
+)"
   fi
   [[ -n "$value" ]] && printf '%s' "$value"
+  return 0
 }
+
 
 # Auth: the default path uses the official OpenAI API. A config may instead
 # provide GT_CODEX_PROVIDER_* to route codex through a custom provider.
@@ -76,16 +97,26 @@ if [[ -n "${GT_CODEX_PROVIDER_ID:-}" ]]; then
     BRIDGE_PORT_FILE="$BRIDGE_DIR/port"
     BRIDGE_LOG_FILE="$BRIDGE_DIR/bridge.log"
     rm -f "$BRIDGE_PORT_FILE"
-    "${GT_CODEX_BRIDGE_PYTHON:-python3}" "$CODEX_ADAPTER_DIR/modelhub_crawl_bridge.py" \
-      --host 127.0.0.1 \
-      --port 0 \
-      --port-file "$BRIDGE_PORT_FILE" \
-      --target-url "$CODEX_BRIDGE_TARGET_URL" \
-      --api-key-env "${GT_CODEX_PROVIDER_ENV_KEY:-}" \
-      --max-tokens "${GT_CODEX_PROVIDER_BRIDGE_MAX_TOKENS:-16384}" \
-      --timeout-seconds "${GT_CODEX_PROVIDER_BRIDGE_TIMEOUT_SECONDS:-600}" \
-      --log-file "$BRIDGE_LOG_FILE" \
-      >>"$BRIDGE_LOG_FILE" 2>&1 &
+    BRIDGE_ARGS=(
+      "$CODEX_ADAPTER_DIR/modelhub_crawl_bridge.py"
+      --host 127.0.0.1
+      --port 0
+      --port-file "$BRIDGE_PORT_FILE"
+      --target-url "$CODEX_BRIDGE_TARGET_URL"
+      --api-key-env "${GT_CODEX_PROVIDER_ENV_KEY:-}"
+      --payload-format "${GT_CODEX_PROVIDER_BRIDGE_PAYLOAD_FORMAT:-auto}"
+      --ip-version "${GT_CODEX_PROVIDER_BRIDGE_IP_VERSION:-auto}"
+      --max-tokens "${GT_CODEX_PROVIDER_BRIDGE_MAX_TOKENS:-16384}"
+      --timeout-seconds "${GT_CODEX_PROVIDER_BRIDGE_TIMEOUT_SECONDS:-600}"
+      --log-file "$BRIDGE_LOG_FILE"
+    )
+    if [[ -n "${GT_CODEX_PROVIDER_BRIDGE_CALLER:-}" ]]; then
+      BRIDGE_ARGS+=(--caller "$GT_CODEX_PROVIDER_BRIDGE_CALLER")
+    fi
+    if [[ "${GT_CODEX_PROVIDER_BRIDGE_DISABLE_PROXY:-0}" == "1" ]]; then
+      BRIDGE_ARGS+=(--disable-proxy)
+    fi
+    "${GT_CODEX_BRIDGE_PYTHON:-python3}" "${BRIDGE_ARGS[@]}" >>"$BRIDGE_LOG_FILE" 2>&1 &
     BRIDGE_PID="$!"
     cleanup_bridge() {
       kill "$BRIDGE_PID" >/dev/null 2>&1 || true

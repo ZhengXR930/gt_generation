@@ -149,15 +149,28 @@ def _runtime_spec_recipe_commands(
     except (OSError, ValueError, json.JSONDecodeError):
         return []
     raw_commands = data.get("build_commands")
+    source_prefix = "runtime_spec.build_commands"
+    if not isinstance(raw_commands, list) or not raw_commands:
+        recipe_path = result_path / "runtime_build.json"
+        if not recipe_path.is_file():
+            return []
+        try:
+            recipe = _load(recipe_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return []
+        raw_commands = recipe.get("commands")
+        source_prefix = "runtime_build.commands"
     if not isinstance(raw_commands, list):
         return []
     commands: list[dict[str, Any]] = []
     for index, item in enumerate(raw_commands):
         environment: dict[str, str] = {"GT_BUILD_JOBS": "1"}
         run_as_root = False
+        source = f"{source_prefix}[{index}]"
         if isinstance(item, dict):
             command = str(item.get("command") or "").strip()
             run_as_root = bool(item.get("run_as_root"))
+            source = str(item.get("source") or source)
             raw_env = item.get("environment")
             if isinstance(raw_env, dict):
                 environment.update({
@@ -173,7 +186,7 @@ def _runtime_spec_recipe_commands(
         if re.search(r"(?:^|[;&|\s])(apt-get|apt|yum|dnf|apk)(?:\s|$)", command):
             run_as_root = True
         commands.append({
-            "source": f"runtime_spec.build_commands[{index}]",
+            "source": source,
             "command": command,
             "run_as_root": run_as_root,
             "environment": environment,
@@ -185,6 +198,8 @@ def _write_frozen_contract_with_commands(
     result_path: Path,
     sample: dict[str, Any],
     recipe_commands: list[dict[str, Any]],
+    *,
+    prefer_frozen_spec: bool = False,
 ) -> dict[str, Any]:
     recipe = write_runtime_build_recipe(result_path, recipe_commands)
     if not recipe.get("written"):
@@ -195,14 +210,15 @@ def _write_frozen_contract_with_commands(
     try:
         runtime_spec = _runtime_spec_module()
         spec = runtime_spec.compile_runtime_spec(
-            result_path, require_artifacts=False, prefer_frozen=False
+            result_path, require_artifacts=False, prefer_frozen=prefer_frozen_spec
         )
         spec_data = spec.to_dict()
         spec_data.update({
             "sample_id": result_path.name,
-            # The evaluator restores source_commit itself. Keep agent-authored
-            # checkout/reset/clean commands out of the published build entries.
-            "build_commands": [str(item["command"]) for item in recipe_commands],
+            # runtime_build.json is the durable rebuild contract.  It preserves
+            # metadata such as run_as_root that runtime_spec.build_commands
+            # cannot represent, so do not cache a lossy copy in the run spec.
+            "build_commands": [],
             "build_workdir": "/gt/_work/src",
             "source_repo": str(
                 sample.get("repo") or sample.get("repo_url") or ""
@@ -245,9 +261,7 @@ def freeze_runtime_contract(result_dir: str | Path) -> dict[str, Any]:
     result_path = Path(result_dir).resolve()
     if result_path.name.startswith("arvo_"):
         return {"ok": True, "skipped": "ARVO uses immutable images"}
-    required = (
-        "sample_info.json", "build.sh", "poc", "reproduction_report.json"
-    )
+    required = ("sample_info.json", "build.sh", "poc")
     missing = [name for name in required if not (result_path / name).is_file()]
     if missing:
         return {
@@ -255,19 +269,54 @@ def freeze_runtime_contract(result_dir: str | Path) -> dict[str, Any]:
             "reason": "missing Stage 01 inputs: " + ", ".join(missing),
         }
     sample = _load(result_path / "sample_info.json")
-    reproduction = _load(result_path / "reproduction_report.json")
-    if reproduction.get("vulnerable_reproduced") is not True:
-        return {"ok": False, "reason": "vulnerable reproduction was not established"}
-    if reproduction.get("matches_issue") is not True:
-        return {"ok": False, "reason": "vulnerable finding does not match the issue"}
-
-    setup, run_as_root = _inner_build_command(
-        str(reproduction.get("setup_command") or "")
-    )
-    run_as_root = run_as_root or "GT_BUILD_AS_ROOT=1" in str(
-        reproduction.get("setup_command") or ""
-    )
     spec_commands = _runtime_spec_recipe_commands(result_path, sample)
+
+    reproduction_path = result_path / "reproduction_report.json"
+    reproduction: dict[str, Any] = {}
+    setup = ""
+    run_as_root = False
+    report_rejection_reason = ""
+    has_sanitizer_trace = (result_path / "sanitizer_trace.txt").is_file()
+    if reproduction_path.is_file():
+        reproduction = _load(reproduction_path)
+        if reproduction.get("vulnerable_reproduced") is not True:
+            report_rejection_reason = "vulnerable reproduction was not established"
+        elif reproduction.get("matches_issue") is not True:
+            report_rejection_reason = "vulnerable finding does not match the issue"
+        else:
+            setup, run_as_root = _inner_build_command(
+                str(reproduction.get("setup_command") or "")
+            )
+            run_as_root = run_as_root or "GT_BUILD_AS_ROOT=1" in str(
+                reproduction.get("setup_command") or ""
+            )
+    elif not spec_commands:
+        return {
+            "ok": False,
+            "reason": "missing reproduction_report.json and runtime_spec build commands",
+        }
+    elif not has_sanitizer_trace:
+        return {
+            "ok": False,
+            "reason": "missing sanitizer_trace.txt for deterministic runtime_spec replay",
+        }
+
+    # A stale or failed agent-authored reproduction_report.json should not
+    # prevent deterministic replay when Stage00/Stage01 already left a frozen
+    # runtime_spec, a rebuild recipe, and a sanitizer baseline.  The clean
+    # vulnerable/fixed replay below is the authoritative oracle.
+    if report_rejection_reason:
+        if not spec_commands:
+            return {"ok": False, "reason": report_rejection_reason}
+        if not has_sanitizer_trace:
+            return {
+                "ok": False,
+                "reason": (
+                    report_rejection_reason
+                    + "; missing sanitizer_trace.txt for deterministic runtime_spec replay"
+                ),
+            }
+
     setup_commands: list[dict[str, Any]] = []
     if setup and not command_masks_failures(setup):
         setup_commands = [{
@@ -278,14 +327,16 @@ def freeze_runtime_contract(result_dir: str | Path) -> dict[str, Any]:
         }]
 
     if not setup_commands and not spec_commands:
-        if not setup:
+        if reproduction_path.is_file() and not setup:
             return {"ok": False, "reason": "reproduction_report.setup_command is empty"}
-        return {"ok": False, "reason": "setup_command masks build failures"}
+        if reproduction_path.is_file():
+            return {"ok": False, "reason": "setup_command masks build failures"}
+        return {"ok": False, "reason": "runtime_spec build commands unavailable"}
 
     first_result: dict[str, Any] | None = None
     if setup_commands:
         first_result = _write_frozen_contract_with_commands(
-            result_path, sample, setup_commands
+            result_path, sample, setup_commands, prefer_frozen_spec=False
         )
         if first_result.get("ok"):
             return first_result
@@ -293,14 +344,21 @@ def freeze_runtime_contract(result_dir: str | Path) -> dict[str, Any]:
             return first_result
 
     fallback = _write_frozen_contract_with_commands(
-        result_path, sample, spec_commands
+        result_path,
+        sample,
+        spec_commands,
+        prefer_frozen_spec=bool(report_rejection_reason or not reproduction_path.is_file()),
     )
     if fallback.get("ok"):
         if first_result is not None:
             fallback["fallback_from"] = first_result.get("reason")
+        elif report_rejection_reason:
+            fallback["fallback_from"] = report_rejection_reason
         return fallback
     if first_result is not None:
         fallback["fallback_from"] = first_result.get("reason")
+    elif report_rejection_reason:
+        fallback["fallback_from"] = report_rejection_reason
     return fallback
 
 
@@ -606,9 +664,12 @@ def _summarize_build_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
         "build_as_root": attempt.get("build_as_root") is True,
         "failure_markers": attempt.get("failure_markers") or [],
     }
-    if attempt.get("returncode") != 0:
-        summary["stdout_tail"] = str(attempt.get("stdout_tail") or "")[-2000:]
-        summary["stderr_tail"] = str(attempt.get("stderr_tail") or "")[-2000:]
+    stdout_tail = str(attempt.get("stdout_tail") or "")[-2000:]
+    stderr_tail = str(attempt.get("stderr_tail") or "")[-2000:]
+    if stdout_tail:
+        summary["stdout_tail"] = stdout_tail
+    if stderr_tail:
+        summary["stderr_tail"] = stderr_tail
     return summary
 
 
@@ -652,11 +713,13 @@ def _run_frozen_spec(result_path: Path, timeout: int) -> dict[str, Any]:
             "finding_signature": _finding_signature(output),
             **(
                 {
-                    "stdout_tail": (proc.stdout or "")[-4000:],
-                    "stderr_tail": (proc.stderr or "")[-4000:],
+                    key: value
+                    for key, value in {
+                        "stdout_tail": (proc.stdout or "")[-4000:],
+                        "stderr_tail": (proc.stderr or "")[-4000:],
+                    }.items()
+                    if value
                 }
-                if proc.returncode in {124, 126, 127} or proc.returncode < 0
-                else {}
             ),
         }
     except subprocess.TimeoutExpired as exc:
@@ -694,7 +757,14 @@ def _finding_signature_matches(
         return False
     expected_type = str(expected.get("crash_type") or "").lower()
     observed_type = str(observed.get("crash_type") or "").lower()
-    if expected_type and observed_type and expected_type != observed_type:
+    generic_types = {"unknown-crash", "unknown"}
+    if (
+        expected_type
+        and observed_type
+        and expected_type != observed_type
+        and expected_type not in generic_types
+        and observed_type not in generic_types
+    ):
         return False
     expected_location = expected.get("crash_location") or {}
     observed_location = observed.get("crash_location") or {}

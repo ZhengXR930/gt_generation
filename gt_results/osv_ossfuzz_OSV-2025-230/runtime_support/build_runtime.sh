@@ -15,6 +15,7 @@ cat > "$runtime/run_poc.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:abort_on_error=1:halt_on_error=1:exitcode=1:symbolize=1}"
-exec /gt/_work/build-wamr-fast-asan/wasm-mutator/wasm_mutator_fuzz -runs=1 "$1"
+bin=$(find /gt/_work/build-wamr-fast-asan /gt/_work/src -type f -name wasm_mutator_fuzz -perm -111 2>/dev/null | head -n 1)
+exec "$bin" -runs=1 "$1"
 EOF
 chmod +x "$runtime/run_poc.sh"

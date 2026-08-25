@@ -5,8 +5,8 @@ import json
 import subprocess
 from pathlib import Path
 
-from reachability.core import evaluate_r1_r5
-from reachability.engine import (
+from evaluator.reachability.core import evaluate_r1_r5
+from evaluator.reachability.engine import (
     extract_assertion_event_checkpoints,
     extract_reachability_checkpoints,
     load_hits,

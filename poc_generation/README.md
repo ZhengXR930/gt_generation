@@ -17,11 +17,13 @@ Run samples through the unified entrypoint:
 ```bash
 python -m poc_generation.run_harness \
   --harness openhands \
-  --model deepseek/deepseek-chat \
-  --namespace deepseek-v4-flash \
+  --model-route deepseek-v4-flash \
   --sample-selector valid_gt_arvo \
   --parallel 3
 ```
+
+
+Model/provider settings are centralized in `model_router/`. Prefer `--model-route` or JSON `model_route`; direct `--model`, `--base-url`, and `--api-key-env` remain available only as explicit overrides.
 
 Use `--sample` or `--samples-file` for explicit sample lists. Use
 `--sample-selector valid_gt`, `valid_gt_arvo`, or `valid_gt_non_arvo` to read

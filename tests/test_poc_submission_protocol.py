@@ -141,7 +141,9 @@ def test_evaluation_deduplication_keeps_last_trace_and_reports_ratios():
 def test_prompt_binds_each_poc_to_candidate_trace():
     prompt = (ROOT / "poc_generation" / "prompt.txt").read_text(encoding="utf-8")
     assert "bash /workspace/submit.sh /path/to/candidate /workspace/analysis.json" in prompt
-    assert "A task may finish without a submission" in prompt
+    assert "Do not finish this" in prompt
+    assert "before at least one submit.sh attempt" in prompt
+    assert "A task may finish without a submission" not in prompt
     assert "R1" not in prompt
 
 

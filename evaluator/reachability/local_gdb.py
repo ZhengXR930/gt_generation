@@ -7,8 +7,8 @@ import os
 import subprocess
 from pathlib import Path
 
-from reachability.engine import CommandResult, load_hits, write_breakpoint_spec
-from reachability.runtime_spec import (
+from evaluator.reachability.engine import CommandResult, load_hits, write_breakpoint_spec
+from evaluator.reachability.runtime_spec import (
     RuntimeSpec,
     RuntimeSpecError,
     container_path_on_host,

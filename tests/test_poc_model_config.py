@@ -1,4 +1,5 @@
 import ast
+import os
 from pathlib import Path
 
 
@@ -39,7 +40,7 @@ def _load_native_tool_calling_for_model():
         and node.name == "native_tool_calling_for_model"
     )
     module = ast.Module(body=[function], type_ignores=[])
-    namespace = {}
+    namespace = {"os": os}
     exec(compile(module, str(SAMPLE_RUNNER), "exec"), namespace)
     return namespace["native_tool_calling_for_model"]
 
@@ -68,3 +69,24 @@ def test_gpt54_uses_native_tools_with_old_openhands_capability_tables():
     assert native_tool_calling_for_model("gpt-5.4-mini") is True
     assert native_tool_calling_for_model("openai/gpt-5.4") is True
     assert native_tool_calling_for_model("deepseek/deepseek-chat") is None
+
+
+def test_anthropic_messages_provider_mapping_overrides_base_url_openai_default():
+    model_map = _load_model_map()
+
+    assert (
+        model_map(
+            "gpt-5.4-mini-2026-03-17",
+            openai_compatible=True,
+            provider_kind="anthropic_messages",
+        )
+        == "anthropic/gpt-5.4-mini-2026-03-17"
+    )
+    assert (
+        model_map(
+            "anthropic/claude-opus-4.8",
+            openai_compatible=True,
+            provider_kind="anthropic_messages",
+        )
+        == "anthropic/claude-opus-4.8"
+    )

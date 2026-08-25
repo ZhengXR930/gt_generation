@@ -5,7 +5,7 @@ cd "${SRC:?}"
 
 # Match the OSS-Fuzz builder layout: project source is $SRC/ndpi, with
 # libpcap/json-c tarballs expanded beside it.
-ln -sfn . ndpi
+[ -e ndpi ] || ln -sfn . ndpi
 
 if [ ! -f libpcap-1.9.1.tar.gz ]; then
   curl -L --retry 3 -o libpcap-1.9.1.tar.gz \

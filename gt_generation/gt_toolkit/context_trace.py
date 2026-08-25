@@ -1,6 +1,6 @@
 """Collect PoC execution context for a completed GT package.
 
-`context_trace.json` is a runtime witness for the source files and functions a
+`context_gt.json` is a runtime witness for the source files and functions a
 PoC traverses on the way to the vulnerability.  It is deliberately cheaper than
 full instruction tracing: the collector breaks at GT semantic anchors and stores
 the bounded GDB backtrace at each anchor.
@@ -276,7 +276,7 @@ def _load_context_hits(path: Path) -> dict[str, Any]:
     return data
 
 
-def collect_context_trace(
+def collect_context_gt(
     *,
     gt_path: Path,
     debug_command: str,
@@ -302,7 +302,7 @@ def collect_context_trace(
     out_dir.mkdir(parents=True, exist_ok=True)
     breakpoints_path = out_dir / "context_breakpoints.json"
     hits_path = out_dir / "context_hits.json"
-    report_path = out_dir / "context_trace.json"
+    report_path = out_dir / "context_gt.json"
     write_breakpoint_spec(checkpoints, breakpoints_path)
 
     command = _format_command(debug_command, poc)
@@ -341,7 +341,7 @@ def collect_context_trace(
     events = [item for item in hits.get("events", []) if isinstance(item, dict)]
     context = _context_from_events(events, codebase=codebase)
     report = {
-        "schema_version": "gt-context-trace-v1",
+        "schema_version": "gt-context-v1",
         "sample_id": str(gt.get("sample_id") or ""),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "collection": {
@@ -464,10 +464,10 @@ def _debug_command_for_result_dir(result_dir: Path) -> str:
 
 
 def _copy_context_output(result_dir: Path) -> bool:
-    produced = result_dir / "context" / "context_trace.json"
+    produced = result_dir / "context" / "context_gt.json"
     if not produced.is_file():
         return False
-    (result_dir / "context_trace.json").write_text(
+    (result_dir / "context_gt.json").write_text(
         produced.read_text(encoding="utf-8", errors="replace"),
         encoding="utf-8",
     )
@@ -481,7 +481,7 @@ def _result_context_paths(result_dir: Path) -> dict[str, Path]:
         "out_dir": out_dir,
         "breakpoints": out_dir / "context_breakpoints.json",
         "hits": out_dir / "context_hits.json",
-        "report": out_dir / "context_trace.json",
+        "report": out_dir / "context_gt.json",
         "stdout": out_dir / "gdb_stdout.txt",
         "stderr": out_dir / "gdb_stderr.txt",
     }
@@ -501,7 +501,7 @@ def _prepare_result_context(result_dir: Path) -> tuple[dict[str, Any], list[dict
     return gt, checkpoints, paths
 
 
-def _write_context_trace_report(
+def _write_context_gt_report(
     *,
     result_dir: Path,
     gt: dict[str, Any],
@@ -520,7 +520,7 @@ def _write_context_trace_report(
     events = [item for item in hits.get("events", []) if isinstance(item, dict)]
     context = _context_from_events(events, codebase=codebase)
     report = {
-        "schema_version": "gt-context-trace-v1",
+        "schema_version": "gt-context-v1",
         "sample_id": str(gt.get("sample_id") or result_dir.name),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "collection": {
@@ -554,11 +554,11 @@ def _write_context_trace_report(
 def _run_repo_result_dir(result_dir: Path, timeout: int, max_events: int, backtrace_limit: int) -> int:
     build_sh = result_dir / "build.sh"
     if not build_sh.is_file():
-        print(json.dumps({"context_trace": "skipped", "reason": "no build.sh"}))
+        print(json.dumps({"context_gt": "skipped", "reason": "no build.sh"}))
         return 0
     command = _debug_command_for_result_dir(result_dir)
     if not command:
-        print(json.dumps({"context_trace": "skipped", "reason": "no debug command"}))
+        print(json.dumps({"context_gt": "skipped", "reason": "no debug command"}))
         return 0
     restored = _restore_vulnerable_source(result_dir)
     arguments = [
@@ -595,7 +595,7 @@ def _run_repo_result_dir(result_dir: Path, timeout: int, max_events: int, backtr
     )
     ok = _copy_context_output(result_dir)
     print(json.dumps({
-        "context_trace": "ran" if ok else "failed",
+        "context_gt": "ran" if ok else "failed",
         "track": "repo",
         "returncode": proc.returncode,
         "source_restored": restored,
@@ -667,7 +667,7 @@ def _run_arvo_result_dir(result_dir: Path, timeout: int, max_events: int, backtr
     )
     paths["stdout"].write_text(proc.stdout, encoding="utf-8", errors="replace")
     paths["stderr"].write_text(proc.stderr, encoding="utf-8", errors="replace")
-    report = _write_context_trace_report(
+    report = _write_context_gt_report(
         result_dir=result_dir,
         gt=gt,
         checkpoints=checkpoints,
@@ -696,7 +696,7 @@ def _run_arvo_result_dir(result_dir: Path, timeout: int, max_events: int, backtr
     )
     ok = bool(report.get("context")) and _copy_context_output(result_dir)
     print(json.dumps({
-        "context_trace": "ran" if ok else "failed",
+        "context_gt": "ran" if ok else "failed",
         "track": "arvo",
         "returncode": proc.returncode,
         "stderr": "" if ok else proc.stderr[-600:],
@@ -714,7 +714,7 @@ def run_for_result_dir(
     result_dir = result_dir.resolve()
     build_sh = result_dir / "build.sh"
     if not build_sh.is_file():
-        print(json.dumps({"context_trace": "skipped", "reason": "no build.sh"}))
+        print(json.dumps({"context_gt": "skipped", "reason": "no build.sh"}))
         return 0
     text = build_sh.read_text(encoding="utf-8", errors="replace")
     if "gt-memory-env" not in text:
@@ -722,40 +722,40 @@ def run_for_result_dir(
     return _run_repo_result_dir(result_dir, timeout, max_events, backtrace_limit)
 
 
-def context_trace_errors(result_dir: Path, context_trace: dict[str, Any]) -> list[str]:
+def context_gt_errors(result_dir: Path, context_gt: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    if context_trace.get("schema_version") != "gt-context-trace-v1":
-        errors.append("context_trace.json has unsupported schema_version")
-    sample_id = str(context_trace.get("sample_id") or "")
+    if context_gt.get("schema_version") != "gt-context-v1":
+        errors.append("context_gt.json has unsupported schema_version")
+    sample_id = str(context_gt.get("sample_id") or "")
     if sample_id and sample_id != result_dir.name:
-        errors.append("context_trace.json sample_id does not match package")
-    collection = context_trace.get("collection")
+        errors.append("context_gt.json sample_id does not match package")
+    collection = context_gt.get("collection")
     if not isinstance(collection, dict):
-        errors.append("context_trace.json collection must be an object")
-    context = context_trace.get("context")
+        errors.append("context_gt.json collection must be an object")
+    context = context_gt.get("context")
     if not isinstance(context, list):
-        errors.append("context_trace.json context must be a list")
+        errors.append("context_gt.json context must be a list")
     elif not context:
-        errors.append("context_trace.json context is empty")
+        errors.append("context_gt.json context is empty")
     else:
         for index, item in enumerate(context):
             if not isinstance(item, dict):
-                errors.append(f"context_trace.json context[{index}] must be an object")
+                errors.append(f"context_gt.json context[{index}] must be an object")
                 continue
             if not str(item.get("file") or ""):
-                errors.append(f"context_trace.json context[{index}] missing file")
+                errors.append(f"context_gt.json context[{index}] missing file")
             if not str(item.get("function") or ""):
-                errors.append(f"context_trace.json context[{index}] missing function")
+                errors.append(f"context_gt.json context[{index}] missing function")
             line = _to_int(item.get("line"))
             if line is None or line < 1:
-                errors.append(f"context_trace.json context[{index}] missing positive line")
+                errors.append(f"context_gt.json context[{index}] missing positive line")
     return errors
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="gt-toolkit context",
-        description="Collect PoC execution context as context_trace.json.",
+        description="Collect PoC execution context as context_gt.json.",
     )
     parser.add_argument("--gt", type=Path)
     parser.add_argument("--poc", type=Path)
@@ -782,7 +782,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.gt or not args.debug_command:
         parser.error("--gt and --debug-command are required unless --for-result-dir is given")
     try:
-        report = collect_context_trace(
+        report = collect_context_gt(
             gt_path=args.gt,
             debug_command=args.debug_command,
             poc=args.poc,

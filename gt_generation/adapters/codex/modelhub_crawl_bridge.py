@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Local Responses-to-Chat bridge for Codex CLI and ModelHub crawl.
+"""Local Responses-to-upstream bridge for Codex CLI and ModelHub crawl.
 
 Codex CLI 0.146 only supports `wire_api = "responses"` for custom providers,
-while the ModelHub crawl endpoint accepts Chat Completions style
-`messages + max_tokens`. This small localhost server lets Codex keep its native
-Responses harness and translates each request to the crawl endpoint.
+while ModelHub crawl endpoints may accept either Chat Completions style payloads
+or Anthropic Messages style payloads. This small localhost server lets Codex
+keep its native Responses harness and translates each request to the crawl
+endpoint.
 """
 
 from __future__ import print_function
@@ -12,12 +13,17 @@ from __future__ import print_function
 import argparse
 import json
 import os
+import socket
 import sys
+import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+_DNS_RESOLVE_LOCK = threading.Lock()
 
 
 def _json_bytes(value):
@@ -64,6 +70,96 @@ def _message_from_response_item(item):
     if role not in ("system", "user", "assistant", "tool"):
         role = "user"
     return {"role": role, "content": content}
+
+
+def _merge_anthropic_messages(messages):
+    merged = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if not content:
+            continue
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if merged and merged[-1].get("role") == role:
+            merged[-1].setdefault("content", []).extend(content)
+        else:
+            merged.append({"role": role, "content": list(content)})
+    return merged
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {"value": value}
+    try:
+        decoded = json.loads(value)
+    except Exception:
+        return {"arguments": value}
+    if isinstance(decoded, dict):
+        return decoded
+    return {"value": decoded}
+
+
+def _anthropic_messages_from_input(request):
+    messages = []
+    system_parts = []
+    instructions = request.get("instructions")
+    if instructions:
+        system_parts.append(str(instructions))
+
+    raw_input = request.get("input")
+    if isinstance(raw_input, str):
+        return "\n\n".join(system_parts), [
+            {"role": "user", "content": [{"type": "text", "text": raw_input}]}
+        ]
+    if not isinstance(raw_input, list):
+        return "\n\n".join(system_parts), []
+
+    for item in raw_input:
+        if not isinstance(item, dict):
+            messages.append({"role": "user", "content": [{"type": "text", "text": str(item)}]})
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            role = str(item.get("role") or "user")
+            content = _text_from_content(item.get("content"))
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+            elif role in ("user", "assistant"):
+                messages.append({"role": role, "content": [{"type": "text", "text": content}]})
+            else:
+                messages.append({"role": "user", "content": [{"type": "text", "text": content}]})
+        elif item_type == "function_call":
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            messages.append({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": str(item.get("name") or ""),
+                    "input": _json_object(item.get("arguments") or "{}"),
+                }],
+            })
+        elif item_type == "function_call_output":
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": str(item.get("call_id") or ""),
+                    "content": _text_from_content(item.get("output")),
+                }],
+            })
+        elif item_type == "reasoning":
+            continue
+        else:
+            content = _text_from_content(item.get("content") or item.get("text"))
+            if content:
+                messages.append({"role": "user", "content": [{"type": "text", "text": content}]})
+    return "\n\n".join(system_parts), _merge_anthropic_messages(messages)
 
 
 def _messages_from_input(request):
@@ -176,6 +272,24 @@ def _chat_tools(response_tools):
     return tools
 
 
+def _anthropic_tools(response_tools):
+    tools = []
+    for tool in response_tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") != "function":
+            continue
+        name = tool.get("name")
+        if not name:
+            continue
+        tools.append({
+            "name": str(name),
+            "description": str(tool.get("description") or ""),
+            "input_schema": tool.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return tools
+
+
 def _chat_payload(response_request, max_tokens):
     payload = {
         "model": response_request.get("model"),
@@ -193,6 +307,35 @@ def _chat_payload(response_request, max_tokens):
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
     return payload
+
+
+def _anthropic_payload(response_request, max_tokens):
+    system, messages = _anthropic_messages_from_input(response_request)
+    payload = {
+        "model": response_request.get("model"),
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    if system:
+        payload["system"] = system
+    if response_request.get("temperature") is not None:
+        payload["temperature"] = response_request.get("temperature")
+    tools = _anthropic_tools(response_request.get("tools"))
+    if tools:
+        payload["tools"] = tools
+    return payload
+
+
+def _payload_format(target_url, configured):
+    value = str(configured or "auto").strip().lower()
+    if value in ("anthropic", "anthropic_messages", "messages"):
+        return "anthropic_messages"
+    if value in ("chat", "chat_completions", "openai_chat", "openai_chat_completions"):
+        return "chat_completions"
+    clean_url = str(target_url or "").split("?", 1)[0].rstrip("/").lower()
+    if clean_url.endswith("/messages"):
+        return "anthropic_messages"
+    return "chat_completions"
 
 
 def _response_usage(chat_usage):
@@ -245,6 +388,37 @@ def _output_items_from_chat(chat_response, model):
     return items, model
 
 
+def _output_items_from_anthropic(message_response, model):
+    model = str(message_response.get("model") or model or "")
+    items = []
+    text_chunks = []
+    for index, block in enumerate(message_response.get("content") or []):
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if text:
+                text_chunks.append(str(text))
+        elif block_type == "tool_use":
+            call_id = str(block.get("id") or "call_%d" % index)
+            arguments = block.get("input")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments or {}, ensure_ascii=False)
+            items.append({
+                "type": "function_call",
+                "id": "fc_%s" % call_id,
+                "call_id": call_id,
+                "name": str(block.get("name") or ""),
+                "arguments": arguments,
+                "status": "completed",
+            })
+    text = "\n".join(text_chunks)
+    if text or not items:
+        items.insert(0, _message_item(text))
+    return items, model
+
+
 def _message_item(text):
     return {
         "type": "message",
@@ -255,16 +429,19 @@ def _message_item(text):
     }
 
 
-def _responses_object(response_request, chat_response):
-    output, model = _output_items_from_chat(chat_response, response_request.get("model"))
+def _responses_object(response_request, upstream_response, payload_format):
+    if payload_format == "anthropic_messages":
+        output, model = _output_items_from_anthropic(upstream_response, response_request.get("model"))
+    else:
+        output, model = _output_items_from_chat(upstream_response, response_request.get("model"))
     return {
-        "id": str(chat_response.get("id") or "resp_%d" % int(time.time() * 1000)),
+        "id": str(upstream_response.get("id") or "resp_%d" % int(time.time() * 1000)),
         "object": "response",
-        "created_at": int(chat_response.get("created") or _now()),
+        "created_at": int(upstream_response.get("created") or _now()),
         "status": "completed",
         "model": model,
         "output": output,
-        "usage": _response_usage(chat_response.get("usage")),
+        "usage": _response_usage(upstream_response.get("usage")),
     }
 
 
@@ -348,11 +525,50 @@ def _redacted_error(exc):
     return text
 
 
+def _urlopen_with_network_options(request, timeout, disable_proxy, ip_version):
+    if disable_proxy:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        open_url = opener.open
+    else:
+        open_url = urllib.request.urlopen
+
+    family = None
+    if str(ip_version or "").strip() == "4":
+        family = socket.AF_INET
+    elif str(ip_version or "").strip() == "6":
+        family = socket.AF_INET6
+    if family is None:
+        return open_url(request, timeout=timeout)
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(host, port, family_arg=0, type_arg=0, proto_arg=0, flags_arg=0):
+        infos = original_getaddrinfo(host, port, family_arg, type_arg, proto_arg, flags_arg)
+        filtered = [info for info in infos if info[0] == family]
+        return filtered or infos
+
+    # urllib has no per-request IP-family option. Serialize this short monkey
+    # patch so a bridge request can force the ModelHub endpoint onto IPv6.
+    with _DNS_RESOLVE_LOCK:
+        socket.getaddrinfo = getaddrinfo
+        try:
+            return open_url(request, timeout=timeout)
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
+
+
 def _call_upstream(server, response_request):
     max_tokens = int(response_request.get("max_output_tokens") or server.max_tokens)
-    payload = _chat_payload(response_request, max_tokens)
     target_url = _expand_env(server.target_url)
+    payload_format = _payload_format(target_url, server.payload_format)
+    if payload_format == "anthropic_messages":
+        payload = _anthropic_payload(response_request, max_tokens)
+    else:
+        payload = _chat_payload(response_request, max_tokens)
     headers = {"Content-Type": "application/json"}
+    if server.caller:
+        headers["caller"] = server.caller
+        headers["X-Caller"] = server.caller
     if server.api_key_env and os.environ.get(server.api_key_env) and "ak=" not in target_url:
         headers["Authorization"] = "Bearer %s" % os.environ[server.api_key_env]
     request = urllib.request.Request(
@@ -361,9 +577,14 @@ def _call_upstream(server, response_request):
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=server.timeout_seconds) as response:
+    with _urlopen_with_network_options(
+        request,
+        timeout=server.timeout_seconds,
+        disable_proxy=server.disable_proxy,
+        ip_version=server.ip_version,
+    ) as response:
         body = response.read()
-    return json.loads(body.decode("utf-8"))
+    return payload_format, json.loads(body.decode("utf-8"))
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -385,8 +606,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("content-length") or "0")
             response_request = json.loads(self.rfile.read(length).decode("utf-8"))
-            chat_response = _call_upstream(self.server, response_request)
-            response = _responses_object(response_request, chat_response)
+            payload_format, upstream_response = _call_upstream(self.server, response_request)
+            response = _responses_object(response_request, upstream_response, payload_format)
             if response_request.get("stream") is False:
                 self._send_json(response)
                 return
@@ -433,6 +654,10 @@ def main(argv=None):
     parser.add_argument("--port-file")
     parser.add_argument("--target-url", required=True)
     parser.add_argument("--api-key-env", default="")
+    parser.add_argument("--payload-format", default="auto")
+    parser.add_argument("--caller", default="")
+    parser.add_argument("--disable-proxy", action="store_true")
+    parser.add_argument("--ip-version", choices=("auto", "4", "6"), default="auto")
     parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--log-file", default="")
@@ -441,6 +666,10 @@ def main(argv=None):
     server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
     server.target_url = args.target_url
     server.api_key_env = args.api_key_env
+    server.payload_format = args.payload_format
+    server.caller = args.caller
+    server.disable_proxy = args.disable_proxy
+    server.ip_version = args.ip_version
     server.max_tokens = args.max_tokens
     server.timeout_seconds = args.timeout_seconds
     server.log_file = args.log_file

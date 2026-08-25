@@ -21,11 +21,14 @@ Run a reward-framework batch with:
 ```bash
 python -m reward_framework.run_harness \
   --harness openhands \
-  --model gpt-5.4-mini-2026-03-17 \
+  --model-route gpt-5.4-mini \
   --run-id reward-smoke \
   --sample-selector valid_gt_arvo \
   --parallel 1
 ```
+
+
+Model/provider settings are shared with baseline PoC generation through `model_router/`. Prefer `--model-route`; direct model/provider flags are kept for explicit overrides.
 
 Use `--sample-selector valid_gt`, `valid_gt_arvo`, or `valid_gt_non_arvo` to
 read `gt_results/valid_gt.json`, or pass explicit `--sample` /

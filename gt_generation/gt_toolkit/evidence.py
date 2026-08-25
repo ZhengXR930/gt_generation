@@ -28,7 +28,7 @@ COMMITMENT_FILES = (
 
 OPTIONAL_COMMITMENT_FILES = (
     "assertion_reward_spec.json",
-    "context_trace.json",
+    "context_gt.json",
     "runtime_build.json",
     "runtime_materials.json",
     "portability_report.json",

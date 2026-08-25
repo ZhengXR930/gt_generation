@@ -135,9 +135,8 @@ def _run_build_sh(
     build_as_root: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    if build_as_root:
-        env["GT_BUILD_AS_ROOT"] = "1"
-        inner = "git config --global --add safe.directory /gt/_work/src && " + inner
+    env["GT_BUILD_AS_ROOT"] = "1"
+    inner = "git config --global --add safe.directory /gt/_work/src && " + inner
     return subprocess.run(
         [str(result_dir / "build.sh"), inner],
         cwd=result_dir,

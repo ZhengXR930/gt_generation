@@ -10,7 +10,7 @@ Subcommands:
   audit-package  Validate a completed GT result directory and all evidence references.
   bind-evidence  Commit the final GT and evidence files by content hash.
   macro-aliases  Add per-sample constant macro aliases to field_bindings.json.
-  context       Collect PoC execution context as context_trace.json.
+  context       Collect PoC execution context as context_gt.json.
   compact-result Remove generation-only files from a validated result directory.
   hydrate-runtime Restore compact non-ARVO runtime material before local testing.
   build-runtime Hydrate and rebuild non-ARVO runtime artifacts from recipe.

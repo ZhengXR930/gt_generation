@@ -109,21 +109,21 @@ def test_context_from_events_records_project_frames_in_execution_order(tmp_path)
     assert context[0]["code"] == "int main(void) { return parse(); }"
 
 
-def test_context_trace_errors_reject_empty_or_malformed_context(tmp_path):
+def test_context_gt_errors_reject_empty_or_malformed_context(tmp_path):
     valid = {
-        "schema_version": "gt-context-trace-v1",
+        "schema_version": "gt-context-v1",
         "sample_id": tmp_path.name,
         "collection": {},
         "context": [{"file": "src/parser.c", "function": "parse", "line": 12}],
     }
-    assert context_trace.context_trace_errors(tmp_path, valid) == []
+    assert context_trace.context_gt_errors(tmp_path, valid) == []
 
     invalid = json.loads(json.dumps(valid))
     invalid["context"] = [{"file": "src/parser.c", "function": "", "line": 0}]
 
-    errors = context_trace.context_trace_errors(tmp_path, invalid)
-    assert "context_trace.json context[0] missing function" in errors
-    assert "context_trace.json context[0] missing positive line" in errors
+    errors = context_trace.context_gt_errors(tmp_path, invalid)
+    assert "context_gt.json context[0] missing function" in errors
+    assert "context_gt.json context[0] missing positive line" in errors
 
 
 def test_split_command_env_keeps_gdb_argv_executable_first():

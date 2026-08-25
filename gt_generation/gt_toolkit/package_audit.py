@@ -15,7 +15,7 @@ from .assertions import (
     validate_frozen_spec,
     validate_invariant_bindings,
 )
-from .context_trace import context_trace_errors
+from .context_trace import context_gt_errors
 from .evidence import commitment_errors
 from .prepare import RUNTIME_ARCHIVE_NAMES, RUNTIME_BUILD_RECIPE_NAME
 from .validate import harness_location_reason, validate_data
@@ -37,7 +37,7 @@ REQUIRED_FILES = (
 
 OPTIONAL_PROJECTION_FILES = (
     "assertion_reward_spec.json",
-    "context_trace.json",
+    "context_gt.json",
     "runtime_build.json",
     "runtime_materials.json",
     "portability_report.json",
@@ -506,9 +506,9 @@ def audit_package(result_dir: Path) -> dict[str, Any]:
             errors.append("evidence_commitment.json sample_id does not match package")
         errors.extend(commitment_errors(result_dir, commitment))
 
-    context_trace = documents.get("context_trace.json")
-    if context_trace is not None:
-        errors.extend(context_trace_errors(result_dir, context_trace))
+    context_gt = documents.get("context_gt.json")
+    if context_gt is not None:
+        errors.extend(context_gt_errors(result_dir, context_gt))
 
     return {
         "result_dir": str(result_dir),

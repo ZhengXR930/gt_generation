@@ -18,8 +18,18 @@
 export USERCC=$CC
 export HOST_CC=$CC
 export NOLTO=1
+export CFLAGS="${CFLAGS:-} -Wno-error=implicit-function-declaration -Wno-implicit-function-declaration"
+mkdir -p subprojects
+if [ ! -f subprojects/qjs/quickjs.c ]; then
+  git clone --quiet https://github.com/quickjs-ng/quickjs subprojects/qjs
+  git -C subprojects/qjs checkout --quiet df44d662912c8999ae4cf6926500b33e03b53589
+fi
 
+if [ -f subprojects/sdb.mk ]; then
+  sed -i 's#^[[:space:]]*cd sdb .*git checkout$#	git -C sdb checkout FETCH_HEAD#' subprojects/sdb.mk
+fi
 sed 's/gcc-ar/llvm-ar/g' -i sys/static.sh
+sed -i '/[$][{]MAKE[}] install DESTDIR=/a exit 0' sys/static.sh
 sys/static.sh || true
 cp -r r2-static $OUT/
 

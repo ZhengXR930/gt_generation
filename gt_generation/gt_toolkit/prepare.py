@@ -1374,7 +1374,7 @@ _HYDRATE_PRESERVED_FILES = (
     "generation_provenance.json",
     "generation_timing.json",
     "reachability_report.json",
-    "context_trace.json",
+    "context_gt.json",
     "default_crash_trace.txt",
     "sanitizer_trace.txt",
     "reproduction_report.json",

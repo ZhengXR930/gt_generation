@@ -16,6 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from harness_runtime.failure_artifact import write_failure_artifact
+from model_router import resolve_model_route
 from reward_framework.adapters import HARNESSES, RewardRequest, build_command
 from reward_framework.adapters.base import DEFAULT_RUNS_ROOT, DEFAULT_SKILL_PACKET
 
@@ -146,22 +148,35 @@ def build_request(
     run_dir: Path,
     sample_id: str,
 ) -> RewardRequest:
-    model = str(_config_value(args, config, "model"))
+    harness = str(_config_value(args, config, "harness", "openhands"))
+    route = resolve_model_route(
+        surface="reward_framework",
+        harness=harness,
+        model_route=str(_config_value(args, config, "model_route", "")),
+        model=str(_config_value(args, config, "model", "")),
+        base_url=str(_config_value(args, config, "base_url", "")),
+        api_key_env=str(_config_value(args, config, "api_key_env", "")),
+        api_version=str(_config_value(args, config, "api_version", "")),
+    )
+    if not route.model:
+        raise ValueError("model or model_route is required")
     skill_packet = Path(
         str(_config_value(args, config, "skill_packet", str(DEFAULT_SKILL_PACKET)))
     ).expanduser().resolve()
     results_dir = run_dir / "results"
     max_effective = _config_value(args, config, "max_effective_submits")
+    extra_args = [str(item) for item in config.get("extra_args", [])]
+    extra_args.extend(route.extra_args)
     return RewardRequest(
-        harness=str(_config_value(args, config, "harness", "openhands")),
+        harness=harness,
         sample_id=sample_id,
-        model=model,
+        model=route.model,
         run_id=run_id,
         results_dir=results_dir,
         skill_packet=skill_packet,
-        base_url=str(_config_value(args, config, "base_url", "")),
-        api_key_env=str(_config_value(args, config, "api_key_env", "")),
-        api_version=str(_config_value(args, config, "api_version", "")),
+        base_url=route.base_url,
+        api_key_env=route.api_key_env,
+        api_version=route.api_version,
         max_iter=int(_config_value(args, config, "max_iter", 100)),
         max_attempts=int(
             config.get("generation_attempts")
@@ -181,7 +196,7 @@ def build_request(
         ),
         reasoning_effort=str(_config_value(args, config, "reasoning_effort", "max")),
         max_output_tokens=int(_config_value(args, config, "max_output_tokens", 4096)),
-        extra_args=tuple(str(item) for item in config.get("extra_args", [])),
+        extra_args=tuple(extra_args),
     )
 
 
@@ -193,10 +208,8 @@ def run_one(
     run_dir: Path,
     sample_id: str,
 ) -> dict[str, Any]:
+    started = time.monotonic()
     request = build_request(args, config, run_id=run_id, run_dir=run_dir, sample_id=sample_id)
-    if not request.skill_packet.is_dir():
-        raise FileNotFoundError(f"skill packet not found: {request.skill_packet}")
-    command = build_command(request)
     sample_dir = request.results_dir / sample_id
     if sample_dir.exists() and not args.overwrite and result_is_complete(sample_dir):
         record: dict[str, Any] = {
@@ -209,6 +222,80 @@ def run_one(
                 config, run_id=run_id, sample_id=sample_id, sample_dir=sample_dir
             )
         return record
+    if not request.skill_packet.is_dir():
+        error = f"FileNotFoundError: skill packet not found: {request.skill_packet}"
+        if args.dry_run:
+            return {
+                "sample": sample_id,
+                "status": "failed",
+                "returncode": None,
+                "seconds": round(time.monotonic() - started, 1),
+                "results_dir": str(sample_dir),
+                "error": error,
+            }
+        write_failure_artifact(
+            sample_dir,
+            sample_id=sample_id,
+            harness=request.harness,
+            model=request.model,
+            framework="reward_framework",
+            status="error",
+            stop_reason="skill_packet_missing",
+            error=error,
+            seconds=round(time.monotonic() - started, 1),
+            extra={
+                "run_id": run_id,
+                "results_dir": str(sample_dir),
+                "skill_packet": str(request.skill_packet),
+            },
+            overwrite_manifest=True,
+        )
+        return {
+            "sample": sample_id,
+            "status": "failed",
+            "returncode": None,
+            "seconds": round(time.monotonic() - started, 1),
+            "results_dir": str(sample_dir),
+            "error": error,
+        }
+    try:
+        command = build_command(request)
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+        if args.dry_run:
+            return {
+                "sample": sample_id,
+                "status": "failed",
+                "returncode": None,
+                "seconds": round(time.monotonic() - started, 1),
+                "results_dir": str(sample_dir),
+                "error": error,
+            }
+        write_failure_artifact(
+            sample_dir,
+            sample_id=sample_id,
+            harness=request.harness,
+            model=request.model,
+            framework="reward_framework",
+            status="error",
+            stop_reason="build_command_failed",
+            error=error,
+            seconds=round(time.monotonic() - started, 1),
+            extra={
+                "run_id": run_id,
+                "results_dir": str(sample_dir),
+                "skill_packet": str(request.skill_packet),
+            },
+            overwrite_manifest=True,
+        )
+        return {
+            "sample": sample_id,
+            "status": "failed",
+            "returncode": None,
+            "seconds": round(time.monotonic() - started, 1),
+            "results_dir": str(sample_dir),
+            "error": error,
+        }
     if args.dry_run:
         return {"sample": sample_id, "status": "planned", "command": command.redacted()}
 
@@ -216,32 +303,132 @@ def run_one(
     logs_dir.mkdir(parents=True, exist_ok=True)
     request.results_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"{sample_id}.log"
-    started = time.monotonic()
+    proc: subprocess.CompletedProcess[str] | None = None
+    run_error: str | None = None
     with log_path.open("w", encoding="utf-8") as log:
         log.write("COMMAND " + json.dumps(command.redacted(), ensure_ascii=False) + "\n")
         log.flush()
-        proc = subprocess.run(
-            command.command,
-            cwd=command.cwd,
-            env=dict(command.env),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                command.command,
+                cwd=command.cwd,
+                env=dict(command.env),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            run_error = f"{type(exc).__name__}: {exc}"
+            log.write(f"\n[batch-runner] adapter launch failed: {run_error}\n")
     record = {
         "sample": sample_id,
-        "status": "complete" if proc.returncode == 0 else "failed",
-        "returncode": proc.returncode,
+        "status": "complete" if proc is not None and proc.returncode == 0 else "failed",
+        "returncode": proc.returncode if proc is not None else None,
         "seconds": round(time.monotonic() - started, 1),
         "results_dir": str(sample_dir),
         "log": str(log_path),
     }
-    if proc.returncode == 0:
+    if run_error:
+        record["error"] = run_error
+    has_sample_artifact = (
+        (sample_dir / "manifest.json").is_file()
+        and (sample_dir / "checkpoint").is_dir()
+    )
+    if proc is not None and proc.returncode == 0 and has_sample_artifact:
         record["reachability"] = maybe_run_reachability(
             config, run_id=run_id, sample_id=sample_id, sample_dir=sample_dir
         )
+    else:
+        if proc is not None and proc.returncode == 0:
+            record["status"] = "failed"
+            record["error"] = "adapter returned 0 without manifest/checkpoint"
+        if not has_sample_artifact:
+            checkpoint_files = {}
+            partial_manifest = sample_dir / "manifest.json"
+            if partial_manifest.is_file():
+                checkpoint_files["partial_manifest.json"] = partial_manifest
+            write_failure_artifact(
+                sample_dir,
+                sample_id=sample_id,
+                harness=request.harness,
+                model=request.model,
+                framework="reward_framework",
+                status="error",
+                stop_reason=(
+                    "adapter_launch_failed"
+                    if proc is None
+                    else (
+                        "adapter_returned_zero_without_sample_artifact"
+                        if proc.returncode == 0
+                        else "adapter_returned_nonzero_without_manifest"
+                    )
+                ),
+                error=(
+                    run_error
+                    or (
+                        "adapter returned 0 without manifest/checkpoint"
+                        if proc is not None and proc.returncode == 0
+                        else f"adapter exited with returncode {proc.returncode}"
+                    )
+                ),
+                returncode=proc.returncode if proc is not None else None,
+                seconds=record["seconds"],
+                command=command.redacted(),
+                log_path=log_path,
+                checkpoint_files=checkpoint_files,
+                extra={
+                    "run_id": run_id,
+                    "results_dir": str(sample_dir),
+                    "skill_packet": str(request.skill_packet),
+                },
+                overwrite_manifest=True,
+            )
     return record
+
+
+def record_unhandled_sample_failure(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    *,
+    run_id: str,
+    run_dir: Path,
+    sample_id: str,
+    exc: BaseException,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    harness = str(_config_value(args, config, "harness", "unknown") or "unknown")
+    model = str(_config_value(args, config, "model", "") or "")
+    sample_dir = run_dir / "results" / sample_id
+    skill_packet = Path(
+        str(_config_value(args, config, "skill_packet", str(DEFAULT_SKILL_PACKET)))
+    ).expanduser().resolve()
+    error = f"{type(exc).__name__}: {exc}"
+    write_failure_artifact(
+        sample_dir,
+        sample_id=sample_id,
+        harness=harness,
+        model=model,
+        framework="reward_framework",
+        status="error",
+        stop_reason="batch_runner_exception",
+        error=error,
+        seconds=round(time.monotonic() - started, 1),
+        extra={
+            "run_id": run_id,
+            "results_dir": str(sample_dir),
+            "skill_packet": str(skill_packet),
+        },
+        overwrite_manifest=True,
+    )
+    return {
+        "sample": sample_id,
+        "status": "failed",
+        "returncode": None,
+        "seconds": round(time.monotonic() - started, 1),
+        "results_dir": str(sample_dir),
+        "error": error,
+    }
 
 
 def write_run_manifest(
@@ -266,6 +453,7 @@ def write_run_manifest(
         "logs_dir": str(run_dir / "logs"),
         "config_path": str(config_path) if config_path else None,
         "model": _config_value(args, config, "model"),
+        "model_route": _config_value(args, config, "model_route", ""),
         "base_url_configured": bool(_config_value(args, config, "base_url", "")),
         "api_key_env": _config_value(args, config, "api_key_env", ""),
         "skill_packet": str(skill_packet),
@@ -297,6 +485,7 @@ def main() -> int:
     parser.add_argument("--skill-packet")
     parser.add_argument("--harness", choices=HARNESSES)
     parser.add_argument("--model")
+    parser.add_argument("--model-route")
     parser.add_argument("--base-url")
     parser.add_argument("--api-key-env")
     parser.add_argument("--api-version")
@@ -343,7 +532,18 @@ def main() -> int:
         }
         with status_path.open("a", encoding="utf-8") as status_file:
             for future in as_completed(futures):
-                record = future.result()
+                sample = futures[future]
+                try:
+                    record = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    record = record_unhandled_sample_failure(
+                        args,
+                        config,
+                        run_id=run_id,
+                        run_dir=run_dir,
+                        sample_id=sample,
+                        exc=exc,
+                    )
                 counts[record["status"]] = counts.get(record["status"], 0) + 1
                 line = json.dumps(record, ensure_ascii=False)
                 print(line, flush=True)

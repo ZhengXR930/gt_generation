@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export SRC="${SRC:-/gt/_work}"
+export OUT="${OUT:-/gt/_out}"
+export WORK="${WORK:-/gt/_work}"
+export PATH="${HOME:-/tmp}/.cargo/bin:$PATH"
+export PIP_BREAK_SYSTEM_PACKAGES="${PIP_BREAK_SYSTEM_PACKAGES:-1}"
+export CC="${CC:-clang}"
+export CXX="${CXX:-clang++}"
+export CFLAGS="${CFLAGS:--O1 -fno-omit-frame-pointer -gline-tables-only -fsanitize=address}"
+export CXXFLAGS="${CXXFLAGS:--O1 -fno-omit-frame-pointer -gline-tables-only -fsanitize=address}"
+export SANITIZER="${SANITIZER:-address}"
+export FUZZING_ENGINE="${FUZZING_ENGINE:-libfuzzer}"
+export ARCHITECTURE="${ARCHITECTURE:-x86_64}"
+export LIB_FUZZING_ENGINE="${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}"
+export FUZZER_LIB="${FUZZER_LIB:-$LIB_FUZZING_ENGINE}"
+
+if [[ ! -e /usr/lib/libFuzzingEngine.a ]]; then
+  _gt_fuzzer_lib="$(find /usr/lib /usr/local/lib -path "*/lib/clang/*/lib/linux/libclang_rt.fuzzer_no_main-x86_64.a" -print -quit 2>/dev/null || true)"
+  if [[ -n "$_gt_fuzzer_lib" ]]; then ln -sf "$_gt_fuzzer_lib" /usr/lib/libFuzzingEngine.a 2>/dev/null || true; fi
+  unset _gt_fuzzer_lib
+fi
+if ! ldconfig -p 2>/dev/null | grep -q "libc++\.so" && [[ ! -e /usr/lib/x86_64-linux-gnu/libc++.so ]]; then
+  _gt_stdlib="$(ldconfig -p 2>/dev/null | awk '/libstdc\+\+\.so/{print $NF; exit}')"
+  if [[ -n "$_gt_stdlib" ]]; then ln -sf "$_gt_stdlib" /usr/lib/x86_64-linux-gnu/libc++.so 2>/dev/null || true; fi
+  unset _gt_stdlib
+fi
+
+# Recreate the official OSS-Fuzz /src layout from prepared local material.
+mkdir -p "$SRC" "$OUT" "$WORK"
+if [[ -d /gt/_work/src ]]; then
+  if [[ ! -e "$SRC/php" ]]; then ln -s /gt/_work/src "$SRC/php"; fi
+  if [[ ! -e /gt/_work/php ]]; then ln -s /gt/_work/src /gt/_work/php; fi
+fi
+if [[ ! -e /gt/_work/php-src && -d /gt/_work/src ]]; then
+  ln -s /gt/_work/src /gt/_work/php-src
+fi
+if [[ -d /gt/oss_fuzz_src ]]; then
+  cp -a -n /gt/oss_fuzz_src/. "$SRC"/
+fi
+
+# Make official dependency scripts retry-safe in the persistent /gt/_work.
+_gt_real_git() { command git "$@"; }
+git() {
+  if [[ "${1:-}" == "clone" ]]; then
+    local _gt_url="" _gt_dest="" _gt_i
+    local _gt_args=("$@")
+    for ((_gt_i=1; _gt_i<${#_gt_args[@]}; _gt_i++)); do
+      case "${_gt_args[$_gt_i]}" in
+        --branch|--depth|--filter|--origin|--reference|--template|--upload-pack|--config|--separate-git-dir|--jobs)
+          ((_gt_i++)) || true
+          ;;
+        http://*|https://*|git@*|*.git)
+          _gt_url="${_gt_args[$_gt_i]}"
+          if (( _gt_i + 1 < ${#_gt_args[@]} )) && [[ "${_gt_args[$((_gt_i+1))]}" != -* ]]; then
+            _gt_dest="${_gt_args[$((_gt_i+1))]}"
+          fi
+          ;;
+      esac
+    done
+    if [[ -z "$_gt_dest" && -n "$_gt_url" ]]; then
+      _gt_dest="${_gt_url##*/}"
+      _gt_dest="${_gt_dest%.git}"
+    fi
+    if [[ -n "$_gt_dest" ]]; then
+      local _gt_dest_path="$_gt_dest"
+      [[ "$_gt_dest_path" = /* ]] || _gt_dest_path="$PWD/$_gt_dest_path"
+      if [[ -e "$_gt_dest_path" ]] && [[ -n "$(find "$_gt_dest_path" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+        echo "Using staged dependency at $_gt_dest_path instead of cloning $_gt_url" >&2
+        return 0
+      fi
+    fi
+  fi
+  _gt_real_git "$@"
+}
+export -f git _gt_real_git
+
+# Dockerfile ENV instructions required by the official build.
+# No Dockerfile ENV instructions.
+
+# Dockerfile COPY/ADD instructions for project-local helper scripts.
+if [[ -e /gt/oss_fuzz_project/build.sh ]]; then mkdir -p /gt/_work; cp -a /gt/oss_fuzz_project/build.sh /gt/_work/; fi
+shopt -s nullglob; _gt_copy_matches=(/gt/oss_fuzz_project/*.options); if (( ${#_gt_copy_matches[@]} )); then mkdir -p /gt/_work; cp -a "${_gt_copy_matches[@]}" /gt/_work/; fi; unset _gt_copy_matches
+
+# Official non-clone RUN commands from projects/php/Dockerfile.
+cd "$SRC"
+# No extra RUN setup commands; layout only.

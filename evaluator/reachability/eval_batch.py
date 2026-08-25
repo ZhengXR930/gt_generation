@@ -8,11 +8,11 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
-from reachability.arvo_gdb import prepare_arvo_target, run_arvo_gdb
-from reachability.core import evaluate_r1_r5
-from reachability.engine import extract_reachability_checkpoints, parse_sanitizer_trace
-from reachability.local_gdb import run_local_gdb
-from reachability.runtime_spec import (
+from evaluator.reachability.arvo_gdb import prepare_arvo_target, run_arvo_gdb
+from evaluator.reachability.core import evaluate_r1_r5
+from evaluator.reachability.engine import extract_reachability_checkpoints, parse_sanitizer_trace
+from evaluator.reachability.local_gdb import run_local_gdb
+from evaluator.reachability.runtime_spec import (
     RuntimeSpecError,
     apply_checkpoint_lines_to_gt,
     compile_runtime_spec,

@@ -359,7 +359,7 @@ def _copy_tree(source: Path, destination: Path) -> None:
         destination.mkdir()
 
 
-def _write_pre_finalization_checkpoint(controller: Any) -> Path | None:
+def _write_pre_finalization_checkpoint(controller: Any, trigger: str | None = None) -> Path | None:
     raw = os.environ.get("OPENHANDS_PRE_FINALIZATION_CHECKPOINT", "").strip()
     if not raw:
         return None
@@ -399,6 +399,7 @@ def _write_pre_finalization_checkpoint(controller: Any) -> Path | None:
             json.dumps(
                 {
                     "phase": "pre_analysis_artifact_finalization",
+                    "trigger": trigger,
                     "iteration": controller.state.iteration,
                     "max_iterations": controller.state.max_iterations,
                 },
@@ -421,7 +422,7 @@ def _start_finalization(controller: Any, trigger: str) -> bool:
     if current and current.get("status") in {"answering", "completed"}:
         return False
 
-    checkpoint = _write_pre_finalization_checkpoint(controller)
+    checkpoint = _write_pre_finalization_checkpoint(controller, trigger)
     controller._pending_action = None
     if hasattr(controller.agent, "pending_actions"):
         controller.agent.pending_actions.clear()
@@ -728,6 +729,27 @@ def install_fine_trace_overlay() -> None:
         submitted = _submitted_trace()
         if submitted is not None:
             await _persist_trace(controller, submitted, "last_poc_submission")
+            return
+        if not _is_finalizing(controller) and not _at_or_past_iteration_limit(controller):
+            count = int(
+                controller.state.extra_data.get(_premature_finish_key()) or 0
+            ) + 1
+            controller.state.extra_data[_premature_finish_key()] = count
+            controller.event_stream.add_event(
+                MessageAction(
+                    content=(
+                        "The benchmark has not recorded any submit.sh attempt yet. "
+                        "Do not finish or provide an analysis-only final answer. "
+                        "Continue with tool use. If no candidate seems promising, "
+                        "create the smallest diagnostic input from your current "
+                        "taken-path hypothesis, write /workspace/analysis.json for "
+                        "that exact input, and run: cd /workspace && bash submit.sh "
+                        "<candidate> /workspace/analysis.json."
+                    ),
+                    wait_for_response=False,
+                ),
+                EventSource.USER,
+            )
             return
         response = action.final_thought or action.thought or json.dumps(
             action.outputs, ensure_ascii=False

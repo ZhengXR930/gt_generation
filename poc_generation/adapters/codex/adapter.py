@@ -12,14 +12,13 @@ NAME = "codex"
 
 
 def build_command(request: Request) -> Command:
-    if not request.is_arvo:
-        raise ValueError("Codex non-ARVO execution is not implemented by harness_runtime")
+    sample_args = arvo_args(request) if request.is_arvo else ["--sample-id", request.sample_id]
     args = [
         runner_python(),
         str(CLI_RUNNER),
         "--harness",
         NAME,
-        *arvo_args(request),
+        *sample_args,
         *common_args(request),
         *request.extra_args,
     ]

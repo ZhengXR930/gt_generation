@@ -35,6 +35,10 @@ from typing import Any
 CODE_ROOT = Path(__file__).resolve().parent          # gt_generation/
 REPO_ROOT = CODE_ROOT.parent                          # repo root
 RUNNER = CODE_ROOT / "runner.py"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from model_router import resolve_model_route  # noqa: E402
 
 # cli name -> adapter script honoring runner.py's GT_AGENT_COMMAND contract
 # (--role-file / --sample / --result-dir).
@@ -72,9 +76,20 @@ def load_config(path: Path) -> dict[str, Any]:
     if not adapter.is_file():
         raise SystemExit(f"adapter for cli {cli!r} not found: {adapter}")
 
-    model = str(raw.get("model") or "").strip()
+    model_route_id = str(raw.get("model_route") or "").strip()
+    requested_model = str(raw.get("model") or "").strip()
+    try:
+        route = resolve_model_route(
+            surface="gt_generation",
+            harness=cli,
+            model_route=model_route_id,
+            model=requested_model,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    model = route.model
     if not model:
-        raise SystemExit("config.model is required (one model id for every stage)")
+        raise SystemExit("config.model or config.model_route is required (one model route/id for every stage)")
 
     reasoning_effort = str(raw.get("reasoning_effort") or "high").strip().lower()
     if cli == "codex" and reasoning_effort not in CODEX_REASONING_EFFORTS:
@@ -83,7 +98,10 @@ def load_config(path: Path) -> dict[str, Any]:
             f"{sorted(CODEX_REASONING_EFFORTS)} for codex; got {reasoning_effort!r}"
         )
     strict_config = bool(raw.get("strict_config", True))
-    codex_provider = load_codex_provider(raw.get("codex_provider"), cli)
+    provider_raw = raw.get("codex_provider")
+    if provider_raw in (None, {}, "") and route.codex_provider:
+        provider_raw = route.codex_provider
+    codex_provider = load_codex_provider(provider_raw, cli)
 
     repo_docker_image = str(raw.get("repo_docker_image") or "gt-memory-env:latest").strip()
     repo_docker_context = Path(
@@ -145,6 +163,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "cli": cli,
         "adapter": adapter,
         "model": model,
+        "model_route": route.route_id if route.known else model_route_id,
+        "model_route_info": route.public_dict(),
         "reasoning_effort": reasoning_effort,
         "strict_config": strict_config,
         "codex_provider": codex_provider,
@@ -209,6 +229,10 @@ def load_codex_provider(raw: Any, cli: str) -> dict[str, Any]:
         provider["bridge"] = {
             "enabled": True,
             "target_url": target_url,
+            "payload_format": str(bridge.get("payload_format") or "auto").strip(),
+            "caller": str(bridge.get("caller") or "").strip(),
+            "disable_proxy": bool(bridge.get("disable_proxy", False)),
+            "ip_version": str(bridge.get("ip_version") or "auto").strip(),
             "max_tokens": str(int(bridge.get("max_tokens") or 16384)),
             "timeout_seconds": str(int(bridge.get("timeout_seconds") or 600)),
         }
@@ -644,7 +668,7 @@ def publish_stage01_migration(work_dir: Path, published_dir: Path) -> dict[str, 
             }
 
     protected_names = [
-        name for name in (*COMMITMENT_FILES, "context_trace.json")
+        name for name in (*COMMITMENT_FILES, "context_gt.json")
         if (published_dir / name).is_file()
     ]
     protected_hashes = {
@@ -761,6 +785,7 @@ def write_provenance(result_dir: Path, cfg: dict[str, Any], track: str) -> None:
         "generated_at": datetime.now().astimezone().isoformat(),
         "cli": cfg["cli"],
         "model": cfg["model"],
+        "model_route": cfg.get("model_route", ""),
         "reasoning_effort": cfg["reasoning_effort"],
         "strict_config": cfg["strict_config"],
         "adapter": str(adapter),
@@ -856,6 +881,10 @@ def run_one(sample_id: str, sample: dict[str, Any], cfg: dict[str, Any],
             env.update({
                 "GT_CODEX_PROVIDER_BRIDGE": "modelhub_crawl",
                 "GT_CODEX_PROVIDER_BRIDGE_TARGET_URL": bridge["target_url"],
+                "GT_CODEX_PROVIDER_BRIDGE_PAYLOAD_FORMAT": bridge.get("payload_format", "auto"),
+                "GT_CODEX_PROVIDER_BRIDGE_CALLER": bridge.get("caller", ""),
+                "GT_CODEX_PROVIDER_BRIDGE_DISABLE_PROXY": "1" if bridge.get("disable_proxy") else "0",
+                "GT_CODEX_PROVIDER_BRIDGE_IP_VERSION": bridge.get("ip_version", "auto"),
                 "GT_CODEX_PROVIDER_BRIDGE_MAX_TOKENS": bridge["max_tokens"],
                 "GT_CODEX_PROVIDER_BRIDGE_TIMEOUT_SECONDS": bridge["timeout_seconds"],
             })
@@ -966,6 +995,7 @@ def main(argv: list[str] | None = None) -> int:
         "batch": args.batch_name,
         "cli": cfg["cli"],
         "model": cfg["model"],
+        "model_route": cfg.get("model_route", ""),
         "reasoning_effort": cfg["reasoning_effort"],
         "strict_config": cfg["strict_config"],
         "run_mode": cfg["run_mode"],
@@ -1011,6 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
         "batch": args.batch_name,
         "cli": cfg["cli"],
         "model": cfg["model"],
+        "model_route": cfg.get("model_route", ""),
         "codex_provider": (
             {key: value for key, value in cfg["codex_provider"].items() if key != "env_key"}
             if cfg.get("codex_provider") else None

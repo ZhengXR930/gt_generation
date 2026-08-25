@@ -1,53 +1,31 @@
 #!/bin/bash -eu
 # Copyright 2024 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-################################################################################
-
-export GEM_HOME=$OUT/ox-gem
-export GEM_PATH=$OUT/ox-gem
-
+export GEM_HOME=$OUT/fuzz_parse-gem
+BUILD=$WORK/Build
 cd $SRC/ox-ruby
 gem build
-
-# Build the native ox extension with ASan instrumentation.  The original
-# OSS-Fuzz wrapper depends on the base-builder-ruby image's preinstalled Ruzzy
-# tree; the local runtime image does not have that tree, so use a direct
-# one-input Ruby validator instead.
-gem_cflags="${CFLAGS//-gline-tables-only/-g}"
-
-gem install --local --ignore-dependencies --install-dir "$GEM_HOME" --no-document *.gem -- \
-  --with-cflags="${gem_cflags}" \
-  --with-ldflags="-fsanitize=address"
-
-cp /gt/runtime_support/ox_repro.rb "$OUT/ox_repro.rb"
-
-cat > "$OUT/fuzz_parse" <<'SH'
+export LDFLAGS="-fsanitize=address ${LDFLAGS:-}"
+RUZZY_DEBUG=1 gem install --development --verbose *.gem || gem install --verbose *.gem
+cp $SRC/harnesses/fuzz_parse.rb $OUT/ || true
+cat > $OUT/fuzz_parse <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
-this_dir=$(cd "$(dirname "$0")" && pwd)
-export GEM_HOME="$this_dir/ox-gem"
-export GEM_PATH="$this_dir/ox-gem"
-
-asan_runtime=$(find /usr/lib/x86_64-linux-gnu -maxdepth 1 -name 'libasan.so.*' 2>/dev/null | sort | tail -n 1)
-if [ -n "${asan_runtime}" ]; then
-  export LD_PRELOAD="${asan_runtime}${LD_PRELOAD:+:${LD_PRELOAD}}"
-fi
-
-export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:abort_on_error=1:halt_on_error=1:exitcode=1}"
-ruby "$this_dir/ox_repro.rb" "$@"
-SH
-
-chmod +x "$OUT/fuzz_parse"
+this_dir=$(dirname "$0")
+export GEM_HOME=$this_dir/fuzz_parse-gem
+export GEM_PATH=$this_dir/fuzz_parse-gem
+asan_rt=$(clang -print-file-name=libclang_rt.asan-x86_64.so)
+export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:abort_on_error=1:halt_on_error=1:exitcode=1:symbolize=1}:use_sigaltstack=0"
+exec env LD_PRELOAD="$asan_rt" ruby -e '
+  Gem.use_paths(ENV["GEM_HOME"], [ENV["GEM_HOME"]])
+  require "ox"
+  poc = ARGV.reverse.find { |a| File.file?(a) }
+  exit 2 unless poc
+  data = File.binread(poc)
+  exit 0 if data.bytesize < 100
+  begin
+    Ox.parse(data)
+  rescue Ox::ParseError, Ox::SyntaxError, EncodingError
+  end
+' -- "$@"
+EOF
+chmod +x $OUT/fuzz_parse

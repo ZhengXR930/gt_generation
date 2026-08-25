@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import sys
 import time
 import traceback
@@ -26,7 +27,12 @@ sys.path.insert(0, str(GT_ROOT / "evaluator"))
 from reachability.eval_batch import evaluate_model_sample  # noqa: E402
 
 
-DEFAULT_REACHABILITY_LOCK_DIR = Path("/home/xinran/.cache/gt_generation_reachability_locks")
+DEFAULT_REACHABILITY_LOCK_DIR = Path(
+    os.environ.get(
+        "GT_GENERATION_REACHABILITY_LOCK_DIR",
+        str(Path.home() / ".cache" / "gt_generation_reachability_locks"),
+    )
+)
 
 
 def sample_has_reachability_input(sample_result_dir: Path) -> tuple[bool, str]:
