@@ -871,6 +871,7 @@ def _copy_tree_or_file(src: Path, dst: Path) -> None:
             shutil.copytree(
                 src,
                 dst,
+                dirs_exist_ok=True,
                 ignore=shutil.ignore_patterns(
                     ".git", "__pycache__", "*.gcda", "*.gcno"
                 ),
