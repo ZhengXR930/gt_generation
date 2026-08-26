@@ -315,9 +315,15 @@ def runtime_metadata(sample_dir: Path, source: str, spec: dict | None = None) ->
     if spec is not None:
         metadata["image"] = str(spec.get("image") or "gt-memory-env:latest")
         metadata["workdir"] = str(spec.get("workdir") or "/gt/_work/src")
+        metadata["executable"] = str(spec.get("executable") or "")
+        metadata["build_commands"] = [str(item) for item in spec.get("build_commands") or []]
+        metadata["build_workdir"] = str(spec.get("build_workdir") or metadata["workdir"])
     else:
         metadata["image"] = runtime_image_from_build_script(sample_dir)
         metadata["workdir"] = "/gt/_work/src"
+        metadata["executable"] = ""
+        metadata["build_commands"] = []
+        metadata["build_workdir"] = "/gt/_work/src"
     return metadata
 
 
@@ -375,7 +381,21 @@ def command_from_runtime_spec(spec: dict, sample_id: str) -> str:
         str(item).replace("{poc}", "/gt/poc") for item in arguments
     ]
     command = " ".join(env_parts + [shlex.quote(item) for item in argv])
-    if workdir != "/gt/_work/src":
+    build_commands = [str(item) for item in spec.get("build_commands") or []]
+    if build_commands:
+        build_workdir = str(spec.get("build_workdir") or workdir).strip()
+        if not build_workdir.startswith("/gt/"):
+            raise RuntimeError(f"{sample_id} runtime_spec.json has invalid build_workdir")
+        executable_for_guard = executable
+        if not executable_for_guard.startswith("/"):
+            executable_for_guard = f"{workdir.rstrip('/')}/{executable_for_guard}"
+        build_script = " && ".join(f"({cmd})" for cmd in build_commands)
+        command = (
+            f"if [ ! -x {shlex.quote(executable_for_guard)} ]; then "
+            f"cd {shlex.quote(build_workdir)} && {build_script} || exit $?; "
+            f"fi; cd {shlex.quote(workdir)} && {command}"
+        )
+    elif workdir != "/gt/_work/src":
         command = f"cd {shlex.quote(workdir)} && {command}"
     return normalize_submission_command(command)
 
@@ -517,6 +537,7 @@ def check_runtime_readiness(sample_dir: Path) -> dict:
         "runtime_source": runtime.get("source"),
         "runtime_image": runtime.get("image"),
         "runtime_workdir": runtime.get("workdir"),
+        "runtime_build_required": bool(runtime.get("build_commands")),
         "required_images": list(required_images),
     }
 
@@ -865,17 +886,24 @@ PY
     path.chmod(0o755)
 
 
+def _copytree_merge(src: Path, dst: Path) -> None:
+    ignore = shutil.ignore_patterns(".git", "__pycache__", "*.gcda", "*.gcno")
+    ignored = set(ignore(str(src), [item.name for item in src.iterdir()]))
+    dst.mkdir(parents=True, exist_ok=True)
+    for child in src.iterdir():
+        if child.name in ignored:
+            continue
+        target = dst / child.name
+        if child.is_dir():
+            _copytree_merge(child, target)
+        else:
+            shutil.copy2(child, target)
+
+
 def _copy_tree_or_file(src: Path, dst: Path) -> None:
     if src.is_dir():
         try:
-            shutil.copytree(
-                src,
-                dst,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(
-                    ".git", "__pycache__", "*.gcda", "*.gcno"
-                ),
-            )
+            _copytree_merge(src, dst)
         except (PermissionError, shutil.Error):
             shutil.rmtree(dst, ignore_errors=True)
             dst.mkdir(parents=True, exist_ok=True)
@@ -1026,6 +1054,86 @@ def copy_source(sample_dir: Path, workspace: Path, sample_info: dict) -> None:
     os.symlink("../_work/src", repo / "src-vul")
 
 
+def workspace_container_path(workspace: Path, value: str, workdir: str) -> Path:
+    if value.startswith("/gt/"):
+        return workspace / value.removeprefix("/gt/")
+    if value.startswith("/"):
+        raise RuntimeError(f"runtime path is outside /gt: {value}")
+    return (workspace / workdir.removeprefix("/gt/") / value).resolve()
+
+
+def materialize_runtime_binary(workspace: Path, runtime: dict, sample_id: str) -> dict:
+    build_commands = [str(item) for item in runtime.get("build_commands") or []]
+    executable = str(runtime.get("executable") or "")
+    workdir = str(runtime.get("workdir") or "/gt/_work/src")
+    image = str(runtime.get("image") or "gt-memory-env:latest")
+    if not build_commands:
+        return {"required": False, "ran": False}
+    if not executable:
+        raise RuntimeError(f"{sample_id} runtime build requested without executable")
+    executable_host = workspace_container_path(workspace, executable, workdir)
+    if executable_host.is_file() and os.access(executable_host, os.X_OK):
+        return {
+            "required": True,
+            "ran": False,
+            "reused": True,
+            "executable": str(executable_host.relative_to(workspace)),
+        }
+    build_workdir = str(runtime.get("build_workdir") or workdir)
+    if not build_workdir.startswith("/gt/"):
+        raise RuntimeError(f"{sample_id} runtime build_workdir is outside /gt")
+    logs_dir = workspace / ".runtime_build_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    commands_run = 0
+    for index, command in enumerate(build_commands, 1):
+        completed = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--user",
+                "0:0",
+                "-e",
+                "HOME=/tmp",
+                "-v",
+                f"{workspace}:/gt",
+                "-w",
+                build_workdir,
+                image,
+                "bash",
+                "-lc",
+                command,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1800,
+            check=False,
+        )
+        commands_run += 1
+        (logs_dir / f"build_{index}.log").write_text(
+            completed.stdout, encoding="utf-8", errors="replace"
+        )
+        if completed.returncode:
+            raise RuntimeError(
+                f"{sample_id} runtime build command {index} failed with "
+                f"exit {completed.returncode}; see {logs_dir / f'build_{index}.log'}"
+            )
+    if not executable_host.is_file():
+        raise RuntimeError(f"{sample_id} runtime build did not produce {executable_host}")
+    if not os.access(executable_host, os.X_OK):
+        executable_host.chmod(executable_host.stat().st_mode | 0o111)
+    return {
+        "required": True,
+        "ran": True,
+        "commands": commands_run,
+        "executable": str(executable_host.relative_to(workspace)),
+        "log_dir": str(logs_dir.relative_to(workspace)),
+    }
+
+
 def prepare_workspace(sample_id: str, scratch: Path) -> tuple[Path, str, dict]:
     sample_dir = GT_ROOT / "gt_results" / sample_id
     sample_info = load_json(sample_dir / "sample_info.json")
@@ -1041,6 +1149,7 @@ def prepare_workspace(sample_id: str, scratch: Path) -> tuple[Path, str, dict]:
     workspace = scratch / "workspace"
     workspace.mkdir(parents=True)
     copy_source(sample_dir, workspace, sample_info)
+    repro["runtime_build"] = materialize_runtime_binary(workspace, repro, sample_id)
     scrub_agent_visible_public_testcases(workspace)
     (workspace / "description.txt").write_text(
         render_description(sample_id, sample_info), encoding="utf-8"
@@ -1685,7 +1794,7 @@ def main() -> int:
             "workspace_adapter": adapter_metadata,
             "api_key_env": api_key_env,
             "max_iter": args.max_iter,
-            "runtime_readiness": runtime_readiness,
+            "runtime_readiness": {**runtime_readiness, "runtime_build": repro.get("runtime_build")},
             "status": status,
             "agent_action_count": agent_action_count,
             "terminal_finish_observed": terminal_finish_observed,
