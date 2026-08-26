@@ -33,8 +33,9 @@ MODELHUB_OPENAI_CHAT_COMPLETIONS_URL = (
     f"?api-version={MODELHUB_OPENAI_API_VERSION}"
 )
 MODELHUB_MESSAGES_BASE_URL = MODELHUB_OPENROUTER_MESSAGES_BASE_URL
-GLM_OPENAI_BASE_URL = MODELHUB_OPENAI_BASE_URL
 LMUAI_BASE_URL = "https://api.lmuai.com"
+GLM_OPENAI_BASE_URL = f"{LMUAI_BASE_URL}/v1"
+GLM_OPENAI_API_KEY_ENV = "GLM_API_KEY"
 
 # DeepSeek's official endpoint is kept as metadata for auditability. The
 # OpenHands DeepSeek route intentionally does not force base_url, because the
@@ -233,15 +234,15 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             extra_args = ("--provider-kind", "openai_compatible")
         return ModelRoute(
             route_id=canonical,
-            model="glm_5.2",
+            model="glm-5.2",
             base_url=GLM_OPENAI_BASE_URL,
-            api_key_env=MODELHUB_OPENAI_API_KEY_ENV,
+            api_key_env=GLM_OPENAI_API_KEY_ENV,
             api_version=MODELHUB_OPENAI_API_VERSION,
             results_namespace="glm-5.2",
             provider_kind="openai_compatible",
             payload_format="chat_completions",
             extra_args=extra_args,
-            metadata={"crawl_base_url": MODELHUB_OVERSEA_OPENAI_CRAWL_BASE_URL},
+            metadata={"provider_base_url": LMUAI_BASE_URL},
         )
 
     if canonical == "claude-opus-4.6":
@@ -385,7 +386,7 @@ def available_model_routes() -> dict[str, str]:
         "deepseek-v4-flash": "OpenHands and deepseek_harness DeepSeek route; official key env DEEPSEEK_API_KEY.",
         "gpt-5.5": "Oversea ModelHub OpenAI-compatible GPT route; currently sends model gpt-5.4-2026-03-05 while writing gpt-5.5 results; key env OPENAI_API_KEY_oversea.",
         "gpt-5.4-mini": "Oversea ModelHub OpenAI-compatible GPT route; key env OPENAI_API_KEY_oversea.",
-        "glm-5.2": "OpenAI-compatible GLM route using the same oversea GPT base URL and OPENAI_API_KEY_oversea.",
+        "glm-5.2": "OpenAI-compatible GLM route using LMUAI and GLM_API_KEY.",
         "claude-opus-4.6": "Compatibility route: run claude-sonnet-5 through LMUAI while writing opus-4.6 result namespaces.",
         "claude-opus-4.8": "Compatibility route: run claude-sonnet-5 through LMUAI while writing opus-4.8 result namespaces.",
         "gt-codex-gpt-5.4": "gt_generation Codex bridge route to oversea ModelHub OpenAI-compatible GPT; model gpt-5.4-2026-03-05.",

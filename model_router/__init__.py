@@ -2,6 +2,7 @@
 
 from .router import (
     DEEPSEEK_OFFICIAL_BASE_URL,
+    GLM_OPENAI_API_KEY_ENV,
     GLM_OPENAI_BASE_URL,
     LMUAI_BASE_URL,
     MODELHUB_CN_OPENAI_BASE_URL,
@@ -20,6 +21,7 @@ from .router import (
 
 __all__ = [
     "DEEPSEEK_OFFICIAL_BASE_URL",
+    "GLM_OPENAI_API_KEY_ENV",
     "GLM_OPENAI_BASE_URL",
     "LMUAI_BASE_URL",
     "MODELHUB_CN_OPENAI_BASE_URL",

@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from model_router import (
+    GLM_OPENAI_API_KEY_ENV,
+    GLM_OPENAI_BASE_URL,
     MODELHUB_MESSAGES_BASE_URL,
     MODELHUB_OPENAI_API_VERSION,
     MODELHUB_OPENAI_API_KEY_ENV,
@@ -194,10 +196,10 @@ def test_poc_sangfor_glm52_route_uses_openai_compatible_provider():
         "arvo_1",
     )
 
-    assert request.model == "glm_5.2"
-    assert request.api_key_env == MODELHUB_OPENAI_API_KEY_ENV
+    assert request.model == "glm-5.2"
+    assert request.api_key_env == GLM_OPENAI_API_KEY_ENV
     assert request.api_version == MODELHUB_OPENAI_API_VERSION
-    assert request.base_url == MODELHUB_OPENAI_BASE_URL
+    assert request.base_url == GLM_OPENAI_BASE_URL
     assert request.namespace == "sangfor-glm-5.2"
     assert request.extra_args == ("--provider-kind", "openai_compatible")
 
@@ -211,10 +213,10 @@ def test_reward_framework_uses_same_model_route_table(tmp_path):
         sample_id="arvo_1",
     )
 
-    assert request.model == "glm_5.2"
-    assert request.api_key_env == MODELHUB_OPENAI_API_KEY_ENV
+    assert request.model == "glm-5.2"
+    assert request.api_key_env == GLM_OPENAI_API_KEY_ENV
     assert request.api_version == MODELHUB_OPENAI_API_VERSION
-    assert request.base_url == MODELHUB_OPENAI_BASE_URL
+    assert request.base_url == GLM_OPENAI_BASE_URL
     assert request.extra_args == ("--provider-kind", "openai_compatible")
 
 
