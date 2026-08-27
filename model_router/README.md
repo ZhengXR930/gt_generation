@@ -7,9 +7,9 @@ Prefer `model_route` in configs and CLI flags. Direct `model`, `base_url`, `api_
 | route | model passed downstream | provider/key | intended use |
 |---|---|---|---|
 | `deepseek-v4-flash` | `deepseek/deepseek-chat` for OpenHands, `deepseek-v4-flash` for DeepSeek Harness | DeepSeek official, `DEEPSEEK_API_KEY` | OpenHands and DeepSeek Harness |
-| `gpt-5.5` | `gpt-5.4-2026-03-05` | Oversea ModelHub OpenAI-compatible deployment, `OPENAI_API_KEY_oversea` | OpenHands and PoC/reward Codex; writes results under `gpt-5.5` |
+| `gpt-5.5` | `gpt-5.5-2026-04-24` | CN ModelHub OpenAI-compatible deployment, `OPENAI_API_KEY` | OpenHands and PoC/reward Codex; writes results under `gpt-5.5` |
 | `gpt-5.4-mini` | `gpt-5.4-mini-2026-03-17` | Oversea ModelHub OpenAI-compatible deployment, `OPENAI_API_KEY_oversea` | OpenHands and PoC/reward Codex |
-| `glm-5.2` | `glm-5.2` | LMUAI OpenAI-compatible `/v1` deployment, `GLM_API_KEY` | OpenHands and Sangfor AI protocol wrapper |
+| `glm-5.2` | `glm-5.2` | CN ModelHub OpenAI-compatible deployment, `OPENAI_API_KEY` | OpenHands |
 | `claude-opus-4.6` | `claude-sonnet-5` | LMUAI, `ANTHROPIC_AUTH_TOKEN` | Compatibility route: OpenHands writes `claude-opus-4.6`; Claude CLI writes `claudecli-claude-opus-4.6` |
 | `claude-opus-4.8` | `claude-sonnet-5` | LMUAI, `ANTHROPIC_AUTH_TOKEN` | Compatibility route: OpenHands writes `claude-opus-4.8`; Claude CLI writes `claudecli-claude-opus-4.8` |
 | `gt-codex-gpt-5.4` | `gpt-5.4-2026-03-05` | Oversea ModelHub OpenAI-compatible deployment via Codex Responses bridge, `OPENAI_API_KEY_oversea` | `gt_generation` Codex |

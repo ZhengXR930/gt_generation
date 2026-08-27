@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tarfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -112,23 +113,32 @@ def compile_runtime_spec(
     frozen_path = gt_dir / "runtime_spec.json"
     if prefer_frozen and frozen_path.is_file():
         spec = _load_frozen_spec(
-            frozen_path, sample_id, require_artifacts=require_artifacts
+            frozen_path, sample_id, require_artifacts=False
         )
-        return (
-            _unwrap_libtool_executable(spec, gt_dir)
-            if require_artifacts
-            else spec
-        )
+        if not require_artifacts:
+            return spec
+        _hydrate_runtime_archive(gt_dir)
+        spec = _relocate_missing_executable(spec, gt_dir)
+        spec = _unwrap_libtool_executable(spec, gt_dir)
+        if not _runtime_executable_exists(gt_dir, spec):
+            build_runtime_workspace(gt_dir)
+            spec = _relocate_missing_executable(spec, gt_dir)
+            spec = _unwrap_libtool_executable(spec, gt_dir)
+        validate_runtime_spec(spec, gt_dir, require_artifacts=True)
+        return spec
 
     report_path = gt_dir / "reproduction_report.json"
-    if not report_path.is_file():
-        raise RuntimeSpecError("reproduction recipe is missing after GT compaction")
-    report = _load_json(report_path)
-    command = _unwrap_reproduction_command(str(report.get("command") or ""))
+    source = "reproduction_report.json"
+    if report_path.is_file():
+        report = _load_json(report_path)
+        command = _unwrap_reproduction_command(str(report.get("command") or ""))
+    else:
+        source, command = _fallback_runtime_command(gt_dir)
     if not command:
         raise RuntimeSpecError("reproduction report has no command")
     workdir, invocation = _select_invocation(command)
     environment, executable, arguments = _parse_invocation(invocation)
+    workdir, executable = _normalize_gt_workdir_executable(workdir, executable)
     if not any("{poc}" in item for item in arguments):
         raise RuntimeSpecError("runtime invocation does not consume the PoC")
     image = _image_from_build_script(gt_dir / "build.sh")
@@ -141,7 +151,7 @@ def compile_runtime_spec(
         arguments=arguments,
         environment=environment,
         input_placeholder="{poc}",
-        source="reproduction_report.json",
+        source=source,
     )
     if require_artifacts:
         spec = _unwrap_libtool_executable(spec, gt_dir)
@@ -302,10 +312,14 @@ def runtime_spec_inner_command(spec: RuntimeSpec, *, poc_path: str = "/gt/poc") 
                     "bash /gt/runtime_support/ossfuzz_project/build.sh",
                 )
             build_commands.append(command)
+        build_prelude = (
+            "git config --global --add safe.directory /gt/_work/src 2>/dev/null || true; "
+            "git config --global --add safe.directory '*' 2>/dev/null || true"
+        )
         build_script = " && ".join(f"({command})" for command in build_commands)
         build_prefix = (
             f"if [ ! -x {shlex.quote(executable_for_guard)} ]; then "
-            f"cd {shlex.quote(spec.build_workdir)} && {build_script} || exit $?; "
+            f"cd {shlex.quote(spec.build_workdir)} && {build_prelude} && {build_script} || exit $?; "
             "fi; "
         )
     run_env = " ".join(
@@ -388,18 +402,160 @@ def apply_checkpoint_lines_to_gt(
     sink = by_kind.get("sink_line")
     sanitizer = result.get("sanitizer_ground_truth") or {}
     if sink:
+        original_sink_line = _as_int(sink.get("gt_line") or gt.get("sink", {}).get("line"))
         for name in ("crash_location", "runtime_crash_location"):
             location = sanitizer.get(name)
-            if isinstance(location, dict) and _same_source_location(location, sink):
+            if not isinstance(location, dict) or not _same_source_location(location, sink):
+                continue
+            # Only remap sanitizer locations that represented the GT sink line.
+            # Runtime crash locations can be adjacent or more precise than the
+            # abstract sink checkpoint, and overwriting them breaks sanitizer
+            # matching for local-workspace samples.
+            if _as_int(location.get("line")) == original_sink_line:
                 location["line"] = sink.get("line")
     return result
 
+
+
+def _fallback_runtime_command(gt_dir: Path) -> tuple[str, str]:
+    reachability_path = gt_dir / "reachability_report.json"
+    if reachability_path.is_file():
+        report = _load_json(reachability_path)
+        command = report.get("debug_command", {}).get("command")
+        if isinstance(command, list) and "--args" in command:
+            index = command.index("--args")
+            args = [str(item) for item in command[index + 1:]]
+            if args:
+                return "reachability_report.debug_command", " ".join(
+                    shlex.quote(item).replace("/gt/poc", "{poc}") for item in args
+                )
+    gt_path = gt_dir / "ground_truth.json"
+    if gt_path.is_file():
+        payload = _load_json(gt_path)
+        trigger = payload.get("poc", {}).get("trigger")
+        if trigger:
+            return "ground_truth.poc.trigger", _unwrap_reproduction_command(str(trigger))
+    raise RuntimeSpecError("reproduction recipe is missing after GT compaction")
+
+
+def _hydrate_runtime_archive(gt_dir: Path) -> None:
+    if (gt_dir / "_work" / "src").is_dir():
+        return
+    archive = gt_dir / "runtime_work.tar.gz"
+    if not archive.is_file():
+        return
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            target = (gt_dir / member.name).resolve()
+            if not str(target).startswith(str(gt_dir.resolve())):
+                raise RuntimeSpecError(f"runtime archive escapes sample directory: {member.name}")
+        tar.extractall(gt_dir)
+
+
+def build_runtime_workspace(gt_dir: Path) -> dict[str, Any]:
+    commands = _runtime_build_commands(gt_dir)
+    if not commands:
+        return {"prepared": False, "built": False}
+    spec_path = gt_dir / "runtime_spec.json"
+    image = "gt-memory-env:latest"
+    workdir = "/gt/_work/src"
+    if spec_path.is_file():
+        try:
+            spec = _load_frozen_spec(spec_path, gt_dir.name, require_artifacts=False)
+            image = spec.image or image
+            workdir = spec.build_workdir or workdir
+        except RuntimeSpecError:
+            pass
+    script = "set -euo pipefail\n" + "\n".join(commands)
+    subprocess.run(
+        [
+            "docker", "run", "--rm",
+            "-v", f"{gt_dir}:/gt",
+            "-w", workdir,
+            image,
+            "bash", "-lc", script,
+        ],
+        check=True,
+        timeout=1800,
+    )
+    return {"prepared": True, "built": True}
+
+
+def _runtime_executable_exists(gt_dir: Path, spec: RuntimeSpec) -> bool:
+    try:
+        executable = container_path_on_host(gt_dir, spec.executable, spec.workdir)
+    except RuntimeSpecError:
+        return False
+    return executable.is_file() and bool(executable.stat().st_mode & 0o111)
+
+
+def _relocate_missing_executable(spec: RuntimeSpec, gt_dir: Path) -> RuntimeSpec:
+    if spec.backend != "local_workspace" or _runtime_executable_exists(gt_dir, spec):
+        return spec
+    sample_info = _load_optional_json(gt_dir / "sample_info.json")
+    target_name = str(sample_info.get("oss_fuzz_target") or "").strip()
+    if target_name:
+        target = gt_dir / "_out" / target_name
+        if target.is_file() and target.stat().st_mode & 0o111:
+            return replace(
+                spec,
+                executable=f"/gt/_out/{target_name}",
+                source=spec.source + "+oss_fuzz_target",
+            )
+    basename = Path(spec.executable).name
+    if not basename:
+        return spec
+    roots = [gt_dir / "_work" / "src", gt_dir / "_work", gt_dir / "_out"]
+    candidates: list[Path] = []
+    for root in roots:
+        if root.is_dir():
+            candidates.extend(
+                path for path in root.rglob(basename)
+                if path.is_file() and path.stat().st_mode & 0o111
+            )
+    unique = list(dict.fromkeys(path.resolve() for path in candidates))
+    if not unique:
+        return spec
+    workdir_root = (gt_dir / _remove_prefix(spec.workdir, "/gt/")).resolve()
+    workdir_matches = [path for path in unique if _is_relative_to(path, workdir_root)]
+    selected: Path | None = None
+    if len(workdir_matches) == 1:
+        selected = workdir_matches[0]
+    elif len(unique) == 1:
+        selected = unique[0]
+    if selected is None:
+        return spec
+    return replace(
+        spec,
+        executable=f"/gt/{selected.relative_to(gt_dir.resolve()).as_posix()}",
+        source=spec.source + "+basename_relocated",
+    )
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _load_optional_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        return _load_json(path)
+    except RuntimeSpecError:
+        return {}
 
 def _load_frozen_spec(
     path: Path, sample_id: str, *, require_artifacts: bool
 ) -> RuntimeSpec:
     data = _load_json(path)
     try:
+        build_commands = _string_list(data.get("build_commands"))
+        if not build_commands:
+            build_commands = _runtime_build_commands(path.parent)
         spec = RuntimeSpec(
             sample_id=str(data.get("sample_id") or sample_id),
             backend=str(data["backend"]),
@@ -410,7 +566,7 @@ def _load_frozen_spec(
             environment={str(k): str(v) for k, v in data.get("environment", {}).items()},
             input_placeholder=str(data.get("input_placeholder") or "{poc}"),
             source=str(data.get("source") or "runtime_spec.json"),
-            build_commands=_string_list(data.get("build_commands")),
+            build_commands=build_commands,
             build_workdir=str(data.get("build_workdir") or "/gt/_work/src"),
             source_repo=str(data.get("source_repo") or ""),
             source_commit=str(data.get("source_commit") or ""),
@@ -422,6 +578,25 @@ def _load_frozen_spec(
         spec, path.parent, require_artifacts=require_artifacts
     )
     return spec
+
+
+def _runtime_build_commands(gt_dir: Path) -> list[str]:
+    path = gt_dir / "runtime_build.json"
+    if not path.is_file():
+        return []
+    try:
+        payload = _load_json(path)
+    except RuntimeSpecError:
+        return []
+    commands = []
+    for item in payload.get("commands") or []:
+        if isinstance(item, dict):
+            command = str(item.get("command") or "").strip()
+        else:
+            command = str(item).strip()
+        if command:
+            commands.append(command)
+    return commands
 
 
 def _string_list(value: Any) -> list[str]:
@@ -475,6 +650,14 @@ def _select_invocation(command: str) -> tuple[str, str]:
     return workdir, invocation
 
 
+def _normalize_gt_workdir_executable(workdir: str, executable: str) -> tuple[str, str]:
+    if workdir == "/gt" and executable.startswith("./_work/src/"):
+        return "/gt/_work/src", "./" + _remove_prefix(executable, "./_work/src/")
+    if workdir == "/gt" and executable.startswith("/gt/_work/src/"):
+        return "/gt/_work/src", "./" + _remove_prefix(executable, "/gt/_work/src/")
+    return workdir, executable
+
+
 def _parse_invocation(command: str) -> tuple[dict[str, str], str, list[str]]:
     try:
         tokens = shlex.split(command)
@@ -490,6 +673,8 @@ def _parse_invocation(command: str) -> tuple[dict[str, str], str, list[str]]:
     )
     tokens = tokens[:redirection]
     environment: dict[str, str] = {}
+    if tokens and tokens[0] == "env":
+        tokens.pop(0)
     while tokens and "=" in tokens[0]:
         key, value = tokens.pop(0).split("=", 1)
         if not _ENV_NAME.fullmatch(key):

@@ -2,6 +2,7 @@ import json
 import tarfile
 
 from reachability.runtime_spec import (
+    apply_checkpoint_lines_to_gt,
     compile_runtime_spec,
     remap_checkpoints_to_workspace,
 )
@@ -18,6 +19,35 @@ def _base_sample(tmp_path, command):
         json.dumps({"command": command})
     )
     return sample
+
+
+def test_apply_checkpoint_lines_preserves_distinct_runtime_crash_location():
+    gt = {
+        "source": {"line": 10},
+        "root_cause": {"line": 20},
+        "sink": {"file": "src/core/os.c", "function": "os_strftime", "line": 1940},
+        "sanitizer_ground_truth": {
+            "crash_location": {"file": "src/core/os.c", "function": "os_strftime", "line": 1940},
+            "runtime_crash_location": {"file": "src/core/os.c", "function": "os_strftime", "line": 1938},
+        },
+    }
+    checkpoints = [
+        {"kind": "source", "line": 10},
+        {"kind": "root_cause_line", "line": 20},
+        {
+            "kind": "sink_line",
+            "file": "src/core/os.c",
+            "function": "os_strftime",
+            "gt_line": 1940,
+            "line": 1942,
+        },
+    ]
+
+    scoring_gt = apply_checkpoint_lines_to_gt(gt, checkpoints)
+
+    assert scoring_gt["sink"]["line"] == 1942
+    assert scoring_gt["sanitizer_ground_truth"]["crash_location"]["line"] == 1942
+    assert scoring_gt["sanitizer_ground_truth"]["runtime_crash_location"]["line"] == 1938
 
 
 def test_runtime_spec_extracts_only_final_poc_invocation(tmp_path):

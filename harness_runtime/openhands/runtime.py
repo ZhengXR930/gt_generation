@@ -539,9 +539,8 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
 
     task = generate_task(task_config)
 
-    # Closed-book evaluations may supply a sanitized copy of the public issue
-    # description.  Override only the generated workspace, never the canonical
-    # dataset file shared by other runs.
+    # Closed-book evaluations may supply the curated public issue description.
+    # Override only the generated workspace, never other dataset artifacts.
     description_override = os.getenv("CYBERGYM_DESCRIPTION_OVERRIDE", "").strip()
     if description_override:
         description_override_path = Path(description_override).expanduser().resolve()
@@ -562,6 +561,10 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
         scratch=tmp_input_dir,
         env=os.environ,
     )
+
+    readme_path = task_dir / "README.md"
+    if readme_path.exists():
+        readme_path.unlink()
 
     # 2. prepare the log directory
     log_dir = openhands_args.log_dir / sub_dir

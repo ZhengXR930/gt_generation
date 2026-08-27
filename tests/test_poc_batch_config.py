@@ -109,9 +109,18 @@ def test_batch_runner_passes_api_version(tmp_path, monkeypatch):
 
     def fake_run(command, **kwargs):
         captured["command"] = command
+        sample_dir = tmp_path / "test" / "arvo_1"
+        (sample_dir / "checkpoint").mkdir(parents=True)
+        (sample_dir / "manifest.json").write_text(json.dumps({"status": "agent_finished"}))
+        (sample_dir / "analysis.json").write_text(json.dumps({
+            "sample_id": "arvo_1",
+            "fine_trace": [],
+            "vuln_logic": {},
+        }))
         return Completed()
 
     monkeypatch.setattr(run_harness.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_harness, "result_is_complete", lambda sample_dir: True)
     monkeypatch.setattr(run_harness, "maybe_run_reachability", lambda *args, **kwargs: {"status": "disabled"})
     result = run_harness.run_one(args, config, "arvo_1")
 
@@ -128,7 +137,12 @@ def test_runtime_server_url_uses_active_docker_bridge_gateway(monkeypatch):
         networks=SimpleNamespace(get=lambda name: bridge)
     )
     monkeypatch.delenv("OPENHANDS_EVAL_HOST_GATEWAY", raising=False)
-    monkeypatch.setattr(openhands_arvo.docker, "from_env", lambda: client)
+    class DockerModule:
+        @staticmethod
+        def from_env():
+            return client
+
+    monkeypatch.setattr(openhands_arvo, "_docker_sdk", lambda: (DockerModule, object))
 
     assert openhands_arvo.runtime_server_url(
         "http://host.docker.internal:8666"

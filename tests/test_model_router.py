@@ -15,6 +15,7 @@ from model_router import (
     MODELHUB_MESSAGES_BASE_URL,
     MODELHUB_OPENAI_API_VERSION,
     MODELHUB_OPENAI_API_KEY_ENV,
+    MODELHUB_CN_OPENAI_BASE_URL,
     MODELHUB_OPENAI_BASE_URL,
     MODELHUB_OPENAI_CHAT_COMPLETIONS_URL,
     MODELHUB_OVERSEA_OPENAI_CRAWL_BASE_URL,
@@ -111,9 +112,9 @@ def test_poc_route_can_be_selected_from_launcher_args():
         "arvo_1",
     )
 
-    assert request.model == "gpt-5.4-2026-03-05"
-    assert request.base_url == MODELHUB_OPENAI_BASE_URL
-    assert request.api_key_env == MODELHUB_OPENAI_API_KEY_ENV
+    assert request.model == "gpt-5.5-2026-04-24"
+    assert request.base_url == MODELHUB_CN_OPENAI_BASE_URL
+    assert request.api_key_env == "OPENAI_API_KEY"
     assert request.api_version == MODELHUB_OPENAI_API_VERSION
     assert request.namespace == "gpt-5.5"
     assert "--bridge-disable-proxy" in request.extra_args
@@ -185,12 +186,12 @@ def test_claude_opus48_compat_route_uses_sonnet5_but_keeps_old_namespaces():
     assert claude_route.results_namespace == "claudecli-claude-opus-4.8"
 
 
-def test_poc_sangfor_glm52_route_uses_openai_compatible_provider():
+def test_poc_openhands_glm52_route_uses_modelhub_openai_provider():
     request = poc_run_harness.build_request(
         _poc_args(
-            harness="sangfor_ai",
+            harness="openhands",
             model_route="glm-5.2",
-            namespace="sangfor-glm-5.2",
+            namespace="glm52",
         ),
         {"samples": ["arvo_1"]},
         "arvo_1",
@@ -198,9 +199,11 @@ def test_poc_sangfor_glm52_route_uses_openai_compatible_provider():
 
     assert request.model == "glm-5.2"
     assert request.api_key_env == GLM_OPENAI_API_KEY_ENV
+    assert request.api_key_env == "OPENAI_API_KEY"
     assert request.api_version == MODELHUB_OPENAI_API_VERSION
     assert request.base_url == GLM_OPENAI_BASE_URL
-    assert request.namespace == "sangfor-glm-5.2"
+    assert request.base_url == MODELHUB_CN_OPENAI_BASE_URL
+    assert request.namespace == "glm52"
     assert request.extra_args == ("--provider-kind", "openai_compatible")
 
 

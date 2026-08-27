@@ -34,8 +34,8 @@ MODELHUB_OPENAI_CHAT_COMPLETIONS_URL = (
 )
 MODELHUB_MESSAGES_BASE_URL = MODELHUB_OPENROUTER_MESSAGES_BASE_URL
 LMUAI_BASE_URL = "https://api.lmuai.com"
-GLM_OPENAI_BASE_URL = f"{LMUAI_BASE_URL}/v1"
-GLM_OPENAI_API_KEY_ENV = "GLM_API_KEY"
+GLM_OPENAI_BASE_URL = MODELHUB_CN_OPENAI_BASE_URL
+GLM_OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 
 # DeepSeek's official endpoint is kept as metadata for auditability. The
 # OpenHands DeepSeek route intentionally does not force base_url, because the
@@ -174,7 +174,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
         )
 
     if canonical == "gpt-5.5":
-        model_name = "gpt-5.4-2026-03-05"
+        model_name = "gpt-5.5-2026-04-24"
         extra_args: tuple[str, ...] = ()
         if harness == "codex":
             extra_args = (
@@ -189,17 +189,16 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
         return ModelRoute(
             route_id=canonical,
             model=model_name,
-            base_url=MODELHUB_OPENAI_BASE_URL,
-            api_key_env=MODELHUB_OPENAI_API_KEY_ENV,
+            base_url=MODELHUB_CN_OPENAI_BASE_URL,
+            api_key_env=GLM_OPENAI_API_KEY_ENV,
             api_version=MODELHUB_OPENAI_API_VERSION,
             results_namespace="gpt-5.5",
             provider_kind="openai_compatible",
             payload_format="chat_completions",
             extra_args=extra_args,
             metadata={
-                "requested_eval_model": "gpt-5.5-2026-04-24",
+                "provider_base_url": MODELHUB_CN_OPENAI_BASE_URL,
                 "effective_model": model_name,
-                "crawl_base_url": MODELHUB_OVERSEA_OPENAI_CRAWL_BASE_URL,
             },
         )
 
@@ -242,7 +241,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             provider_kind="openai_compatible",
             payload_format="chat_completions",
             extra_args=extra_args,
-            metadata={"provider_base_url": LMUAI_BASE_URL},
+            metadata={"provider_base_url": MODELHUB_CN_OPENAI_BASE_URL},
         )
 
     if canonical == "claude-opus-4.6":
@@ -384,7 +383,7 @@ def available_model_routes() -> dict[str, str]:
 
     return {
         "deepseek-v4-flash": "OpenHands and deepseek_harness DeepSeek route; official key env DEEPSEEK_API_KEY.",
-        "gpt-5.5": "Oversea ModelHub OpenAI-compatible GPT route; currently sends model gpt-5.4-2026-03-05 while writing gpt-5.5 results; key env OPENAI_API_KEY_oversea.",
+        "gpt-5.5": "CN ModelHub OpenAI-compatible GPT route; sends model gpt-5.5-2026-04-24; key env OPENAI_API_KEY.",
         "gpt-5.4-mini": "Oversea ModelHub OpenAI-compatible GPT route; key env OPENAI_API_KEY_oversea.",
         "glm-5.2": "OpenAI-compatible GLM route using LMUAI and GLM_API_KEY.",
         "claude-opus-4.6": "Compatibility route: run claude-sonnet-5 through LMUAI while writing opus-4.6 result namespaces.",

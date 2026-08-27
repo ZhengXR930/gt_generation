@@ -7,20 +7,24 @@ cd "${SRC:?}"
 # libpcap/json-c tarballs expanded beside it.
 [ -e ndpi ] || ln -sfn . ndpi
 
-if [ ! -f libpcap-1.9.1.tar.gz ]; then
-  curl -L --retry 3 -o libpcap-1.9.1.tar.gz \
-    https://www.tcpdump.org/release/libpcap-1.9.1.tar.gz
+if [ -f libpcap-1.9.1.tar.gz ] && ! tar -tzf libpcap-1.9.1.tar.gz >/dev/null 2>&1; then
+  rm -f libpcap-1.9.1.tar.gz
+  rm -rf libpcap-1.9.1
 fi
-
+if [ ! -f libpcap-1.9.1.tar.gz ]; then
+  curl -L --retry 5 --retry-all-errors --connect-timeout 20 -o libpcap-1.9.1.tar.gz     https://www.tcpdump.org/release/libpcap-1.9.1.tar.gz
+fi
 if [ ! -d libpcap-1.9.1 ]; then
   tar -xzf libpcap-1.9.1.tar.gz
 fi
 
-if [ ! -f json-c-0.17-20230812.tar.gz ]; then
-  curl -L --retry 3 -o json-c-0.17-20230812.tar.gz \
-    https://github.com/json-c/json-c/archive/refs/tags/json-c-0.17-20230812.tar.gz
+if [ -f json-c-0.17-20230812.tar.gz ] && ! tar -tzf json-c-0.17-20230812.tar.gz >/dev/null 2>&1; then
+  rm -f json-c-0.17-20230812.tar.gz
+  rm -rf json-c-json-c-0.17-20230812
 fi
-
+if [ ! -f json-c-0.17-20230812.tar.gz ]; then
+  curl -L --retry 5 --retry-all-errors --connect-timeout 20 -o json-c-0.17-20230812.tar.gz     https://github.com/json-c/json-c/archive/refs/tags/json-c-0.17-20230812.tar.gz
+fi
 if [ ! -d json-c-json-c-0.17-20230812 ]; then
   tar -xzf json-c-0.17-20230812.tar.gz
 fi

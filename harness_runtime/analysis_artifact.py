@@ -89,7 +89,7 @@ Expression rules:
 - Do not use tautologies such as {"op":"eq","left":"x","right":"x"} or {"op":"same_object","left":"x","right":"x"} to fill relation.
 - operands, via, relation.left, and relation.right must be concrete verbatim source expressions or literals from the cited source evidence: variables, fields, macros, constants, string/integer literals, calls, or language-native variables such as PHP $name tokens.
 - Never put English explanations, conceptual phrases, unresolved instrumentation placeholders such as $event.field, or invented property names in operands, via, relation.left, or relation.right.
-- README.md, description.txt, workspace, checkpoint files, candidate_trace.json, analysis.json, prompts, runtime logs, harness, test, fuzz setup, and build/setup code are not valid anchors for source, root_cause, sink, or vuln_logic propagation endpoints."""
+- README.md, description.txt, workspace, checkpoint files, candidate_trace.json, analysis.json, prompts, runtime logs, harness, test, fuzz setup, and setup files are not valid anchors for source, root_cause, sink, or vuln_logic propagation endpoints."""
 
 
 def _sample_id_instruction(sample_id: Optional[str]) -> str:

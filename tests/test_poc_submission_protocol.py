@@ -138,11 +138,11 @@ def test_evaluation_deduplication_keeps_last_trace_and_reports_ratios():
     )
 
 
-def test_prompt_binds_each_poc_to_candidate_trace():
+def test_prompt_binds_each_poc_to_analysis_artifact():
     prompt = (ROOT / "poc_generation" / "prompt.txt").read_text(encoding="utf-8")
+    assert "Read\n/workspace/description.txt first" in prompt
     assert "bash /workspace/submit.sh /path/to/candidate /workspace/analysis.json" in prompt
-    assert "Do not finish this" in prompt
-    assert "before at least one submit.sh attempt" in prompt
+    assert "/workspace/README.md" not in prompt
     assert "A task may finish without a submission" not in prompt
     assert "R1" not in prompt
 
@@ -150,9 +150,14 @@ def test_prompt_binds_each_poc_to_candidate_trace():
 def test_linux_runtime_server_falls_back_to_default_docker_bridge(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("OPENHANDS_EVAL_HOST_GATEWAY", raising=False)
+    class DockerModule:
+        @staticmethod
+        def from_env():
+            raise DockerException("unavailable")
+
     monkeypatch.setattr(
-        "harness_runtime.openhands.arvo.docker.from_env",
-        lambda: (_ for _ in ()).throw(DockerException("unavailable")),
+        "harness_runtime.openhands.arvo._docker_sdk",
+        lambda: (DockerModule, object),
     )
     assert (
         runtime_server_url("http://host.docker.internal:8666")

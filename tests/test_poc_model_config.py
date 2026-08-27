@@ -68,6 +68,8 @@ def test_gpt54_uses_native_tools_with_old_openhands_capability_tables():
 
     assert native_tool_calling_for_model("gpt-5.4-mini") is True
     assert native_tool_calling_for_model("openai/gpt-5.4") is True
+    assert native_tool_calling_for_model("glm-5.2") is True
+    assert native_tool_calling_for_model("openai/glm-5.2") is True
     assert native_tool_calling_for_model("deepseek/deepseek-chat") is None
 
 

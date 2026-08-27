@@ -66,15 +66,15 @@ if [[ $CFLAGS != *sanitize=memory* ]]; then
     PROTO_CONVERTER=$SRC/mruby/oss-fuzz/proto_to_ruby.cpp
     rm -rf $SRC/mruby/genfiles
     mkdir $SRC/mruby/genfiles
-    $SRC/LPM/external.protobuf/bin/protoc --proto_path=$SRC/mruby/oss-fuzz ruby.proto --cpp_out=$SRC/mruby/genfiles
-    $CXX -c $CXXFLAGS $SRC/mruby/genfiles/ruby.pb.cc -o $SRC/mruby/genfiles/ruby.pb.o -I $SRC/LPM/external.protobuf/include
-    $CXX -I $SRC/mruby/include -I $SRC/LPM/external.protobuf/include $CXXFLAGS $PROTO_FUZZ_TARGET $SRC/mruby/genfiles/ruby.pb.o $PROTO_CONVERTER \
+    protoc --proto_path=$SRC/mruby/oss-fuzz ruby.proto --cpp_out=$SRC/mruby/genfiles
+    $CXX -c $CXXFLAGS $SRC/mruby/genfiles/ruby.pb.cc -o $SRC/mruby/genfiles/ruby.pb.o -I /usr/include
+    $CXX -I $SRC/mruby/include -I /usr/include $CXXFLAGS $PROTO_FUZZ_TARGET $SRC/mruby/genfiles/ruby.pb.o $PROTO_CONVERTER \
       -I $SRC/mruby/genfiles \
       -I $SRC/libprotobuf-mutator \
       -I $SRC/mruby/include -lz -lm \
       $SRC/LPM/src/libfuzzer/libprotobuf-mutator-libfuzzer.a \
       $SRC/LPM/src/libprotobuf-mutator.a \
-      $SRC/LPM/external.protobuf/lib/libprotobuf.a \
+      /usr/lib/x86_64-linux-gnu/libprotobuf.a \
       $SRC/mruby/build/host/lib/libmruby.a \
       $LIB_FUZZING_ENGINE \
       -o $OUT/mruby_proto_fuzzer

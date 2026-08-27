@@ -80,5 +80,13 @@ export -f git _gt_real_git
 if [[ -e /gt/oss_fuzz_project/build.sh ]]; then mkdir -p /gt; cp -a /gt/oss_fuzz_project/build.sh /gt/_work; fi
 
 # Official non-clone RUN commands from projects/mruby/Dockerfile.
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y protobuf-compiler libprotobuf-dev
+fi
 cd "$SRC"
-mkdir LPM; cd LPM; cmake $SRC/libprotobuf-mutator -GNinja -DLIB_PROTO_MUTATOR_DOWNLOAD_PROTOBUF=ON -DLIB_PROTO_MUTATOR_TESTING=OFF -DCMAKE_BUILD_TYPE=Release; ninja;
+rm -rf LPM
+mkdir LPM
+cd LPM
+cmake $SRC/libprotobuf-mutator -GNinja -DLIB_PROTO_MUTATOR_DOWNLOAD_PROTOBUF=OFF -DLIB_PROTO_MUTATOR_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+ninja

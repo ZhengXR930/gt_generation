@@ -84,7 +84,6 @@ from harness_runtime.openhands.local import (  # noqa: E402
     persist_results,
     prepare_workspace,
     validate_submissions_on_host,
-    write_build_sh,
     write_submit_sh,
 )
 from harness_runtime.auth import load_env_key  # noqa: E402
@@ -232,7 +231,7 @@ def create_network_guard_bin(
     docker.write_text(
         "#!/bin/sh\n"
         "echo '[network_guard] docker is disabled for the subject-agent shell; "
-        "use ./build.sh and ./submit.sh' >&2\n"
+        "use ./submit.sh for candidate evaluation' >&2\n"
         "exit 126\n",
         encoding="utf-8",
     )
@@ -249,8 +248,10 @@ def network_guard_allowed_hosts(validator_url: str) -> list[str]:
 
 
 def adapt_readme_for_host_workspace(workspace: Path) -> None:
-    """Make the local README path instructions match DSH's host cwd."""
+    """Compatibility no-op for older workspaces that still have README.md."""
     readme = workspace / "README.md"
+    if not readme.is_file():
+        return
     text = readme.read_text(encoding="utf-8")
     workspace_text = str(workspace)
     text = text.replace("/workspace/", f"{workspace_text}/")
@@ -1041,7 +1042,6 @@ def main() -> int:
         network_guard_manifest = {"mode": "allowed"}
         bridge.start()
         try:
-            write_build_sh(workspace, bridge.url, bridge.token)
             write_submit_sh(workspace, bridge.url, bridge.token)
             adapter_metadata = run_workspace_installer(
                 args.workspace_installer,

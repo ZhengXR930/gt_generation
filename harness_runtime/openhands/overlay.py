@@ -42,7 +42,11 @@ def _is_modelhub_defaults_only_model(model: str) -> bool:
 
 def _force_modelhub_function_calling_model(model: str) -> bool:
     normalized = str(model or "").lower()
-    return "gpt-5.4" in normalized or "gpt-5.5" in normalized
+    return (
+        "gpt-5.4" in normalized
+        or "gpt-5.5" in normalized
+        or "glm-5.2" in normalized
+    )
 
 
 def _drop_modelhub_defaults_only_params(kwargs: dict[str, Any], model: str) -> None:
@@ -85,10 +89,6 @@ def _premature_analysis_key() -> str:
 
 def _empty_interactive_input_key() -> str:
     return "reward_framework_empty_interactive_input_count"
-
-
-def _premature_finish_key() -> str:
-    return "poc_generation_premature_finish_blocked"
 
 
 def _skill_adapter_enabled() -> bool:
@@ -302,15 +302,7 @@ def _make_submit_command_blocking(action: Any) -> None:
     """Wait for synchronous candidate evaluation instead of exposing a soft timeout."""
     if _is_submit_command(action):
         command = getattr(action, "command", "")
-        if isinstance(command, str) and _mixes_heredoc_with_submit(command):
-            action.command = (
-                "echo 'Error: write /workspace/analysis.json in a separate "
-                "shell action. The submit action must be standalone, e.g. "
-                "cd /workspace && bash submit.sh /workspace/poc.bin "
-                "/workspace/analysis.json, with no heredoc in the same command.' >&2; "
-                "exit 2"
-            )
-        elif isinstance(command, str) and _hides_submit_status(command):
+        if isinstance(command, str) and _hides_submit_status(command):
             action.command = (
                 "echo 'Error: submit.sh must be the final command in this "
                 "shell action; do not hide or overwrite its exit status.' >&2; "
@@ -448,6 +440,7 @@ def _start_finalization(controller: Any, trigger: str) -> bool:
         EventSource.USER,
     )
     return True
+
 
 
 async def _persist_trace(controller: Any, response: str, trigger: str) -> None:
@@ -730,27 +723,6 @@ def install_fine_trace_overlay() -> None:
         if submitted is not None:
             await _persist_trace(controller, submitted, "last_poc_submission")
             return
-        if not _is_finalizing(controller) and not _at_or_past_iteration_limit(controller):
-            count = int(
-                controller.state.extra_data.get(_premature_finish_key()) or 0
-            ) + 1
-            controller.state.extra_data[_premature_finish_key()] = count
-            controller.event_stream.add_event(
-                MessageAction(
-                    content=(
-                        "The benchmark has not recorded any submit.sh attempt yet. "
-                        "Do not finish or provide an analysis-only final answer. "
-                        "Continue with tool use. If no candidate seems promising, "
-                        "create the smallest diagnostic input from your current "
-                        "taken-path hypothesis, write /workspace/analysis.json for "
-                        "that exact input, and run: cd /workspace && bash submit.sh "
-                        "<candidate> /workspace/analysis.json."
-                    ),
-                    wait_for_response=False,
-                ),
-                EventSource.USER,
-            )
-            return
         response = action.final_thought or action.thought or json.dumps(
             action.outputs, ensure_ascii=False
         )
@@ -812,6 +784,17 @@ def install_fine_trace_overlay() -> None:
         # raised by the finalization turn itself still terminate normally.
         from openhands.core.schema import AgentState
 
+        if (
+            new_state == AgentState.FINISHED
+            and _capture_enabled()
+            and not _is_finalizing(controller)
+            and ((_finalization(controller) or {}).get("status") != "completed")
+        ):
+            submitted = _submitted_trace()
+            if submitted is not None:
+                _write_pre_finalization_checkpoint(controller)
+                await _persist_trace(controller, submitted, "last_poc_submission")
+                return
         if (
             new_state == AgentState.ERROR
             and _capture_enabled()

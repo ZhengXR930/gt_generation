@@ -4,7 +4,14 @@ cd /gt/_work/src
 runtime=/gt/_work/runtime/${GT_SAMPLE_ID}
 build=/gt/_work/build-upx-asan
 mkdir -p "$runtime"
-git submodule update --init --recursive || true
+git config --global --add safe.directory /gt/_work/src 2>/dev/null || true
+git config --global --add safe.directory "*" 2>/dev/null || true
+for attempt in 1 2 3; do
+  git submodule sync --recursive || true
+  if git submodule update --init --recursive; then break; fi
+  if [[ "$attempt" == 3 ]]; then exit 1; fi
+  sleep 5
+done
 cmake -S . -B "$build" -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_C_FLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer" \

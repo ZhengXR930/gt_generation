@@ -131,12 +131,18 @@ def cleanup_scratch(scratch: Path) -> None:
     logging.warning("Could not fully clean scratch %s: %s", scratch, last_exc)
 
 
+def remove_agent_readme(workspace: Path) -> None:
+    readme = workspace / "README.md"
+    if readme.exists():
+        readme.unlink()
+
+
 def ensure_arvo_source(arvo_id: str) -> Path:
     """Materialize the source supplied to the subject from the stock ARVO image.
 
     The lightweight CyberGym metadata subset intentionally does not contain the
     large repo tarballs.  Hydrate each selected sample once, before creating the
-    task workspace, so README.md never advertises a source tree that is absent.
+    task workspace, so description.txt never advertises a source tree that is absent.
     """
     arvo_dir = GT_ROOT / "external" / "cybergym_data_subset" / "data" / "arvo" / arvo_id
     arvo_dir.mkdir(parents=True, exist_ok=True)
@@ -151,39 +157,15 @@ def normalize_public_issue_description(description: str) -> str:
 
 
 def load_public_issue_description(sample_id: str) -> str:
-    """Load the public natural-language issue description for a benchmark task.
-
-    The curated per-sample package is the authoritative public task input.  It
-    is safe for PoC generation because it contains only the issue description,
-    not GT traces, sanitizer output, assertions, known PoCs, or crash state.
-    ``selected_1000.json`` is kept only as a compatibility fallback.
-    """
-    curated_path = GT_ROOT / "gt_results" / sample_id / "issue_description.json"
-    if curated_path.is_file():
-        value = json.loads(curated_path.read_text(encoding="utf-8"))
-        if isinstance(value, dict):
-            description = normalize_public_issue_description(
-                str(value.get("issue_description") or "")
-            )
-            if description:
-                return description
-        raise RuntimeError(f"{sample_id} has invalid issue_description in {curated_path}")
-
-    selected_path = GT_ROOT / "dataset" / "selected_1000.json"
-    selected = json.loads(selected_path.read_text(encoding="utf-8"))
-    description = next(
-        (
-            normalize_public_issue_description(str(item.get("issue_description") or ""))
-            for item in selected
-            if isinstance(item, dict) and item.get("sample_id") == sample_id
-        ),
-        "",
-    )
-    if not description:
-        raise RuntimeError(
-            f"{sample_id} has no issue_description in {curated_path} or {selected_path}"
+    """Load the fixed agent-visible public description for a benchmark task."""
+    description_path = GT_ROOT / "gt_results" / sample_id / "description.txt"
+    if description_path.is_file():
+        description = normalize_public_issue_description(
+            description_path.read_text(encoding="utf-8", errors="replace")
         )
-    return description
+        if description:
+            return description
+    raise RuntimeError(f"{sample_id} has no curated description.txt at {description_path}")
 
 
 def _ensure_arvo_source_locked(arvo_id: str, arvo_dir: Path) -> Path:
@@ -256,7 +238,7 @@ def native_tool_calling_for_model(model: str) -> bool | None:
             f"got {override!r}"
         )
     normalized = model[len("openai/"):] if model.startswith("openai/") else model
-    if normalized.startswith(("gpt-5.4", "gpt-5.5")):
+    if normalized.startswith(("gpt-5.4", "gpt-5.5", "glm-5.2")):
         return True
     return None
 
@@ -724,6 +706,9 @@ def run_attempt(
             else None
         )
         tmp_input_dir = openhands_args.tmp_dir / run_dir.name
+
+        template_workspace = tmp_input_dir / "template"
+        remove_agent_readme(template_workspace)
 
         for name in ("file", "cache"):
             src = (frozen_checkpoint or run_dir) / name
