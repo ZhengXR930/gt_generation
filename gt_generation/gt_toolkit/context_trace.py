@@ -31,7 +31,6 @@ from .reachability import (
 SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".rs", ".go")
 RUNTIME_MARKERS = (
     "/usr/",
-    "/lib/",
     "llvm/projects/compiler-rt/",
     "compiler-rt/",
     "libfuzzer/",
@@ -391,6 +390,55 @@ def _split_command_env(command: str) -> tuple[dict[str, str], list[str]]:
     return env, parts[index:]
 
 
+def _container_path_on_host(result_dir: Path, value: str, workdir: str) -> Path | None:
+    if value.startswith("/gt/"):
+        return result_dir / value[len("/gt/"):]
+    if value.startswith("/"):
+        return None
+    host_workdir = workdir[len("/gt/"):] if workdir.startswith("/gt/") else workdir
+    return (result_dir / host_workdir / value).resolve()
+
+
+def _is_shebang_script(path: Path | None) -> bool:
+    if path is None:
+        return False
+    try:
+        with path.open("rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def _container_path_from_host(result_dir: Path, host_path: Path) -> str | None:
+    try:
+        relative = host_path.resolve().relative_to(result_dir.resolve())
+    except ValueError:
+        return None
+    return "/gt/" + str(relative).replace("\\", "/")
+
+
+def _repair_container_executable_path(result_dir: Path, value: str) -> str:
+    if not value.startswith("/gt/") or value == "/gt/poc":
+        return value
+    direct = result_dir / value[len("/gt/"):]
+    if direct.exists():
+        return value
+    out_candidate = result_dir / "_out" / Path(value).name
+    if out_candidate.exists():
+        return f"/gt/_out/{Path(value).name}"
+    executable_matches = [
+        path
+        for path in result_dir.rglob(Path(value).name)
+        if path.is_file() and os.access(path, os.X_OK)
+    ]
+    executable_matches.sort(key=lambda path: ("_work/src" not in str(path), len(str(path))))
+    if executable_matches:
+        repaired = _container_path_from_host(result_dir, executable_matches[0])
+        if repaired:
+            return repaired
+    return value
+
+
 def _debug_command_from_runtime_spec(result_dir: Path) -> str:
     path = result_dir / "runtime_spec.json"
     if not path.is_file():
@@ -406,7 +454,14 @@ def _debug_command_from_runtime_spec(result_dir: Path) -> str:
     executable = str(spec.get("executable") or "")
     if not executable:
         return ""
-    argv.append(executable)
+    workdir = str(spec.get("workdir") or "/gt")
+    executable_host = _container_path_on_host(result_dir, executable, workdir)
+    executable = _repair_container_executable_path(result_dir, executable)
+    executable_host = _container_path_on_host(result_dir, executable, workdir)
+    if _is_shebang_script(executable_host):
+        argv.extend(["/bin/bash", executable])
+    else:
+        argv.append(executable)
     for arg in spec.get("arguments") or []:
         argv.append(str(arg).replace("{poc}", "/gt/poc"))
     return _shell_join(argv)
@@ -436,6 +491,7 @@ def _debug_command_from_reachability_report(result_dir: Path) -> str:
         f"/data00/home/zhengxinran/Documents/trae_projects/test/gt_generation/gt_results/{result_dir.name}",
     ]
     rewritten: list[str] = []
+    marker = f"/gt_results/{result_dir.name}/"
     for item in argv:
         value = item
         for prefix in host_prefixes:
@@ -445,6 +501,9 @@ def _debug_command_from_reachability_report(result_dir: Path) -> str:
             if value.startswith(prefix + "/"):
                 value = "/gt/" + value[len(prefix) + 1:]
                 break
+        if marker in value:
+            value = "/gt/" + value.split(marker, 1)[1]
+        value = _repair_container_executable_path(result_dir, value)
         if value.endswith("/poc"):
             value = "/gt/poc"
         rewritten.append(value)
@@ -453,14 +512,44 @@ def _debug_command_from_reachability_report(result_dir: Path) -> str:
 
 def _debug_command_for_result_dir(result_dir: Path) -> str:
     for supplier in (
-        _debug_command_from_runtime_spec,
         _debug_command_from_reachability_report,
+        _debug_command_from_runtime_spec,
         derive_debug_command,
     ):
         command = supplier(result_dir)
         if command:
             return command
     return ""
+
+
+def _repair_repo_result_permissions(result_dir: Path) -> dict[str, Any]:
+    build_sh = result_dir / "build.sh"
+    if not build_sh.is_file():
+        return {"ran": False, "reason": "no build.sh"}
+    targets = ["/gt"]
+    command = "mkdir -p /gt/context; chown -R {uid}:{gid} {targets} 2>/dev/null || true".format(
+        uid=os.getuid(),
+        gid=os.getgid(),
+        targets=" ".join(targets),
+    )
+    env = dict(os.environ)
+    env["GT_BUILD_AS_ROOT"] = "1"
+    try:
+        proc = subprocess.run(
+            [str(build_sh), command],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ran": True, "returncode": 124, "error": str(exc)[-300:]}
+    return {
+        "ran": True,
+        "returncode": proc.returncode,
+        "stderr": proc.stderr[-300:],
+    }
 
 
 def _copy_context_output(result_dir: Path) -> bool:
@@ -556,11 +645,17 @@ def _run_repo_result_dir(result_dir: Path, timeout: int, max_events: int, backtr
     if not build_sh.is_file():
         print(json.dumps({"context_gt": "skipped", "reason": "no build.sh"}))
         return 0
+    permission_repair = _repair_repo_result_permissions(result_dir)
+    restored = _restore_vulnerable_source(result_dir)
     command = _debug_command_for_result_dir(result_dir)
     if not command:
-        print(json.dumps({"context_gt": "skipped", "reason": "no debug command"}))
+        print(json.dumps({
+            "context_gt": "skipped",
+            "reason": "no debug command",
+            "source_restored": restored,
+            "permission_repair": permission_repair,
+        }))
         return 0
-    restored = _restore_vulnerable_source(result_dir)
     arguments = [
         "PYTHONPATH=/repo/gt_generation:/repo",
         "python3",
@@ -599,6 +694,7 @@ def _run_repo_result_dir(result_dir: Path, timeout: int, max_events: int, backtr
         "track": "repo",
         "returncode": proc.returncode,
         "source_restored": restored,
+        "permission_repair": permission_repair,
         "stderr": "" if ok else proc.stderr[-600:],
     }))
     return 0 if ok else 1
@@ -607,64 +703,78 @@ def _run_repo_result_dir(result_dir: Path, timeout: int, max_events: int, backtr
 def _run_arvo_result_dir(result_dir: Path, timeout: int, max_events: int, backtrace_limit: int) -> int:
     context = _arvo_context(result_dir)
     if context is None:
+        print(json.dumps({"context_gt": "skipped", "reason": "missing ARVO context"}))
         return 1
-    target = context["target"]
-    binary = f"/out/{target}" if target else (
-        "$(set -- /out/*; for f; do [ -x \"$f\" ] && [ -f \"$f\" ] && echo \"$f\"; done | head -1)"
-    )
     repo_root = _repo_root()
     gt, checkpoints, paths = _prepare_result_context(result_dir)
-    gdb_command = [
-        "gdb",
-        "--batch",
-        "-q",
-        "-x",
-        "/repo/evaluator/reachability/gdb_context_trace.py",
-        "--args",
-        binary,
-        "/gt/poc",
+    sys.path.insert(0, str(repo_root))
+    from evaluator.reachability.arvo_gdb import prepare_arvo_target, target_arguments
+
+    bundled_gdb = [
+        "/opt/reachability-gdb/lib64/ld-linux-x86-64.so.2",
+        "--library-path",
+        "/opt/reachability-gdb/lib/x86_64-linux-gnu:"
+        "/opt/reachability-gdb/usr/lib/x86_64-linux-gnu",
+        "/opt/reachability-gdb/usr/bin/gdb",
     ]
-    inner = (
-        "set -e\n"
-        "if ! command -v gdb >/dev/null 2>&1; then\n"
-        "  apt-get update -qq >/dev/null 2>&1 || true\n"
-        "  apt-get install -y -qq gdb >/dev/null 2>&1 || true\n"
-        "fi\n"
-        "command -v gdb >/dev/null 2>&1 || { echo 'no gdb in image' >&2; exit 3; }\n"
-        f"SRC_ROOT=/src/{shlex.quote(context['project'])}\n"
-        'if [ ! -d \"$SRC_ROOT\" ]; then\n'
-        "  SRC_ROOT=$(for d in /src/*/; do [ -d \"$d/.git\" ] && { echo \"${d%/}\"; break; }; done)\n"
-        "fi\n"
-        'if [ -z \"$SRC_ROOT\" ] || [ ! -d \"$SRC_ROOT\" ]; then SRC_ROOT=/src; fi\n'
-        "export CONTEXT_BREAKPOINTS=/gt/context/context_breakpoints.json\n"
-        "export CONTEXT_OUTPUT=/gt/context/context_hits.json\n"
-        f"export CONTEXT_MAX_EVENTS={max_events}\n"
-        f"export CONTEXT_BACKTRACE_LIMIT={backtrace_limit}\n"
-        "export CONTEXT_SOURCE_ROOT=\"$SRC_ROOT\"\n"
-        + _shell_join(gdb_command) + "\n"
-        f"chown -R {os.getuid()}:{os.getgid()} /gt/context 2>/dev/null || true\n"
-    )
-    proc = subprocess.run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "bash",
-            *_proxy_environment(),
-            "-v",
-            f"{repo_root}:/repo:ro",
-            "-v",
-            f"{result_dir}:/gt",
-            context["image"],
-            "-lc",
-            inner,
-        ],
-        capture_output=True,
-        text=True,
-        errors="replace",
-        timeout=max(timeout + 600, 900),
-    )
+    command: list[str] = []
+    proc: subprocess.CompletedProcess[str] | None = None
+    command_env = {
+        "HOME": "/tmp",
+        "PYTHONHOME": "/opt/reachability-gdb/usr",
+        "ASAN_OPTIONS": "detect_leaks=0",
+        "CONTEXT_BREAKPOINTS": str(paths["breakpoints"]),
+        "CONTEXT_OUTPUT": str(paths["hits"]),
+        "CONTEXT_MAX_EVENTS": str(max_events),
+        "CONTEXT_BACKTRACE_LIMIT": str(backtrace_limit),
+        "CONTEXT_SOURCE_ROOT": f"/src/{context['project']}",
+    }
+    try:
+        with prepare_arvo_target(context["image"], repo_root=repo_root) as prepared:
+            command = [
+                "docker",
+                "exec",
+                "-e",
+                "HOME=/tmp",
+                "-e",
+                "PYTHONHOME=/opt/reachability-gdb/usr",
+                "-e",
+                "ASAN_OPTIONS=detect_leaks=0",
+                "-e",
+                f"CONTEXT_BREAKPOINTS={paths['breakpoints']}",
+                "-e",
+                f"CONTEXT_OUTPUT={paths['hits']}",
+                "-e",
+                f"CONTEXT_MAX_EVENTS={max_events}",
+                "-e",
+                f"CONTEXT_BACKTRACE_LIMIT={backtrace_limit}",
+                "-e",
+                f"CONTEXT_SOURCE_ROOT=/src/{context['project']}",
+                "-w",
+                str(repo_root),
+                prepared.container_id,
+                *bundled_gdb,
+                "--data-directory=/opt/reachability-gdb/usr/share/gdb",
+                "--batch",
+                "-q",
+                "-x",
+                str(repo_root / "evaluator" / "reachability" / "gdb_context_trace.py"),
+                "--args",
+                *target_arguments(prepared, result_dir / "poc"),
+            ]
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout,
+            )
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        paths["stdout"].write_text(getattr(exc, "stdout", "") or "", encoding="utf-8", errors="replace")
+        paths["stderr"].write_text(str(exc), encoding="utf-8", errors="replace")
+        print(json.dumps({"context_gt": "failed", "track": "arvo", "error": str(exc)[-600:]}))
+        return 1
+
     paths["stdout"].write_text(proc.stdout, encoding="utf-8", errors="replace")
     paths["stderr"].write_text(proc.stderr, encoding="utf-8", errors="replace")
     report = _write_context_gt_report(
@@ -673,21 +783,8 @@ def _run_arvo_result_dir(result_dir: Path, timeout: int, max_events: int, backtr
         checkpoints=checkpoints,
         hits_path=paths["hits"],
         report_path=paths["report"],
-        command=[
-            "docker",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "bash",
-            "-v",
-            f"{repo_root}:/repo:ro",
-            "-v",
-            f"{result_dir}:/gt",
-            context["image"],
-            "-lc",
-            inner,
-        ],
-        command_env={},
+        command=command,
+        command_env=command_env,
         returncode=proc.returncode,
         timeout=timeout,
         max_events=max_events,
@@ -699,10 +796,11 @@ def _run_arvo_result_dir(result_dir: Path, timeout: int, max_events: int, backtr
         "context_gt": "ran" if ok else "failed",
         "track": "arvo",
         "returncode": proc.returncode,
+        "events": (report.get("collection") or {}).get("event_count"),
+        "context_count": len(report.get("context") or []),
         "stderr": "" if ok else proc.stderr[-600:],
     }))
     return 0 if ok else 1
-
 
 def run_for_result_dir(
     result_dir: Path,

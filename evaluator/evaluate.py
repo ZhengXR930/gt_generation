@@ -14,6 +14,8 @@ from evaluator.reasoning.analysis_artifact import (
     validate_analysis_artifact_quality,
 )
 from evaluator.reasoning.vuln_logic_scoring import score_vuln_logic
+from evaluator.reasoning.fine_trace_coverage import score_fine_trace_coverage
+from evaluator.reasoning.context_recall import score_context_recall
 from evaluator.reachability.core import evaluate_r1_r5
 from evaluator.reachability.probes import compile_runtime_probes
 
@@ -103,6 +105,30 @@ def evaluate_sample(
     sample_id = sample_dir.name
     gt_dir = GT_RESULTS / sample_id
     result: dict[str, Any] = {"model": model, "sample_id": sample_id}
+    analysis_artifact, analysis_load_error = _load_analysis_artifact(sample_dir)
+    try:
+        result["fine_trace_coverage"] = score_fine_trace_coverage(
+            sample_id,
+            analysis_artifact,
+            gt_dir=gt_dir,
+        )
+        if analysis_load_error:
+            result["fine_trace_coverage"]["analysis_load_error"] = analysis_load_error
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        result["fine_trace_coverage"] = {
+            "unavailable": f"fine_trace coverage failed: {type(exc).__name__}: {exc}"
+        }
+    try:
+        result["context_recall"] = score_context_recall(
+            sample_id,
+            sample_dir,
+            gt_dir=gt_dir,
+        )
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        result["context_recall"] = {
+            "unavailable": f"context recall failed: {type(exc).__name__}: {exc}"
+        }
+
     logic, quality_error = _load_vuln_logic(
         sample_dir,
         require_quality=require_analysis_quality,
@@ -231,6 +257,19 @@ def evaluate_sample(
     return result
 
 
+def _load_analysis_artifact(sample_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
+    analysis_path = sample_dir / "analysis.json"
+    if not analysis_path.is_file():
+        return None, "analysis.json missing"
+    try:
+        value = json.loads(analysis_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"analysis.json invalid: {type(exc).__name__}: {exc}"
+    if not isinstance(value, dict):
+        return None, "analysis.json is not an object"
+    return value, None
+
+
 def _load_vuln_logic(
     sample_dir: Path,
     *,
@@ -314,6 +353,17 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if item.get("reasoning", {}).get("evaluation_protocol")
         == "vuln-logic-invariant-reasoning-v2"
     ]
+    fine_trace = [
+        item["fine_trace_coverage"] for item in rows
+        if item.get("fine_trace_coverage", {}).get("evaluation_protocol")
+        == "fine-trace-coverage-v2"
+    ]
+    context_recall = [
+        item["context_recall"] for item in rows
+        if item.get("context_recall", {}).get("evaluation_protocol")
+        == "context-function-recall-v1"
+        and not item.get("context_recall", {}).get("unavailable")
+    ]
     candidates = [
         candidate
         for row in rows
@@ -389,6 +439,16 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for row in rows
         ),
         "reasoning_scored_samples": len(reasoning),
+        "fine_trace_scored_samples": len(fine_trace),
+        "fine_trace_node_recall": _mean_nested(fine_trace, "nodes", "recall"),
+        "fine_trace_edge_recall": _mean_nested(fine_trace, "edges", "recall"),
+        "context_recall_scored_samples": len(context_recall),
+        "context_file_recall": _mean_nested(context_recall, "files", "recall"),
+        "context_function_recall": _mean_nested(context_recall, "functions", "recall"),
+        "fine_trace_stage_coverage": {
+            stage: _mean_stage(fine_trace, stage)
+            for stage in ("parser", "source", "root_cause", "sink", "trigger")
+        },
         "reasoning_dimensions": {
             "source": {
                 "loc": _mean(reasoning, "source_loc_score"),
@@ -497,9 +557,27 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _mean_nested(rows, outer, key):
+    values = [
+        (row.get(outer) or {}).get(key)
+        for row in rows
+        if isinstance(row.get(outer), dict) and (row.get(outer) or {}).get(key) is not None
+    ]
+    return (sum(values) / len(values)) if values else None
+
+
 def _mean(rows: list[dict[str, Any]], key: str) -> float | None:
     values = [item[key] for item in rows if item.get(key) is not None]
     return sum(values) / len(values) if values else None
+
+
+def _mean_stage(rows: list[dict[str, Any]], stage: str) -> float | None:
+    values = [
+        (item.get("stage_coverage") or {}).get(stage)
+        for item in rows
+        if (item.get("stage_coverage") or {}).get(stage) is not None
+    ]
+    return sum(bool(value) for value in values) / len(values) if values else None
 
 
 def _sum_int(rows: list[dict[str, Any]], key: str) -> int:
