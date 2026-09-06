@@ -226,7 +226,17 @@ def _write_output():
 def main():
     gdb.execute("set pagination off")
     gdb.execute("set confirm off")
-    gdb.execute("set breakpoint pending off")
+    gdb.execute("set breakpoint pending on")
+    for command in (
+        "set follow-exec-mode same",
+        "set follow-fork-mode parent",
+        "set detach-on-fork on",
+        "handle SIGSTOP nostop noprint pass",
+    ):
+        try:
+            gdb.execute(command)
+        except gdb.error:
+            pass
     if SOURCE_ROOT:
         try:
             gdb.execute("directory {}".format(SOURCE_ROOT))
