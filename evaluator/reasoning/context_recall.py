@@ -70,7 +70,7 @@ def score_context_recall(
 
     gt_payload = _load_object(gt_path)
     visit_payload = _load_object(visit_json_path)
-    gt_points = _points(gt_payload.get("context"))
+    gt_points = _points(_gt_context_items(gt_payload))
     visit_points = _points(visit_payload.get("context"))
 
     gt_files = _dedupe_files(gt_points)
@@ -135,6 +135,15 @@ def _load_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path} is not a JSON object")
     return value
+
+
+def _gt_context_items(payload: dict[str, Any]) -> list[Any]:
+    items: list[Any] = []
+    for key in ("context", "anchors", "events"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            items.extend(value)
+    return items
 
 
 def _points(raw: Any) -> list[ContextPoint]:

@@ -456,6 +456,105 @@ def iter_traecli_jsonl(path: Path) -> Iterable[tuple[str, str | None, str]]:
             if text:
                 yield "checkpoint/traecli_stdout.jsonl:assistant", last_command, text
 
+
+def _command_from_function_call(item: dict[str, Any]) -> str:
+    if item.get("name") not in {"exec_command", "apply_patch"}:
+        return ""
+    raw_args = item.get("arguments")
+    if isinstance(raw_args, str):
+        try:
+            args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            return raw_args
+    elif isinstance(raw_args, dict):
+        args = raw_args
+    else:
+        return ""
+    if item.get("name") == "apply_patch":
+        return "apply_patch"
+    command = str(args.get("cmd") or args.get("command") or "")
+    workdir = str(args.get("workdir") or "")
+    if workdir and command:
+        return f"{command}\n# workdir: {workdir}"
+    return command
+
+
+def iter_codex_session_jsonl(path: Path) -> Iterable[tuple[str, str | None, str]]:
+    """Read persisted Codex/Trae session logs under trae_home/cli/sessions."""
+    last_command: str | None = None
+    call_commands: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_type = str(event.get("type") or payload.get("type") or "")
+
+        if event_type == "event_msg" and payload.get("type") == "exec_command_end":
+            command_value = payload.get("command")
+            if isinstance(command_value, list):
+                command = " ".join(str(part) for part in command_value)
+            else:
+                command = str(command_value or payload.get("cmd") or "")
+            output = str(
+                payload.get("aggregated_output")
+                or payload.get("formatted_output")
+                or payload.get("stdout")
+                or ""
+            )
+            if command:
+                last_command = command
+                yield "checkpoint/trae_session:exec_command", command, command
+            if output:
+                yield (
+                    "checkpoint/trae_session:exec_output",
+                    command or last_command,
+                    shorten_middle(output, MAX_PLAIN_LOG_LINE_CHARS),
+                )
+            continue
+
+        if event_type != "history_mutation":
+            continue
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "function_call":
+                command = _command_from_function_call(item)
+                if not command:
+                    continue
+                call_id = str(item.get("call_id") or "")
+                if call_id:
+                    call_commands[call_id] = command
+                last_command = command
+                yield "checkpoint/trae_session:function_call", command, command
+            elif item_type == "function_call_output":
+                call_id = str(item.get("call_id") or "")
+                command = call_commands.get(call_id) or last_command
+                output = str(item.get("output") or "")
+                if output:
+                    yield (
+                        "checkpoint/trae_session:function_output",
+                        command,
+                        shorten_middle(output, MAX_PLAIN_LOG_LINE_CHARS),
+                    )
+            elif item_type == "message" and item.get("role") == "assistant":
+                pieces = item.get("content") or []
+                texts = []
+                for piece in pieces:
+                    if isinstance(piece, dict) and piece.get("type") in {"output_text", "text"}:
+                        texts.append(str(piece.get("text") or ""))
+                text = "\n".join(part for part in texts if part)
+                if text:
+                    yield "checkpoint/trae_session:assistant", last_command, text
+
 def iter_observed_context_jsonl(path: Path) -> Iterable[tuple[str, str | None, str]]:
     """Read normalized tool observations saved by local harness adapters."""
     try:
@@ -543,6 +642,9 @@ def source_streams(sample_dir: Path) -> Iterable[tuple[str, str | None, str]]:
     for path in sorted(checkpoint.glob("sessions-jsonl/**/*.jsonl")):
         checkpoint_sources += 1
         yield from iter_plain_log(path)
+    for path in sorted((checkpoint / "trae_home" / "cli" / "sessions").glob("**/*.jsonl")):
+        checkpoint_sources += 1
+        yield from iter_codex_session_jsonl(path)
     for path in sorted((sample_dir / "runs").glob("*.log")):
         yield from iter_plain_log(path)
 

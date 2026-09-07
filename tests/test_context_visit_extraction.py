@@ -85,6 +85,60 @@ def test_claude_jsonl_extracts_read_file_and_function(tmp_path):
     )
 
 
+def test_trae_session_jsonl_extracts_exec_output_context(tmp_path):
+    sample = tmp_path / "ns" / "arvo_2"
+    session_dir = sample / "checkpoint" / "trae_home" / "cli" / "sessions" / "2026" / "08" / "23"
+    session_dir.mkdir(parents=True)
+    call_id = "call_1"
+    lines = [
+        {
+            "type": "history_mutation",
+            "payload": {
+                "items": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": call_id,
+                        "arguments": json.dumps(
+                            {
+                                "cmd": "sed -n '600,660p' repo-vul/src-vul/gnutls/lib/x509/pkcs12.c"
+                            }
+                        ),
+                    }
+                ]
+            },
+        },
+        {
+            "type": "history_mutation",
+            "payload": {
+                "items": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": (
+                            "Output:\n"
+                            "647 int gnutls_pkcs12_get_bag(gnutls_pkcs12_t pkcs12) {\n"
+                        ),
+                    }
+                ]
+            },
+        },
+    ]
+    (session_dir / "rollout.jsonl").write_text(
+        "\n".join(json.dumps(item) for item in lines) + "\n",
+        encoding="utf-8",
+    )
+
+    report = visit.build_context_visit(sample)
+
+    assert any(
+        item["file"] == "gnutls/lib/x509/pkcs12.c"
+        and item["function"] == "gnutls_pkcs12_get_bag"
+        and item["line"] == 647
+        for item in report["context"]
+    )
+
+
 def test_context_visit_manifest_update(tmp_path):
     sample = tmp_path / "ns" / "sample_1"
     checkpoint = sample / "checkpoint"

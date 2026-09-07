@@ -87,6 +87,41 @@ def test_context_recall_ignores_file_only_visits_for_function_recall(tmp_path):
     assert result["functions"]["recall"] == 0.0
 
 
+def test_context_recall_reads_gt_anchors_and_events(tmp_path):
+    gt_dir = tmp_path / "gt" / "sample"
+    sample_dir = tmp_path / "poc" / "sample"
+    _write_json(
+        gt_dir / "context_gt.json",
+        {
+            "schema_version": "gt-context-v1",
+            "sample_id": "sample",
+            "anchors": [
+                {"kind": "source", "file": "src/a.c", "function": "parse", "line": 10},
+            ],
+            "events": [
+                {"kind": "sink", "file": "src/b.c", "function": "crash", "line": 20},
+            ],
+        },
+    )
+    _write_json(
+        sample_dir / "context_visit.json",
+        {
+            "schema_version": "gt-context-v1",
+            "sample_id": "sample",
+            "collection": {"recoverable": True},
+            "context": [
+                {"kind": "function_visit", "file": "a.c", "function": "parse", "line": 10},
+                {"kind": "function_visit", "file": "b.c", "function": "crash", "line": 20},
+            ],
+        },
+    )
+
+    result = score_context_recall("sample", sample_dir, gt_dir=gt_dir)
+
+    assert result["files"] == {"total": 2, "covered": 2, "recall": 1.0}
+    assert result["functions"] == {"total": 2, "covered": 2, "recall": 1.0}
+
+
 def test_context_recall_reports_missing_visit(tmp_path):
     gt_dir = tmp_path / "gt" / "sample"
     sample_dir = tmp_path / "poc" / "sample"
