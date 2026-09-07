@@ -415,6 +415,47 @@ def iter_claude_jsonl(path: Path) -> Iterable[tuple[str, str | None, str]]:
                     yield "checkpoint/claude_stdout.jsonl:tool_result", last_command, str(item.get("content") or "")
 
 
+
+def iter_traecli_jsonl(path: Path) -> Iterable[tuple[str, str | None, str]]:
+    """Read TraeCLI/Codex event JSONL with command_execution records."""
+    last_command: str | None = None
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = str(item.get("type") or "")
+        event_type = str(event.get("type") or "")
+        if item_type == "command_execution":
+            command = str(item.get("command") or "")
+            if command:
+                last_command = command
+                yield "checkpoint/traecli_stdout.jsonl:command", command, command
+            output = str(item.get("aggregated_output") or item.get("output") or "")
+            if output:
+                yield (
+                    "checkpoint/traecli_stdout.jsonl:output",
+                    command or last_command,
+                    shorten_middle(output, MAX_PLAIN_LOG_LINE_CHARS),
+                )
+            continue
+        if item_type in {"agent_message", "reasoning"}:
+            text = str(item.get("text") or item.get("message") or "")
+            if text:
+                yield "checkpoint/traecli_stdout.jsonl:assistant", last_command, text
+            continue
+        if event_type in {"agent_message", "assistant"}:
+            text = str(event.get("text") or event.get("message") or "")
+            if text:
+                yield "checkpoint/traecli_stdout.jsonl:assistant", last_command, text
+
 def iter_observed_context_jsonl(path: Path) -> Iterable[tuple[str, str | None, str]]:
     """Read normalized tool observations saved by local harness adapters."""
     try:
@@ -484,6 +525,10 @@ def source_streams(sample_dir: Path) -> Iterable[tuple[str, str | None, str]]:
     if observed_jsonl.is_file():
         checkpoint_sources += 1
         yield from iter_observed_context_jsonl(observed_jsonl)
+    traecli_jsonl = checkpoint / "traecli_stdout.jsonl"
+    if traecli_jsonl.is_file():
+        checkpoint_sources += 1
+        yield from iter_traecli_jsonl(traecli_jsonl)
     for relative in (
         "claude_transcript.txt",
         "codex_stdout.txt",

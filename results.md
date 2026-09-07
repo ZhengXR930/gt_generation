@@ -2,7 +2,7 @@
 
 Scope: `valid_gt.json` 500 samples. This report covers the complete formal result sets and excludes the partial OpenHands+Claude namespace (`claude-opus-4.6`). Metrics use relaxed analysis-quality mode so structurally valid `analysis.json` artifacts are scored even when quality lint flags weak anchors. Historical `fine_trace.role="propagation"` is normalized as `intermediate`.
 
-Codex context recall is scored only on recoverable `context_visit.json` files; unrecoverable Codex checkpoints are kept as missing context rather than filled from `analysis.json`.
+Codex context recall is scored only on recoverable `context_visit.json` files; the remaining unrecoverable Codex GPT-5.5 checkpoints are kept as missing context rather than filled from `analysis.json`.
 
 ## Runtime / Reachability
 
@@ -53,7 +53,7 @@ Codex context recall is scored only on recoverable `context_visit.json` files; u
 | OpenHands + GPT-5.4-mini | 500 | 68.5% | 495 | 19.6% |
 | OpenHands + GLM-5.2 | 500 | 64.5% | 499 | 20.4% |
 | Codex + GPT-5.5 | 319 | 57.0% | 235 | 34.3% |
-| Codex + GPT-5.4-mini | 84 | 85.8% | 84 | 32.1% |
+| Codex + GPT-5.4-mini | 500 | 52.1% | 499 | 14.2% |
 | ClaudeCLI + Claude Opus 4.6 | 500 | 87.1% | 500 | 39.1% |
 
 Raw summary: `evaluation_results/formal_results_fast_summary.json`. Context-only summary: `evaluation_results/context_recall_current.json`.
