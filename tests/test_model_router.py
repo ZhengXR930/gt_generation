@@ -141,7 +141,7 @@ def test_legacy_poc_fields_override_known_route_defaults():
     assert request.namespace == "legacy"
 
 
-def test_claude_opus46_compat_route_uses_sonnet5_but_keeps_old_namespaces():
+def test_claude_opus46_route_uses_opus46_and_keeps_old_namespaces():
     openhands_route = resolve_model_route(
         surface="poc_generation",
         harness="openhands",
@@ -153,18 +153,18 @@ def test_claude_opus46_compat_route_uses_sonnet5_but_keeps_old_namespaces():
         model_route="claude-opus-4.6",
     )
 
-    assert openhands_route.model == "claude-sonnet-5"
+    assert openhands_route.model == "claude-opus-4-6"
     assert openhands_route.base_url == "https://api.lmuai.com"
     assert openhands_route.api_key_env == "ANTHROPIC_AUTH_TOKEN"
     assert openhands_route.results_namespace == "claude-opus-4.6"
     assert openhands_route.extra_args == ("--provider-kind", "anthropic")
-    assert claude_route.model == "claude-sonnet-5"
+    assert claude_route.model == "claude-opus-4-6"
     assert claude_route.base_url == "https://api.lmuai.com"
     assert claude_route.api_key_env == "ANTHROPIC_AUTH_TOKEN"
     assert claude_route.results_namespace == "claudecli-claude-opus-4.6"
 
 
-def test_claude_opus48_compat_route_uses_sonnet5_but_keeps_old_namespaces():
+def test_claude_opus48_route_uses_opus48_and_keeps_old_namespaces():
     openhands_route = resolve_model_route(
         surface="poc_generation",
         harness="openhands",
@@ -177,12 +177,12 @@ def test_claude_opus48_compat_route_uses_sonnet5_but_keeps_old_namespaces():
     )
 
     assert openhands_route.route_id == "claude-opus-4.8"
-    assert openhands_route.model == "claude-sonnet-5"
+    assert openhands_route.model == "claude-opus-4-8"
     assert openhands_route.base_url == "https://api.lmuai.com"
     assert openhands_route.api_key_env == "ANTHROPIC_AUTH_TOKEN"
     assert openhands_route.results_namespace == "claude-opus-4.8"
     assert openhands_route.extra_args == ("--provider-kind", "anthropic")
-    assert claude_route.model == "claude-sonnet-5"
+    assert claude_route.model == "claude-opus-4-8"
     assert claude_route.results_namespace == "claudecli-claude-opus-4.8"
 
 

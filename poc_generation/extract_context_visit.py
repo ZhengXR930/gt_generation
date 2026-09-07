@@ -68,6 +68,18 @@ FUNCTION_LINE_RE = re.compile(
 GREP_RESULT_RE = re.compile(
     r"(?P<path>(?:repo-vul/src-vul|src-vul|/workspace/repo-vul/src-vul|/[^:\s]+)/(?:[^:\s]+)):(?P<line>\d+):(?P<code>.*)"
 )
+STACK_FRAME_RE = re.compile(
+    r"^\s*#\d+\s+(?:0x[0-9A-Fa-f]+\s+(?:in\s+)?)?"
+    r"(?P<function>[A-Za-z_~][A-Za-z0-9_:~.]*)\b.*?\s+"
+    r"(?P<path>(?:/src/|/workspace/repo-vul/src-vul/|repo-vul/src-vul/|src-vul/|/gt/_work/src/)?[^:\s`<>]+\.(?:cpp|cxx|cc|hpp|hxx|hh|inc|ll|mm|java|php|rb|ts|js|go|rs|yy|c|h|l|m|py|y))"
+    r":(?P<line>\d+)(?::\d+)?",
+    re.MULTILINE,
+)
+BACKTICK_STACK_RE = re.compile(
+    r"(?:in|from)\s+`(?P<function>[A-Za-z_~][A-Za-z0-9_:~.]*)`\s+at\s+`"
+    r"(?P<path>(?:/src/|/workspace/repo-vul/src-vul/|repo-vul/src-vul/|src-vul/|/gt/_work/src/)?[^:\s`<>]+\.(?:cpp|cxx|cc|hpp|hxx|hh|inc|ll|mm|java|php|rb|ts|js|go|rs|yy|c|h|l|m|py|y))"
+    r":(?P<line>\d+)(?::\d+)?`"
+)
 SED_RANGE_RE = re.compile(
     r"sed\s+-n\s+['\"]?(?P<start>\d+)\s*,\s*(?P<end>\d+)p['\"]?\s+(?P<path>[^\s;&|]+)"
 )
@@ -272,6 +284,26 @@ def extract_from_text(
                         command=command,
                     )
 
+    for match in STACK_FRAME_RE.finditer(text):
+        add_visit(
+            visits,
+            file=match.group("path"),
+            function=match.group("function"),
+            line=int(match.group("line")),
+            evidence=f"{source}:stack_frame",
+            command=command,
+        )
+
+    for match in BACKTICK_STACK_RE.finditer(text):
+        add_visit(
+            visits,
+            file=match.group("path"),
+            function=match.group("function"),
+            line=int(match.group("line")),
+            evidence=f"{source}:summary_stack_frame",
+            command=command,
+        )
+
     active_file: str | None = None
     active_line = 1
     sed = SED_RANGE_RE.search(command or "")
@@ -466,9 +498,8 @@ def source_streams(sample_dir: Path) -> Iterable[tuple[str, str | None, str]]:
     for path in sorted(checkpoint.glob("sessions-jsonl/**/*.jsonl")):
         checkpoint_sources += 1
         yield from iter_plain_log(path)
-    if checkpoint_sources == 0:
-        for path in sorted((sample_dir / "runs").glob("*.log")):
-            yield from iter_plain_log(path)
+    for path in sorted((sample_dir / "runs").glob("*.log")):
+        yield from iter_plain_log(path)
 
 
 def load_json(path: Path) -> dict[str, Any]:

@@ -364,6 +364,14 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         == "context-function-recall-v1"
         and not item.get("context_recall", {}).get("unavailable")
     ]
+    context_recoverable = [
+        item for item in context_recall
+        if item.get("context_visit_recoverable") is True
+    ]
+    context_with_functions = [
+        item for item in context_recoverable
+        if int(item.get("visit_functions_total") or 0) > 0
+    ]
     candidates = [
         candidate
         for row in rows
@@ -442,9 +450,11 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "fine_trace_scored_samples": len(fine_trace),
         "fine_trace_node_recall": _mean_nested(fine_trace, "nodes", "recall"),
         "fine_trace_edge_recall": _mean_nested(fine_trace, "edges", "recall"),
-        "context_recall_scored_samples": len(context_recall),
-        "context_file_recall": _mean_nested(context_recall, "files", "recall"),
-        "context_function_recall": _mean_nested(context_recall, "functions", "recall"),
+        "context_recall_scored_samples": len(context_recoverable),
+        "context_recall_files_present_samples": len(context_recall),
+        "context_function_scored_samples": len(context_with_functions),
+        "context_file_recall": _mean_nested(context_recoverable, "files", "recall"),
+        "context_function_recall": _mean_nested(context_with_functions, "functions", "recall"),
         "fine_trace_stage_coverage": {
             stage: _mean_stage(fine_trace, stage)
             for stage in ("parser", "source", "root_cause", "sink", "trigger")

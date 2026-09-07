@@ -19,6 +19,30 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GT_RESULTS = REPO_ROOT / "gt_results"
 _SPACE_RE = re.compile(r"\s+")
 _FILE_SENTINELS = {"", "<file>", "unknown"}
+_RUNTIME_FILE_MARKERS = (
+    "llvm-project/compiler-rt/",
+    "compiler-rt/lib/fuzzer/",
+    "lib/fuzzer/",
+    "libfuzzer/",
+    "aflplusplus/",
+    "sanitizer_common/",
+    "/usr/include/",
+    "sysdeps/",
+)
+_RUNTIME_FILE_BASENAMES = {
+    "FuzzerDriver.cpp",
+    "FuzzerLoop.cpp",
+    "FuzzerMain.cpp",
+    "aflpp_driver.c",
+    "afl_driver.cpp",
+    "libc_start_call_main.h",
+}
+_RUNTIME_FUNCTIONS = {
+    "__libc_start_call_main",
+    "__libc_start_main",
+    "ExecuteCallback",
+    "ExecuteFilesOnyByOne",
+}
 
 
 @dataclass(frozen=True)
@@ -70,6 +94,7 @@ def score_context_recall(
         "sample_id": sample_id,
         "context_visit_recoverable": bool(recoverable),
         "context_visit_path": str(visit_json_path.relative_to(sample_dir)),
+        "matching_policy": "file_basename; function_name_and_file_basename; runtime_harness_frames_excluded",
         "files": {
             "total": len(gt_files),
             "covered": sum(1 for item in matched_files if item["matched_by"]),
@@ -99,6 +124,7 @@ def _unavailable(sample_id: str, reason: str) -> dict[str, Any]:
         "evaluation_protocol": "context-function-recall-v1",
         "sample_id": sample_id,
         "unavailable": reason,
+        "matching_policy": "file_basename; function_name_and_file_basename; runtime_harness_frames_excluded",
         "files": {"total": 0, "covered": 0, "recall": None},
         "functions": {"total": 0, "covered": 0, "recall": None},
     }
@@ -122,6 +148,8 @@ def _points(raw: Any) -> list[ContextPoint]:
         if not file or "*" in file:
             continue
         function = _norm_function(item.get("function"))
+        if _is_runtime_context(file, function):
+            continue
         points.append(
             ContextPoint(
                 file=file,
@@ -134,7 +162,15 @@ def _points(raw: Any) -> list[ContextPoint]:
 
 
 def _dedupe_files(points: list[ContextPoint]) -> list[str]:
-    return sorted({point.file for point in points if point.file})
+    seen: set[str] = set()
+    result: list[str] = []
+    for point in points:
+        key = _file_basename(point.file)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(point.file)
+    return sorted(result, key=lambda item: (_file_basename(item), item))
 
 
 def _dedupe_functions(points: list[ContextPoint]) -> list[ContextPoint]:
@@ -143,12 +179,12 @@ def _dedupe_functions(points: list[ContextPoint]) -> list[ContextPoint]:
     for point in points:
         if point.function in _FILE_SENTINELS:
             continue
-        key = (point.file, point.function)
+        key = (_file_basename(point.file), _norm_function(point.function))
         if key in seen:
             continue
         seen.add(key)
         result.append(point)
-    return sorted(result, key=lambda item: (item.file, item.function, item.line or 0))
+    return sorted(result, key=lambda item: (_file_basename(item.file), item.function, item.file, item.line or 0))
 
 
 def _first_matching_file(target: str, visits: list[str]) -> str | None:
@@ -193,6 +229,7 @@ def _unmatched_visit_functions(
 def _point_dict(point: ContextPoint) -> dict[str, Any]:
     return {
         "file": point.file,
+        "file_basename": _file_basename(point.file),
         "function": point.function,
         "line": point.line,
         "kind": point.kind,
@@ -200,10 +237,22 @@ def _point_dict(point: ContextPoint) -> dict[str, Any]:
 
 
 def _path_matches(left: str, right: str) -> bool:
-    l, r = _norm_path(left), _norm_path(right)
-    if not l or not r:
-        return False
-    return l == r or l.endswith("/" + r) or r.endswith("/" + l)
+    basename = _file_basename(left)
+    return bool(basename) and basename == _file_basename(right)
+
+
+def _is_runtime_context(file: str, function: str) -> bool:
+    lowered = _norm_path(file).lower()
+    basename = _file_basename(file)
+    if basename in _RUNTIME_FILE_BASENAMES:
+        return True
+    if any(marker in lowered for marker in _RUNTIME_FILE_MARKERS):
+        return True
+    return _norm_function(function) in _RUNTIME_FUNCTIONS
+
+
+def _file_basename(value: Any) -> str:
+    return _norm_path(value).rsplit("/", 1)[-1]
 
 
 def _norm_path(value: Any) -> str:

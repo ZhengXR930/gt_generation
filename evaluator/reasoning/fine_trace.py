@@ -14,6 +14,7 @@ from typing import Any
 
 REQUIRED_STEP_FIELDS = ("step", "file", "function", "line", "var", "code", "note")
 STEP_ROLES = {"source", "sink", "intermediate", "root_cause", None}
+ROLE_ALIASES = {"propagation": "intermediate"}
 _DSML_FINISH_MESSAGE = re.compile(
     r'^\s*<｜｜DSML｜｜tool_calls>\s*'
     r'<｜｜DSML｜｜invoke\s+name="finish">\s*'
@@ -99,11 +100,13 @@ def validate_fine_trace(response: str) -> str | None:
             item["line_end"], int
         ):
             return f"step {expected_step} line_end must be an integer or null"
-        if "role" in item and item["role"] not in STEP_ROLES:
-            return (
-                f"step {expected_step} role must be source, sink, intermediate, "
-                "root_cause, or null"
-            )
+        if "role" in item:
+            role = ROLE_ALIASES.get(item["role"], item["role"])
+            if role not in STEP_ROLES:
+                return (
+                    f"step {expected_step} role must be source, sink, intermediate, "
+                    "root_cause, or null"
+                )
         if "depends_on" in item:
             return (
                 f"step {expected_step} must not contain depends_on; represent "

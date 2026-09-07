@@ -246,7 +246,7 @@ def model_map(model: str, *, openai_compatible: bool = False, provider_kind: str
 
     kind = str(provider_kind or "").strip().lower().replace("-", "_")
     if kind in {"anthropic", "anthropic_messages", "modelhub_messages"}:
-        if model.startswith("anthropic/") or model.startswith("claude-"):
+        if model.startswith("anthropic/"):
             return model
         return f"anthropic/{model}"
 

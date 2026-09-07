@@ -253,7 +253,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
         namespace = "claudecli-claude-opus-4.6" if harness == "claude" else "claude-opus-4.6"
         return ModelRoute(
             route_id=canonical,
-            model="claude-sonnet-5",
+            model="claude-opus-4-6",
             base_url=LMUAI_BASE_URL,
             api_key_env="ANTHROPIC_AUTH_TOKEN",
             results_namespace=namespace,
@@ -262,7 +262,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             extra_args=extra_args,
             metadata={
                 "requested_eval_model": "claude-opus-4.6",
-                "effective_model": "claude-sonnet-5",
+                "effective_model": "claude-opus-4-6",
             },
         )
 
@@ -275,7 +275,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
         namespace = "claudecli-claude-opus-4.8" if harness == "claude" else "claude-opus-4.8"
         return ModelRoute(
             route_id=canonical,
-            model="claude-sonnet-5",
+            model="claude-opus-4-8",
             base_url=LMUAI_BASE_URL,
             api_key_env="ANTHROPIC_AUTH_TOKEN",
             results_namespace=namespace,
@@ -284,7 +284,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             extra_args=extra_args,
             metadata={
                 "requested_eval_model": "claude-opus-4.8",
-                "effective_model": "claude-sonnet-5",
+                "effective_model": "claude-opus-4-8",
             },
         )
 
@@ -386,7 +386,7 @@ def available_model_routes() -> dict[str, str]:
         "gpt-5.5": "CN ModelHub OpenAI-compatible GPT route; sends model gpt-5.5-2026-04-24; key env OPENAI_API_KEY.",
         "gpt-5.4-mini": "Oversea ModelHub OpenAI-compatible GPT route; key env OPENAI_API_KEY_oversea.",
         "glm-5.2": "OpenAI-compatible GLM route using LMUAI and GLM_API_KEY.",
-        "claude-opus-4.6": "Compatibility route: run claude-sonnet-5 through LMUAI while writing opus-4.6 result namespaces.",
-        "claude-opus-4.8": "Compatibility route: run claude-sonnet-5 through LMUAI while writing opus-4.8 result namespaces.",
+        "claude-opus-4.6": "Run claude-opus-4-6 through LMUAI while writing opus-4.6 result namespaces.",
+        "claude-opus-4.8": "Run claude-opus-4-8 through LMUAI while writing opus-4.8 result namespaces.",
         "gt-codex-gpt-5.4": "gt_generation Codex bridge route to oversea ModelHub OpenAI-compatible GPT; model gpt-5.4-2026-03-05.",
     }
