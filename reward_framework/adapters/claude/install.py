@@ -18,7 +18,7 @@ from reward_framework.adapters.agent_skill_export import (
 )
 
 from reward_framework.adapters.claude.contract import ADAPTER_NAME, INTERFACE_VERSION, resolve_skills_dir
-from reward_framework.adapters.base import SKILL_PACKET_ENV
+from reward_framework.adapters.base import SKILL_PACKET_ENV, substitute_skill_path_placeholders
 
 
 def install_skill_packet(
@@ -67,7 +67,21 @@ def install_workspace_skill_packet(
     skills_dir = config_dir / "skills"
     manifest = install_skill_packet(packet, skills_dir, project_dir=workspace)
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    state_dir = scratch / "state"
+    state_dir.mkdir(exist_ok=True)
+    substitute_skill_path_placeholders(
+        skills_dir,
+        helpers_dir=skills_dir / "poc-submission" / "helpers",
+        state_dir=state_dir,
+        workspace=workspace,
+    )
     manifest["workspace"] = str(workspace)
+    manifest["agent_paths"] = {
+        "skill_packet": str(skills_dir),
+        "helpers": str(skills_dir / "poc-submission" / "helpers"),
+        "state": str(state_dir),
+        "workspace": str(workspace),
+    }
     return manifest
 
 

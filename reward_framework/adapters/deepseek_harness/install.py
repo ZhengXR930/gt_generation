@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from reward_framework.adapters.agent_skill_export import export_native_agent_skills
 
 from reward_framework.adapters.deepseek_harness.contract import ADAPTER_NAME, INTERFACE_VERSION, resolve_bundle_dir
-from reward_framework.adapters.base import SKILL_PACKET_ENV
+from reward_framework.adapters.base import SKILL_PACKET_ENV, substitute_skill_path_placeholders
 
 
 PLUGIN_TS = """import { readFileSync } from 'node:fs'
@@ -130,10 +130,25 @@ def install_workspace_skill_packet(
     scratch: Path,
     env: dict[str, str],
 ) -> dict:
-    del harness, workspace, sample_id
+    del harness, sample_id
     packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
     manifest = export_bundle(packet, scratch / "dsh_bundle")
     env["HARNESS_DSH_PATCH_FILE"] = str(manifest["patch_file"])
+    skills_dir = Path(manifest["bundle_dir"]) / "skills"
+    state_dir = scratch / "state"
+    state_dir.mkdir(exist_ok=True)
+    substitute_skill_path_placeholders(
+        skills_dir,
+        helpers_dir=skills_dir / "poc-submission" / "helpers",
+        state_dir=state_dir,
+        workspace=workspace,
+    )
+    manifest["agent_paths"] = {
+        "skill_packet": str(skills_dir),
+        "helpers": str(skills_dir / "poc-submission" / "helpers"),
+        "state": str(state_dir),
+        "workspace": str(workspace),
+    }
     return manifest
 
 

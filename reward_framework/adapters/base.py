@@ -11,13 +11,7 @@ from typing import Mapping
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_FILE = REPO_ROOT / "reward_framework" / "prompt.txt"
 DEFAULT_RUNS_ROOT = REPO_ROOT / "reward_framework" / "harness_runs"
-DEFAULT_SKILL_PACKET = (
-    REPO_ROOT
-    / "reward_framework"
-    / "offline_static_distillation"
-    / "templates"
-    / "skill_packet"
-)
+DEFAULT_SKILL_PACKET = REPO_ROOT / "reward_framework" / "skill_packets" / "initial"
 SERVER_ROOT = REPO_ROOT / "harness_runtime" / "server"
 OPENHANDS_RUNNER = REPO_ROOT / "harness_runtime" / "openhands" / "arvo.py"
 OPENHANDS_LOCAL_RUNNER = REPO_ROOT / "harness_runtime" / "openhands" / "local.py"
@@ -27,6 +21,26 @@ DSH_LOCAL_RUNNER = REPO_ROOT / "harness_runtime" / "deepseek_harness" / "local.p
 
 SKILL_PACKET_ENV = "REWARD_FRAMEWORK_SKILL_PACKET_DIR"
 MAX_EFFECTIVE_SUBMITS_ENV = "REWARD_FRAMEWORK_MAX_EFFECTIVE_SUBMITS"
+SKILL_PATH_PLACEHOLDERS = ("${HELPERS_DIR}", "${STATE_DIR}", "${WORKSPACE}")
+
+
+def substitute_skill_path_placeholders(
+    root: Path,
+    *,
+    helpers_dir: Path,
+    state_dir: Path,
+    workspace: Path,
+) -> None:
+    replacements = {
+        "${HELPERS_DIR}": str(helpers_dir),
+        "${STATE_DIR}": str(state_dir),
+        "${WORKSPACE}": str(workspace),
+    }
+    for skill in root.rglob("SKILL.md"):
+        text = skill.read_text(encoding="utf-8", errors="replace")
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        skill.write_text(text, encoding="utf-8")
 
 
 def runner_python() -> str:

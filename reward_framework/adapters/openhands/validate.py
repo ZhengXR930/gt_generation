@@ -10,31 +10,21 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from reward_framework.adapters.openhands.contract import (  # noqa: E402
     REPRODUCTION_SKILL_REL,
-    REQUIRED_REPRODUCTION_HELPERS,
     REQUIRED_SUBMISSION_HELPERS,
     SUBMISSION_SKILL_REL,
     WORKSPACE_STATE_DIR,
 )
 
-
 REQUIRED = {
-    REPRODUCTION_SKILL_REL: ("Reproduction Skill", WORKSPACE_STATE_DIR),
-    SUBMISSION_SKILL_REL: ("Submission Skill", WORKSPACE_STATE_DIR),
-    **{
-        f"submission_skill/helpers/{name}": ()
-        for name in REQUIRED_SUBMISSION_HELPERS
-    },
-    **{
-        f"reproduction_skill/helpers/{name}": ()
-        for name in REQUIRED_REPRODUCTION_HELPERS
-    },
+    REPRODUCTION_SKILL_REL: ("PoC Reproduction Skill",),
+    SUBMISSION_SKILL_REL: ("PoC Submission Skill",),
+    **{f"submission_skill/helpers/{name}": () for name in REQUIRED_SUBMISSION_HELPERS},
 }
 
 FORBIDDEN_TEXT = (
@@ -47,9 +37,9 @@ FORBIDDEN_TEXT = (
 )
 
 PROMPT_REQUIRED = (
-    "Reproduction Skill",
-    "Submission Skill",
-    "TRAIN evidence",
+    "description.txt",
+    "submit.sh",
+    "analysis.json",
 )
 
 
@@ -83,66 +73,40 @@ def check_packet(packet: Path) -> list[str]:
         work = Path(tmp)
         state = work / WORKSPACE_STATE_DIR
         state.mkdir()
-        (work / "candidate.bin").write_bytes(b"issue reproduction candidate\n")
-        (work / "note.md").write_text(
-            "candidate goal: test parser/source/root-cause/sink/trigger alignment\n",
-            encoding="utf-8",
-        )
-        (work / "analysis.md").write_text(
-            "current hypothesis: the target consumes candidate.bin as input\n",
-            encoding="utf-8",
-        )
+        candidate = work / "candidate.bin"
+        analysis = work / "analysis.json"
+        result = work / "result.json"
+        candidate.write_bytes(b"issue reproduction candidate\n")
+        analysis.write_text('{"sample_id":"smoke"}\n', encoding="utf-8")
+        result.write_text('{"exit_code":0}\n', encoding="utf-8")
+
         commands = [
-            [
-                "python3",
-                str(packet / "submission_skill/helpers/candidate_diff.py"),
-                "--current",
-                "candidate.bin",
-                "--history-jsonl",
-                f"{WORKSPACE_STATE_DIR}/submit_history.jsonl",
-                "--out",
-                f"{WORKSPACE_STATE_DIR}/candidate_diff.json",
-            ],
             [
                 "python3",
                 str(packet / "submission_skill/helpers/submit_preflight.py"),
                 "--candidate",
-                "candidate.bin",
-                "--artifact-kind",
-                "raw",
+                str(candidate),
+                "--history-jsonl",
+                str(state / "submit_history.jsonl"),
                 "--analysis",
-                "analysis.md",
-                "--note-file",
-                "note.md",
-                "--evidence-file",
-                "analysis.md",
+                str(analysis),
                 "--out",
-                f"{WORKSPACE_STATE_DIR}/preflight.json",
-            ],
-            [
-                "python3",
-                str(packet / "submission_skill/helpers/submit_command_lint.py"),
-                "--command",
-                "bash submit.sh candidate.bin analysis.json",
-                "--out",
-                f"{WORKSPACE_STATE_DIR}/submit_command_lint.json",
+                str(state / "preflight.json"),
             ],
             [
                 "python3",
                 str(packet / "submission_skill/helpers/submit_history.py"),
                 "record",
                 "--candidate",
-                "candidate.bin",
-                "--candidate-kind",
-                "raw",
+                str(candidate),
                 "--analysis",
-                "analysis.md",
-                "--preflight-report",
-                f"{WORKSPACE_STATE_DIR}/preflight.json",
-                "--submission-status",
+                str(analysis),
+                "--history-jsonl",
+                str(state / "submit_history.jsonl"),
+                "--result-json",
+                str(result),
+                "--status",
                 "smoke",
-                "--repair-class",
-                "unknown",
                 "--note",
                 "smoke",
             ],
@@ -150,32 +114,10 @@ def check_packet(packet: Path) -> list[str]:
                 "python3",
                 str(packet / "submission_skill/helpers/submit_history.py"),
                 "summarize",
+                "--history-jsonl",
+                str(state / "submit_history.jsonl"),
                 "--out",
-                f"{WORKSPACE_STATE_DIR}/summary.md",
-            ],
-            [
-                "python3",
-                str(packet / "reproduction_skill/helpers/candidate_plan.py"),
-                "--issue-file",
-                "note.md",
-                "--code-notes",
-                "analysis.md",
-                "--previous-plan",
-                f"{WORKSPACE_STATE_DIR}/summary.md",
-                "--out",
-                f"{WORKSPACE_STATE_DIR}/candidate_plan.md",
-            ],
-            [
-                "python3",
-                str(packet / "reproduction_skill/helpers/issue_code_alignment.py"),
-                "--issue-file",
-                "note.md",
-                "--code-notes",
-                "analysis.md",
-                "--plan",
-                f"{WORKSPACE_STATE_DIR}/candidate_plan.md",
-                "--out",
-                f"{WORKSPACE_STATE_DIR}/issue_code_alignment.json",
+                str(state / "submit_history_summary.json"),
             ],
         ]
         for cmd in commands:
@@ -184,18 +126,12 @@ def check_packet(packet: Path) -> list[str]:
                 fail(
                     "helper smoke failed: "
                     + " ".join(cmd)
-                    + f"\nstdout={proc.stdout}\nstderr={proc.stderr}"
+                    + "\nstdout="
+                    + proc.stdout
+                    + "\nstderr="
+                    + proc.stderr
                 )
-        expected_outputs = [
-            "candidate_diff.json",
-            "preflight.json",
-            "submit_command_lint.json",
-            "submit_history.jsonl",
-            "summary.md",
-            "candidate_plan.md",
-            "issue_code_alignment.json",
-        ]
-        for name in expected_outputs:
+        for name in ("preflight.json", "submit_history.jsonl", "submit_history_summary.json"):
             path = state / name
             if not path.is_file() or path.stat().st_size <= 0:
                 fail(f"helper smoke missing output: {name}")
@@ -203,40 +139,31 @@ def check_packet(packet: Path) -> list[str]:
     return notes
 
 
-def check_prompts(prompt_dir: Path) -> list[str]:
+def check_prompts(prompt_root: Path) -> list[str]:
     notes: list[str] = []
-    if not prompt_dir.is_dir():
-        fail(f"missing prompt dir: {prompt_dir}")
-    for path in sorted(prompt_dir.glob("*.txt")):
-        text = _read(path)
-        for bad in FORBIDDEN_TEXT:
-            if bad in text:
-                fail(f"{path.name} contains forbidden stale text {bad!r}")
-    combined = "\n".join(_read(p) for p in sorted(prompt_dir.glob("*.txt")))
+    files = [prompt_root] if prompt_root.is_file() else sorted(prompt_root.glob("*.txt"))
+    if not files:
+        fail(f"missing prompt file(s): {prompt_root}")
+    combined = "\n".join(_read(path) for path in files)
+    for bad in FORBIDDEN_TEXT:
+        if bad in combined:
+            fail(f"prompt contains forbidden stale text {bad!r}")
     for needle in PROMPT_REQUIRED:
         if needle not in combined:
             fail(f"prompts missing required interface phrase {needle!r}")
-    notes.append(f"prompts ok: {prompt_dir}")
+    notes.append(f"prompts ok: {prompt_root}")
     return notes
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--packet",
-        action="append",
-        default=[],
-        help="Skill packet directory to validate. May be repeated.",
-    )
-    parser.add_argument(
-        "--prompts",
-        default=str(REPO_ROOT / "reward_framework/offline_static_distillation/prompts"),
-    )
+    parser.add_argument("--packet", action="append", default=[])
+    parser.add_argument("--prompts", default=str(REPO_ROOT / "reward_framework" / "prompt.txt"))
     args = parser.parse_args(argv)
 
     packets = [Path(p).resolve() for p in args.packet]
     if not packets:
-        packets = [REPO_ROOT / "reward_framework/offline_static_distillation/templates/skill_packet"]
+        packets = [REPO_ROOT / "reward_framework" / "skill_packets" / "initial"]
     notes: list[str] = []
     for packet in packets:
         notes.extend(check_packet(packet))

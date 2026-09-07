@@ -90,15 +90,16 @@ def test_reward_harness_adapters_use_neutral_runtime_only():
 
 
 def test_reward_skill_packet_uses_current_names():
-    packet = ROOT / "reward_framework" / "offline_static_distillation" / "templates" / "skill_packet"
+    packet = ROOT / "reward_framework" / "skill_packets" / "initial"
     assert (packet / "reproduction_skill" / "SKILL.md").is_file()
     assert (packet / "submission_skill" / "SKILL.md").is_file()
     assert not (packet / "level1_submission_verification").exists()
     assert not (packet / "level2_vulnerability_reproduction").exists()
 
     source_paths = [
-        ROOT / "reward_framework" / "offline_static_distillation" / "cli.py",
-        ROOT / "reward_framework" / "offline_static_distillation" / "README.md",
+        ROOT / "reward_framework" / "distillation" / "cli.py",
+        ROOT / "reward_framework" / "distillation" / "prompt_templates" / "teacher.md",
+        ROOT / "reward_framework" / "distillation" / "prompt_templates" / "curator.md",
         ROOT / "reward_framework" / "adapters" / "agent_skill_export.py",
         ROOT / "reward_framework" / "adapters" / "openhands" / "contract.py",
         ROOT / "reward_framework" / "adapters" / "openhands" / "validate.py",

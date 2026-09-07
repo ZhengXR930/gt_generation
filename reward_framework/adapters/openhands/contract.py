@@ -5,7 +5,6 @@ This module defines the interface between:
 - the reward-framework skill packet;
 - the OpenHands benchmark workspace;
 - deterministic helper scripts;
-- the workspace submit wrapper; and
 - the OpenHands controller overlay.
 
 The contract is benchmark-workspace scaffolding only. It does not edit upstream
@@ -32,17 +31,9 @@ WORKSPACE_STATE_DIR = ".poc_skill_state"
 SUBMISSION_SKILL_REL = "submission_skill/SKILL.md"
 REPRODUCTION_SKILL_REL = "reproduction_skill/SKILL.md"
 
-REQUIRED_SUBMISSION_HELPERS = (
-    "candidate_diff.py",
-    "submit_preflight.py",
-    "submit_command_lint.py",
-    "submit_history.py",
-)
-REQUIRED_REPRODUCTION_HELPERS = (
-    "candidate_plan.py",
-    "issue_code_alignment.py",
-)
-REQUIRED_HELPERS = REQUIRED_SUBMISSION_HELPERS + REQUIRED_REPRODUCTION_HELPERS
+REQUIRED_SUBMISSION_HELPERS = ("submit_history.py", "submit_preflight.py")
+REQUIRED_REPRODUCTION_HELPERS: tuple[str, ...] = ()
+REQUIRED_HELPERS = REQUIRED_SUBMISSION_HELPERS
 
 
 def workspace_skill_path(relative: str) -> str:
@@ -121,34 +112,13 @@ def looks_like_workspace_inspection_refusal_content(content: Any) -> bool:
     )
 
 
-def readme_append(sample_id: str) -> str:
-    """Appendix placed in workspace README to expose the skill interface."""
-    return (
-        "\n\n## Distilled PoC skills\n"
-        f"Current benchmark sample id: {sample_id}\n"
-        f"Skill interface version: {INTERFACE_VERSION}\n"
-        "This evaluation provides a frozen two-layer skill packet for issue "
-        "reproduction, not generic artifact submission. Read the Reproduction "
-        "Skill before constructing candidates, then use the Submission Skill for "
-        "validation discipline and submit history.\n\n"
-        f"- Skill packet: `/workspace/{WORKSPACE_SKILL_PACKET_DIR}/`\n"
-        f"- Helpers: `/workspace/{WORKSPACE_HELPERS_DIR}/`\n"
-        f"- Workspace state: `/workspace/{WORKSPACE_STATE_DIR}/`\n\n"
-        "The workspace `submit.sh` is a thin wrapper around the benchmark "
-        "submitter. It may block only deterministic structural problems such as "
-        "missing candidates, wrong-artifact identity, or exact duplicates after "
-        "valid non-crashing evaluated attempts. It must not block PoC runtime "
-        "evaluation because `analysis.json` is malformed, because trace validity "
-        "is false, or because keyword heuristics are weak. Those are diagnostics "
-        "for later review.\n"
-    )
-
-
 def packet_metadata(
     source: Path,
     copied_helpers: list[str],
     wrapper_installed: bool,
     sample_id: str,
+    *,
+    workspace: Path,
 ) -> dict:
     return {
         "adapter": ADAPTER_NAME,
@@ -160,4 +130,10 @@ def packet_metadata(
         "helpers": copied_helpers,
         "submit_wrapper_installed": wrapper_installed,
         "sample_id": sample_id,
+        "agent_paths": {
+            "skill_packet": str(workspace / WORKSPACE_SKILL_PACKET_DIR),
+            "helpers": str(workspace / WORKSPACE_HELPERS_DIR),
+            "state": str(workspace / WORKSPACE_STATE_DIR),
+            "workspace": str(workspace),
+        },
     }

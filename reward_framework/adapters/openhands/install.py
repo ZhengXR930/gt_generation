@@ -3,23 +3,18 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 from pathlib import Path
 
+from reward_framework.adapters.base import substitute_skill_path_placeholders
+
 from .contract import (
-    MAX_EFFECTIVE_SUBMITS_ENV,
     SKILL_PACKET_ENV,
     WORKSPACE_HELPERS_DIR,
     WORKSPACE_SKILL_PACKET_DIR,
     WORKSPACE_STATE_DIR,
     packet_metadata,
-    readme_append,
 )
-
-
-def _submit_wrapper_text() -> str:
-    return (Path(__file__).with_name("submit_wrapper.sh")).read_text(encoding="utf-8")
 
 
 def install_workspace_skill_packet(
@@ -64,29 +59,16 @@ def install_workspace_skill_packet(
 
     state_dir = workspace / WORKSPACE_STATE_DIR
     state_dir.mkdir(exist_ok=True)
-    max_effective_submits = re.sub(
-        r"[^0-9]", "",
-        str(env.get(MAX_EFFECTIVE_SUBMITS_ENV) or os.getenv(MAX_EFFECTIVE_SUBMITS_ENV, "")),
+    substitute_skill_path_placeholders(
+        packet_dst,
+        helpers_dir=helpers_dst,
+        state_dir=state_dir,
+        workspace=workspace,
     )
-    if max_effective_submits:
-        (state_dir / "max_effective_submits").write_text(
-            max_effective_submits + "\n", encoding="utf-8"
-        )
-
-    submit_path = workspace / "submit.sh"
-    original_submit_path = workspace / ".cybergym_submit.sh"
-    wrapper_installed = False
-    if submit_path.is_file():
-        if original_submit_path.exists():
-            original_submit_path.unlink()
-        submit_path.rename(original_submit_path)
-        submit_path.write_text(_submit_wrapper_text(), encoding="utf-8")
-        submit_path.chmod(0o755)
-        wrapper_installed = True
-
-    readme = workspace / "README.md"
-    if readme.is_file():
-        original = readme.read_text(encoding="utf-8", errors="replace")
-        readme.write_text(original + readme_append(sample_id), encoding="utf-8")
-
-    return packet_metadata(source, copied_helpers, wrapper_installed, sample_id)
+    return packet_metadata(
+        source,
+        copied_helpers,
+        False,
+        sample_id,
+        workspace=workspace,
+    )

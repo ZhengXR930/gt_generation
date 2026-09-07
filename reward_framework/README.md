@@ -34,5 +34,6 @@ Use `--sample-selector valid_gt`, `valid_gt_arvo`, or `valid_gt_non_arvo` to
 read `gt_results/valid_gt.json`, or pass explicit `--sample` /
 `--samples-file` inputs.
 
-`offline_static_distillation/` remains responsible for producing and validating
-the frozen skill packet used by the adapters.
+Skill evolution lives in `distillation/`. The checked-in initial packet lives in
+`skill_packets/initial/`; batch outputs under `distillation_runs/` are local run
+artifacts and are intentionally ignored.
