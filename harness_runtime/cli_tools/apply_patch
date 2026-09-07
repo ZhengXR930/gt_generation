@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Small apply_patch compatibility command for CLI agent workspaces.
+
+Codex models often use an apply_patch shell command. The hosted Codex
+environment provides that command, but host-side benchmark runners do not
+necessarily have it installed. This shim implements the subset used by agents:
+add, delete, update, and move files inside the current workspace.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+class PatchError(Exception):
+    pass
+
+
+def _workspace_root():
+    configured = os.environ.get("BENCHMARK_WORKSPACE") or os.environ.get("WORKSPACE")
+    root = Path(configured).expanduser() if configured else Path.cwd()
+    return root.resolve()
+
+
+def _resolve(path_text, root):
+    path = Path(path_text.strip()).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise PatchError("refusing to patch path outside workspace: %s" % path_text) from exc
+    return resolved
+
+
+def _read(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _collect(lines, index):
+    block = []
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("*** ") and not line.startswith("*** End of File"):
+            break
+        if line.startswith("*** End of File"):
+            index += 1
+            continue
+        block.append(line)
+        index += 1
+    return block, index
+
+
+def _apply_add(path, block):
+    out = []
+    for line in block:
+        if not line.startswith("+"):
+            raise PatchError("add-file lines must start with '+': %r" % line)
+        out.append(line[1:])
+    _write(path, "\n".join(out) + ("\n" if out else ""))
+
+
+def _apply_update(path, block):
+    if not path.exists():
+        raise PatchError("file to update does not exist: %s" % path)
+    text = _read(path)
+    hunks = []
+    current = []
+    for line in block:
+        if line.startswith("@@"):
+            if current:
+                hunks.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        hunks.append(current)
+    if not hunks:
+        raise PatchError("empty update patch for %s" % path)
+
+    for hunk in hunks:
+        old_lines = []
+        new_lines = []
+        for line in hunk:
+            if not line:
+                old_lines.append("")
+                new_lines.append("")
+            elif line[0] == " ":
+                old_lines.append(line[1:])
+                new_lines.append(line[1:])
+            elif line[0] == "-":
+                old_lines.append(line[1:])
+            elif line[0] == "+":
+                new_lines.append(line[1:])
+            elif line.startswith("*** End of File"):
+                continue
+            else:
+                raise PatchError("bad update line prefix in %s: %r" % (path, line))
+        old = "\n".join(old_lines)
+        new = "\n".join(new_lines)
+        candidates = [old]
+        if old and not old.endswith("\n"):
+            candidates.append(old + "\n")
+        replaced = False
+        for needle in candidates:
+            if needle and needle in text:
+                text = text.replace(needle, new + ("\n" if needle.endswith("\n") else ""), 1)
+                replaced = True
+                break
+        if not replaced:
+            raise PatchError("could not find update hunk in %s" % path)
+    _write(path, text)
+
+
+def _parse_and_apply(patch_text):
+    lines = patch_text.splitlines()
+    if not lines or lines[0].strip() != "*** Begin Patch":
+        raise PatchError("patch must start with '*** Begin Patch'")
+    if lines[-1].strip() != "*** End Patch":
+        raise PatchError("patch must end with '*** End Patch'")
+
+    root = _workspace_root()
+    index = 1
+    changed = 0
+    while index < len(lines) - 1:
+        line = lines[index]
+        if line.startswith("*** Add File: "):
+            path = _resolve(line.split(": ", 1)[1], root)
+            block, index = _collect(lines, index + 1)
+            _apply_add(path, block)
+            changed += 1
+            continue
+        if line.startswith("*** Delete File: "):
+            path = _resolve(line.split(": ", 1)[1], root)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                raise PatchError("file to delete does not exist: %s" % path)
+            index += 1
+            changed += 1
+            continue
+        if line.startswith("*** Update File: "):
+            src = _resolve(line.split(": ", 1)[1], root)
+            index += 1
+            move_to = None
+            if index < len(lines) and lines[index].startswith("*** Move to: "):
+                move_to = _resolve(lines[index].split(": ", 1)[1], root)
+                index += 1
+            block, index = _collect(lines, index)
+            _apply_update(src, block)
+            if move_to is not None:
+                move_to.parent.mkdir(parents=True, exist_ok=True)
+                src.rename(move_to)
+            changed += 1
+            continue
+        if not line.strip():
+            index += 1
+            continue
+        raise PatchError("unexpected patch directive: %s" % line)
+    if changed == 0:
+        raise PatchError("patch contained no file operations")
+
+
+def main():
+    patch_text = "\n".join(sys.argv[1:]) if len(sys.argv) > 1 else sys.stdin.read()
+    try:
+        _parse_and_apply(patch_text)
+    except PatchError as exc:
+        print("apply_patch: %s" % exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
