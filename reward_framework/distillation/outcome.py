@@ -140,10 +140,5 @@ def diagnostics_summary(eval_row: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def failure_mode_key(outcome_record: dict[str, Any], vulnerability_type: str | None) -> str:
-    stage = outcome_record.get("first_failed_stage") or outcome_record.get("deepest_stage") or "Unknown"
-    return f"{stage}|{(vulnerability_type or 'unknown').strip().lower()}"
-
-
 def _depth(stage: str | None) -> int:
     return STAGE_ORDER.index(stage) + 1 if stage in STAGE_ORDER else 0

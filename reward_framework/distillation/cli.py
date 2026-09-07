@@ -17,7 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from evaluator.evaluate import evaluate_sample  # noqa: E402
 from reward_framework.distillation.artifacts import read_json, sample_project, write_json  # noqa: E402
 from reward_framework.distillation.audit import audit_framework  # noqa: E402
-from reward_framework.distillation.diagnosis_view import learning_diagnosis, learning_evaluation  # noqa: E402
+from reward_framework.distillation.diagnosis_view import BEHAVIOR_SECTIONS, learning_diagnosis, learning_evaluation  # noqa: E402
 from reward_framework.distillation.defaults import (  # noqa: E402
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
@@ -31,7 +31,6 @@ from reward_framework.distillation.outcome import classify_outcome  # noqa: E402
 from reward_framework.distillation.pools import (  # noqa: E402
     build_validation_panel,
     load_pools,
-    mark_targeted,
     save_pools,
     teacher_view,
     update_pools,
@@ -263,26 +262,20 @@ def _false_positive_summary(eval_row: dict[str, Any] | None, outcome_record: dic
 
 
 
-_DIAGNOSIS_REQUIRED_TEXT_FIELDS = (
-    "stage_summary",
-    "issue_alignment_diagnosis",
-    "reasoning_diagnosis",
-    "reachability_diagnosis",
-    "submission_diagnosis",
-    "candidate_source_diagnosis",
-    "evidence_excerpt",
-)
-
-
 def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
-    missing = [
-        field for field in _DIAGNOSIS_REQUIRED_TEXT_FIELDS
-        if not str(diagnosis.get(field) or "").strip()
-    ]
-    if missing:
-        return "diagnosis missing required text field(s): " + ", ".join(missing)
     if not str(diagnosis.get("issue_description") or "").strip():
         return "diagnosis missing issue_description"
+    missing: list[str] = []
+    for section in BEHAVIOR_SECTIONS:
+        value = diagnosis.get(section)
+        if not isinstance(value, dict):
+            missing.append(section)
+            continue
+        for field in ("summary", "evidence"):
+            if not str(value.get(field) or "").strip():
+                missing.append(f"{section}.{field}")
+    if missing:
+        return "diagnosis missing required behavior field(s): " + ", ".join(missing)
     return None
 
 
@@ -292,28 +285,25 @@ def _normalize_diagnosis_for_outcome(
     *,
     sample_id: str = "",
 ) -> dict[str, Any]:
-    """Attach deterministic outcome facts without imposing diagnostic labels."""
-    normalized = dict(diagnosis)
-    outcome = str((outcome_record or {}).get("outcome") or normalized.get("outcome") or "").lower()
+    """Attach deterministic facts without accepting legacy diagnosis fields."""
+    normalized: dict[str, Any] = {}
+    raw_sample_id = diagnosis.get("sample_id") or sample_id
+    if raw_sample_id:
+        normalized["sample_id"] = raw_sample_id
+    outcome = str((outcome_record or {}).get("outcome") or diagnosis.get("outcome") or "").lower()
     if outcome:
         normalized["outcome"] = outcome
-    if "stage_summary" not in normalized and normalized.get("diagnosis"):
-        normalized["stage_summary"] = normalized.get("diagnosis")
-    if "reasoning_diagnosis" not in normalized:
-        normalized["reasoning_diagnosis"] = normalized.get("behavioral_summary") or normalized.get("diagnosis")
-    if "reachability_diagnosis" not in normalized:
-        normalized["reachability_diagnosis"] = normalized.get("failed_stage_reason") or normalized.get("diagnosis")
-    if "submission_diagnosis" not in normalized:
-        normalized["submission_diagnosis"] = normalized.get("cross_stage_issue") or normalized.get("diagnosis")
-    if "issue_description" not in normalized or not str(normalized.get("issue_description") or "").strip():
-        normalized["issue_description"] = _sample_issue_description(sample_id) if sample_id else ""
-    if "issue_alignment_diagnosis" not in normalized:
-        normalized["issue_alignment_diagnosis"] = normalized.get("diagnosis")
-    normalized.pop("failure_type", None)
-    normalized.pop("failure_mode_key", None)
-    normalized.pop("transferable_signal", None)
+    issue = str(diagnosis.get("issue_description") or "").strip()
+    if not issue and sample_id:
+        issue = _sample_issue_description(sample_id)
+    if issue:
+        normalized["issue_description"] = issue
+    if diagnosis.get("vulnerability_type") not in (None, ""):
+        normalized["vulnerability_type"] = diagnosis.get("vulnerability_type")
+    for section in BEHAVIOR_SECTIONS:
+        if section in diagnosis:
+            normalized[section] = diagnosis.get(section)
     return normalized
-
 
 def cmd_diagnose_batch(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.resolve()
@@ -409,14 +399,8 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
             "outcome": learning.get("outcome"),
             **false_positive,
             "issue_description": learning.get("issue_description"),
-            "issue_alignment_diagnosis": learning.get("issue_alignment_diagnosis"),
             "vulnerability_type": learning.get("vulnerability_type"),
-            "stage_summary": learning.get("stage_summary"),
-            "reasoning_diagnosis": learning.get("reasoning_diagnosis"),
-            "reachability_diagnosis": learning.get("reachability_diagnosis"),
-            "submission_diagnosis": learning.get("submission_diagnosis"),
-            "candidate_source_diagnosis": learning.get("candidate_source_diagnosis"),
-            "evidence_excerpt": learning.get("evidence_excerpt"),
+            **{section: learning.get(section) for section in BEHAVIOR_SECTIONS},
             "outcome_record": outcome_record,
         })
 
@@ -549,19 +533,6 @@ def cmd_apply_curation(args: argparse.Namespace) -> int:
     decisions = payload.get("decisions", payload if isinstance(payload, list) else [])
     out_packet = args.out_packet or run_dir / "skill_packets" / f"batch_{args.batch_index + 1:03d}"
     result = apply_curator_decisions(packet, decisions, out_packet=out_packet)
-
-    # Record which recurring failure mode each written lesson is meant to reduce,
-    # so a later batch can tell whether it actually worked. The applied records
-    # carry their decision_index, so this is exact even when two decisions
-    # target the same section.
-    pools_path = run_dir / POOLS_FILE
-    pools = load_pools(pools_path)
-    for applied in result["applied"]:
-        decision = decisions[applied["decision_index"]]
-        mode_key = str(decision.get("failure_mode_key") or "").strip()
-        if mode_key:
-            mark_targeted(pools, mode_key, applied["lesson_id"])
-    save_pools(pools_path, pools)
 
     write_json(batch_dir / "applied_updates.json", result)
     print(json.dumps({

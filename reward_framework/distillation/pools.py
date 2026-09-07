@@ -15,6 +15,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+BEHAVIOR_SECTIONS = (
+    "search_behavior",
+    "candidate_behavior",
+    "feedback_behavior",
+    "outcome_diagnosis",
+    "transferable_observation",
+)
+
 EXCERPT_CHARS = 640
 
 _FAILURE_OUTCOMES = {"failure", "partial"}
@@ -81,14 +89,6 @@ def update_pools(pools: dict[str, Any], batch_index: int, records: list[dict[str
         })
     return pools
 
-
-def mark_targeted(pools: dict[str, Any], mode_key: str, lesson_id: str) -> None:
-    """Compatibility no-op for old callers; v4 pools have no failure-mode keys."""
-    _upgrade_in_place(pools)
-    pools.setdefault("targeted_patterns", []).append({
-        "pattern": mode_key,
-        "lesson_id": lesson_id,
-    })
 
 
 def teacher_view(pools: dict[str, Any], *, limit: int = 80, through_batch: int | None = None) -> dict[str, Any]:
@@ -239,14 +239,8 @@ def _sample_record(
         "project": record.get("project"),
         "outcome": outcome,
         "issue_description": _short(record.get("issue_description")),
-        "issue_alignment_diagnosis": _short(record.get("issue_alignment_diagnosis")),
         "vulnerability_type": record.get("vulnerability_type"),
-        "stage_summary": _short(record.get("stage_summary")),
-        "reasoning_diagnosis": _short(record.get("reasoning_diagnosis")),
-        "reachability_diagnosis": _short(record.get("reachability_diagnosis")),
-        "submission_diagnosis": _short(record.get("submission_diagnosis")),
-        "candidate_source_diagnosis": _short(record.get("candidate_source_diagnosis")),
-        "evidence_excerpt": _short(record.get("evidence_excerpt")),
+        **{section: _short_value(record.get(section)) for section in BEHAVIOR_SECTIONS},
         "false_positive": bool(record.get("false_positive") or outcome_record.get("false_positive") or false_positive_pocs),
         "false_positive_pocs": false_positive_pocs,
     }
@@ -255,6 +249,18 @@ def _sample_record(
 def _short(value: Any, limit: int = EXCERPT_CHARS) -> str:
     text = str(value or "").strip()
     return text[:limit]
+
+
+def _short_value(value: Any, limit: int = EXCERPT_CHARS) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _short_value(item, limit=limit)
+            for key, item in value.items()
+            if item not in (None, "", [], {})
+        }
+    if isinstance(value, list):
+        return [_short_value(item, limit=limit) for item in value if item not in (None, "", [], {})]
+    return _short(value, limit=limit)
 
 
 def _visible_samples(samples: list[dict[str, Any]], through_batch: int | None) -> list[dict[str, Any]]:
@@ -296,14 +302,8 @@ def _teacher_sample(sample: dict[str, Any]) -> dict[str, Any]:
             "project",
             "outcome",
             "issue_description",
-            "issue_alignment_diagnosis",
             "vulnerability_type",
-            "stage_summary",
-            "reasoning_diagnosis",
-            "reachability_diagnosis",
-            "submission_diagnosis",
-            "candidate_source_diagnosis",
-            "evidence_excerpt",
+            *BEHAVIOR_SECTIONS,
         )
         if sample.get(key) not in (None, "")
     }

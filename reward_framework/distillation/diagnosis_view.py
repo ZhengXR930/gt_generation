@@ -11,24 +11,20 @@ from __future__ import annotations
 import re
 from typing import Any
 
-TEXT_FIELDS = (
-    "issue_alignment_diagnosis",
-    "reasoning_diagnosis",
-    "reachability_diagnosis",
-    "submission_diagnosis",
-    "candidate_source_diagnosis",
-    "stage_summary",
-    "evidence_excerpt",
+BEHAVIOR_SECTIONS = (
+    "search_behavior",
+    "candidate_behavior",
+    "feedback_behavior",
+    "outcome_diagnosis",
+    "transferable_observation",
 )
-
-ABSTRACT_FIELDS = (*TEXT_FIELDS, "issue_description")
 
 _LEARNING_KEYS = (
     "sample_id",
     "outcome",
     "issue_description",
     "vulnerability_type",
-    *TEXT_FIELDS,
+    *BEHAVIOR_SECTIONS,
 )
 
 _REPLACEMENTS = (
@@ -99,6 +95,19 @@ def abstract_text(value: Any) -> str:
     return text
 
 
+def abstract_value(value: Any) -> Any:
+    """Recursively abstract strings while preserving JSON structure."""
+    if isinstance(value, dict):
+        return {
+            str(key): abstract_value(item)
+            for key, item in value.items()
+            if item not in (None, "", [], {})
+        }
+    if isinstance(value, list):
+        return [abstract_value(item) for item in value if item not in (None, "", [], {})]
+    return abstract_text(value)
+
+
 def learning_diagnosis(diagnosis: dict[str, Any], outcome_record: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return the abstract per-sample diagnosis consumed by learning roles."""
     out: dict[str, Any] = {}
@@ -106,10 +115,12 @@ def learning_diagnosis(diagnosis: dict[str, Any], outcome_record: dict[str, Any]
         if key not in diagnosis:
             continue
         value = diagnosis.get(key)
-        if value in (None, ""):
+        if value in (None, "", [], {}):
             continue
-        if key in ABSTRACT_FIELDS:
+        if key == "issue_description":
             out[key] = abstract_text(value)
+        elif key in BEHAVIOR_SECTIONS:
+            out[key] = abstract_value(value)
         else:
             out[key] = value
     if outcome_record:

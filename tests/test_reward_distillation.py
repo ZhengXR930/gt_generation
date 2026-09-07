@@ -35,6 +35,20 @@ def _valid_gt(tmp_path, count=500):
     return valid
 
 
+def _section(summary, evidence="evidence"):
+    return {"summary": summary, "evidence": evidence}
+
+
+def _behavioral_fields(prefix="behavior"):
+    return {
+        "search_behavior": _section(f"{prefix} search", f"{prefix} search evidence"),
+        "candidate_behavior": _section(f"{prefix} candidate", f"{prefix} candidate evidence"),
+        "feedback_behavior": _section(f"{prefix} feedback", f"{prefix} feedback evidence"),
+        "outcome_diagnosis": _section(f"{prefix} outcome", f"{prefix} outcome evidence"),
+        "transferable_observation": _section(f"{prefix} transferable", f"{prefix} transferable evidence"),
+    }
+
+
 def test_split_falls_back_to_corpus_order_without_dates(tmp_path):
     empty = tmp_path / "no_dates.json"
     empty.write_text(json.dumps({"rows": []}), encoding="utf-8")
@@ -227,27 +241,21 @@ def test_pools_keep_sample_level_records_without_failure_mode_gate():
             "sample_id": "a",
             "project": "p1",
             "vulnerability_type": "oob read",
-            "stage_summary": "reached Source, missed Sink",
-            "reasoning_diagnosis": "understood source but missed sink guard",
-            "reachability_diagnosis": "candidate reached source only",
-            "submission_diagnosis": "submitted once",
+            **_behavioral_fields("partial"),
             "outcome_record": {"outcome": "partial", "first_failed_stage": "Sink"},
         },
         {
             "sample_id": "b",
             "project": "p2",
             "vulnerability_type": "uaf",
-            "stage_summary": "triggered",
-            "reasoning_diagnosis": "tracked lifetime state",
-            "reachability_diagnosis": "candidate reached Trigger",
-            "submission_diagnosis": "validated concrete candidate",
+            **_behavioral_fields("success"),
             "outcome_record": {"outcome": "success", "deepest_stage": "Trigger"},
         },
         {
             "sample_id": "c",
             "project": "p3",
             "vulnerability_type": "x",
-            "stage_summary": "reachability unavailable",
+            **_behavioral_fields("infra"),
             "outcome_record": {"outcome": "infrastructure"},
         },
     ])
@@ -263,7 +271,7 @@ def test_pools_keep_sample_level_records_without_failure_mode_gate():
         "batches_seen": 1,
     }
     assert view["failure_pool"][0]["sample_id"] == "a"
-    assert view["failure_pool"][0]["reasoning_diagnosis"] == "understood source but missed sink guard"
+    assert view["failure_pool"][0]["search_behavior"]["summary"] == "partial search"
     assert view["crash_pool"] == []
     assert view["success_pool"][0]["sample_id"] == "b"
     assert view["infrastructure_pool"][0]["sample_id"] == "c"
@@ -276,10 +284,7 @@ def test_success_pool_keeps_sample_level_diagnosis_records():
         "project": "p1",
         "vulnerability_type": "uaf",
         "outcome": "success",
-        "stage_summary": "Trigger reached",
-        "reasoning_diagnosis": "identified stale-object use",
-        "reachability_diagnosis": "candidate reached R5",
-        "submission_diagnosis": "submitted after concrete local validation",
+        **_behavioral_fields("success"),
         "outcome_record": {"outcome": "success", "deepest_stage": "Trigger"},
     }])
     view = teacher_view(pools)
@@ -288,15 +293,17 @@ def test_success_pool_keeps_sample_level_diagnosis_records():
         "project": "p1",
         "outcome": "success",
         "vulnerability_type": "uaf",
-        "stage_summary": "Trigger reached",
-        "reasoning_diagnosis": "identified stale-object use",
-        "reachability_diagnosis": "candidate reached R5",
-        "submission_diagnosis": "submitted after concrete local validation",
+        **_behavioral_fields("success"),
     }]
 
-
 def test_success_diagnosis_outcome_is_normalized_without_failure_type():
-    diagnosis = {"sample_id": "ok1", "outcome": "partial", "failure_type": "reasoning"}
+    diagnosis = {
+        "sample_id": "ok1",
+        "outcome": "partial",
+        "failure_type": "reasoning",
+        "issue_description": "issue",
+        **_behavioral_fields("success"),
+    }
     normalized = _normalize_diagnosis_for_outcome(
         diagnosis, {"outcome": "success", "deepest_stage": "Trigger"}
     )
@@ -308,8 +315,7 @@ def test_success_diagnosis_outcome_is_normalized_without_failure_type():
     )
     assert infra["outcome"] == "infrastructure"
     assert "failure_type" not in infra
-
-
+    assert "search_behavior" not in infra, "legacy fields must not be synthesized"
 
 
 def test_learning_diagnosis_strips_evaluator_and_code_coordinates():
@@ -318,12 +324,14 @@ def test_learning_diagnosis_strips_evaluator_and_code_coordinates():
         "outcome": "partial",
         "issue_description": "public issue",
         "vulnerability_type": "oob",
-        "reasoning_diagnosis": "Reached R4 Sink in `src/foo.c:123` and function parse_input before Trigger failed.",
-        "reachability_diagnosis": "R2_source_reached was true, but Parser/Source/Root Cause labels were incomplete.",
-        "submission_diagnosis": "See https://example.test and commit abcdef1234567890 for line 55.",
-        "candidate_source_diagnosis": "manual construction",
-        "stage_summary": "Sink reached, Trigger missed",
-        "evidence_excerpt": "repo-vul/src-vul/lib/a.cc:77 showed the issue",
+        "search_behavior": _section(
+            "Reached R4 Sink in `src/foo.c:123` and function parse_input before Trigger failed.",
+            "R2_source_reached was true in repo-vul/src-vul/lib/a.cc:77.",
+        ),
+        "candidate_behavior": _section("manual construction", "See https://example.test and commit abcdef1234567890 for line 55."),
+        "feedback_behavior": _section("Parser feedback was reused", "Source path stayed stable."),
+        "outcome_diagnosis": _section("Sink reached, Trigger missed", "Root Cause label was incomplete."),
+        "transferable_observation": _section("candidate mutation helped", "source artifact evidence"),
     }
     learned = learning_diagnosis(raw, {"outcome": "partial"})
     rendered = json.dumps(learned)
@@ -332,7 +340,7 @@ def test_learning_diagnosis_strips_evaluator_and_code_coordinates():
     assert "src/foo.c" not in rendered and "a.cc" not in rendered and "abcdef" not in rendered
     assert "observable failure" in rendered
     assert learned["sample_id"] == "arvo_1"
-
+    assert learned["search_behavior"]["summary"]
 
 def test_learning_evaluation_hides_stage_labels():
     view = learning_evaluation({"batch_index": 1, "rows": [{
@@ -357,7 +365,7 @@ def test_distillation_role_prompts_are_external_templates():
     expected = {"diagnostician.md", "teacher.md", "curator.md", "correction.md", "README.md"}
     template_dir = Path("reward_framework/distillation/prompt_templates")
     assert expected <= {path.name for path in template_dir.glob("*.md")}
-    assert "You are the Sample Diagnostician." in load_template("diagnostician.md")
+    assert "You are the Sample Behavior Diagnostician." in load_template("diagnostician.md")
     assert "You are the Batch Skill Evolution Teacher." in load_template("teacher.md")
     assert "You are the Skill Update Curator." in load_template("curator.md")
     assert "You are the Skill Correction Agent." in load_template("correction.md")
@@ -409,7 +417,7 @@ def test_templates_state_the_proposal_evidence_boundary():
     for name in ("teacher.md", "curator.md"):
         text = load_template(name)
         assert "never written into the packet" in text or "never reaches the packet" in text
-    assert "No need to generate any lesson." in load_template("diagnostician.md")
+    assert "do not generate lessons" in load_template("diagnostician.md")
 
 
 def _pool_record(sample_id, project, summary="sink miss"):
@@ -417,10 +425,7 @@ def _pool_record(sample_id, project, summary="sink miss"):
         "sample_id": sample_id,
         "project": project,
         "vulnerability_type": "oob read",
-        "stage_summary": summary,
-        "reasoning_diagnosis": "missed the sink obligation",
-        "reachability_diagnosis": "candidate reached source but not sink",
-        "submission_diagnosis": "submitted once",
+        **_behavioral_fields(summary),
         "outcome_record": {"outcome": "partial", "first_failed_stage": "Sink"},
     }
 
@@ -437,10 +442,7 @@ def test_folding_a_batch_twice_does_not_duplicate_sample_level_records():
         "project": "p1",
         "outcome": "partial",
         "vulnerability_type": "oob read",
-        "stage_summary": "sink miss",
-        "reasoning_diagnosis": "missed the sink obligation",
-        "reachability_diagnosis": "candidate reached source but not sink",
-        "submission_diagnosis": "submitted once",
+        **_behavioral_fields("sink miss"),
     }]
 
     update_pools(pools, 1, [_pool_record("b", "p2", "same sink miss")])
@@ -458,7 +460,7 @@ def test_rerunning_a_batch_with_no_results_withdraws_what_it_contributed():
     view = teacher_view(pools)
     assert view["counts"]["failure_pool"] == 1
     assert view["failure_pool"][0]["sample_id"] == "a"
-    assert view["failure_pool"][0]["stage_summary"] == "first"
+    assert view["failure_pool"][0]["search_behavior"]["summary"] == "first search"
 
 
 def test_a_sample_disappears_when_its_batch_is_withdrawn():
@@ -564,27 +566,17 @@ _EVAL_ROW = {
 
 
 
-def test_diagnosis_quality_requires_candidate_source():
-    assert _diagnosis_quality_error({
-        "stage_summary": "s",
-        "issue_description": "i",
-        "issue_alignment_diagnosis": "a",
-        "reasoning_diagnosis": "r",
-        "reachability_diagnosis": "reach",
-        "submission_diagnosis": "sub",
-        "candidate_source_diagnosis": "manual candidate",
-        "evidence_excerpt": "e",
-    }) is None
-    assert "candidate_source_diagnosis" in _diagnosis_quality_error({
-        "stage_summary": "s",
-        "issue_description": "i",
-        "issue_alignment_diagnosis": "a",
-        "reasoning_diagnosis": "r",
-        "reachability_diagnosis": "reach",
-        "submission_diagnosis": "sub",
-        "candidate_source_diagnosis": "",
-        "evidence_excerpt": "e",
-    })
+def test_diagnosis_quality_requires_behavior_sections():
+    valid = {"issue_description": "i", **_behavioral_fields("ok")}
+    assert _diagnosis_quality_error(valid) is None
+
+    missing_evidence = {"issue_description": "i", **_behavioral_fields("ok")}
+    missing_evidence["candidate_behavior"] = {"summary": "candidate", "evidence": ""}
+    assert "candidate_behavior.evidence" in _diagnosis_quality_error(missing_evidence)
+
+    missing_section = {"issue_description": "i", **_behavioral_fields("ok")}
+    missing_section.pop("feedback_behavior")
+    assert "feedback_behavior" in _diagnosis_quality_error(missing_section)
 
 
 def test_diagnostics_summary_carries_all_three_and_stays_small():
@@ -673,13 +665,13 @@ def test_validation_panel_selects_success_crash_and_failure_samples():
         {
             "sample_id": "ok",
             "project": "p1",
-            "stage_summary": "triggered",
+            **_behavioral_fields("triggered"),
             "outcome_record": {"outcome": "success", "deepest_stage": "Trigger"},
         },
         {
             "sample_id": "fp",
             "project": "p2",
-            "stage_summary": "reached R4 but produced a false positive crash",
+            **_behavioral_fields("false positive crash"),
             "false_positive": True,
             "false_positive_pocs": 1,
             "outcome_record": {"outcome": "partial", "deepest_stage": "Sink"},
@@ -687,7 +679,7 @@ def test_validation_panel_selects_success_crash_and_failure_samples():
         {
             "sample_id": "fail",
             "project": "p3",
-            "stage_summary": "parser rejected every candidate",
+            **_behavioral_fields("parser rejected every candidate"),
             "outcome_record": {"outcome": "failure", "first_failed_stage": "Parser"},
         },
     ])
@@ -710,13 +702,13 @@ def test_validation_panel_rotates_by_panel_index():
         records.append({
             "sample_id": f"ok{i}",
             "project": "p",
-            "stage_summary": "triggered",
+            **_behavioral_fields("triggered"),
             "outcome_record": {"outcome": "success", "deepest_stage": "Trigger"},
         })
         records.append({
             "sample_id": f"fp{i}",
             "project": "p",
-            "stage_summary": "false positive crash",
+            **_behavioral_fields("false positive crash"),
             "false_positive": True,
             "false_positive_pocs": 1,
             "outcome_record": {"outcome": "partial", "deepest_stage": "Sink"},
@@ -724,7 +716,7 @@ def test_validation_panel_rotates_by_panel_index():
         records.append({
             "sample_id": f"fail{i}",
             "project": "p",
-            "stage_summary": "parser rejected every candidate",
+            **_behavioral_fields("parser rejected every candidate"),
             "outcome_record": {"outcome": "failure", "first_failed_stage": "Parser"},
         })
     update_pools(pools, 0, records)
