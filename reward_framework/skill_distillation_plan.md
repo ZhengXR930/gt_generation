@@ -1,92 +1,347 @@
-# Reward Framework Skill Distillation Plan
+# Reward Framework Skill Distillation Workflow
 
-## Scope
+This document is the canonical workflow for the current skill-distillation
+experiments. It replaces older notes that treated the task as stage-by-stage
+vulnerability understanding. The current goal is to improve the coding agent's
+PoC reproduction behavior: how it searches, constructs candidates, submits,
+uses feedback, switches paths, and decides when to continue.
 
-This framework distills reusable PoC reproduction skills from the `valid_gt.json` corpus. The 500 samples are ordered by the committer date of each sample's `vulnerable_commit` — the state of the repository the agent is actually handed. The earliest 300 are the training set, the most recent 200 are the held-out test set. Training is processed as 30 batches of 10 samples. The default coding-agent run for each training batch is Codex with `gpt-5.5-2026-04-24`.
+## Objective
 
-The ordering was computed once from `dataset/commit_dates.json` and is **frozen** into `gt_results/train_gt.json` and `gt_results/test_gt.json`, next to the `valid_gt.json` denominator they partition. Everything downstream reads those files; nothing recomputes the split. That matters because a split recomputed per run would silently change the moment another date was resolved, and results either side of that change would not be comparable.
+We distill compact behavioral skills from the TRAIN split and evaluate whether
+they improve target PoC reproduction on later samples.
 
-Each frozen file carries every sample's date and which field it came from, so "why is this sample in train" is answerable from the split alone. Of the 500 samples, 442 are ordered by their vulnerable-commit date, 29 by their fix-commit date, and 10 by the fix date recorded in the local ARVO patch. The remaining 19 could not be dated — their upstreams are unreachable from the evaluation network or refuse fetch-by-sha — and sit at the tail, which places them in the held-out set; their position within the test set carries no chronological meaning.
+- Dataset: `gt_results/valid_gt.json`, 500 valid samples.
+- Split: chronological TRAIN 300 / TEST 200, pinned in `gt_results/train_gt.json`
+  and `gt_results/test_gt.json`.
+- Operational batch size: 10 samples.
+- Distillation window: the most recent 3 accepted operational batches, usually
+  30 diagnoses, plus accumulated pools.
+- Default coding agent under improvement: Codex harness with
+  `gpt-5.5-2026-04-24`.
+- Default distillation roles: Codex subsessions with `gpt-5.5-2026-04-24`.
 
-Projects overlap between train and test. That is deliberate: this measures whether skills learned from past vulnerabilities help on later ones, not out-of-distribution transfer. It is only safe because ground-truth text cannot reach the skill packet — see Packet Isolation.
+The coding agent is the object being improved. Diagnostician, Teacher, Curator,
+and Correction Agent are fixed measurement and distillation tools.
 
-## Initial Skill Packet
+## Prompt Boundary
 
-The initial packet contains two skills.
+The coding agent uses the shared benchmark prompt in `reward_framework/prompt.txt`.
+It should remain close to the historical Codex evaluation prompt:
+
+- read `description.txt` first;
+- work only inside the benchmark workspace;
+- do not use the network or retrieve an existing PoC;
+- generate concrete raw PoC input files;
+- write `analysis.json` for submitted candidates;
+- submit through the provided `submit.sh` interface;
+- continue improving candidates until the target issue triggers or the budget is
+  exhausted;
+- do not access `gt_results` or private ground-truth files.
+
+The prompt must not add extra behavioral nudges that differ between ARVO and
+non-ARVO samples. The framework only provides the same shape of workspace,
+description, submission interface, and result recording.
+
+## Skill Packet
+
+The skill packet has two skills.
 
 ### Reproduction Skill
 
-`reproduction_skill/SKILL.md` has no helper scripts. It contains:
+`reproduction_skill/SKILL.md` contains:
 
-- R.A Reproduction Loop Definition: fixed workflow `Issue + Code -> Hypothesis -> Candidate -> Attempt -> Feedback -> Revise`. Distillation must not rewrite this loop.
-- R.B Vulnerability Hypothesis Construction: updateable guidance for using Parser, Source, Root Cause, Sink, and Trigger evidence to form better hypotheses.
-- R.C Learned Lessons: the primary learning area.
-  - R.C1 Stage-level Lessons: Parser, Source, Root Cause, Sink, Trigger lessons.
-  - R.C2 Cross-stage Lessons: preserving progress when moving between stages.
-  - R.C3 Vulnerability-type Lessons: lessons organized by vulnerability class.
+- `R.A Reproduction Loop`: fixed. It gives a light loop: read the description,
+  build a plausible PoC candidate early, submit, interpret feedback, revise or
+  finalize.
+- `R.B Learned Reproduction Lessons`: updateable. These are short behavioral
+  biases for search, candidate construction, mutation, and path switching.
+
+No other reproduction sections are currently writable. Do not reintroduce large
+stage-level rule blocks unless the workflow is explicitly redesigned.
 
 ### Submission Skill
 
 `submission_skill/SKILL.md` contains:
 
-- S.A Submission Loop: fixed workflow `Candidate -> readiness reasoning -> submit -> record result -> return evidence to reproduction`.
-- S.B Evidence-Gain Gate: fixed principle with updateable strategy. Semantic evidence gain remains in agent reasoning, not in helper code.
-- S.C Learned Submission Lessons: updateable lessons distilled from trajectories.
+- `S.A Submission Loop`: fixed mechanical loop.
+- `S.B Evidence-Gain Principle`: fixed. Submission feedback is evidence for the
+  next candidate, not automatic final success.
+- `S.C Learned Submission Lessons`: updateable. These are short behavioral
+  biases about validation, feedback use, duplicate avoidance, and non-target
+  crash handling.
 
-Submission helpers are limited to `submit_history.py` (persist candidate identity, status, notes) and `submit_preflight.py` (existence, exact duplicate, near-duplicate warning, structural summary). Helpers must not judge semantic evidence gain or use hidden GT/reachability information.
+Helpers are mechanical only:
 
-Skill documents name runtime locations through `${HELPERS_DIR}` and `${STATE_DIR}` only. Each adapter installs the packet in its own native form and resolves those placeholders at install time, so one distilled artifact stays valid under every harness.
+- `submit_preflight.py`: file existence, exact duplicate detection,
+  near-duplicate warning, structural summary.
+- `submit_history.py`: candidate hash, analysis path, result path, status, and
+  notes.
 
-## Lesson Addressing and Capacity
+Helpers must not judge semantic evidence gain, force a submission, expose GT, or
+change feedback semantics across harnesses.
 
-Every lesson in a writable section carries a stable id (`- [R.C1#3] ...`). A curator decision either replaces an addressed lesson or appends a new one. Each section has a capacity; once it is full, the only way to add something is to replace something. This is what keeps the packet sharp instead of letting it grow into a contradictory pile across 30 batches.
+## One Operational Batch
 
-Writable targets: `reproduction:R.B`, `reproduction:R.C1`, `reproduction:R.C2`, `reproduction:R.C3`, `submission:S.B`, `submission:S.C`. R.A and S.A are not addressable at all.
+For batch `k`, run the coding agent with the current accepted skill packet
+`S_k`.
 
-## Batch Workflow
+1. Run generation.
+   - Use 3 parallel workers by default.
+   - Use `--max-attempts 1` unless explicitly testing retries.
+   - Store results under `reward_framework/harness_runs/<run_id>/results`.
+   - Do not write into `poc_generation/poc_results`.
 
-For each 10-sample training batch:
+2. Evaluate deterministically.
+   - `success` means a submitted candidate triggered the target vulnerability in
+     post-hoc reachability/GT evaluation.
+   - A manifest-level successful submission or sanitizer crash is not enough.
+   - Preserve non-target crashes as false-positive evidence.
+   - Fine-trace coverage and reasoning scores are diagnostic signals, not the
+     success definition.
 
-1. Run the coding agent with the current skill packet.
-2. Evaluate each sample with the three GT-derived diagnostics:
-   - **fine-trace coverage** — node and edge recall over the GT trace DAG: what fraction of GT steps the agent's `analysis.json.fine_trace` recovered, and what fraction of the GT `depends_on` dependencies it recovered with both endpoints in causal order. A node is recovered or it is not; there is no weighting or partial credit (static);
-   - **vuln_logic reasoning** — whether the agent named the right source, obligation, sink, and propagation, scored against `verified_invariants.json` with field-binding normalization (static);
-   - **location reachability** — how far the submitted PoC actually ran, as the R1..R5 ladder (dynamic).
-3. Derive the outcome deterministically from reachability: `success`, `partial`, `failure`, or `infrastructure`, plus `deepest_stage` and `first_failed_stage`. No model decides this.
-4. The diagnostician reads the trajectory, the public description, the diagnostics, and the deterministic verdict, then explains *why* the run stopped where it did.
-5. Fold each batch into `pools.json`: sample-level failure and success diagnosis records, plus derived modes keyed by stage/vulnerability type for recurrence gating. The pools are the Teacher memory; there is no separate memory file.
-6. The Teacher reads the pools, the current lessons with their ids and remaining capacity, and this batch's diagnoses, then proposes updates for modes that clear the recurrence gate.
-7. The Curator returns `MODIFY` or `SKIP` for each proposal, rewriting the wording it accepts.
-8. Applied decisions produce the packet used by the next batch.
+3. Run Diagnostician.
+   - It reads trajectory, submissions, runtime output, public description,
+     reachability, reasoning, and fine-trace diagnostics.
+   - It explains behavior, not whether the agent perfectly understood the bug.
+   - It should answer how candidates were formed, whether submission was timely,
+     how feedback affected later candidates, whether the agent refined one path
+     or switched families, and why this helped or blocked reproduction.
+   - It outputs a small `retry_recommendation` with natural-language summary and
+     evidence.
 
-## Roles Are Subsessions
+4. Optional strict retry.
+   - Retry only samples whose diagnosis says retry is worthwhile because the run
+     was structurally healthy and the failure looks stochastic or near-miss.
+   - Retry results go to a separate run id, for example
+     `<batch_run_id>_retry1`.
+   - Retry uses `--max-attempts 1`.
+   - Merge retry into the primary batch result only when deterministic target
+     success improves. Reachability-depth-only improvement is useful diagnostic
+     evidence, but it must not overwrite the primary result.
+   - Retry diagnoses may be passed to Teacher together with first-attempt
+     diagnoses, so Teacher can compare first/retry behavior for the same sample.
 
-The diagnostician, Teacher, and Curator are agents, not one-shot completions. They are fixed measurement and distillation tools, run as Codex subsessions with the distiller model. The coding agent is the object being improved and remains configurable by harness and model: the default is Codex with `gpt-5.5-2026-04-24`, while later experimental arms can use DSH+DeepSeek or another harness without changing the distillation roles. Each role gets a working directory of input files and writes one `OUTPUT.json`. The diagnostician therefore reads the entire trajectory rather than a truncated excerpt, and every role can grep and diff its inputs.
+5. Fold accepted batch evidence into pools.
+   - Pools store sample-level diagnoses separated by deterministic outcome:
+     success, failure/partial, non-target crash, and infrastructure.
+   - Pools are Teacher memory. Do not maintain a separate memory file unless the
+     design changes.
 
-`harness_runtime/subsession.py` owns the neutral executor; the benchmark runner delegates to it, so there is one implementation of the bridge and the `codex exec` invocation. Role workspaces get a clean `CODEX_HOME`: the PoC skills belong to the agent under study, not to the roles studying it.
+## Teacher
 
-## Packet Isolation
+Teacher consumes:
 
-The diagnostician and Teacher may read ground truth: on the training split that is label access. What must never happen is ground-truth text reaching `SKILL.md`, because that file is an input to the agent at test time.
+- current skill packet;
+- current lesson snapshot and capacity;
+- diagnoses from the most recent 3 accepted operational batches;
+- retry diagnoses when present;
+- pools.
 
-The boundary is the `proposal` field. Only `proposal` is written into the packet, and it passes `reward_framework/distillation/lint.py` first, which rejects source-file names, `file:line` anchors, hex and long numeric constants, sample ids, and any identifier or code fragment drawn from the local ground-truth corpus. `evidence` and `rationale` stay in the run artifacts. The packet-local changelog records ids and targets only.
+Teacher performs contrastive behavioral learning:
 
-`audit-plan` checks this functionally: it asserts the lint rejects a real ground-truth function name, asserts it accepts a generic transferable lesson, and asserts sentinel evidence strings do not survive into a generated packet.
+- successful or higher-progress behavior versus failed, partial, or non-target
+  crash behavior;
+- candidate construction versus candidate stagnation;
+- useful feedback-driven mutation versus ignored feedback;
+- productive path switching versus broad drift or wrong-path refinement;
+- timely submission versus prolonged analysis without a concrete test.
 
-## Held-out Evaluation
+Teacher may propose at most two concise updates. Allowed targets are only:
 
-`run-test` runs the 200 test samples once with a frozen packet and no learning; `evaluate-test` reports the outcome distribution and trigger rate. Arms:
+- `reproduction:R.B`
+- `submission:S.C`
 
-- `bare` — the same scaffold with every learned lesson stripped, isolating the effect of the lessons from the effect of having a skill at all;
-- `initial` — the hand-written initial packet;
-- `distilled` — the packet after the final training batch.
+Teacher must not modify `R.A`, `S.A`, or `S.B`. Every proposal is a conditional
+behavior bias: its condition must be observable from the public issue, source,
+current trajectory, local diagnostics, submitted candidates, or runtime output
+available during the run. Post-hoc reachability and inferred rankings such as
+"best-reaching" may support training analysis, but cannot activate a lesson at
+test time. Proposals must remain free of sample ids, project names,
+file/function names, constants, GT labels, and evaluator terminology.
 
-The no-packet baseline is the existing `poc_generation/` pipeline, which does not import the reward adapters.
+## Curator
 
-## Implementation Targets
+Curator receives Teacher proposals and the current skill. It returns only:
 
-- `reward_framework/skill_packets/initial/` is the canonical initial packet.
-- `reward_framework/distillation/` owns splits, batch orchestration, deterministic outcomes, pools, role prompts, packet lint, and update application.
-- `evaluator/reasoning/fine_trace_coverage.py` owns deterministic fine-trace coverage scoring.
-- `evaluator/evaluate.py` includes fine-trace coverage in per-sample and batch summaries.
-- Reward adapters expose the same task protocol as normal PoC generation plus the skill packet, and must not append README content or forced-submit constraints.
+- `MODIFY`: accept by rewriting the lesson into concise, transferable skill text;
+- `SKIP`: reject.
+
+Curator should prefer revising an overlapping existing lesson over adding a new
+one. It should reject proposals that are narrow patches, duplicate existing
+guidance, encourage over-analysis, delay submission, over-preserve a wrong path,
+increase broad search drift, or make false-positive finalization more likely. It
+must also reject or rewrite any proposal whose condition is hidden, vague, or so
+broad that the lesson would apply to every sample by default.
+
+Accepted curation creates a candidate next skill packet `S_candidate`.
+
+## Correction And Propagation Gate
+
+Correction is the guardrail for whether `S_candidate` becomes the next accepted
+skill.
+
+The primary comparison is matched:
+
+- compare `S_candidate` against the previous accepted skill `S_prev` on the same
+  batch or validation panel;
+- no-skill or historical full-run results are external references only, not the
+  main acceptance gate for a learned update.
+
+Decision rule:
+
+- If `S_candidate` improves deterministic target success over `S_prev`, keep or
+  apply the update.
+- If `S_candidate` ties but shows cleaner behavior with no extra false positives
+  or regressions, it may be kept only with explicit evidence.
+- If `S_candidate` is worse, or retry does not recover target success, do not
+  propagate it. Roll back to `S_prev` or correct/remove the responsible lesson.
+
+When a candidate update fails the gate, rerun the same batch with the previous
+accepted skill. The accepted rerun result becomes the batch result used for pools
+and for the next Teacher window. Failed candidate-skill runs may be kept as
+correction evidence, but they should not become the main training evidence.
+
+## Batch-Level Control Flow
+
+For each batch `k`:
+
+1. Start from accepted skill `S_k`.
+2. Run batch `k` with `S_k`.
+3. Evaluate, diagnose, optionally retry, and merge only target-success
+   improvements.
+4. Add accepted diagnoses to pools.
+5. Teacher proposes updates from the latest 3 accepted batches plus pools.
+6. Curator rewrites or skips proposals.
+7. Apply accepted curation to form `S_candidate` for the next batch.
+8. Validate `S_candidate` against `S_k` on a matched next batch or small panel.
+9. If validation passes, promote `S_candidate` to accepted `S_{k+1}`.
+10. If validation fails, roll back or correct, then rerun the same validation
+    batch with the previous accepted skill before moving forward.
+
+This means a non-improving update is not allowed to silently continue into later
+batches.
+
+## Artifacts
+
+Canonical locations:
+
+- `reward_framework/skill_packets/initial/`: hand-written initial packet.
+- `reward_framework/distillation_runs/<run>/skill_packets/batch_XXX/`: accepted
+  or candidate packets for a distillation run.
+- `reward_framework/distillation_runs/<run>/batch_XXX/samples.txt`: batch sample
+  list.
+- `reward_framework/distillation_runs/<run>/batch_XXX/evaluation.json`: batch
+  deterministic evaluation.
+- `reward_framework/distillation_runs/<run>/batch_XXX/diagnoses.json`: behavior
+  diagnoses for accepted first attempts.
+- `reward_framework/distillation_runs/<run>/batch_XXX/retry/`: retry sample
+  lists and merge reports.
+- `reward_framework/distillation_runs/<run>/batch_XXX/teacher_candidate_updates.json`.
+- `reward_framework/distillation_runs/<run>/batch_XXX/curator_decisions.json`.
+- `reward_framework/distillation_runs/<run>/batch_XXX/correction_decision.json`.
+- `reward_framework/harness_runs/<run_id>/results/<sample_id>/`: generated PoC
+  run artifacts.
+
+## Command Skeleton
+
+Run a batch:
+
+```bash
+python reward_framework/distillation/cli.py run-batch \
+  --run-dir reward_framework/distillation_runs/<run> \
+  --batch-index <k> \
+  --skill-packet reward_framework/distillation_runs/<run>/skill_packets/batch_<kkk> \
+  --reward-run-id <run_id> \
+  --coding-harness codex \
+  --coding-model gpt-5.5-2026-04-24 \
+  --base-url https://aidp.bytedance.net/api/modelhub/online/v2/crawl/openai/deployments/gpt_openapi \
+  --api-key-env OPENAI_API_KEY \
+  --parallel 3 \
+  --max-iter 100 \
+  --max-attempts 1 \
+  --timeout 10800 \
+  --reasoning-effort medium \
+  --overwrite
+```
+
+Evaluate:
+
+```bash
+python reward_framework/distillation/cli.py evaluate-batch \
+  --run-dir reward_framework/distillation_runs/<run> \
+  --batch-index <k> \
+  --results-dir reward_framework/harness_runs/<run_id>/results
+```
+
+Diagnose:
+
+```bash
+python reward_framework/distillation/cli.py diagnose-batch \
+  --run-dir reward_framework/distillation_runs/<run> \
+  --batch-index <k> \
+  --results-dir reward_framework/harness_runs/<run_id>/results \
+  --evaluation reward_framework/distillation_runs/<run>/batch_<kkk>/evaluation.json \
+  --execute \
+  --parallel 3 \
+  --role-model gpt-5.5-2026-04-24 \
+  --base-url https://aidp.bytedance.net/api/modelhub/online/v2/crawl/openai/deployments/gpt_openapi \
+  --api-key-env OPENAI_API_KEY \
+  --reasoning-effort medium
+```
+
+Teacher and Curator:
+
+```bash
+python reward_framework/distillation/cli.py propose-updates \
+  --run-dir reward_framework/distillation_runs/<run> \
+  --batch-index <k> \
+  --skill-packet reward_framework/distillation_runs/<run>/skill_packets/batch_<kkk> \
+  --diagnosis-window-size 3 \
+  --execute \
+  --role-model gpt-5.5-2026-04-24 \
+  --base-url https://aidp.bytedance.net/api/modelhub/online/v2/crawl/openai/deployments/gpt_openapi \
+  --api-key-env OPENAI_API_KEY \
+  --reasoning-effort medium
+
+python reward_framework/distillation/cli.py curate-updates \
+  --run-dir reward_framework/distillation_runs/<run> \
+  --batch-index <k> \
+  --skill-packet reward_framework/distillation_runs/<run>/skill_packets/batch_<kkk> \
+  --updates reward_framework/distillation_runs/<run>/batch_<kkk>/teacher_candidate_updates.json \
+  --execute \
+  --role-model gpt-5.5-2026-04-24 \
+  --base-url https://aidp.bytedance.net/api/modelhub/online/v2/crawl/openai/deployments/gpt_openapi \
+  --api-key-env OPENAI_API_KEY \
+  --reasoning-effort medium
+```
+
+Correction:
+
+```bash
+python reward_framework/distillation/cli.py correct-skill \
+  --run-dir reward_framework/distillation_runs/<run> \
+  --batch-index <k> \
+  --previous-packet reward_framework/distillation_runs/<run>/skill_packets/batch_<prev> \
+  --current-packet reward_framework/distillation_runs/<run>/skill_packets/batch_<candidate> \
+  --evaluation reward_framework/distillation_runs/<run>/batch_<kkk>/evaluation.json \
+  --diagnoses reward_framework/distillation_runs/<run>/batch_<kkk>/diagnoses.json \
+  --applied-updates reward_framework/distillation_runs/<run>/batch_<prev>/applied_updates.json \
+  --baseline-evaluation previous_skill=<matched_previous_skill_eval.json> \
+  --execute \
+  --role-model gpt-5.5-2026-04-24 \
+  --base-url https://aidp.bytedance.net/api/modelhub/online/v2/crawl/openai/deployments/gpt_openapi \
+  --api-key-env OPENAI_API_KEY \
+  --reasoning-effort medium
+```
+
+## Current Guardrails
+
+- Do not change `R.A`, `S.A`, or `S.B` through Teacher/Curator.
+- Do not add forced-submit scripts, forced reminders, or hidden feedback fields.
+- Do not expose `_out`, compiled non-ARVO artifacts, GT, or prior PoCs to the
+  coding agent workspace.
+- Do not merge retry results unless deterministic target success improves.
+- Do not propagate a learned update that fails matched validation.
+- Do not use a failed candidate-skill run as the main evidence for the next
+  Teacher window.

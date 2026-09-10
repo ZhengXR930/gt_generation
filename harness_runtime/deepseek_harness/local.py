@@ -880,7 +880,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="max",
+        default="high",
         choices=("off", "high", "max"),
     )
     parser.add_argument(
@@ -1018,9 +1018,7 @@ def main() -> int:
         write_dsh_settings(dsh_home, args.model, args.reasoning_effort)
 
         prompt_path.write_text(
-            render_prompt(
-                args.prompt_file, sample_id=args.sample_id, workspace=workspace
-            ),
+            render_prompt(args.prompt_file, sample_id=args.sample_id, workspace=workspace),
             encoding="utf-8",
         )
         (run_dir / "args.json").write_text(
@@ -1226,7 +1224,8 @@ def main() -> int:
             sample_result_dir, workspace, run_dir, config_path, prompt_path, manifest
         )
         copy_dsh_checkpoint(dsh_home, sample_result_dir, new_session_files)
-        slim_dsh_checkpoint_if_analysis_valid(sample_result_dir)
+        if not os.environ.get("REWARD_FRAMEWORK_RUN_ID"):
+            slim_dsh_checkpoint_if_analysis_valid(sample_result_dir)
         reachability_metadata = run_reachability_pipeline(
             model_namespace=sample_result_dir.parent.name,
             sample_id=args.sample_id,

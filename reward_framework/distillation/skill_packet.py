@@ -168,7 +168,7 @@ def apply_correction_decision(
 ) -> dict[str, Any]:
     """Materialize a post-batch correction decision as the next packet."""
     decision = str(correction.get("decision") or "").upper()
-    if decision not in {"KEEP", "MODIFY", "REMOVE", "ROLLBACK"}:
+    if decision not in {"KEEP", "CORRECT", "ROLLBACK"}:
         raise ValueError(f"unsupported correction decision {decision!r}")
 
     source = previous_packet if decision == "ROLLBACK" else current_packet
@@ -179,12 +179,12 @@ def apply_correction_decision(
 
     applied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    if decision in {"MODIFY", "REMOVE"}:
+    if decision == "CORRECT":
         operations = correction.get("operations") or []
         if not operations and (correction.get("target") or correction.get("target_lesson_id")):
             operations = [correction]
         for position, operation in enumerate(operations):
-            action = str(operation.get("action") or operation.get("decision") or decision).upper()
+            action = str(operation.get("action") or operation.get("decision") or "").upper()
             target = str(operation.get("target") or "")
             lesson_id = str(operation.get("target_lesson_id") or operation.get("lesson_id") or "")
             if allowed_lesson_ids is not None and (target, lesson_id) not in allowed_lesson_ids:

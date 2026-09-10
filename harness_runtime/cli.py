@@ -71,6 +71,7 @@ from harness_runtime.openhands.local import (  # noqa: E402
 )
 from harness_runtime.workspace import (  # noqa: E402
     install_submit_candidate_guard,
+    protect_submit_contract,
     render_prompt,
     run_workspace_installer,
 )
@@ -89,6 +90,15 @@ def _scratch_root() -> Path:
 
 def _make_scratch(sample_id: str, harness: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=f"run_{sample_id}_{harness}_", dir=_scratch_root()))
+
+
+def _prepare_agent_env(workspace: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["BENCHMARK_WORKSPACE"] = str(workspace)
+    tools_dir = ROOT / "cli_tools"
+    if tools_dir.is_dir():
+        env["PATH"] = str(tools_dir) + os.pathsep + env.get("PATH", "")
+    return env
 
 
 def _cleanup_cli_scratch(scratch: Path) -> None:
@@ -191,6 +201,10 @@ def _rewrite_workspace_paths(workspace: Path) -> None:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         text = text.replace("/workspace", str(workspace))
+        # Some host curl builds used by CLI harnesses predate --fail-with-body.
+        # Keep the public submit contract unchanged while making the generated
+        # script executable on the host before the agent sees it.
+        text = text.replace("--fail-with-body", "--fail")
         path.write_text(text, encoding="utf-8")
     submit = workspace / "submit.sh"
     if submit.is_file():
@@ -1051,7 +1065,8 @@ def run_once(args: argparse.Namespace, sample_id: str, task_id: str, results_dir
         )
         _rewrite_workspace_paths(workspace)
         install_submit_candidate_guard(workspace / "submit.sh")
-        env = os.environ.copy()
+        env = _prepare_agent_env(workspace)
+        protect_submit_contract(workspace, scratch, env)
         if harness == "claude":
             cli_runtime = _prepare_claude_runtime(
                 args, workspace, sample_id, scratch, env, checkpoint
@@ -1385,8 +1400,7 @@ def run_local_once(args: argparse.Namespace, sample_id: str, results_dir: Path) 
     try:
         runtime_readiness = check_local_runtime_readiness(gt_sample_dir)
         workspace, inner_command, repro = prepare_local_workspace(sample_id, scratch)
-        env = os.environ.copy()
-        env["BENCHMARK_WORKSPACE"] = str(workspace)
+        env = _prepare_agent_env(workspace)
         if harness == "claude":
             cli_runtime = _prepare_claude_runtime(
                 args, workspace, sample_id, scratch, env, checkpoint
@@ -1394,6 +1408,8 @@ def run_local_once(args: argparse.Namespace, sample_id: str, results_dir: Path) 
         bridge = LocalExecutionBridge(workspace, inner_command, repro)
         bridge.start()
         write_local_submit_sh(workspace, bridge.url, bridge.token)
+        install_submit_candidate_guard(workspace / "submit.sh")
+        protect_submit_contract(workspace, scratch, env)
         adapter_metadata = run_workspace_installer(
             args.workspace_installer,
             harness=harness,

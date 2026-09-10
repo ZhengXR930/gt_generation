@@ -26,10 +26,34 @@ from harness_runtime.analysis_artifact import (  # noqa: E402
     analysis_artifact_repair_prompt,
 )
 from harness_runtime.openhands.local import (  # noqa: E402
-    _extract_structural_analysis_from_text,
-    _trajectory_digest,
-    write_checkpoint_digest,
+    _extract_analysis_from_text,
 )
+
+
+def _extract_structural_analysis_from_text(
+    text: str, sample_id: str
+) -> tuple[str, str | None] | None:
+    artifact_text = _extract_analysis_from_text(text, sample_id)
+    if artifact_text is None:
+        return None
+    return artifact_text, validate_analysis_artifact_quality(artifact_text)
+
+
+def _trajectory_digest(path: Path, max_chars: int) -> str:
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")[-max_chars:]
+
+
+def write_checkpoint_digest(sample_dir: Path, sample_id: str) -> None:
+    checkpoint = sample_dir / "checkpoint"
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    digest = checkpoint_text_digest(sample_dir, 120000)
+    if digest:
+        (checkpoint / "agent_checkpoint.md").write_text(
+            f"# Checkpoint digest for {sample_id}\n\n{digest}\n",
+            encoding="utf-8",
+        )
 
 
 def load_json(path: Path) -> dict[str, Any]:

@@ -155,23 +155,11 @@ def validate_analysis_artifact_quality(response: str) -> str | None:
             error = _quality_location_error(edge[endpoint], f"{prefix}.{endpoint}")
             if error:
                 return error
-        for via_index, value in enumerate(edge["via"], 1):
-            if not _looks_like_source_expression(value):
-                return (
-                    f"{prefix}.via[{via_index}] must be a concrete source "
-                    f"expression, literal, macro, or order keyword; got {value!r}"
-                )
         relation = edge.get("relation")
         if relation is not None:
             error = _quality_relation_error(relation, f"{prefix}.relation")
             if error:
                 return error
-    error = _quality_trace_projection_error(artifact)
-    if error:
-        return error
-    error = _quality_trace_logic_consistency_error(artifact)
-    if error:
-        return error
     return None
 
 

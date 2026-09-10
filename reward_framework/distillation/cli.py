@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -15,14 +16,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from evaluator.evaluate import evaluate_sample  # noqa: E402
-from reward_framework.distillation.artifacts import read_json, sample_project, write_json  # noqa: E402
+from reward_framework.distillation.artifacts import load_json_if_exists, read_json, sample_project, write_json  # noqa: E402
 from reward_framework.distillation.audit import audit_framework  # noqa: E402
 from reward_framework.distillation.diagnosis_view import BEHAVIOR_SECTIONS, learning_diagnosis, learning_evaluation  # noqa: E402
 from reward_framework.distillation.defaults import (  # noqa: E402
-    DEFAULT_API_KEY_ENV,
-    DEFAULT_BASE_URL,
+    DEFAULT_CODING_API_KEY_ENV,
+    DEFAULT_CODING_BASE_URL,
     DEFAULT_CODING_HARNESS,
     DEFAULT_CODING_MODEL,
+    DEFAULT_DISTILLER_API_KEY_ENV,
+    DEFAULT_DISTILLER_BASE_URL,
     DEFAULT_DISTILLER_MODEL,
     DEFAULT_RUN_ROOT,
     INITIAL_PACKET,
@@ -100,6 +103,7 @@ def _harness_command(args: argparse.Namespace, *, run_id: str, sample_file: Path
         "--api-key-env", args.api_key_env,
         "--parallel", str(args.parallel),
         "--max-iter", str(args.max_iter),
+        "--max-attempts", str(args.max_attempts),
         "--timeout", str(args.timeout),
     ]
     if getattr(args, "no_skill", False):
@@ -134,6 +138,52 @@ def cmd_freeze_split(args: argparse.Namespace) -> int:
     )
     print(json.dumps(freeze_split(split), indent=2, ensure_ascii=False))
     return 0
+
+
+def _attempt_specs(args: argparse.Namespace, samples: list[str]) -> list[dict[str, Any]]:
+    specs = [{"label": "first", "results_dir": args.results_dir.resolve(), "evaluation": None, "samples": samples}]
+    for raw in getattr(args, "attempt", []) or []:
+        if "=" not in raw:
+            raise SystemExit("--attempt must be label=results_dir")
+        label, path = raw.split("=", 1)
+        label = label.strip()
+        if not label or label == "first" or not re.match(r"^[A-Za-z0-9_.-]+$", label):
+            raise SystemExit("--attempt label must be non-empty, not first, and use only A-Za-z0-9_.-")
+        results_dir = Path(path).resolve()
+        present = [sample_id for sample_id in samples if (results_dir / sample_id).is_dir()]
+        specs.append({"label": label, "results_dir": results_dir, "evaluation": None, "samples": present})
+    return specs
+
+
+def _evaluate_attempt_rows(namespace: str, results_dir: Path, samples: list[str]) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for sample_id in samples:
+        sample_dir = results_dir / sample_id
+        if not sample_dir.is_dir():
+            continue
+        row = evaluate_sample(namespace, sample_dir, require_analysis_quality=False)
+        row["deterministic_outcome"] = classify_outcome(row)
+        rows[sample_id] = row
+    return rows
+
+
+def _outcome_rank(outcome_record: dict[str, Any] | None) -> tuple[int, int]:
+    record = outcome_record or {}
+    outcome = str(record.get("outcome") or "").lower()
+    if outcome == "success" or record.get("triggered") is True:
+        return (3, int(record.get("submitted_unique_pocs") or 0))
+    if int(record.get("submitted_unique_pocs") or 0) > 0:
+        return (2, int(record.get("submitted_unique_pocs") or 0))
+    if outcome in {"failure", "partial"}:
+        return (1, 0)
+    return (0, 0)
+
+
+def _selected_attempt(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    valid = [attempt for attempt in attempts if attempt.get("diagnosis")]
+    if not valid:
+        return None
+    return max(valid, key=lambda attempt: _outcome_rank(attempt.get("outcome_record")))
 
 
 def cmd_init_run(args: argparse.Namespace) -> int:
@@ -210,18 +260,30 @@ def cmd_evaluate_batch(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_role(args: argparse.Namespace, role: str, workspace: Path, build, out_json: Path) -> dict[str, Any]:
+def _run_role(
+    args: argparse.Namespace,
+    role: str,
+    workspace: Path,
+    build,
+    out_json: Path,
+    *,
+    retry_note: str = "",
+) -> dict[str, Any]:
     """Run one role, doing as little as the previous attempt left undone.
 
     A sample that already has an artifact is never re-run. A session that ended
     without writing one is re-entered in place. Only a session that failed on
     its own terms - a non-zero exit or a timeout - starts over.
     """
+    if args.redo and out_json.exists():
+        out_json.unlink()
     plan, reason = ("fresh", "forced by --redo") if args.redo else plan_role(workspace, out_json)
     if plan == "reuse":
         return {"status": "reused", "role": role, "reason": reason, "output": str(out_json)}
 
     run = resume_role(role, workspace, reason=reason) if plan == "resume" else build()
+    if retry_note:
+        run = type(run)(run.role, run.workspace, retry_note.strip() + "\n\n" + run.prompt, run.output_file)
     if not args.execute:
         return {"status": "workspace_prepared", "role": role, "plan": plan,
                 "workspace": str(run.workspace), "output": str(out_json)}
@@ -253,13 +315,79 @@ def _false_positive_summary(eval_row: dict[str, Any] | None, outcome_record: dic
     runtime = (eval_row or {}).get("runtime") or {}
     submission = runtime.get("submission_outcome") or {}
     submission_crashed = int(submission.get("crashed_pocs") or submission.get("triggered_pocs") or 0)
+    outcome_false_positives = int((outcome_record or {}).get("false_positive_pocs") or 0)
     triggered = bool((outcome_record or {}).get("triggered"))
-    false_positive_pocs = submission_crashed if submission_crashed and not triggered else 0
+    false_positive_pocs = 0 if triggered else max(submission_crashed, outcome_false_positives)
     return {
         "false_positive": bool(false_positive_pocs),
         "false_positive_pocs": false_positive_pocs,
     }
 
+
+
+_FORBIDDEN_DIAGNOSIS_TERMS = (
+    re.compile(r"\bR[0-5](?:_[A-Za-z0-9_]+)?\b"),
+    re.compile(r"\bParser\b"),
+    re.compile(r"\bSource\b"),
+    re.compile(r"\bRoot Cause\b"),
+    re.compile(r"\bSink\b"),
+    re.compile(r"\bTrigger\b"),
+    re.compile(r"\bGT\b"),
+)
+
+
+def _diagnosis_text_values(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        texts: list[str] = []
+        for item in value.values():
+            texts.extend(_diagnosis_text_values(item))
+        return texts
+    if isinstance(value, list):
+        texts = []
+        for item in value:
+            texts.extend(_diagnosis_text_values(item))
+        return texts
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def _forbidden_diagnosis_terms(diagnosis: dict[str, Any]) -> list[str]:
+    hits: set[str] = set()
+    for section in (*BEHAVIOR_SECTIONS, "retry_recommendation"):
+        for text in _diagnosis_text_values(diagnosis.get(section)):
+            for pattern in _FORBIDDEN_DIAGNOSIS_TERMS:
+                for match in pattern.finditer(text):
+                    hits.add(match.group(0))
+    return sorted(hits)
+
+
+def _retry_recommendation_error(diagnosis: dict[str, Any]) -> str | None:
+    retry = diagnosis.get("retry_recommendation")
+    if not isinstance(retry, dict):
+        return "diagnosis missing retry_recommendation"
+    decision = str(retry.get("decision") or "").strip()
+    if decision not in {"retry", "do_not_retry"}:
+        return "diagnosis retry_recommendation.decision must be retry or do_not_retry"
+    missing = [
+        f"retry_recommendation.{field}"
+        for field in ("summary", "evidence")
+        if not str(retry.get(field) or "").strip()
+    ]
+    if missing:
+        return "diagnosis missing required retry field(s): " + ", ".join(missing)
+    return None
+
+
+def _diagnosis_retry_note(error: str) -> str:
+    return (
+        "Your previous OUTPUT.json was rejected by the output-quality gate: "
+        f"{error}. Keep the same factual diagnosis, but rewrite the JSON values "
+        "using behavior-language only. Do not use evaluator-only terms such as "
+        "R0, R1, R2, R3, R4, R5, Parser, Source, Root Cause, Sink, Trigger, or GT. "
+        "Use terms like accepted input, issue-relevant path, vulnerable condition, "
+        "sensitive operation, observable failure, target issue, or non-target crash."
+    )
 
 
 def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
@@ -276,6 +404,12 @@ def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
                 missing.append(f"{section}.{field}")
     if missing:
         return "diagnosis missing required behavior field(s): " + ", ".join(missing)
+    retry_error = _retry_recommendation_error(diagnosis)
+    if retry_error:
+        return retry_error
+    forbidden = _forbidden_diagnosis_terms(diagnosis)
+    if forbidden:
+        return "diagnosis uses evaluator-only term(s): " + ", ".join(forbidden)
     return None
 
 
@@ -303,22 +437,45 @@ def _normalize_diagnosis_for_outcome(
     for section in BEHAVIOR_SECTIONS:
         if section in diagnosis:
             normalized[section] = diagnosis.get(section)
+    if "retry_recommendation" in diagnosis:
+        normalized["retry_recommendation"] = diagnosis.get("retry_recommendation")
     return normalized
 
 def cmd_diagnose_batch(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.resolve()
     batch_dir = run_dir / f"batch_{args.batch_index:03d}"
-    results_dir = args.results_dir.resolve()
     eval_report = read_json(args.evaluation.resolve() if args.evaluation else batch_dir / "evaluation.json")
     eval_by_sample = {row["sample_id"]: row for row in eval_report.get("rows", [])}
 
     samples = _batch_samples(run_dir, args.batch_index)
+    attempt_specs = _attempt_specs(args, samples)
+    if getattr(args, "attempt_only", False):
+        attempt_specs = [spec for spec in attempt_specs if spec["label"] != "first"]
+        if not attempt_specs:
+            raise SystemExit("--attempt-only requires at least one --attempt label=results_dir")
+    for spec in attempt_specs:
+        if spec["label"] == "first":
+            spec["evaluation"] = eval_by_sample
+        else:
+            spec["evaluation"] = _evaluate_attempt_rows(
+                spec["results_dir"].parent.name, spec["results_dir"], samples
+            )
 
-    def run_one(sample_id: str) -> dict[str, Any]:
-        eval_row = eval_by_sample.get(sample_id)
+    def run_one(sample_id: str, spec: dict[str, Any]) -> dict[str, Any]:
+        label = str(spec["label"])
+        results_dir = spec["results_dir"]
+        eval_row = spec["evaluation"].get(sample_id)
         outcome_record = (eval_row or {}).get("deterministic_outcome") or classify_outcome(eval_row)
-        workspace = batch_dir / "subsessions" / "diagnose" / sample_id
-        out_json = batch_dir / "diagnoses" / f"{sample_id}.json"
+        workspace = (
+            batch_dir / "subsessions" / "diagnose" / sample_id
+            if label == "first"
+            else batch_dir / "subsessions" / "diagnose_attempts" / label / sample_id
+        )
+        out_json = (
+            batch_dir / "diagnoses" / f"{sample_id}.json"
+            if label == "first"
+            else batch_dir / "diagnoses_attempts" / label / f"{sample_id}.json"
+        )
         status = _run_role(
             args, "diagnose", workspace, out_json=out_json,
             build=lambda: build_diagnosis_role(workspace, sample_id, results_dir, eval_row, outcome_record),
@@ -336,6 +493,7 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
                 retry_status = _run_role(
                     retry_args, "diagnose", workspace, out_json=out_json,
                     build=lambda: build_diagnosis_role(workspace, sample_id, results_dir, eval_row, outcome_record),
+                    retry_note=_diagnosis_retry_note(quality_error),
                 )
                 retry_status["retry_of_invalid_output"] = {
                     "status": status.get("status"),
@@ -344,54 +502,91 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
                 status = retry_status
         return {
             "sample_id": sample_id,
+            "attempt": label,
             "status": status,
             "out_json": out_json,
             "outcome_record": outcome_record,
         }
 
     parallel = max(1, int(getattr(args, "parallel", 1) or 1))
-    completed: dict[str, dict[str, Any]] = {}
-    if parallel == 1 or len(samples) <= 1:
-        for sample_id in samples:
-            completed[sample_id] = run_one(sample_id)
+    jobs = [(sample_id, spec) for spec in attempt_specs for sample_id in spec["samples"]]
+    completed: dict[tuple[str, str], dict[str, Any]] = {}
+    if parallel == 1 or len(jobs) <= 1:
+        for sample_id, spec in jobs:
+            completed[(sample_id, str(spec["label"]))] = run_one(sample_id, spec)
     else:
-        with ThreadPoolExecutor(max_workers=min(parallel, len(samples))) as executor:
-            futures = {executor.submit(run_one, sample_id): sample_id for sample_id in samples}
+        with ThreadPoolExecutor(max_workers=min(parallel, len(jobs))) as executor:
+            futures = {executor.submit(run_one, sample_id, spec): (sample_id, str(spec["label"])) for sample_id, spec in jobs}
             for future in as_completed(futures):
-                sample_id = futures[future]
+                sample_id, label = futures[future]
                 try:
-                    completed[sample_id] = future.result()
+                    completed[(sample_id, label)] = future.result()
                 except Exception as exc:  # keep the batch report materialized for partial failures
-                    completed[sample_id] = {
+                    completed[(sample_id, label)] = {
                         "sample_id": sample_id,
+                        "attempt": label,
                         "status": {"status": "error", "role": "diagnose", "error": repr(exc)},
-                        "out_json": batch_dir / "diagnoses" / f"{sample_id}.json",
+                        "out_json": (
+                            batch_dir / "diagnoses" / f"{sample_id}.json"
+                            if label == "first"
+                            else batch_dir / "diagnoses_attempts" / label / f"{sample_id}.json"
+                        ),
                         "outcome_record": (
-                            (eval_by_sample.get(sample_id) or {}).get("deterministic_outcome")
-                            or classify_outcome(eval_by_sample.get(sample_id))
+                            ((next(spec for spec in attempt_specs if spec["label"] == label)["evaluation"]).get(sample_id) or {}).get("deterministic_outcome")
+                            or classify_outcome((next(spec for spec in attempt_specs if spec["label"] == label)["evaluation"]).get(sample_id))
                         ),
                     }
 
-    statuses, diagnoses, pool_records = [], [], []
+    statuses, by_sample = [], {sample_id: [] for sample_id in samples}
     for sample_id in samples:
-        item = completed[sample_id]
-        out_json = item["out_json"]
-        outcome_record = item["outcome_record"]
-        statuses.append({"sample_id": sample_id, **item["status"]})
-        if not out_json.is_file():
+        for spec in attempt_specs:
+            label = str(spec["label"])
+            if sample_id not in spec["samples"]:
+                continue
+            item = completed[(sample_id, label)]
+            out_json = item["out_json"]
+            outcome_record = item["outcome_record"]
+            status_row = {"sample_id": sample_id, "attempt": label, **item["status"]}
+            statuses.append(status_row)
+            if not out_json.is_file():
+                continue
+            diagnosis = _normalize_diagnosis_for_outcome(read_json(out_json), outcome_record, sample_id=sample_id)
+            quality_error = _diagnosis_quality_error(diagnosis)
+            if quality_error:
+                status_row["status"] = "invalid_output"
+                status_row["error"] = quality_error
+                write_json(out_json, {**diagnosis, "diagnosis_quality_error": quality_error})
+                continue
+            raw_out = (
+                batch_dir / "diagnoses_raw" / f"{sample_id}.json"
+                if label == "first"
+                else batch_dir / "diagnoses_raw_attempts" / label / f"{sample_id}.json"
+            )
+            write_json(raw_out, diagnosis)
+            learning = learning_diagnosis(diagnosis, outcome_record)
+            write_json(out_json, learning)
+            by_sample[sample_id].append({
+                "attempt": label,
+                "outcome_record": outcome_record,
+                "diagnosis": learning,
+            })
+
+    diagnoses, pool_records = [], []
+    for sample_id in samples:
+        attempts = by_sample[sample_id]
+        if getattr(args, "attempt_only", False):
             continue
-        diagnosis = _normalize_diagnosis_for_outcome(read_json(out_json), outcome_record, sample_id=sample_id)
-        quality_error = _diagnosis_quality_error(diagnosis)
-        if quality_error:
-            statuses[-1]["status"] = "invalid_output"
-            statuses[-1]["error"] = quality_error
-            write_json(out_json, {**diagnosis, "diagnosis_quality_error": quality_error})
+        selected = _selected_attempt(attempts)
+        if not selected:
             continue
-        raw_out = batch_dir / "diagnoses_raw" / f"{sample_id}.json"
-        write_json(raw_out, diagnosis)
-        learning = learning_diagnosis(diagnosis, outcome_record)
+        learning = dict(selected["diagnosis"])
+        learning["selected_attempt"] = selected["attempt"]
+        if len(attempts) > 1:
+            learning["attempts"] = attempts
+        out_json = batch_dir / "diagnoses" / f"{sample_id}.json"
         write_json(out_json, learning)
         diagnoses.append(learning)
+        outcome_record = selected["outcome_record"]
         false_positive = _false_positive_summary(eval_by_sample.get(sample_id), outcome_record)
         pool_records.append({
             "sample_id": sample_id,
@@ -401,8 +596,27 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
             "issue_description": learning.get("issue_description"),
             "vulnerability_type": learning.get("vulnerability_type"),
             **{section: learning.get(section) for section in BEHAVIOR_SECTIONS},
+            "retry_recommendation": learning.get("retry_recommendation"),
+            "attempts": attempts,
+            "selected_attempt": selected["attempt"],
             "outcome_record": outcome_record,
         })
+
+    if getattr(args, "attempt_only", False):
+        attempt_diagnoses = []
+        for sample_id in samples:
+            for attempt in by_sample[sample_id]:
+                learning = dict(attempt["diagnosis"])
+                learning["attempt"] = attempt["attempt"]
+                attempt_diagnoses.append(learning)
+        write_json(batch_dir / "diagnosis_status_attempts.json", statuses)
+        write_json(batch_dir / "retry_diagnoses.json", attempt_diagnoses)
+        print(json.dumps({
+            "status": "attempt_diagnosis",
+            "items": len(statuses),
+            "materialized": len(attempt_diagnoses),
+        }, indent=2))
+        return 0
 
     write_json(batch_dir / "diagnosis_status.json", statuses)
     if diagnoses:
@@ -758,22 +972,23 @@ def _add_role_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--redo", action="store_true",
                         help="start every role over, discarding artifacts an earlier run produced")
     parser.add_argument("--role-model", default=DEFAULT_DISTILLER_MODEL)
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV)
+    parser.add_argument("--base-url", default=DEFAULT_DISTILLER_BASE_URL)
+    parser.add_argument("--api-key-env", default=DEFAULT_DISTILLER_API_KEY_ENV)
     parser.add_argument("--api-version", default="2024-03-01-preview")
-    parser.add_argument("--reasoning-effort", default="max")
+    parser.add_argument("--reasoning-effort", default="medium")
     parser.add_argument("--role-timeout", type=int, default=3600)
 
 
 def _add_harness_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--coding-harness", default=DEFAULT_CODING_HARNESS)
     parser.add_argument("--coding-model", default=DEFAULT_CODING_MODEL)
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV)
+    parser.add_argument("--base-url", default=DEFAULT_CODING_BASE_URL)
+    parser.add_argument("--api-key-env", default=DEFAULT_CODING_API_KEY_ENV)
     parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--max-iter", type=int, default=100)
+    parser.add_argument("--max-attempts", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=10800)
-    parser.add_argument("--reasoning-effort", default="max")
+    parser.add_argument("--reasoning-effort", default="medium")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reward-run-id")
@@ -789,8 +1004,8 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--coding-harness", default=DEFAULT_CODING_HARNESS)
     init.add_argument("--coding-model", default=DEFAULT_CODING_MODEL)
     init.add_argument("--distiller-model", default=DEFAULT_DISTILLER_MODEL)
-    init.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    init.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV)
+    init.add_argument("--base-url", default=DEFAULT_DISTILLER_BASE_URL)
+    init.add_argument("--api-key-env", default=DEFAULT_DISTILLER_API_KEY_ENV)
     init.set_defaults(func=cmd_init_run)
 
     run_batch = sub.add_parser("run-batch")
@@ -812,6 +1027,10 @@ def main(argv: list[str] | None = None) -> int:
     diagnose.add_argument("--batch-index", type=int, required=True)
     diagnose.add_argument("--results-dir", type=Path, required=True)
     diagnose.add_argument("--evaluation", type=Path)
+    diagnose.add_argument("--attempt", action="append", default=[],
+                          help="optional retry attempt as label=results_dir; may be repeated")
+    diagnose.add_argument("--attempt-only", action="store_true",
+                          help="diagnose only the supplied retry attempts and leave batch diagnoses/pools untouched")
     diagnose.add_argument("--parallel", type=int, default=1)
     _add_role_args(diagnose)
     diagnose.set_defaults(func=cmd_diagnose_batch)

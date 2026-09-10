@@ -11,6 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .signatures import (
+    SOURCE_SUFFIXES,
+    function_matches,
+    parse_sanitizer_stack_frame,
+    source_path_matches,
+)
+
 
 CHECKPOINT_KINDS = (
     'parser_admitted',
@@ -26,9 +33,6 @@ CHECKPOINT_KINDS = (
 _ASSERTION_EVENT_RE = re.compile(r'ASSERT_EVT\s+point=([A-Za-z0-9_.:-]+)')
 _TRACE_EVENT_RE = re.compile(r'^ASSERT_EVT\s+(.*)$')
 _TRACE_CASE_RE = re.compile(r'^CASE\s+name=(\S+)\s+')
-_SOURCE_SUFFIXES = {'.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.rs', '.go'}
-
-
 @dataclass
 class CommandResult:
     command: list[str]
@@ -284,18 +288,15 @@ def _same_source_location(left: dict[str, Any], right: dict[str, Any]) -> bool:
         return False
     left_function = str(left.get('function') or '')
     right_function = str(right.get('function') or '')
-    if not left_function or left_function != right_function:
+    if not left_function or not function_matches(left_function, right_function):
         return False
-    left_file = str(left.get('file') or '').replace('\\', '/')
-    right_file = str(right.get('file') or '').replace('\\', '/')
-    file_match = bool(
-        left_file
-        and right_file
-        and (left_file.endswith(right_file) or right_file.endswith(left_file))
-    )
     left_line = _to_int(left.get('line'))
     right_line = _to_int(right.get('line'))
-    return file_match and left_line is not None and left_line == right_line
+    return (
+        source_path_matches(str(left.get('file') or ''), str(right.get('file') or ''))
+        and left_line is not None
+        and left_line == right_line
+    )
 
 
 def _scan_assertion_markers(codebase: Path) -> dict[str, dict[str, Any]]:
@@ -303,7 +304,7 @@ def _scan_assertion_markers(codebase: Path) -> dict[str, dict[str, Any]]:
     if not codebase.is_dir():
         return result
     for path in codebase.rglob('*'):
-        if not path.is_file() or path.suffix.lower() not in _SOURCE_SUFFIXES:
+        if not path.is_file() or path.suffix.lower() not in SOURCE_SUFFIXES:
             continue
         if '.git' in path.parts:
             continue
@@ -481,7 +482,7 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
     # the real ASan report by hundreds of lines.
     sanitizer_name = ''
     first = re.search(
-        r'ERROR:\s+(AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer)'
+        r'(?:ERROR|WARNING):\s+(AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer)'
         r':\s+([A-Za-z0-9_-]+)',
         trace_text,
     )
@@ -506,9 +507,6 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
     access = re.search(r'\b(READ|WRITE|FREE) of size\b|\b(READ|WRITE) memory access\b', trace_text)
     if access:
         access_type = next(group for group in access.groups() if group)
-    frame_re = re.compile(
-        r'#(\d+)\s+0x[0-9a-fA-F]+\s+in\s+(.+?)\s+([^\s:]+):(\d+)(?::(\d+))?'
-    )
     current: str | None = 'crash_stack'
     for line in trace_text.splitlines():
         normalized_line = line.strip().lower()
@@ -525,16 +523,10 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
             current = None
         if current is None:
             continue
-        match = frame_re.search(line)
-        if not match:
+        frame = parse_sanitizer_stack_frame(line)
+        if not frame:
             continue
-        sections[current].append({
-            'frame': int(match.group(1)),
-            'function': match.group(2).strip(),
-            'file': _trim_project_path(match.group(3)),
-            'line': _to_int(match.group(4)),
-            'column': _to_int(match.group(5)),
-        })
+        sections[current].append(frame)
 
     def first_project_frame(frames: list[dict[str, Any]]) -> dict[str, Any]:
         runtime_markers = (
@@ -584,14 +576,6 @@ def parse_sanitizer_trace(trace_text: str) -> dict[str, Any]:
         'allocation_context': first_project_frame(sections['allocation_stack']),
         **sections,
     }
-
-
-def _trim_project_path(path: str) -> str:
-    markers = ['/build_sanitizer/', '/build_valgrind/', '/build_debug/', '/src/', '/work/']
-    for marker in markers:
-        if marker in path:
-            return path.split(marker, 1)[1]
-    return path
 
 
 def _to_int(value: Any) -> int | None:

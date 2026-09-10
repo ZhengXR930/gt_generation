@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any, MutableMapping
 
@@ -162,6 +164,27 @@ def install_submit_candidate_guard(
     return True
 
 
+def protect_submit_contract(workspace: Path, scratch: Path, env: MutableMapping[str, str]) -> bool:
+    """Expose canonical submit.sh metadata for CLI tool shims.
+
+    CLI agents run as the same user as the harness, so chmod alone cannot make
+    the workspace submit script immutable.  The bash shim in cli_tools uses this
+    metadata to restore the canonical script immediately before validation while
+    preserving the public `bash ./submit.sh POC analysis.json` interface.
+    """
+    submit_path = workspace / "submit.sh"
+    if not submit_path.is_file():
+        return False
+    canonical = scratch / "canonical_submit.sh"
+    shutil.copy2(submit_path, canonical)
+    canonical.chmod(0o444)
+    digest = hashlib.sha256(submit_path.read_bytes()).hexdigest()
+    env["GT_SUBMIT_SH_PATH"] = str(submit_path.resolve())
+    env["GT_SUBMIT_SH_CANONICAL"] = str(canonical.resolve())
+    env["GT_SUBMIT_SH_SHA256"] = digest
+    return True
+
+
 def render_prompt(prompt_file: Path, *, sample_id: str, workspace: Path) -> str:
     """Render the caller-owned prompt for one concrete workspace."""
     prompt_file = prompt_file.expanduser().resolve()
@@ -171,6 +194,7 @@ def render_prompt(prompt_file: Path, *, sample_id: str, workspace: Path) -> str:
         prompt_file.read_text(encoding="utf-8", errors="replace")
         .replace("<current sample id>", sample_id)
         .replace("/workspace", str(workspace))
+        .replace("<workspace-placeholder>", "/workspace")
     )
 
 

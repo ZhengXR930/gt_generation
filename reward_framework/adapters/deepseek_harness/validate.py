@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate DeepSeek Harness bundle export."""
+"""Validate DeepSeek Harness native skill export."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ def validate_bundle(bundle_dir: Path) -> dict:
     required = [
         "package.json",
         "cordis.patch.yml",
-        "plugin/index.ts",
         "adapter_manifest.json",
         "skills/reward_framework_skill_export.json",
     ]
@@ -33,16 +32,9 @@ def validate_bundle(bundle_dir: Path) -> dict:
     if "dsh" not in pkg or "bundle" not in pkg["dsh"]:
         raise ValueError("package.json missing dsh.bundle")
     patch_text = (bundle_dir / "cordis.patch.yml").read_text(encoding="utf-8")
-    for needle in ["insert:", "id: reward-framework-poc-skills", "index.ts"]:
+    for needle in ["id: skill-filesystem", "customSkillDirs:", "includeDefaultRoots: false"]:
         if needle not in patch_text:
-            raise ValueError(f"cordis.patch.yml missing expected insert syntax {needle!r}")
-    plugin = (bundle_dir / "plugin/index.ts").read_text(encoding="utf-8")
-    for needle in ["ctx.tools.register", "reward_framework_read_poc_skill"]:
-        if needle not in plugin:
-            raise ValueError(f"plugin missing expected DSH/Cordis hook {needle!r}")
-    for needle in ["type: 'object'", "required: ['skill']", "additionalProperties: false"]:
-        if needle not in plugin:
-            raise ValueError(f"plugin tool schema missing expected raw JSON Schema text {needle!r}")
+            raise ValueError(f"cordis.patch.yml missing expected native skill config {needle!r}")
     skill_validation = validate_native_agent_skills(bundle_dir / "skills")
     return {"status": "pass", "bundle_dir": str(bundle_dir), "skills": skill_validation}
 

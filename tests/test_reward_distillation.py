@@ -45,7 +45,11 @@ def _behavioral_fields(prefix="behavior"):
         "candidate_behavior": _section(f"{prefix} candidate", f"{prefix} candidate evidence"),
         "feedback_behavior": _section(f"{prefix} feedback", f"{prefix} feedback evidence"),
         "outcome_diagnosis": _section(f"{prefix} outcome", f"{prefix} outcome evidence"),
-        "transferable_observation": _section(f"{prefix} transferable", f"{prefix} transferable evidence"),
+        "retry_recommendation": {
+            "decision": "do_not_retry",
+            "summary": f"{prefix} retry summary",
+            "evidence": f"{prefix} retry evidence",
+        },
     }
 
 
@@ -149,7 +153,7 @@ def test_correction_limits_modify_remove_to_applied_lessons(tmp_path):
     ], out_packet=current)
 
     result = apply_correction_decision(current, base, {
-        "decision": "REMOVE",
+        "decision": "CORRECT",
         "operations": [{"action": "REMOVE", "target": "submission:S.C", "target_lesson_id": "S.C#1"}],
     }, out_packet=tmp_path / "blocked", allowed_lesson_ids={("reproduction:R.B", "R.B#1")})
     assert not result["applied"]
@@ -168,7 +172,7 @@ def test_correction_can_remove_or_rollback_lessons(tmp_path):
     ], out_packet=current)
 
     removed = apply_correction_decision(current, base, {
-        "decision": "REMOVE",
+        "decision": "CORRECT",
         "operations": [{"action": "REMOVE", "target": "reproduction:R.B", "target_lesson_id": "R.B#1"}],
     }, out_packet=tmp_path / "removed")
     assert removed["applied"][0]["mode"] == "remove"
@@ -224,6 +228,20 @@ def test_outcome_is_deterministic_from_reachability():
     assert partial["outcome"] == "partial"
     assert partial["first_failed_stage"] == "Root Cause"
     assert partial["deepest_stage"] == "Source"
+
+    fp = classify_outcome({"runtime": {"submitted_unique_pocs": 1, "nonzero_exit_false_positives": 1, "candidates": [
+        {"execution_status": "executed", "target_vulnerability_triggered": False, "location_reachability": {
+            "R1_input_admitted": True, "R2_source_reached": True, "R3_root_cause_reached": False}}]}})
+    assert fp["outcome"] == "partial"
+    assert fp["false_positive"] is True
+    assert fp["false_positive_pocs"] == 1
+
+    candidate_fp = classify_outcome({"runtime": {"submitted_unique_pocs": 1, "candidates": [
+        {"execution_status": "executed", "target_vulnerability_triggered": False, "location_reachability": {
+            "R1_input_admitted": True, "R2_source_reached": True, "R3_root_cause_reached": False,
+            "sanitizer_observed": {"sanitizer": "AddressSanitizer", "crash_type": "heap-buffer-overflow"}}}]}})
+    assert candidate_fp["false_positive"] is True
+    assert candidate_fp["false_positive_pocs"] == 1
 
     nothing = classify_outcome({"runtime": {"submitted_unique_pocs": 0, "candidates": [],
                                             "unavailable": "not applicable: no submitted PoC"}})
@@ -318,7 +336,7 @@ def test_success_diagnosis_outcome_is_normalized_without_failure_type():
     assert "search_behavior" not in infra, "legacy fields must not be synthesized"
 
 
-def test_learning_diagnosis_strips_evaluator_and_code_coordinates():
+def test_learning_diagnosis_rewrites_only_evaluator_terms():
     raw = {
         "sample_id": "arvo_1",
         "outcome": "partial",
@@ -331,13 +349,12 @@ def test_learning_diagnosis_strips_evaluator_and_code_coordinates():
         "candidate_behavior": _section("manual construction", "See https://example.test and commit abcdef1234567890 for line 55."),
         "feedback_behavior": _section("Parser feedback was reused", "Source path stayed stable."),
         "outcome_diagnosis": _section("Sink reached, Trigger missed", "Root Cause label was incomplete."),
-        "transferable_observation": _section("candidate mutation helped", "source artifact evidence"),
     }
     learned = learning_diagnosis(raw, {"outcome": "partial"})
     rendered = json.dumps(learned)
     assert "R4" not in rendered and "R2_source_reached" not in rendered
     assert "Parser" not in rendered and "Source" not in rendered and "Sink" not in rendered and "Trigger" not in rendered
-    assert "src/foo.c" not in rendered and "a.cc" not in rendered and "abcdef" not in rendered
+    assert "src/foo.c" in rendered and "a.cc" in rendered and "abcdef" in rendered
     assert "observable failure" in rendered
     assert learned["sample_id"] == "arvo_1"
     assert learned["search_behavior"]["summary"]
@@ -368,7 +385,7 @@ def test_distillation_role_prompts_are_external_templates():
     assert "You are the Sample Behavior Diagnostician." in load_template("diagnostician.md")
     assert "You are the Batch Skill Evolution Teacher." in load_template("teacher.md")
     assert "You are the Skill Update Curator." in load_template("curator.md")
-    assert "You are the Skill Correction Agent." in load_template("correction.md")
+    assert "You are the Skill Update Corrector." in load_template("correction.md")
 
 
 def test_role_task_prompt_points_at_files_not_inline_payloads():
@@ -577,6 +594,32 @@ def test_diagnosis_quality_requires_behavior_sections():
     missing_section = {"issue_description": "i", **_behavioral_fields("ok")}
     missing_section.pop("feedback_behavior")
     assert "feedback_behavior" in _diagnosis_quality_error(missing_section)
+
+    missing_retry = {"issue_description": "i", **_behavioral_fields("ok")}
+    missing_retry.pop("retry_recommendation")
+    assert "retry_recommendation" in _diagnosis_quality_error(missing_retry)
+
+    bad_retry = {"issue_description": "i", **_behavioral_fields("ok")}
+    bad_retry["retry_recommendation"] = {"decision": "repair_required", "summary": "x", "evidence": "y"}
+    assert "retry or do_not_retry" in _diagnosis_quality_error(bad_retry)
+
+
+def test_diagnosis_quality_rejects_evaluator_stage_terms_in_behavior_text():
+    diagnosis = {"issue_description": "i", **_behavioral_fields("ok")}
+    diagnosis["outcome_diagnosis"] = {
+        "summary": "The candidate reached R4 Sink before missing Trigger.",
+        "evidence": "The runtime report said R0 and R4_sink_reached were observed.",
+    }
+    error = _diagnosis_quality_error(diagnosis)
+    assert "evaluator-only" in error
+    assert "R0" in error and "R4" in error and "Sink" in error
+
+    natural = {"issue_description": "i", **_behavioral_fields("ok")}
+    natural["search_behavior"] = {
+        "summary": "The agent searched the parser implementation but described progress behaviorally.",
+        "evidence": "Lowercase parser is ordinary project vocabulary, not an evaluator label.",
+    }
+    assert _diagnosis_quality_error(natural) is None
 
 
 def test_diagnostics_summary_carries_all_three_and_stays_small():

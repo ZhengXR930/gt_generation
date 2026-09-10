@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ADAPTER_NAME = "deepseek_harness"
-INTERFACE_VERSION = "dsh-plugin-bundle-interface-v1"
+INTERFACE_VERSION = "dsh-native-skill-interface-v1"
 BUNDLE_DIR_ENV = "REWARD_FRAMEWORK_DSH_BUNDLE_DIR"
 
 

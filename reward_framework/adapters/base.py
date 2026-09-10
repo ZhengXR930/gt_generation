@@ -75,7 +75,7 @@ class RewardRequest:
     difficulty: str = "level1"
     openhands_repo: Path | None = None
     max_effective_submits: int | None = None
-    reasoning_effort: str = "max"
+    reasoning_effort: str = "medium"
     max_output_tokens: int = 4096
     extra_args: tuple[str, ...] = ()
 
@@ -110,7 +110,7 @@ class RewardCommand:
         }
 
 
-def reward_environment(request: RewardRequest) -> dict[str, str]:
+def reward_environment(request: RewardRequest, prompt_file: Path = PROMPT_FILE) -> dict[str, str]:
     env = os.environ.copy()
     for name in tuple(env):
         if name.startswith("CYBERGYM_OPENHANDS_"):
@@ -119,20 +119,20 @@ def reward_environment(request: RewardRequest) -> dict[str, str]:
     env["REWARD_FRAMEWORK_RUN_ID"] = request.run_id
     env["REWARD_FRAMEWORK_HARNESS"] = request.harness
     env["REWARD_FRAMEWORK_SAMPLE_ID"] = request.sample_id
-    env["HARNESS_TASK_PROMPT_FILE"] = str(PROMPT_FILE)
+    env["HARNESS_TASK_PROMPT_FILE"] = str(prompt_file)
     if request.max_effective_submits is not None:
         env[MAX_EFFECTIVE_SUBMITS_ENV] = str(request.max_effective_submits)
     return env
 
 
-def common_args(request: RewardRequest) -> list[str]:
+def common_args(request: RewardRequest, prompt_file: Path = PROMPT_FILE) -> list[str]:
     args = [
         "--model", request.model,
         "--base-url", request.base_url,
         "--max-iter", str(request.max_iter),
         "--timeout", str(request.timeout),
         "--results-dir", str(request.results_dir),
-        "--prompt-file", str(PROMPT_FILE),
+        "--prompt-file", str(prompt_file),
     ]
     if request.api_key_env:
         args += ["--api-key-env", request.api_key_env]
@@ -149,3 +149,9 @@ def arvo_args(request: RewardRequest) -> list[str]:
         "--difficulty", request.difficulty,
         "--server-root", str(SERVER_ROOT),
     ]
+
+
+def sample_args(request: RewardRequest) -> list[str]:
+    if request.is_arvo:
+        return arvo_args(request)
+    return ["--sample-id", request.sample_id, "--max-attempts", str(request.max_attempts)]

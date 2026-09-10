@@ -141,6 +141,10 @@ def adapt_arvo_workspace_for_host(workspace: Path, sample_id: str) -> None:
     text = text.replace("/workspace/", f"{placeholder}/")
     text = text.replace("/workspace", placeholder)
     text = text.replace(placeholder, workspace_text)
+    # Host-side DSH runs can inherit older curl builds that predate
+    # --fail-with-body. Keep the public submit.sh contract intact while making
+    # the generated script executable before the agent sees it.
+    text = text.replace("--fail-with-body", "--fail")
     path.write_text(text, encoding="utf-8")
 
     submit_path = workspace / "submit.sh"
@@ -580,7 +584,8 @@ def run_attempt(args: argparse.Namespace, sample_result_dir: Path, attempt: int)
 
         persist_results(sample_result_dir, workspace, run_dir, config_path, prompt_path, manifest)
         copy_dsh_checkpoint(dsh_home, sample_result_dir, new_session_files)
-        slim_dsh_checkpoint_if_analysis_valid(sample_result_dir)
+        if not os.environ.get("REWARD_FRAMEWORK_RUN_ID"):
+            slim_dsh_checkpoint_if_analysis_valid(sample_result_dir)
         reachability_metadata = run_reachability_pipeline(
             model_namespace=sample_result_dir.parent.name,
             sample_id=sample_id,
@@ -699,7 +704,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="max",
+        default="high",
         choices=("off", "high", "max"),
     )
     parser.add_argument(

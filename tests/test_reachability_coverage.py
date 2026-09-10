@@ -1,6 +1,7 @@
 from reachability.core import evaluate_r1_r5
 from reachability.coverage import checkpoints_to_hits
-from reachability.engine import extract_reachability_checkpoints
+from reachability.engine import extract_reachability_checkpoints, parse_sanitizer_trace
+from reachability.eval_batch import _select_sanitizer_trace
 from reachability.eval_batch import summarize_candidates
 
 
@@ -256,6 +257,100 @@ def test_r5_matches_gt_source_file_with_commit_anchor():
         "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n"
         "    #0 0x1 in janetc_pop_funcdef /gt/_work/janet/src/core/compile.c:965:44\n"
         "SUMMARY: AddressSanitizer: heap-buffer-overflow /gt/_work/janet/src/core/compile.c:965:44 in janetc_pop_funcdef\n"
+    )
+
+    assert evaluate_r1_r5(
+        gt=gt, sanitizer_trace=trace
+    )["target_vulnerability_triggered"] is True
+
+
+def test_saved_submit_runtime_precedes_gdb_sanitizer_trace():
+    saved = (
+        "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
+        "    #0 0x1 in target /src/project/bug.c:12:1\n"
+    )
+    gdb = (
+        "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
+        "    #0 0x2 in adjacent /src/project/bug.c:99:1\n"
+    )
+
+    trace, source = _select_sanitizer_trace(
+        current_runtime_trace=gdb,
+        saved_runtime_trace=saved,
+    )
+
+    assert source == "saved_runtime_and_gdb"
+    assert trace.startswith(saved)
+
+
+def test_sanitizer_parser_keeps_cpp_template_function_and_source_location():
+    trace = (
+        "==1==WARNING: MemorySanitizer: use-of-uninitialized-value\n"
+        "    #0 0x5ff6a6 in "
+        "OT::hmtxvmtx<OT::hmtx, OT::hhea>::accelerator_t::get_advance(unsigned int) const "
+        "/src/harfbuzz/src/./hb-ot-hmtx-table.hh:254:11\n"
+        "SUMMARY: MemorySanitizer: use-of-uninitialized-value "
+        "/src/harfbuzz/src/./hb-ot-hmtx-table.hh:254:11 in "
+        "OT::hmtxvmtx<OT::hmtx, OT::hhea>::accelerator_t::get_advance(unsigned int) const\n"
+    )
+
+    observed = parse_sanitizer_trace(trace)
+
+    assert observed["sanitizer"] == "MemorySanitizer"
+    assert observed["crash_type"] == "use-of-uninitialized-value"
+    assert observed["crash_location"] == {
+        "function": (
+            "OT::hmtxvmtx<OT::hmtx, OT::hhea>::accelerator_t::"
+            "get_advance(unsigned int) const"
+        ),
+        "file": "harfbuzz/src/hb-ot-hmtx-table.hh",
+        "line": 254,
+    }
+
+
+def test_r5_normalizes_dot_segments_in_sanitizer_source_path():
+    gt = {
+        "sample_id": "sample",
+        "sanitizer_ground_truth": {
+            "detector": "MemorySanitizer",
+            "crash_type": "use-of-uninitialized-value",
+            "crash_location": {
+                "file": "src/hb-ot-hmtx-table.hh",
+                "function": "get_advance",
+                "line": 254,
+            },
+        },
+    }
+    trace = (
+        "==1==WARNING: MemorySanitizer: use-of-uninitialized-value\n"
+        "    #0 0x5ff6a6 in get_advance "
+        "/src/harfbuzz/src/./hb-ot-hmtx-table.hh:254:11\n"
+    )
+
+    assert evaluate_r1_r5(
+        gt=gt, sanitizer_trace=trace
+    )["target_vulnerability_triggered"] is True
+
+
+def test_r5_matches_file_and_function_when_sanitizer_omits_line():
+    gt = {
+        "sample_id": "sample",
+        "sanitizer_ground_truth": {
+            "detector": "address",
+            "crash_type": "SEGV (wild-addr-read)",
+            "crash_location": {
+                "file": "libarchive/archive_read_support_format_rar5.c",
+                "function": "copy_string",
+                "line": 2812,
+            },
+        },
+    }
+    trace = (
+        "==1==ERROR: AddressSanitizer: SEGV on unknown address 0x1\n"
+        "    #0 0x1234 in copy_string "
+        "/src/libarchive/archive_read_support_format_rar5.c\n"
+        "SUMMARY: AddressSanitizer: SEGV "
+        "/src/libarchive/archive_read_support_format_rar5.c in copy_string\n"
     )
 
     assert evaluate_r1_r5(

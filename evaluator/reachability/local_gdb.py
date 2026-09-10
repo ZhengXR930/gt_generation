@@ -36,8 +36,8 @@ def run_local_gdb(
     max_hits_per_event: int = 64,
 ) -> tuple[CommandResult, list[dict], bool]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    breakpoints_path = output_dir / "reachability_breakpoints.json"
-    hits_path = output_dir / "reachability_hits.json"
+    breakpoints_path = (output_dir / "reachability_breakpoints.json").resolve()
+    hits_path = (output_dir / "reachability_hits.json").resolve()
     write_breakpoint_spec(checkpoints, breakpoints_path)
     try:
         hits_path.unlink()

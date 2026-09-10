@@ -24,7 +24,10 @@ GT_ROOT = RUNTIME_ROOT.parent
 
 sys.path.insert(0, str(GT_ROOT / "evaluator"))
 
-from reachability.eval_batch import evaluate_model_sample  # noqa: E402
+from reachability.eval_batch import evaluate_model_sample, write_no_candidate_eval  # noqa: E402
+
+
+NO_CANDIDATE_REASONS = {"no_deduplicated_pocs", "no_poc_file"}
 
 
 DEFAULT_REACHABILITY_LOCK_DIR = Path(
@@ -44,6 +47,9 @@ def sample_has_reachability_input(sample_result_dir: Path) -> tuple[bool, str]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return False, f"invalid_manifest: {exc}"
+    candidates = manifest.get("deduplicated_pocs")
+    if not isinstance(candidates, list) or not candidates:
+        return False, "no_deduplicated_pocs"
     runtime_readiness = manifest.get("runtime_readiness")
     if (
         isinstance(runtime_readiness, dict)
@@ -56,9 +62,6 @@ def sample_has_reachability_input(sample_result_dir: Path) -> tuple[bool, str]:
         and poc_generation.get("runtime_unavailable") is True
     ):
         return False, "unavailable_runtime_spec"
-    candidates = manifest.get("deduplicated_pocs")
-    if not isinstance(candidates, list) or not candidates:
-        return False, "no_deduplicated_pocs"
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
@@ -145,6 +148,25 @@ def run_reachability_pipeline(
 
     has_input, reason = sample_has_reachability_input(sample_result_dir)
     if not has_input:
+        if reason in NO_CANDIDATE_REASONS:
+            result = write_no_candidate_eval(
+                model=model_namespace,
+                sample_id=sample_id,
+                sample_dir=sample_result_dir,
+                reason=reason,
+            )
+            metadata.update(
+                {
+                    "status": "complete",
+                    "reason": reason,
+                    "summary": result.get("summary") or {},
+                    "report_path": "reachability_eval.json",
+                    "seconds": round(time.monotonic() - started, 1),
+                }
+            )
+            _write_pipeline_metadata(sample_result_dir, metadata)
+            update_manifest_reachability(sample_result_dir, metadata)
+            return metadata
         metadata.update({"status": "skipped", "reason": reason})
         _write_pipeline_metadata(sample_result_dir, metadata)
         update_manifest_reachability(sample_result_dir, metadata)

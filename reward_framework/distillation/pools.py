@@ -20,7 +20,6 @@ BEHAVIOR_SECTIONS = (
     "candidate_behavior",
     "feedback_behavior",
     "outcome_diagnosis",
-    "transferable_observation",
 )
 
 EXCERPT_CHARS = 640
@@ -241,6 +240,7 @@ def _sample_record(
         "issue_description": _short(record.get("issue_description")),
         "vulnerability_type": record.get("vulnerability_type"),
         **{section: _short_value(record.get(section)) for section in BEHAVIOR_SECTIONS},
+        "retry_recommendation": _short_value(record.get("retry_recommendation")),
         "false_positive": bool(record.get("false_positive") or outcome_record.get("false_positive") or false_positive_pocs),
         "false_positive_pocs": false_positive_pocs,
     }
@@ -304,6 +304,7 @@ def _teacher_sample(sample: dict[str, Any]) -> dict[str, Any]:
             "issue_description",
             "vulnerability_type",
             *BEHAVIOR_SECTIONS,
+            "retry_recommendation",
         )
         if sample.get(key) not in (None, "")
     }

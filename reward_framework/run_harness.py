@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from harness_runtime.failure_artifact import write_failure_artifact
 from model_router import resolve_model_route
+from poc_generation.extract_context_visit import write_context_visit
 from reward_framework.adapters import HARNESSES, RewardRequest, build_command
 from reward_framework.adapters.base import DEFAULT_RUNS_ROOT, DEFAULT_SKILL_PACKET
 
@@ -111,6 +112,23 @@ def result_is_complete(sample_dir: Path) -> bool:
     )
 
 
+def _sample_has_submitted_candidate(sample_dir: Path) -> bool:
+    manifest = sample_dir / "manifest.json"
+    if not manifest.is_file():
+        return False
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    deduplicated = payload.get("deduplicated_pocs")
+    if isinstance(deduplicated, list) and deduplicated:
+        return True
+    attempts = payload.get("submission_attempts")
+    if isinstance(attempts, list) and attempts:
+        return True
+    return int(payload.get("num_submission_attempts") or 0) > 0
+
+
 def maybe_run_reachability(
     config: dict[str, Any],
     *,
@@ -138,6 +156,28 @@ def maybe_run_reachability(
     if "error" in result:
         return {"status": "error", "error": result["error"]}
     return {"status": "complete", "summary": result.get("summary") or {}}
+
+
+def maybe_write_context_visit(sample_dir: Path) -> dict[str, Any]:
+    """Materialize context_visit.json from the saved agent checkpoint."""
+    if not (sample_dir / "checkpoint").is_dir():
+        return {"status": "skipped", "reason": "checkpoint missing"}
+    try:
+        written = write_context_visit(
+            sample_dir,
+            overwrite=True,
+            update_manifest_flag=True,
+        )
+        report = _load_json(sample_dir / "context_visit.json")
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    collection = report.get("collection") or {}
+    return {
+        "status": "complete",
+        "written": written,
+        "recoverable": bool(collection.get("recoverable")),
+        "context_count": int(collection.get("context_count") or 0),
+    }
 
 
 def build_request(
@@ -194,7 +234,7 @@ def build_request(
         max_effective_submits=(
             int(max_effective) if max_effective not in (None, "", 0) else None
         ),
-        reasoning_effort=str(_config_value(args, config, "reasoning_effort", "max")),
+        reasoning_effort=str(_config_value(args, config, "reasoning_effort", "medium")),
         max_output_tokens=int(_config_value(args, config, "max_output_tokens", 4096)),
         extra_args=tuple(extra_args),
     )
@@ -335,7 +375,9 @@ def run_one(
         (sample_dir / "manifest.json").is_file()
         and (sample_dir / "checkpoint").is_dir()
     )
-    if proc is not None and proc.returncode == 0 and has_sample_artifact:
+    if (sample_dir / "checkpoint").is_dir():
+        record["context_visit"] = maybe_write_context_visit(sample_dir)
+    if has_sample_artifact:
         record["reachability"] = maybe_run_reachability(
             config, run_id=run_id, sample_id=sample_id, sample_dir=sample_dir
         )

@@ -358,7 +358,7 @@ def execute_role(
     base_url: str,
     api_key_env: str,
     api_version: str = "2024-03-01-preview",
-    reasoning_effort: str = "max",
+    reasoning_effort: str = "medium",
     max_output_tokens: int = 4096,
     timeout: int = 3600,
 ) -> dict[str, Any]:

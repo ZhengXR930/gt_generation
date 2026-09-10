@@ -1,4 +1,4 @@
-"""Export a DeepSeek Harness bundle/plugin scaffold for PoC skills."""
+"""Export DeepSeek Harness native skill configuration for PoC skills."""
 
 from __future__ import annotations
 
@@ -19,46 +19,6 @@ from reward_framework.adapters.deepseek_harness.contract import ADAPTER_NAME, IN
 from reward_framework.adapters.base import SKILL_PACKET_ENV, substitute_skill_path_placeholders
 
 
-PLUGIN_TS = """import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-
-export const name = 'reward-framework-poc-skills'
-export const inject = ['tools']
-
-const root = new URL('..', import.meta.url).pathname
-
-function readSkill(name) {
-  return readFileSync(join(root, 'skills', name, 'SKILL.md'), 'utf8')
-}
-
-export function apply(ctx) {
-  ctx.tools.register({
-    name: 'reward_framework_read_poc_skill',
-    description: 'Read a reward-framework PoC reproduction skill by name.',
-    parameters: {
-      type: 'object',
-      properties: {
-        skill: {
-          type: 'string',
-          enum: ['poc-reproduction', 'poc-submission'],
-          description: 'Skill to read.',
-        },
-      },
-      required: ['skill'],
-      additionalProperties: false,
-    },
-    output: {
-      schema: { type: 'string' },
-      render: (_args, value) => [{ type: 'text', text: value }],
-    },
-    async execute(args) {
-      return readSkill(args.skill)
-    },
-  })
-
-}
-"""
-
 def export_bundle(packet: Path, destination: Path | None = None) -> dict:
     dest = resolve_bundle_dir(str(destination) if destination else None).resolve()
     if dest.exists():
@@ -70,9 +30,6 @@ def export_bundle(packet: Path, destination: Path | None = None) -> dict:
         skills_dir,
         adapter_name=ADAPTER_NAME,
     )
-    plugin_dir = dest / "plugin"
-    plugin_dir.mkdir()
-    (plugin_dir / "index.ts").write_text(PLUGIN_TS, encoding="utf-8")
     (dest / "package.json").write_text(
         json.dumps(
             {
@@ -81,30 +38,19 @@ def export_bundle(packet: Path, destination: Path | None = None) -> dict:
                 "private": True,
                 "type": "module",
                 "dsh": {"bundle": "cordis.patch.yml"},
-                "dependencies": {
-                    "@deepseek-ai/cordis": "*",
-                    "@deepseek-ai/dsh-tools": "*",
-                },
             },
             indent=2,
         )
         + "\n",
         encoding="utf-8",
     )
-    plugin_entry = (plugin_dir / "index.ts").resolve()
-    (dest / "cordis.patch.yml").write_text(
-        "- insert:\n"
-        "    - id: reward-framework-poc-skills\n"
-        f"      name: '{plugin_entry}'\n",
-        encoding="utf-8",
-    )
+    write_native_skill_patch(dest / "cordis.patch.yml", skills_dir)
     (dest / "README.md").write_text(
         "# Reward Framework DeepSeek Harness Adapter\n\n"
-        "This directory is a DeepSeek Harness bundle scaffold. Mount it as a "
-        "Cordis/DSH bundle or patch overlay according to the local DSH profile. "
-        "It does not patch DeepSeek Harness core.\n\n"
-        "The plugin exposes a model-callable skill reader tool. Benchmark submit "
-        "tools should be supplied by the surrounding evaluation harness.\n",
+        "This directory exports the current reward skill packet as native DSH "
+        "filesystem skills. Mount `cordis.patch.yml` with `dsh --patch`; it "
+        "configures the built-in `skill-filesystem` provider so the built-in "
+        "`skill` tool can load `poc-reproduction` and `poc-submission`.\n",
         encoding="utf-8",
     )
     manifest = {
@@ -113,13 +59,30 @@ def export_bundle(packet: Path, destination: Path | None = None) -> dict:
         "bundle_dir": str(dest),
         "native_skill_export": native_manifest,
         "patch_file": str(dest / "cordis.patch.yml"),
-        "plugin_entry": str(plugin_dir / "index.ts"),
+        "native_skill_root": str(skills_dir.resolve()),
+        "dsh_skill_provider_config": {
+            "includeDefaultRoots": False,
+            "customSkillDirs": [str(skills_dir.resolve())],
+            "watch": False,
+        },
     }
     (dest / "adapter_manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     return manifest
+
+
+def write_native_skill_patch(path: Path, skills_dir: Path) -> None:
+    path.write_text(
+        "- id: skill-filesystem\n"
+        "  config:\n"
+        "    includeDefaultRoots: false\n"
+        "    customSkillDirs:\n"
+        f"      - '{str(skills_dir.resolve()).replace(chr(39), chr(39) + chr(39))}'\n"
+        "    watch: false\n",
+        encoding="utf-8",
+    )
 
 
 def install_workspace_skill_packet(
@@ -132,11 +95,27 @@ def install_workspace_skill_packet(
 ) -> dict:
     del harness, sample_id
     packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
-    manifest = export_bundle(packet, scratch / "dsh_bundle")
-    env["HARNESS_DSH_PATCH_FILE"] = str(manifest["patch_file"])
-    skills_dir = Path(manifest["bundle_dir"]) / "skills"
+    skills_dir = workspace / ".dsh" / "skills"
+    native_manifest = export_native_agent_skills(
+        packet,
+        skills_dir,
+        adapter_name=ADAPTER_NAME,
+    )
+    metadata_file = skills_dir / "reward_framework_skill_export.json"
+    if metadata_file.exists():
+        metadata_file.unlink()
+    manifest = {
+        "adapter": ADAPTER_NAME,
+        "interface_version": INTERFACE_VERSION,
+        "install_mode": "workspace-dsh-skills",
+        "native_skill_export": native_manifest,
+        "native_skill_root": str(skills_dir.resolve()),
+    }
     state_dir = scratch / "state"
     state_dir.mkdir(exist_ok=True)
+    patch_file = scratch / "dsh_native_skills.patch.yml"
+    write_native_skill_patch(patch_file, skills_dir)
+    env["HARNESS_DSH_PATCH_FILE"] = str(patch_file)
     substitute_skill_path_placeholders(
         skills_dir,
         helpers_dir=skills_dir / "poc-submission" / "helpers",
@@ -148,6 +127,7 @@ def install_workspace_skill_packet(
         "helpers": str(skills_dir / "poc-submission" / "helpers"),
         "state": str(state_dir),
         "workspace": str(workspace),
+        "dsh_patch_file": str(patch_file),
     }
     return manifest
 

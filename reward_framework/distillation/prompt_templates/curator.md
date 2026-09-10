@@ -19,23 +19,24 @@ judge the proposal and is never written into the packet.
 
 ## Decision Rule
 
-Return `MODIFY` only when the proposed lesson is:
+Treat every proposed lesson as a conditional policy. It needs both:
 
-- supported by a clear behavior contrast, not just a single failure detail;
-- transferable to unseen samples using only test-time information;
-- actionable for search, candidate mutation, submission, feedback use, path
-  switching, or stopping behavior;
-- non-redundant with the current lessons;
-- concise enough to be a behavioral bias rather than a procedure;
-- low-risk for over-analysis, delayed submission, excessive conservatism,
-  wrong-path refinement, broad search drift, or false-positive finalization.
+- a condition the coding agent can recognize from the public issue, source,
+  current trajectory, local diagnostics, submitted candidates, or runtime output;
+- a concise action that improves search, mutation, submission, feedback use,
+  switching, or stopping while that condition holds.
 
-Otherwise return `SKIP`.
+Return `MODIFY` when a clear positive/negative behavior contrast supports both
+parts and the lesson transfers beyond the cited samples. Rewrite hidden or vague
+conditions into concrete observable ones when the evidence supports doing so.
+Return `SKIP` when the proposal depends on post-hoc reachability, an inferred
+"best" path with no observable basis, one sample's mechanism, or a condition so
+broad that the action would become the default for every task.
 
-When modifying text, preserve the behavior signal while removing over-specific
-or rigid wording. Prefer revising an existing overlapping lesson over adding
-another one. Accept at most one update unless two proposals are clearly
-independent and both well supported.
+Keep the result short and non-redundant. Check that it does not encourage
+over-analysis, delayed submission, prolonged wrong-path refinement, broad search
+drift, or finalization on an unrelated crash. Accept at most one update unless
+two proposals are independent and both well supported.
 
 Allowed targets:
 - `reproduction:R.B`

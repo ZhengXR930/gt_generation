@@ -14,20 +14,16 @@ LEVEL_SPECS = (
         "source_dir": "reproduction_skill",
         "native_name": "poc-reproduction",
         "description": (
-            "Use when reproducing a vulnerability or bug from an issue description "
-            "and code evidence: identify the target input contract, maintain the "
-            "parser/source/root-cause/sink/trigger hypothesis, and plan the next "
-            "candidate PoC revision."
+            "Use when constructing a concrete proof-of-concept input from the "
+            "local issue description, workspace, and submission feedback."
         ),
     },
     {
         "source_dir": "submission_skill",
         "native_name": "poc-submission",
         "description": (
-            "Use when reproducing a vulnerability or bug from an issue description "
-            "and the agent needs disciplined PoC submission/verification behavior: "
-            "meaningful evidence-bearing submits, candidate history, duplicate "
-            "avoidance, and analysis-as-diagnostic rather than a runtime gate."
+            "Use when submitting a concrete local PoC candidate and recording "
+            "the returned benchmark feedback for later revision."
         ),
     },
 )
@@ -56,18 +52,11 @@ def _yaml_single_quote(value: str) -> str:
 
 def _native_skill_text(name: str, description: str, body: str, adapter_name: str) -> str:
     body = _strip_frontmatter(body)
-    prelude = (
-        f"\n\nAdapter: `{adapter_name}` native skill export. This skill is one layer of "
-        "the reward-framework PoC reproduction packet. If helper scripts are needed, "
-        "use the `helpers/` directory inside this skill folder or copy those helpers "
-        "into the benchmark workspace.\n\n"
-    )
     return (
         "---\n"
         f"name: {name}\n"
         f"description: {_yaml_single_quote(description)}\n"
         "---\n\n"
-        + prelude
         + body
     )
 
@@ -182,9 +171,6 @@ def write_bridge_file(path: Path, *, adapter_name: str, skills_dir: Path) -> Non
         "# Reward Framework PoC Skills\n\n"
         f"Adapter: `{adapter_name}`\n\n"
         f"Native skills directory: `{skills_dir}`\n\n"
-        "Use `poc-reproduction` to plan issue-aligned PoC candidates, "
-        "then use `poc-submission` to decide and record meaningful "
-        "submits. Do not treat training reasoning/reachability diagnostics as "
-        "test-time oracle feedback.\n",
+        "Installed skills: `poc-reproduction`, `poc-submission`.\n",
         encoding="utf-8",
     )

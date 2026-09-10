@@ -21,6 +21,7 @@ from .engine import (
     extract_reachability_checkpoints,
     parse_sanitizer_trace,
 )
+from .signatures import function_matches, location_matches, source_path_matches
 
 
 def evaluate_r1_r5(
@@ -186,19 +187,14 @@ def _hit_matches_expected_location(hit: dict[str, Any]) -> bool:
         return True
     if expected_line is not None and observed_line != expected_line:
         return False
-    expected_file = str(hit.get('expected_file') or '').replace('\\', '/')
-    observed_file = str(hit.get('file') or '').replace('\\', '/')
-    if expected_file and observed_file and not (
-        expected_file.endswith(observed_file)
-        or observed_file.endswith(expected_file)
-    ):
+    expected_file = str(hit.get('expected_file') or '')
+    observed_file = str(hit.get('file') or '')
+    if expected_file and observed_file and not source_path_matches(expected_file, observed_file):
         return False
     expected_function = str(hit.get('expected_function') or '')
     observed_function = str(hit.get('function') or '')
-    if expected_function and observed_function and not (
-        expected_function == observed_function
-        or expected_function in observed_function
-        or observed_function in expected_function
+    if expected_function and observed_function and not function_matches(
+        expected_function, observed_function
     ):
         return False
     return True
@@ -321,41 +317,7 @@ def _sanitizer_matches_gt(gt: dict[str, Any], observed: dict[str, Any]) -> bool:
 
 
 def _location_matches(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
-    if not expected or not observed:
-        return False
-    expected_file = _normalize_source_file(str(expected.get('file') or ''))
-    observed_file = _normalize_source_file(str(observed.get('file') or ''))
-    file_match = bool(
-        expected_file
-        and observed_file
-        and (expected_file.endswith(observed_file) or observed_file.endswith(expected_file))
-    )
-    line_match = _to_int(expected.get('line')) == _to_int(observed.get('line'))
-    expected_function = str(expected.get('function') or '')
-    observed_function = str(observed.get('function') or '')
-    function_match = bool(
-        expected_function
-        and observed_function
-        and (
-            expected_function == observed_function
-            or expected_function in observed_function
-            or observed_function in expected_function
-        )
-    )
-    expected_line = _to_int(expected.get('line'))
-    if expected_file and expected_line is not None:
-        return bool(file_match and line_match)
-    if expected_function:
-        return function_match
-    return file_match
-
-
-def _normalize_source_file(path: str) -> str:
-    """Strip source-version anchors while preserving path suffix matching."""
-    path = path.replace('\\', '/')
-    if '@' in path:
-        path = path.split('@', 1)[0]
-    return path
+    return location_matches(expected, observed)
 
 
 def _reachability_depth(

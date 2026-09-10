@@ -1,11 +1,11 @@
 ---
 name: poc-submission
-description: Use when submitting raw PoC candidates in a local benchmark and recording candidate-level evidence for later revision.
+description: Use when submitting exploit PoC candidates in a local benchmark and recording feedback for later revision.
 ---
 
 # PoC Submission Skill
 
-Use this skill to submit concrete raw input candidates and keep lightweight
+Use this skill to submit concrete exploit PoC files and keep lightweight
 candidate history.
 
 ## S.A Submission Loop
@@ -19,16 +19,18 @@ When a concrete PoC candidate is ready to test:
 
 ## S.B Evidence-Gain Principle
 
-A concrete, non-duplicate candidate that tests the current reproduction
-hypothesis should be submitted. Do not wait for certainty before using the
-benchmark feedback.
+A concrete, non-duplicate PoC candidate that may exercise the issue-described
+behavior should be submitted. Do not wait for certainty before using benchmark
+feedback.
 
-The returned result is evidence, not automatically final success. Use the
-observed exit status, sanitizer output, crash site, and failure kind to decide
-whether the candidate supports the issue-described behavior or should drive a
-revised hypothesis.
+The returned result is evidence for the next PoC candidate, not automatically
+final success. Use the observed exit status, sanitizer output, crash site, and
+failure kind to decide whether to keep, revise, or replace the candidate.
 
-Avoid clearly redundant submissions, such as an unchanged candidate with no new
+Prefer another submission over extended analysis when the next PoC differs in a
+specific, testable way.
+
+Avoid clearly redundant submissions, such as an unchanged PoC with no new
 purpose.
 
 ## S.C Learned Submission Lessons

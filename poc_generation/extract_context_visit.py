@@ -457,6 +457,84 @@ def iter_traecli_jsonl(path: Path) -> Iterable[tuple[str, str | None, str]]:
                 yield "checkpoint/traecli_stdout.jsonl:assistant", last_command, text
 
 
+def _text_from_dsh_tool_result(value: Any) -> str:
+    pieces: list[str] = []
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            pieces.append(_text_from_dsh_tool_result(item))
+        return "\n".join(part for part in pieces if part)
+    if isinstance(value, dict):
+        if "text" in value:
+            return str(value.get("text") or "")
+        if "content" in value:
+            return _text_from_dsh_tool_result(value.get("content"))
+    return ""
+
+
+def iter_dsh_session_jsonl(path: Path) -> Iterable[tuple[str, str | None, str]]:
+    """Read DeepSeek Harness session logs saved under dsh_home/sessions-jsonl."""
+    last_command: str | None = None
+    call_commands: dict[str, str] = {}
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for raw in handle:
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            event_type = str(event.get("type") or "")
+            if event_type == "tool/call":
+                call_id = str(data.get("callId") or "")
+                name = str(data.get("name") or "tool")
+                raw_args = data.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        args = {"command": raw_args}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = {}
+                command = str(
+                    args.get("command")
+                    or args.get("file_path")
+                    or args.get("path")
+                    or raw_args
+                    or ""
+                )
+                if not command:
+                    continue
+                if call_id:
+                    call_commands[call_id] = command
+                last_command = command
+                yield f"checkpoint/dsh_session:{name}:call", command, command
+                continue
+            if event_type == "tool/result":
+                call_id = str(data.get("callId") or "")
+                command = call_commands.get(call_id) or last_command
+                message = data.get("message") if isinstance(data.get("message"), dict) else {}
+                content = ""
+                for item in message.get("content") or []:
+                    content_part = _text_from_dsh_tool_result(item)
+                    if content_part:
+                        content += content_part + "\n"
+                if content:
+                    yield (
+                        "checkpoint/dsh_session:tool_result",
+                        command,
+                        shorten_middle(content, MAX_PLAIN_LOG_LINE_CHARS),
+                    )
+
+
 def _command_from_function_call(item: dict[str, Any]) -> str:
     if item.get("name") not in {"exec_command", "apply_patch"}:
         return ""
@@ -642,6 +720,9 @@ def source_streams(sample_dir: Path) -> Iterable[tuple[str, str | None, str]]:
     for path in sorted(checkpoint.glob("sessions-jsonl/**/*.jsonl")):
         checkpoint_sources += 1
         yield from iter_plain_log(path)
+    for path in sorted((checkpoint / "dsh_home" / "sessions-jsonl").glob("**/*.jsonl")):
+        checkpoint_sources += 1
+        yield from iter_dsh_session_jsonl(path)
     for path in sorted((checkpoint / "trae_home" / "cli" / "sessions").glob("**/*.jsonl")):
         checkpoint_sources += 1
         yield from iter_codex_session_jsonl(path)

@@ -39,6 +39,18 @@ def candidate_ladder(candidate: dict[str, Any]) -> tuple[str | None, str | None]
     return reached, None
 
 
+def _candidate_has_non_target_crash(candidate: dict[str, Any]) -> bool:
+    reachability = candidate.get("location_reachability") or {}
+    sanitizer = reachability.get("sanitizer_observed") or {}
+    if sanitizer.get("sanitizer") or sanitizer.get("crash_type"):
+        return True
+    for key in ("vul_exit_code", "exit_code", "vulnerable_exit_code"):
+        value = candidate.get(key) if key in candidate else reachability.get(key)
+        if value not in (None, 0, "0", ""):
+            return True
+    return False
+
+
 def classify_outcome(eval_row: dict[str, Any] | None) -> dict[str, Any]:
     """Map one evaluator row to a deterministic outcome record."""
     runtime = ((eval_row or {}).get("runtime") or {}) if isinstance(eval_row, dict) else {}
@@ -46,12 +58,21 @@ def classify_outcome(eval_row: dict[str, Any] | None) -> dict[str, Any]:
     executed = [item for item in candidates if item.get("execution_status") == "executed"]
     submitted = int(runtime.get("submitted_unique_pocs") or 0)
     submission = runtime.get("submission_outcome") or {}
+    candidate_false_positives = sum(
+        1 for item in executed
+        if item.get("target_vulnerability_triggered") is not True
+        and _candidate_has_non_target_crash(item)
+    )
+    reachability_false_positives = max(
+        int(runtime.get("nonzero_exit_false_positives") or 0),
+        candidate_false_positives,
+    )
     unavailable = str(runtime.get("unavailable") or "")
 
     def record(outcome: str, *, deepest: str | None = None, failed: str | None = None, reason: str = "") -> dict[str, Any]:
         crashed_pocs = int(submission.get("crashed_pocs") or submission.get("triggered_pocs") or 0)
         target_triggered = outcome == "success"
-        false_positive_pocs = crashed_pocs if crashed_pocs and not target_triggered else 0
+        false_positive_pocs = 0 if target_triggered else max(crashed_pocs, reachability_false_positives)
         row = {
             "protocol": "deterministic-outcome-v1",
             "submitted_unique_pocs": submitted,

@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from evaluator.reachability.arvo_gdb import prepare_arvo_target, run_arvo_gdb
 from evaluator.reachability.core import evaluate_r1_r5
-from evaluator.reachability.engine import extract_reachability_checkpoints, parse_sanitizer_trace
+from evaluator.reachability.engine import (
+    CommandResult,
+    extract_reachability_checkpoints,
+    load_hits,
+    parse_sanitizer_trace,
+)
 from evaluator.reachability.local_gdb import run_local_gdb
 from evaluator.reachability.runtime_spec import (
     RuntimeSpecError,
@@ -83,6 +89,48 @@ def _candidate_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def write_no_candidate_eval(
+    *,
+    model: str,
+    sample_id: str,
+    sample_dir: Path,
+    reason: str = "no submitted PoC",
+) -> dict[str, Any]:
+    """Write a normal reachability artifact for runs that submitted nothing.
+
+    No submitted candidate is a valid behavioral outcome for a harness/model
+    run.  Treating it as a missing reachability file makes downstream batch
+    accounting unstable, so persist an explicit zero-candidate failure signal
+    using the same top-level schema as evaluated samples.
+    """
+    summary = {
+        "evaluation_protocol": "location_reachability_per_unique_poc_v3",
+        "model": model,
+        "sample_id": sample_id,
+        "runtime_spec": {"backend": "not_invoked_no_submitted_poc"},
+        "checkpoint_source": {
+            "R1": "ground_truth.reachability_checkpoints.parser_admitted",
+            "R2": "ground_truth.source",
+            "R3": "ground_truth.root_cause exact source line",
+            "R4": "ground_truth.sink exact source line",
+            "target_vulnerability_triggered": (
+                "ground_truth.sanitizer_ground_truth"
+            ),
+        },
+        "candidates": [],
+        "summary": {
+            **summarize_candidates([]),
+            "no_reachability_input_reason": reason,
+        },
+    }
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir / "reachability_eval.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return summary
+
+
 def _failure_stage(report: dict[str, Any]) -> str:
     if report.get("R4_sink_reached") is True:
         return "R4_reached"
@@ -151,6 +199,7 @@ def evaluate_model_sample(
     timeout: int,
     debugger_image: str,
     max_hits_per_event: int,
+    reuse_existing: bool = False,
 ) -> dict[str, Any]:
     manifest = json.loads((sample_dir / "manifest.json").read_text())
     gt_path = GT_RESULTS / sample_id / "ground_truth.json"
@@ -158,38 +207,49 @@ def evaluate_model_sample(
         return {"model": model, "sample_id": sample_id, "skipped": "no GT"}
     candidates = manifest.get("deduplicated_pocs")
     if not isinstance(candidates, list) or not candidates:
-        return {
-            "model": model,
-            "sample_id": sample_id,
-            "skipped": "no submitted PoC",
-        }
+        return write_no_candidate_eval(
+            model=model,
+            sample_id=sample_id,
+            sample_dir=sample_dir,
+            reason="no submitted PoC",
+        )
     gt_dir = GT_RESULTS / sample_id
     image = _arvo_image(sample_id, manifest)
-    try:
-        runtime_spec = compile_runtime_spec(gt_dir)
-    except RuntimeSpecError as exc:
-        return {
-            "model": model,
-            "sample_id": sample_id,
-            "runtime_status": "runtime_spec_unavailable",
-            "error": str(exc),
-        }
-
     gt = json.loads(gt_path.read_text())
     checkpoints = extract_reachability_checkpoints(gt)
     scoring_gt = gt
-    if runtime_spec.backend == "local_workspace":
-        checkpoints = remap_checkpoints_to_workspace(checkpoints, gt_dir)
-        scoring_gt = apply_checkpoint_lines_to_gt(gt, checkpoints)
+    previous_eval = _load_previous_reachability_eval(sample_dir)
+    if reuse_existing:
+        runtime_spec_summary = previous_eval.get("runtime_spec") or {
+            "backend": "saved_existing_artifacts"
+        }
+    else:
+        try:
+            runtime_spec = compile_runtime_spec(gt_dir)
+        except RuntimeSpecError as exc:
+            return {
+                "model": model,
+                "sample_id": sample_id,
+                "runtime_status": "runtime_spec_unavailable",
+                "error": str(exc),
+            }
+        runtime_spec_summary = runtime_spec.to_dict()
+        if runtime_spec.backend == "local_workspace":
+            checkpoints = remap_checkpoints_to_workspace(checkpoints, gt_dir)
+            scoring_gt = apply_checkpoint_lines_to_gt(gt, checkpoints)
     reachability_root = sample_dir / "reachability"
     rows: list[dict[str, Any]] = []
     try:
         target_context = (
-            prepare_arvo_target(
-                image, repo_root=REPO_ROOT, debugger_image=debugger_image
+            nullcontext(None)
+            if reuse_existing
+            else (
+                prepare_arvo_target(
+                    image, repo_root=REPO_ROOT, debugger_image=debugger_image
+                )
+                if image is not None
+                else nullcontext(None)
             )
-            if image is not None
-            else nullcontext(None)
         )
         with target_context as prepared:
             for candidate in candidates:
@@ -207,7 +267,12 @@ def evaluate_model_sample(
                     rows.append({**metadata, "error": "PoC file is missing"})
                     continue
                 try:
-                    if prepared is not None:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    if reuse_existing:
+                        gdb_result, hits, checked = _load_existing_reachability_artifacts(
+                            output_dir
+                        )
+                    elif prepared is not None:
                         gdb_result, hits, checked = run_arvo_gdb(
                             prepared=prepared,
                             poc_path=poc_path,
@@ -260,6 +325,11 @@ def evaluate_model_sample(
                             is True,
                             "gdb_returncode": gdb_result.returncode,
                             "sanitizer_trace_source": sanitizer_trace_source,
+                            "reachability_artifact_source": (
+                                "saved_reachability_artifacts"
+                                if reuse_existing
+                                else "fresh_execution"
+                            ),
                         }
                     )
                     (output_dir / "reachability_report.json").write_text(
@@ -269,7 +339,17 @@ def evaluate_model_sample(
                     row = {
                         **metadata,
                         "execution_status": (
-                            "executed" if checked else "infrastructure_failed"
+                            (
+                                "reused_saved_hit_ledger"
+                                if reuse_existing and checked
+                                else (
+                                    "saved_runtime_only"
+                                    if reuse_existing
+                                    else "executed"
+                                )
+                            )
+                            if checked or reuse_existing
+                            else "infrastructure_failed"
                         ),
                         **{
                             field: report.get(field)
@@ -286,10 +366,15 @@ def evaluate_model_sample(
                             )
                         ),
                     }
-                    if not checked:
+                    if not checked and not reuse_existing:
                         row["error"] = (
                             "GDB reachability execution did not produce a valid "
                             f"hit ledger (returncode={gdb_result.returncode})"
+                        )
+                    if not checked and reuse_existing:
+                        row["warning"] = (
+                            "saved reachability hit ledger is missing or invalid; "
+                            "R1-R4 were left unchecked and R5 used saved runtime output"
                         )
                     rows.append(row)
                 except Exception as exc:  # noqa: BLE001 - isolate one candidate
@@ -311,7 +396,7 @@ def evaluate_model_sample(
         "evaluation_protocol": "location_reachability_per_unique_poc_v3",
         "model": model,
         "sample_id": sample_id,
-        "runtime_spec": runtime_spec.to_dict(),
+        "runtime_spec": runtime_spec_summary,
         "checkpoint_source": {
             "R1": "ground_truth.reachability_checkpoints.parser_admitted",
             "R2": "ground_truth.source",
@@ -331,6 +416,39 @@ def evaluate_model_sample(
     return summary
 
 
+def _load_existing_reachability_artifacts(
+    output_dir: Path,
+) -> tuple[CommandResult, list[dict[str, Any]], bool]:
+    stdout_path = output_dir / "gdb_stdout.txt"
+    stderr_path = output_dir / "gdb_stderr.txt"
+    hits_path = output_dir / "reachability_hits.json"
+    stdout = _read_text(stdout_path)
+    stderr = _read_text(stderr_path)
+    hits = load_hits(hits_path) if hits_path.is_file() else []
+    checked = hits_path.is_file() and not any(hit.get("run_error") for hit in hits)
+    return CommandResult(
+        command=[],
+        returncode=0 if checked else 1,
+        stdout=stdout,
+        stderr=stderr,
+    ), hits, checked
+
+
+def _load_previous_reachability_eval(sample_dir: Path) -> dict[str, Any]:
+    path = sample_dir / "reachability_eval.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+
 def _select_sanitizer_trace(
     *,
     current_runtime_trace: str | None,
@@ -338,13 +456,10 @@ def _select_sanitizer_trace(
 ) -> tuple[str | None, str]:
     """Choose sanitizer evidence without letting GDB signal output mask it.
 
-    Under GDB, sanitizer-instrumented binaries often stop at SIGSEGV before the
-    sanitizer runtime prints its usual `ERROR: ...` / `SUMMARY: ...` report.
-    The submit-time runtime output is persisted separately and is the correct
-    target-trigger oracle for that exact candidate.  Use current GDB output when
-    it already contains sanitizer evidence; otherwise fall back to saved runtime
-    output.  If both carry sanitizer evidence, concatenate them so source frames
-    from either run remain available to the parser.
+    Under GDB, sanitizer-instrumented binaries can stop at a debugger-visible
+    signal before the sanitizer runtime prints the same report the submit path
+    recorded. The submit-time runtime output is the target-trigger oracle for
+    that exact candidate, so it must take precedence when present.
     """
     current = current_runtime_trace or ""
     saved = saved_runtime_trace or ""
@@ -362,12 +477,12 @@ def _select_sanitizer_trace(
         or saved_observed.get("crash_stack")
         or saved_observed.get("crash_location")
     )
-    if current_has_sanitizer and saved_has_sanitizer:
-        return current + "\n" + saved, "gdb_and_saved_runtime"
+    if saved_has_sanitizer:
+        if current_has_sanitizer:
+            return saved + "\n" + current, "saved_runtime_and_gdb"
+        return saved, "saved_runtime_output"
     if current_has_sanitizer:
         return current, "gdb_runtime"
-    if saved_has_sanitizer:
-        return saved, "saved_runtime_output"
     if current:
         return current, "gdb_runtime_no_sanitizer"
     if saved:
@@ -384,12 +499,20 @@ def main(argv: list[str] | None = None) -> int:
         "--debugger-image", default="gt-memory-env:latest"
     )
     parser.add_argument("--max-hits-per-event", type=int, default=64)
+    parser.add_argument("--parallel", type=int, default=1)
+    parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="Rescore saved hit ledgers/runtime outputs without launching GDB.",
+    )
     args = parser.parse_args(argv)
 
-    results = []
-    for model, sample_id, sample_dir in discover_samples(
+    rows = discover_samples(
         models=args.model, sample_ids=args.sample_id
-    ):
+    )
+
+    def run(row: tuple[str, str, Path]) -> dict[str, Any]:
+        model, sample_id, sample_dir = row
         result = evaluate_model_sample(
             model=model,
             sample_id=sample_id,
@@ -397,22 +520,41 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             debugger_image=args.debugger_image,
             max_hits_per_event=args.max_hits_per_event,
+            reuse_existing=args.reuse_existing,
         )
-        results.append(result)
-        if "skipped" in result:
-            print(f"{model}/{sample_id}: skipped ({result['skipped']})")
-        elif "error" in result:
-            print(f"{model}/{sample_id}: ERROR {result['error']}")
-        else:
-            summary = result["summary"]
-            print(
-                f"{model}/{sample_id}: "
-                f"{summary['evaluated_unique_pocs']}/"
-                f"{summary['submitted_unique_pocs']} evaluated, "
-                f"target-triggered={summary['gt_triggered_pocs']}, "
-                f"nonzero-false-positive="
-                f"{summary['nonzero_exit_false_positives']}"
-            )
+        return result
+
+    results = []
+    workers = max(1, int(args.parallel or 1))
+    if workers == 1:
+        iterator = map(run, rows)
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = [executor.submit(run, row) for row in rows]
+        iterator = (future.result() for future in as_completed(futures))
+
+    try:
+        for result in iterator:
+            results.append(result)
+            model = result.get("model")
+            sample_id = result.get("sample_id")
+            if "skipped" in result:
+                print(f"{model}/{sample_id}: skipped ({result['skipped']})")
+            elif "error" in result:
+                print(f"{model}/{sample_id}: ERROR {result['error']}")
+            else:
+                summary = result["summary"]
+                print(
+                    f"{model}/{sample_id}: "
+                    f"{summary['evaluated_unique_pocs']}/"
+                    f"{summary['submitted_unique_pocs']} evaluated, "
+                    f"target-triggered={summary['gt_triggered_pocs']}, "
+                    f"nonzero-false-positive="
+                    f"{summary['nonzero_exit_false_positives']}"
+                )
+    finally:
+        if workers != 1:
+            executor.shutdown(wait=True)
 
     output = POC_RESULTS / "reachability_eval_report.json"
     output.write_text(

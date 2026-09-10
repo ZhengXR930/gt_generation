@@ -264,7 +264,7 @@ def run_one(args: argparse.Namespace, config: dict[str, Any], sample_id: str) ->
         (sample_dir / "manifest.json").is_file()
         and (sample_dir / "checkpoint").is_dir()
     )
-    if proc is not None and proc.returncode == 0 and has_sample_artifact:
+    if has_sample_artifact:
         record["reachability"] = maybe_run_reachability(
             config, namespace=request.namespace, sample_id=sample_id, sample_dir=sample_dir
         )

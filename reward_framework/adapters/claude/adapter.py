@@ -2,10 +2,10 @@ from reward_framework.adapters.base import (
     CLI_RUNNER,
     RewardCommand,
     RewardRequest,
-    arvo_args,
     common_args,
     reward_environment,
     runner_python,
+    sample_args,
 )
 
 NAME = "claude"
@@ -13,14 +13,12 @@ INSTALLER = "reward_framework.adapters.claude.install:install_workspace_skill_pa
 
 
 def build_command(request: RewardRequest) -> RewardCommand:
-    if not request.is_arvo:
-        raise ValueError("Claude non-ARVO execution is not implemented by harness_runtime")
     args = [
         runner_python(),
         str(CLI_RUNNER),
         "--harness",
         NAME,
-        *arvo_args(request),
+        *sample_args(request),
         *common_args(request),
         "--workspace-installer",
         INSTALLER,

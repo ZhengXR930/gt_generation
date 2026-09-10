@@ -208,6 +208,9 @@ def evaluate_sample(
         candidate = {
             "attempt_id": attempt_id,
             "sequence_in_run": item.get("sequence_in_run"),
+            "poc_sha256": item.get("poc_sha256"),
+            "original_exit_code": item.get("original_exit_code"),
+            "runtime_output_path": item.get("runtime_output_path"),
             "execution_status": item.get("execution_status"),
             "execution_error": item.get("error"),
             "location_hit_source": hit_source,
