@@ -17,17 +17,22 @@ they improve target PoC reproduction on later samples.
 - Operational batch size: 10 samples.
 - Distillation window: the most recent 3 accepted operational batches, usually
   30 diagnoses, plus accumulated pools.
-- Default coding agent under improvement: Codex harness with
-  `gpt-5.5-2026-04-24`.
-- Default distillation roles: Codex subsessions with `gpt-5.5-2026-04-24`.
+- Current default coding agent under improvement: DeepSeek Harness
+  (`deepseek_harness`) with `deepseek-v4-flash`.
+- Current default distillation roles: Codex subsession runner using
+  `deepseek-v4-flash` through the configured model router/base URL.
 
 The coding agent is the object being improved. Diagnostician, Teacher, Curator,
 and Correction Agent are fixed measurement and distillation tools.
 
 ## Prompt Boundary
 
-The coding agent uses the shared benchmark prompt in `reward_framework/prompt.txt`.
-It should remain close to the historical Codex evaluation prompt:
+The coding agent normally uses the shared benchmark prompt in
+`reward_framework/prompt.txt`. The DSH adapter may supply a DSH-specific prompt
+file when matching an existing DSH baseline; that file is tracked under
+`reward_framework/prompts/`. Prompt differences must be explicit in the run
+configuration. The prompt should remain close to the historical evaluation
+style:
 
 - read `description.txt` first;
 - work only inside the benchmark workspace;
@@ -41,7 +46,7 @@ It should remain close to the historical Codex evaluation prompt:
 
 The prompt must not add extra behavioral nudges that differ between ARVO and
 non-ARVO samples. The framework only provides the same shape of workspace,
-description, submission interface, and result recording.
+description, submission interface, skill packet, and result recording.
 
 ## Skill Packet
 
@@ -203,6 +208,20 @@ and for the next Teacher window. Failed candidate-skill runs may be kept as
 correction evidence, but they should not become the main training evidence.
 
 ## Batch-Level Control Flow
+
+The portable DSH baseline split and per-batch summary are tracked at
+`reward_framework/baselines/deepseek_harness_v4_flash/`. Local run outputs under
+`reward_framework/harness_runs/` and `reward_framework/distillation_runs/` are
+not portable by default.
+
+Start DSH reward runs by initializing from that tracked baseline directory, for
+example:
+
+```bash
+python -m reward_framework.distillation.cli init-run \
+  --run-dir reward_framework/distillation_runs/dsh_deepseek \
+  --baseline-dir reward_framework/baselines/deepseek_harness_v4_flash
+```
 
 For each batch `k`:
 

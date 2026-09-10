@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from reward_framework.distillation.defaults import (  # noqa: E402
     DEFAULT_CODING_BASE_URL,
     DEFAULT_CODING_HARNESS,
     DEFAULT_CODING_MODEL,
+    DEFAULT_DSH_BASELINE_DIR,
     DEFAULT_DISTILLER_API_KEY_ENV,
     DEFAULT_DISTILLER_BASE_URL,
     DEFAULT_DISTILLER_MODEL,
@@ -189,24 +191,61 @@ def _selected_attempt(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
 def cmd_init_run(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    split = load_frozen_split()
-    write_split_manifest(run_dir / "split_manifest.json", split)
+    split_source = "frozen_gt"
+    if args.baseline_dir:
+        split_payload = _copy_baseline_split(run_dir, args.baseline_dir.resolve())
+        split_source = str(args.baseline_dir.resolve())
+        train = [str(item) for item in split_payload.get("train") or []]
+        test = [str(item) for item in split_payload.get("test") or []]
+        batches = split_payload.get("batches") or []
+        ordering = str(split_payload.get("ordering") or "baseline split_manifest.json")
+        undated = [str(item) for item in split_payload.get("undated_samples") or []]
+    else:
+        split = load_frozen_split()
+        write_split_manifest(run_dir / "split_manifest.json", split)
+        train = split.train
+        test = split.test
+        batches = split.batches
+        ordering = split.ordering
+        undated = split.undated
     copy_initial_packet(run_dir / "skill_packets" / "batch_000", args.initial_packet)
     write_json(run_dir / POOLS_FILE, load_pools(run_dir / POOLS_FILE))
     write_json(run_dir / "run_config.json", {
-        "coding_agent": {"harness": args.coding_harness, "model": args.coding_model},
+        "coding_agent": {
+            "harness": args.coding_harness,
+            "model": args.coding_model,
+            "base_url": args.coding_base_url,
+            "api_key_env": args.coding_api_key_env,
+        },
         "distiller": {"model": args.distiller_model, "base_url": args.base_url, "api_key_env": args.api_key_env},
+        "split_source": split_source,
     })
     print(json.dumps({
         "status": "initialized",
         "run_dir": str(run_dir),
-        "ordering": split.ordering,
-        "train": len(split.train),
-        "test": len(split.test),
-        "batches": len(split.batches),
-        "undated_samples": len(split.undated),
+        "ordering": ordering,
+        "train": len(train),
+        "test": len(test),
+        "batches": len(batches),
+        "undated_samples": len(undated),
+        "split_source": split_source,
     }, indent=2))
     return 0
+
+
+def _copy_baseline_split(run_dir: Path, baseline_dir: Path) -> dict[str, Any]:
+    split_file = baseline_dir / "split_manifest.json"
+    if not split_file.is_file():
+        raise FileNotFoundError(f"baseline split not found: {split_file}")
+    split_payload = read_json(split_file)
+    if not isinstance(split_payload.get("batches"), list):
+        raise ValueError(f"baseline split has no batches: {split_file}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(split_file, run_dir / "split_manifest.json")
+    summary_file = baseline_dir / "batch_summary.json"
+    if summary_file.is_file():
+        shutil.copy2(summary_file, run_dir / "batch_summary.json")
+    return split_payload
 
 
 # --------------------------------------------------------------------------- training loop
@@ -1001,8 +1040,19 @@ def main(argv: list[str] | None = None) -> int:
     init = sub.add_parser("init-run")
     init.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_ROOT / "default")
     init.add_argument("--initial-packet", type=Path, default=INITIAL_PACKET)
+    init.add_argument(
+        "--baseline-dir",
+        type=Path,
+        default=None,
+        help=(
+            "optional tracked baseline directory containing split_manifest.json; "
+            f"for current DSH experiments use {DEFAULT_DSH_BASELINE_DIR}"
+        ),
+    )
     init.add_argument("--coding-harness", default=DEFAULT_CODING_HARNESS)
     init.add_argument("--coding-model", default=DEFAULT_CODING_MODEL)
+    init.add_argument("--coding-base-url", default=DEFAULT_CODING_BASE_URL)
+    init.add_argument("--coding-api-key-env", default=DEFAULT_CODING_API_KEY_ENV)
     init.add_argument("--distiller-model", default=DEFAULT_DISTILLER_MODEL)
     init.add_argument("--base-url", default=DEFAULT_DISTILLER_BASE_URL)
     init.add_argument("--api-key-env", default=DEFAULT_DISTILLER_API_KEY_ENV)

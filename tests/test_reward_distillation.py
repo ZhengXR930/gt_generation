@@ -7,7 +7,7 @@ from reward_framework.distillation.lint import lint_lesson_text, load_literal_in
 from reward_framework.distillation.outcome import classify_outcome, diagnostics_summary
 from reward_framework.distillation.pools import build_validation_panel, empty_pools, teacher_view, update_pools
 from reward_framework.distillation.artifacts import write_json
-from reward_framework.distillation.cli import _diagnosis_quality_error, _normalize_diagnosis_for_outcome
+from reward_framework.distillation.cli import _copy_baseline_split, _diagnosis_quality_error, _normalize_diagnosis_for_outcome
 from reward_framework.distillation.diagnosis_view import abstract_text, learning_diagnosis, learning_evaluation
 from reward_framework.distillation.prompts import load_template, role_task_prompt
 from reward_framework.distillation.roles import (
@@ -76,6 +76,26 @@ def test_split_orders_by_commit_date(tmp_path):
     assert values == sorted(values), "split must be ascending in commit date"
     assert split.dates[split.train[-1]] <= split.dates[split.test[0]]
     assert not split.undated
+
+
+def test_baseline_split_can_initialize_a_run(tmp_path):
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    split = {
+        "protocol": "reward-skill-distillation-split-v3",
+        "train": ["s0", "s1"],
+        "test": ["s2"],
+        "batches": [{"batch_index": 0, "samples": ["s0", "s1"]}],
+    }
+    summary = {"baseline_model": "deepseek-harness-v4-flash"}
+    write_json(baseline / "split_manifest.json", split)
+    write_json(baseline / "batch_summary.json", summary)
+
+    copied = _copy_baseline_split(tmp_path / "run", baseline)
+
+    assert copied == split
+    assert json.loads((tmp_path / "run" / "split_manifest.json").read_text()) == split
+    assert json.loads((tmp_path / "run" / "batch_summary.json").read_text()) == summary
 
 
 def test_lessons_get_stable_ids_and_capacity(tmp_path):
