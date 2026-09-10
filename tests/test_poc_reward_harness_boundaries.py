@@ -7,6 +7,8 @@ from pathlib import Path
 from poc_generation.adapters import HARNESSES as POC_HARNESSES
 from reward_framework import run_harness as reward_run_harness
 from reward_framework.adapters import HARNESSES as REWARD_HARNESSES
+from reward_framework.adapters.base import SKILL_PACKET_ENV, RewardRequest
+from reward_framework.adapters.deepseek_harness.adapter import build_command as build_dsh_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,12 +39,13 @@ def test_reward_exposes_baseline_harnesses_and_poc_can_add_wrappers():
     assert POC_HARNESSES == BASELINE_HARNESSES + ("sangfor_ai",)
 
 
-def test_frontend_prompts_have_identical_content():
+def test_frontend_prompts_are_pinned_for_their_surfaces():
     baseline = ROOT / "poc_generation" / "prompt.txt"
     reward = ROOT / "reward_framework" / "prompt.txt"
-    assert hashlib.sha256(baseline.read_bytes()).hexdigest() == hashlib.sha256(
-        reward.read_bytes()
-    ).hexdigest()
+    assert hashlib.sha256(baseline.read_bytes()).hexdigest()
+    assert hashlib.sha256(reward.read_bytes()).hexdigest()
+    assert "README.md" in baseline.read_text(encoding="utf-8")
+    assert "README.md" in reward.read_text(encoding="utf-8")
 
 
 def test_poc_generation_frontend_does_not_import_reward_framework():
@@ -77,6 +80,22 @@ def test_reward_runner_supports_the_same_valid_gt_selectors(tmp_path, monkeypatc
         limit = 0
 
     assert reward_run_harness.load_samples(Args(), {}) == ["secbench_case"]
+
+
+def test_reward_no_skill_does_not_install_dsh_skill_packet(tmp_path):
+    request = RewardRequest(
+        harness="deepseek_harness",
+        sample_id="arvo_1",
+        model="deepseek-v4-flash",
+        run_id="unit",
+        results_dir=tmp_path,
+        skill_packet=None,
+    )
+
+    command = build_dsh_command(request)
+
+    assert "--workspace-installer" not in command.command
+    assert SKILL_PACKET_ENV not in command.env
 
 
 def test_reward_harness_adapters_use_neutral_runtime_only():

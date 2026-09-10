@@ -54,6 +54,7 @@ def _reward_args(**overrides):
         api_key_env=None,
         api_version=None,
         skill_packet=None,
+        no_skill=False,
         max_iter=None,
         max_attempts=3,
         max_effective_submits=None,

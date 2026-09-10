@@ -21,9 +21,9 @@ def build_command(request: RewardRequest) -> RewardCommand:
         str(runner),
         *sample_args,
         *common_args(request),
-        "--workspace-installer",
-        INSTALLER,
     ]
+    if request.skill_packet is not None:
+        args += ["--workspace-installer", INSTALLER]
     if request.is_arvo:
         args += ["--harness-profile", "standard"]
     if request.openhands_repo:

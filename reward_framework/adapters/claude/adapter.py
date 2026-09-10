@@ -20,8 +20,8 @@ def build_command(request: RewardRequest) -> RewardCommand:
         NAME,
         *sample_args(request),
         *common_args(request),
-        "--workspace-installer",
-        INSTALLER,
     ]
+    if request.skill_packet is not None:
+        args += ["--workspace-installer", INSTALLER]
     args += list(request.extra_args)
     return RewardCommand(NAME, tuple(args), env=reward_environment(request))

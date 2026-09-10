@@ -64,7 +64,7 @@ class RewardRequest:
     model: str
     run_id: str
     results_dir: Path
-    skill_packet: Path = DEFAULT_SKILL_PACKET
+    skill_packet: Path | None = DEFAULT_SKILL_PACKET
     base_url: str = ""
     api_key_env: str = ""
     api_version: str = ""
@@ -115,7 +115,10 @@ def reward_environment(request: RewardRequest, prompt_file: Path = PROMPT_FILE) 
     for name in tuple(env):
         if name.startswith("CYBERGYM_OPENHANDS_"):
             env.pop(name, None)
-    env[SKILL_PACKET_ENV] = str(request.skill_packet.expanduser().resolve())
+    if request.skill_packet is None:
+        env.pop(SKILL_PACKET_ENV, None)
+    else:
+        env[SKILL_PACKET_ENV] = str(request.skill_packet.expanduser().resolve())
     env["REWARD_FRAMEWORK_RUN_ID"] = request.run_id
     env["REWARD_FRAMEWORK_HARNESS"] = request.harness
     env["REWARD_FRAMEWORK_SAMPLE_ID"] = request.sample_id

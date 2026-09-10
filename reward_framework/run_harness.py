@@ -62,6 +62,21 @@ def _now_id() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
+def _no_skill_requested(args: argparse.Namespace, config: dict[str, Any]) -> bool:
+    return bool(getattr(args, "no_skill", False) or config.get("no_skill"))
+
+
+def _skill_packet_from_config(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> Path | None:
+    if _no_skill_requested(args, config):
+        return None
+    return Path(
+        str(_config_value(args, config, "skill_packet", str(DEFAULT_SKILL_PACKET)))
+    ).expanduser().resolve()
+
+
 def load_samples(args: argparse.Namespace, config: dict[str, Any]) -> list[str]:
     samples: list[str] = []
     selector = _config_value(args, config, "sample_selector", "")
@@ -200,9 +215,7 @@ def build_request(
     )
     if not route.model:
         raise ValueError("model or model_route is required")
-    skill_packet = Path(
-        str(_config_value(args, config, "skill_packet", str(DEFAULT_SKILL_PACKET)))
-    ).expanduser().resolve()
+    skill_packet = _skill_packet_from_config(args, config)
     results_dir = run_dir / "results"
     max_effective = _config_value(args, config, "max_effective_submits")
     extra_args = [str(item) for item in config.get("extra_args", [])]
@@ -262,7 +275,7 @@ def run_one(
                 config, run_id=run_id, sample_id=sample_id, sample_dir=sample_dir
             )
         return record
-    if not request.skill_packet.is_dir():
+    if request.skill_packet is not None and not request.skill_packet.is_dir():
         error = f"FileNotFoundError: skill packet not found: {request.skill_packet}"
         if args.dry_run:
             return {
@@ -286,7 +299,7 @@ def run_one(
             extra={
                 "run_id": run_id,
                 "results_dir": str(sample_dir),
-                "skill_packet": str(request.skill_packet),
+                "skill_packet": str(request.skill_packet) if request.skill_packet else None,
             },
             overwrite_manifest=True,
         )
@@ -324,7 +337,7 @@ def run_one(
             extra={
                 "run_id": run_id,
                 "results_dir": str(sample_dir),
-                "skill_packet": str(request.skill_packet),
+                "skill_packet": str(request.skill_packet) if request.skill_packet else None,
             },
             overwrite_manifest=True,
         )
@@ -422,7 +435,7 @@ def run_one(
                 extra={
                     "run_id": run_id,
                     "results_dir": str(sample_dir),
-                    "skill_packet": str(request.skill_packet),
+                    "skill_packet": str(request.skill_packet) if request.skill_packet else None,
                 },
                 overwrite_manifest=True,
             )
@@ -442,9 +455,7 @@ def record_unhandled_sample_failure(
     harness = str(_config_value(args, config, "harness", "unknown") or "unknown")
     model = str(_config_value(args, config, "model", "") or "")
     sample_dir = run_dir / "results" / sample_id
-    skill_packet = Path(
-        str(_config_value(args, config, "skill_packet", str(DEFAULT_SKILL_PACKET)))
-    ).expanduser().resolve()
+    skill_packet = _skill_packet_from_config(args, config)
     error = f"{type(exc).__name__}: {exc}"
     write_failure_artifact(
         sample_dir,
@@ -459,7 +470,7 @@ def record_unhandled_sample_failure(
         extra={
             "run_id": run_id,
             "results_dir": str(sample_dir),
-            "skill_packet": str(skill_packet),
+            "skill_packet": str(skill_packet) if skill_packet else None,
         },
         overwrite_manifest=True,
     )
@@ -483,9 +494,7 @@ def write_run_manifest(
     args: argparse.Namespace,
 ) -> None:
     harness = str(_config_value(args, config, "harness", "openhands"))
-    skill_packet = Path(
-        str(_config_value(args, config, "skill_packet", str(DEFAULT_SKILL_PACKET)))
-    ).expanduser().resolve()
+    skill_packet = _skill_packet_from_config(args, config)
     manifest = {
         "run_id": run_id,
         "framework": "reward_framework",
@@ -498,7 +507,8 @@ def write_run_manifest(
         "model_route": _config_value(args, config, "model_route", ""),
         "base_url_configured": bool(_config_value(args, config, "base_url", "")),
         "api_key_env": _config_value(args, config, "api_key_env", ""),
-        "skill_packet": str(skill_packet),
+        "skill_packet": str(skill_packet) if skill_packet else None,
+        "no_skill": skill_packet is None,
         "max_effective_submits": _config_value(args, config, "max_effective_submits"),
         "samples": samples,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -525,6 +535,7 @@ def main() -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
     parser.add_argument("--skill-packet")
+    parser.add_argument("--no-skill", action="store_true")
     parser.add_argument("--harness", choices=HARNESSES)
     parser.add_argument("--model")
     parser.add_argument("--model-route")
