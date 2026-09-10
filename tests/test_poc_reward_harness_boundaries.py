@@ -39,11 +39,12 @@ def test_reward_exposes_baseline_harnesses_and_poc_can_add_wrappers():
     assert POC_HARNESSES == BASELINE_HARNESSES + ("sangfor_ai",)
 
 
-def test_frontend_prompts_are_pinned_for_their_surfaces():
+def test_frontend_prompts_have_identical_content():
     baseline = ROOT / "poc_generation" / "prompt.txt"
     reward = ROOT / "reward_framework" / "prompt.txt"
-    assert hashlib.sha256(baseline.read_bytes()).hexdigest()
-    assert hashlib.sha256(reward.read_bytes()).hexdigest()
+    assert hashlib.sha256(baseline.read_bytes()).hexdigest() == hashlib.sha256(
+        reward.read_bytes()
+    ).hexdigest()
     assert "README.md" in baseline.read_text(encoding="utf-8")
     assert "README.md" in reward.read_text(encoding="utf-8")
 
