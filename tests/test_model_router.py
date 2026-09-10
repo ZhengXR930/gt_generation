@@ -116,8 +116,30 @@ def test_poc_route_can_be_selected_from_launcher_args():
     assert request.base_url == MODELHUB_CN_OPENAI_BASE_URL
     assert request.api_key_env == "OPENAI_API_KEY"
     assert request.api_version == MODELHUB_OPENAI_API_VERSION
-    assert request.namespace == "gpt-5.5"
+    assert request.namespace == "codex-gpt55"
     assert "--bridge-disable-proxy" in request.extra_args
+
+
+def test_poc_namespaces_match_existing_harness_result_dirs():
+    expected = {
+        ("openhands", "gpt-5.5"): "gpt-5.5",
+        ("codex", "gpt-5.5"): "codex-gpt55",
+        ("openhands", "gpt-5.4-mini"): "gpt-5.4-mini",
+        ("codex", "gpt-5.4-mini"): "codex-gpt54-mini",
+        ("openhands", "deepseek-v4-flash"): "deepseek-v4-flash",
+        ("deepseek_harness", "deepseek-v4-flash"): "deepseek-harness-v4-flash",
+        ("openhands", "glm-5.2"): "glm52",
+        ("openhands", "claude-opus-4.6"): "claude-opus-4.6",
+        ("claude", "claude-opus-4.6"): "claudecli-opus-4-6",
+    }
+
+    for (harness, model_route), namespace in expected.items():
+        route = resolve_model_route(
+            surface="poc_generation",
+            harness=harness,
+            model_route=model_route,
+        )
+        assert route.results_namespace == namespace
 
 
 def test_legacy_poc_fields_override_known_route_defaults():
@@ -161,7 +183,7 @@ def test_claude_opus46_route_uses_opus46_and_keeps_old_namespaces():
     assert claude_route.model == "claude-opus-4-6"
     assert claude_route.base_url == "https://api.lmuai.com"
     assert claude_route.api_key_env == "ANTHROPIC_AUTH_TOKEN"
-    assert claude_route.results_namespace == "claudecli-claude-opus-4.6"
+    assert claude_route.results_namespace == "claudecli-opus-4-6"
 
 
 def test_claude_opus48_route_uses_opus48_and_keeps_old_namespaces():
@@ -183,7 +205,7 @@ def test_claude_opus48_route_uses_opus48_and_keeps_old_namespaces():
     assert openhands_route.results_namespace == "claude-opus-4.8"
     assert openhands_route.extra_args == ("--provider-kind", "anthropic")
     assert claude_route.model == "claude-opus-4-8"
-    assert claude_route.results_namespace == "claudecli-claude-opus-4.8"
+    assert claude_route.results_namespace == "claudecli-opus-4-8"
 
 
 def test_poc_openhands_glm52_route_uses_modelhub_openai_provider():

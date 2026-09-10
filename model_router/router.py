@@ -160,7 +160,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
                 model="deepseek-v4-flash",
                 base_url=DEEPSEEK_OFFICIAL_BASE_URL,
                 api_key_env="DEEPSEEK_API_KEY",
-                results_namespace="deepseek-v4-flash",
+                results_namespace="deepseek-harness-v4-flash",
                 provider_kind="deepseek_official",
                 metadata={"official_base_url": DEEPSEEK_OFFICIAL_BASE_URL},
             )
@@ -176,7 +176,9 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
     if canonical == "gpt-5.5":
         model_name = "gpt-5.5-2026-04-24"
         extra_args: tuple[str, ...] = ()
+        namespace = "gpt-5.5"
         if harness == "codex":
+            namespace = "codex-gpt55"
             extra_args = (
                 "--codex-bridge",
                 "modelhub_crawl",
@@ -192,7 +194,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             base_url=MODELHUB_CN_OPENAI_BASE_URL,
             api_key_env=GLM_OPENAI_API_KEY_ENV,
             api_version=MODELHUB_OPENAI_API_VERSION,
-            results_namespace="gpt-5.5",
+            results_namespace=namespace,
             provider_kind="openai_compatible",
             payload_format="chat_completions",
             extra_args=extra_args,
@@ -204,7 +206,9 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
 
     if canonical == "gpt-5.4-mini":
         extra_args: tuple[str, ...] = ()
+        namespace = "gpt-5.4-mini"
         if harness == "codex":
+            namespace = "codex-gpt54-mini"
             extra_args = (
                 "--codex-bridge",
                 "modelhub_crawl",
@@ -220,7 +224,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             base_url=MODELHUB_OPENAI_BASE_URL,
             api_key_env=MODELHUB_OPENAI_API_KEY_ENV,
             api_version=MODELHUB_OPENAI_API_VERSION,
-            results_namespace="gpt-5.4-mini",
+            results_namespace=namespace,
             provider_kind="openai_compatible",
             payload_format="chat_completions",
             extra_args=extra_args,
@@ -237,7 +241,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             base_url=GLM_OPENAI_BASE_URL,
             api_key_env=GLM_OPENAI_API_KEY_ENV,
             api_version=MODELHUB_OPENAI_API_VERSION,
-            results_namespace="glm-5.2",
+            results_namespace="glm52",
             provider_kind="openai_compatible",
             payload_format="chat_completions",
             extra_args=extra_args,
@@ -250,7 +254,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             if harness in {"openhands", "sangfor_ai"}
             else ()
         )
-        namespace = "claudecli-claude-opus-4.6" if harness == "claude" else "claude-opus-4.6"
+        namespace = "claudecli-opus-4-6" if harness == "claude" else "claude-opus-4.6"
         return ModelRoute(
             route_id=canonical,
             model="claude-opus-4-6",
@@ -272,7 +276,7 @@ def _route_for(canonical: str, *, surface: str, harness: str) -> ModelRoute:
             if harness in {"openhands", "sangfor_ai"}
             else ()
         )
-        namespace = "claudecli-claude-opus-4.8" if harness == "claude" else "claude-opus-4.8"
+        namespace = "claudecli-opus-4-8" if harness == "claude" else "claude-opus-4.8"
         return ModelRoute(
             route_id=canonical,
             model="claude-opus-4-8",
@@ -382,10 +386,10 @@ def available_model_routes() -> dict[str, str]:
     """Return the supported public route ids and their intended use."""
 
     return {
-        "deepseek-v4-flash": "OpenHands and deepseek_harness DeepSeek route; official key env DEEPSEEK_API_KEY.",
+        "deepseek-v4-flash": "OpenHands and deepseek_harness DeepSeek route; harness-specific result namespaces; official key env DEEPSEEK_API_KEY.",
         "gpt-5.5": "CN ModelHub OpenAI-compatible GPT route; sends model gpt-5.5-2026-04-24; key env OPENAI_API_KEY.",
         "gpt-5.4-mini": "Oversea ModelHub OpenAI-compatible GPT route; key env OPENAI_API_KEY_oversea.",
-        "glm-5.2": "OpenAI-compatible GLM route using LMUAI and GLM_API_KEY.",
+        "glm-5.2": "CN ModelHub OpenAI-compatible GLM route; key env OPENAI_API_KEY; result namespace glm52.",
         "claude-opus-4.6": "Run claude-opus-4-6 through LMUAI while writing opus-4.6 result namespaces.",
         "claude-opus-4.8": "Run claude-opus-4-8 through LMUAI while writing opus-4.8 result namespaces.",
         "gt-codex-gpt-5.4": "gt_generation Codex bridge route to oversea ModelHub OpenAI-compatible GPT; model gpt-5.4-2026-03-05.",
