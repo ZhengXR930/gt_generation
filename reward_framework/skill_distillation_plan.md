@@ -112,20 +112,14 @@ For batch `k`, run the coding agent with the current accepted skill packet
    - It should answer how candidates were formed, whether submission was timely,
      how feedback affected later candidates, whether the agent refined one path
      or switched families, and why this helped or blocked reproduction.
-   - It outputs a small `retry_recommendation` with natural-language summary and
-     evidence.
+   - It does not decide whether to re-run the coding agent. Repeat runs are
+     out-of-band experiments, not part of the main training evidence.
 
-4. Optional strict retry.
-   - Retry only samples whose diagnosis says retry is worthwhile because the run
-     was structurally healthy and the failure looks stochastic or near-miss.
-   - Retry results go to a separate run id, for example
-     `<batch_run_id>_retry1`.
-   - Retry uses `--max-attempts 1`.
-   - Merge retry into the primary batch result only when deterministic target
-     success improves. Reachability-depth-only improvement is useful diagnostic
-     evidence, but it must not overwrite the primary result.
-   - Retry diagnoses may be passed to Teacher together with first-attempt
-     diagnoses, so Teacher can compare first/retry behavior for the same sample.
+4. Optional out-of-band repeat runs.
+   - Repeat runs are useful for studying stochasticity, but they must stay
+     separate from the main batch result unless the experiment is explicitly
+     labeled as a repeat-run study.
+   - Teacher/Curator consume the first accepted batch result by default.
 
 5. Fold accepted batch evidence into pools.
    - Pools store sample-level diagnoses separated by deterministic outcome:
@@ -227,8 +221,7 @@ For each batch `k`:
 
 1. Start from accepted skill `S_k`.
 2. Run batch `k` with `S_k`.
-3. Evaluate, diagnose, optionally retry, and merge only target-success
-   improvements.
+3. Evaluate and diagnose the accepted batch result.
 4. Add accepted diagnoses to pools.
 5. Teacher proposes updates from the latest 3 accepted batches plus pools.
 6. Curator rewrites or skips proposals.
@@ -360,7 +353,8 @@ python reward_framework/distillation/cli.py correct-skill \
 - Do not add forced-submit scripts, forced reminders, or hidden feedback fields.
 - Do not expose `_out`, compiled non-ARVO artifacts, GT, or prior PoCs to the
   coding agent workspace.
-- Do not merge retry results unless deterministic target success improves.
+- Do not merge repeat-run results into the main distillation evidence unless the
+  run is explicitly labeled as a repeat-run study.
 - Do not propagate a learned update that fails matched validation.
 - Do not use a failed candidate-skill run as the main evidence for the next
   Teacher window.

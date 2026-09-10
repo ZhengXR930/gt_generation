@@ -45,11 +45,6 @@ def _behavioral_fields(prefix="behavior"):
         "candidate_behavior": _section(f"{prefix} candidate", f"{prefix} candidate evidence"),
         "feedback_behavior": _section(f"{prefix} feedback", f"{prefix} feedback evidence"),
         "outcome_diagnosis": _section(f"{prefix} outcome", f"{prefix} outcome evidence"),
-        "retry_recommendation": {
-            "decision": "do_not_retry",
-            "summary": f"{prefix} retry summary",
-            "evidence": f"{prefix} retry evidence",
-        },
     }
 
 
@@ -614,14 +609,6 @@ def test_diagnosis_quality_requires_behavior_sections():
     missing_section = {"issue_description": "i", **_behavioral_fields("ok")}
     missing_section.pop("feedback_behavior")
     assert "feedback_behavior" in _diagnosis_quality_error(missing_section)
-
-    missing_retry = {"issue_description": "i", **_behavioral_fields("ok")}
-    missing_retry.pop("retry_recommendation")
-    assert "retry_recommendation" in _diagnosis_quality_error(missing_retry)
-
-    bad_retry = {"issue_description": "i", **_behavioral_fields("ok")}
-    bad_retry["retry_recommendation"] = {"decision": "repair_required", "summary": "x", "evidence": "y"}
-    assert "retry or do_not_retry" in _diagnosis_quality_error(bad_retry)
 
 
 def test_diagnosis_quality_rejects_evaluator_stage_terms_in_behavior_text():

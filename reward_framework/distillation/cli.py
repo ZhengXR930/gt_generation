@@ -393,30 +393,12 @@ def _diagnosis_text_values(value: Any) -> list[str]:
 
 def _forbidden_diagnosis_terms(diagnosis: dict[str, Any]) -> list[str]:
     hits: set[str] = set()
-    for section in (*BEHAVIOR_SECTIONS, "retry_recommendation"):
+    for section in BEHAVIOR_SECTIONS:
         for text in _diagnosis_text_values(diagnosis.get(section)):
             for pattern in _FORBIDDEN_DIAGNOSIS_TERMS:
                 for match in pattern.finditer(text):
                     hits.add(match.group(0))
     return sorted(hits)
-
-
-def _retry_recommendation_error(diagnosis: dict[str, Any]) -> str | None:
-    retry = diagnosis.get("retry_recommendation")
-    if not isinstance(retry, dict):
-        return "diagnosis missing retry_recommendation"
-    decision = str(retry.get("decision") or "").strip()
-    if decision not in {"retry", "do_not_retry"}:
-        return "diagnosis retry_recommendation.decision must be retry or do_not_retry"
-    missing = [
-        f"retry_recommendation.{field}"
-        for field in ("summary", "evidence")
-        if not str(retry.get(field) or "").strip()
-    ]
-    if missing:
-        return "diagnosis missing required retry field(s): " + ", ".join(missing)
-    return None
-
 
 def _diagnosis_retry_note(error: str) -> str:
     return (
@@ -443,9 +425,6 @@ def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
                 missing.append(f"{section}.{field}")
     if missing:
         return "diagnosis missing required behavior field(s): " + ", ".join(missing)
-    retry_error = _retry_recommendation_error(diagnosis)
-    if retry_error:
-        return retry_error
     forbidden = _forbidden_diagnosis_terms(diagnosis)
     if forbidden:
         return "diagnosis uses evaluator-only term(s): " + ", ".join(forbidden)
@@ -476,8 +455,6 @@ def _normalize_diagnosis_for_outcome(
     for section in BEHAVIOR_SECTIONS:
         if section in diagnosis:
             normalized[section] = diagnosis.get(section)
-    if "retry_recommendation" in diagnosis:
-        normalized["retry_recommendation"] = diagnosis.get("retry_recommendation")
     return normalized
 
 def cmd_diagnose_batch(args: argparse.Namespace) -> int:
@@ -635,7 +612,6 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
             "issue_description": learning.get("issue_description"),
             "vulnerability_type": learning.get("vulnerability_type"),
             **{section: learning.get(section) for section in BEHAVIOR_SECTIONS},
-            "retry_recommendation": learning.get("retry_recommendation"),
             "attempts": attempts,
             "selected_attempt": selected["attempt"],
             "outcome_record": outcome_record,

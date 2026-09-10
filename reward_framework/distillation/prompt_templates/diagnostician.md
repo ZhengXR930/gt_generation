@@ -48,19 +48,6 @@ Focus on observable reproduction behavior:
 - for failed or partial runs, what search/submission pattern preceded the final
   lack of reproduction.
 
-Also decide whether this sample is worth exactly one model retry. Use `retry`
-for failed or partial runs where the trajectory looks stochastic rather than
-structurally blocked: the agent engaged the issue-relevant code or input format,
-formed at least one plausible candidate family, and the submission/runtime path
-worked well enough that another independent attempt may plausibly explore a
-useful mutation, seed choice, path switch, or candidate refinement. The agent
-does not need to have written down a precise unsubmitted next candidate.
-
-Use `do_not_retry` for successful runs, framework/runtime failures, runs with no
-meaningful candidate formation, runs where the agent mainly searched unrelated
-paths, or runs dominated by repeated duplicate/non-progress submissions without
-evidence that a fresh attempt could change the search behavior.
-
 Use reasoning, trace, reachability, and context diagnostics as evidence for
 interpreting these behaviors. Do not treat incomplete reasoning or trace
 recovery itself as a failure that must be corrected.
@@ -109,10 +96,5 @@ Return ONLY one JSON object:
   "outcome_diagnosis": {
     "summary": "natural-language explanation of why the behavior helped or blocked reproduction",
     "evidence": "natural-language evidence connecting behavior to the deterministic outcome"
-  },
-  "retry_recommendation": {
-    "decision": "retry or do_not_retry",
-    "summary": "natural-language explanation of whether another independent model attempt is justified",
-    "evidence": "natural-language evidence from trajectory, submissions, and feedback"
   }
 }

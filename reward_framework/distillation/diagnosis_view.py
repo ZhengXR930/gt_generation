@@ -23,7 +23,6 @@ _LEARNING_KEYS = (
     "issue_description",
     "vulnerability_type",
     *BEHAVIOR_SECTIONS,
-    "retry_recommendation",
 )
 
 _REPLACEMENTS = (
@@ -77,7 +76,7 @@ def learning_diagnosis(diagnosis: dict[str, Any], outcome_record: dict[str, Any]
             continue
         if key == "issue_description":
             out[key] = abstract_text(value)
-        elif key in BEHAVIOR_SECTIONS or key == "retry_recommendation":
+        elif key in BEHAVIOR_SECTIONS:
             out[key] = abstract_value(value)
         else:
             out[key] = value

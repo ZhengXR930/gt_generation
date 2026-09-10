@@ -19,9 +19,7 @@ Read:
   Existing learned lessons, lesson IDs, and available capacity.
 
 - `inputs/batch_diagnoses.json`
-  Current batch behavior diagnoses. A sample may appear more than once when a
-  strict retry was run; compare the `attempt` values as first/retry behavior
-  evidence for that same sample.
+  Current batch behavior diagnoses.
 
 - `inputs/pools.json`
   Accumulated success, failure, non-target-crash, and infrastructure behavior
