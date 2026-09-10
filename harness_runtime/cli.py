@@ -194,9 +194,14 @@ def _rewrite_workspace_paths(workspace: Path) -> None:
 
     The stock task template is written for containers mounted at /workspace.
     Codex/Claude/DSH CLI agents run from a host directory in this runner, so the
-    generated submit.sh and description.txt must reference the concrete workspace path.
+    generated submit.sh, README.md, and description.txt must reference the
+    concrete workspace path.
     """
-    for path in (workspace / "description.txt", workspace / "submit.sh"):
+    for path in (
+        workspace / "README.md",
+        workspace / "description.txt",
+        workspace / "submit.sh",
+    ):
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")

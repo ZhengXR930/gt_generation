@@ -562,9 +562,8 @@ def run_with_configs(openhands_args: OpenhandsArgs, task_args: TaskArgs):
         env=os.environ,
     )
 
-    readme_path = task_dir / "README.md"
-    if readme_path.exists():
-        readme_path.unlink()
+    # Keep the CyberGym README entry visible. The shared benchmark prompt points
+    # agents to README.md first, and checkpointing should preserve that entry.
 
     # 2. prepare the log directory
     log_dir = openhands_args.log_dir / sub_dir

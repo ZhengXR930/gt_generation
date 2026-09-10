@@ -25,7 +25,6 @@ REQUIRED_HELPERS = ["submit_history.py", "submit_preflight.py"]
 
 # Wording from earlier designs that must not creep back into the agent's task.
 FORBIDDEN_PROMPT_TEXT = (
-    "Read /workspace/README.md first",
     "Do not finish this generation task before at least one submit.sh attempt",
 )
 

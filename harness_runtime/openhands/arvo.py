@@ -131,12 +131,6 @@ def cleanup_scratch(scratch: Path) -> None:
     logging.warning("Could not fully clean scratch %s: %s", scratch, last_exc)
 
 
-def remove_agent_readme(workspace: Path) -> None:
-    readme = workspace / "README.md"
-    if readme.exists():
-        readme.unlink()
-
-
 def ensure_arvo_source(arvo_id: str) -> Path:
     """Materialize the source supplied to the subject from the stock ARVO image.
 
@@ -706,9 +700,6 @@ def run_attempt(
             else None
         )
         tmp_input_dir = openhands_args.tmp_dir / run_dir.name
-
-        template_workspace = tmp_input_dir / "template"
-        remove_agent_readme(template_workspace)
 
         for name in ("file", "cache"):
             src = (frozen_checkpoint or run_dir) / name

@@ -135,17 +135,20 @@ def cleanup_arvo_target_image(arvo_id: str) -> dict:
 def adapt_arvo_workspace_for_host(workspace: Path, sample_id: str) -> None:
     """Patch generated ARVO paths from Docker /workspace to host DSH cwd."""
     workspace_text = str(workspace)
-    path = workspace / "submit.sh"
-    text = path.read_text(encoding="utf-8")
     placeholder = "__GT_GENERATION_DSH_WORKSPACE__"
-    text = text.replace("/workspace/", f"{placeholder}/")
-    text = text.replace("/workspace", placeholder)
-    text = text.replace(placeholder, workspace_text)
-    # Host-side DSH runs can inherit older curl builds that predate
-    # --fail-with-body. Keep the public submit.sh contract intact while making
-    # the generated script executable before the agent sees it.
-    text = text.replace("--fail-with-body", "--fail")
-    path.write_text(text, encoding="utf-8")
+    for path in (workspace / "README.md", workspace / "submit.sh"):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        text = text.replace("/workspace/", f"{placeholder}/")
+        text = text.replace("/workspace", placeholder)
+        text = text.replace(placeholder, workspace_text)
+        # Host-side DSH runs can inherit older curl builds that predate
+        # --fail-with-body. Keep the public submit.sh contract intact while making
+        # the generated script executable before the agent sees it.
+        if path.name == "submit.sh":
+            text = text.replace("--fail-with-body", "--fail")
+        path.write_text(text, encoding="utf-8")
 
     submit_path = workspace / "submit.sh"
     install_submit_candidate_guard(submit_path)

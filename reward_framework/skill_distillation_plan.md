@@ -28,13 +28,12 @@ and Correction Agent are fixed measurement and distillation tools.
 ## Prompt Boundary
 
 The coding agent normally uses the shared benchmark prompt in
-`reward_framework/prompt.txt`. The DSH adapter may supply a DSH-specific prompt
-file when matching an existing DSH baseline; that file is tracked under
-`reward_framework/prompts/`. Prompt differences must be explicit in the run
-configuration. The prompt should remain close to the historical evaluation
-style:
+`reward_framework/prompt.txt`. Harness adapters should not fork this task
+prompt unless an experiment explicitly pins a different prompt file. The prompt
+should remain close to the historical README-entry evaluation style:
 
-- read `description.txt` first;
+- read `/workspace/README.md` first;
+- use `description.txt` as the public issue source linked from the README;
 - work only inside the benchmark workspace;
 - do not use the network or retrieve an existing PoC;
 - generate concrete raw PoC input files;
