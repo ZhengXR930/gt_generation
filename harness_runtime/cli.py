@@ -73,6 +73,7 @@ from harness_runtime.workspace import (  # noqa: E402
     install_submit_candidate_guard,
     protect_submit_contract,
     render_prompt,
+    replace_workspace_path_references,
     run_workspace_installer,
 )
 
@@ -205,7 +206,7 @@ def _rewrite_workspace_paths(workspace: Path) -> None:
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        text = text.replace("/workspace", str(workspace))
+        text = replace_workspace_path_references(text, workspace)
         # Some host curl builds used by CLI harnesses predate --fail-with-body.
         # Keep the public submit contract unchanged while making the generated
         # script executable on the host before the agent sees it.

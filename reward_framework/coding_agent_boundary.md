@@ -29,12 +29,18 @@ score, no ground truth, no teacher feedback, no run history.
 
 ## Both arms are given the same task
 
-`reward_framework/prompt.txt` is **byte-identical** to `poc_generation/prompt.txt`, and a
-test enforces that. The packet is never mentioned in it. Every harness already has its own
-way to surface a skill — native Agent Skills under `$CODEX_HOME/skills` and `.claude/`, a
-bundle for DeepSeek Harness, a workspace copy plus a bootstrap read for OpenHands — so a
-mention would add nothing except an instruction the baseline arm never receives. With the
-prompts identical, the only difference between the arms is the packet itself.
+`reward_framework/prompt.txt` is the fixed coding-agent task prompt for reward
+runs. For the current DSH+DeepSeek experiments it is a DSH-shaped README-entry
+prompt, while `poc_generation/prompt.txt` remains the cross-harness evaluation
+prompt. Within one reward comparison, the baseline and skill arms must use the
+same `reward_framework/prompt.txt`; the only treatment difference is the skill
+packet.
+
+The packet is never mentioned in the task prompt. Every harness already has its
+own way to surface a skill — native Agent Skills under `$CODEX_HOME/skills` and
+`.claude/`, a bundle for DeepSeek Harness, a workspace copy plus a bootstrap read
+for OpenHands — so a mention would add nothing except an instruction the baseline
+arm never receives.
 
 The corollary is that delivery is a *silent* treatment: if an agent's skill discovery does
 not fire, the packet had no effect and the run still looks normal. That is a thing to

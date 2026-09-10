@@ -17,7 +17,7 @@ from reward_framework.adapters.conformance import check_installed_packet
 from reward_framework.adapters.deepseek_harness.install import install_workspace_skill_packet as dsh_install
 from reward_framework.adapters.openhands.install import install_workspace_skill_packet as openhands_install
 from reward_framework.distillation.defaults import INITIAL_PACKET
-from harness_runtime.workspace import render_prompt
+from harness_runtime.workspace import render_prompt, replace_workspace_path_references
 
 ADAPTERS = {
     "openhands": openhands_install,
@@ -73,6 +73,19 @@ def test_task_prompt_is_untouched_by_installation(name, tmp_path):
     rendered = render_prompt(PROMPT_FILE, sample_id="arvo_1", workspace=workspace)
     leftover = [token for token in SKILL_PATH_PLACEHOLDERS if token in rendered]
     assert leftover == [], f"{name}: the task prompt should carry no placeholders, found {leftover}"
+
+
+def test_workspace_path_rendering_does_not_rewrite_prose(tmp_path):
+    workspace = tmp_path / "workspace"
+    text = (
+        "submit /workspace/analysis.json from /workspace, "
+        "but do not rewrite README/workspace artifacts in prose"
+    )
+
+    rendered = replace_workspace_path_references(text, workspace)
+
+    assert f"submit {workspace}/analysis.json from {workspace}" in rendered
+    assert "README/workspace artifacts" in rendered
 
 
 def test_all_adapters_agree_on_the_lesson_text(tmp_path):

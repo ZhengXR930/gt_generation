@@ -74,6 +74,7 @@ from harness_runtime.deepseek_harness.reachability import (  # noqa: E402
 from harness_runtime.workspace import (  # noqa: E402
     install_submit_candidate_guard,
     render_prompt,
+    replace_workspace_path_references,
     run_workspace_installer,
 )
 
@@ -140,8 +141,7 @@ def adapt_arvo_workspace_for_host(workspace: Path, sample_id: str) -> None:
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8")
-        text = text.replace("/workspace/", f"{placeholder}/")
-        text = text.replace("/workspace", placeholder)
+        text = replace_workspace_path_references(text, Path(placeholder))
         text = text.replace(placeholder, workspace_text)
         # Host-side DSH runs can inherit older curl builds that predate
         # --fail-with-body. Keep the public submit.sh contract intact while making

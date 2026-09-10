@@ -6,6 +6,7 @@ import importlib
 import hashlib
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any, MutableMapping
@@ -190,11 +191,19 @@ def render_prompt(prompt_file: Path, *, sample_id: str, workspace: Path) -> str:
     prompt_file = prompt_file.expanduser().resolve()
     if not prompt_file.is_file():
         raise FileNotFoundError(f"prompt file not found: {prompt_file}")
-    return (
-        prompt_file.read_text(encoding="utf-8", errors="replace")
-        .replace("<current sample id>", sample_id)
-        .replace("/workspace", str(workspace))
-        .replace("<workspace-placeholder>", "/workspace")
+    text = prompt_file.read_text(encoding="utf-8", errors="replace")
+    text = text.replace("<current sample id>", sample_id)
+    text = replace_workspace_path_references(text, workspace)
+    return text.replace("<workspace-placeholder>", "/workspace")
+
+
+def replace_workspace_path_references(text: str, workspace: Path) -> str:
+    """Replace literal /workspace path references without touching prose."""
+    workspace_text = str(workspace)
+    return re.sub(
+        r"(?<![A-Za-z0-9_.-])/workspace(?=(?:/|\b))",
+        lambda _match: workspace_text,
+        text,
     )
 
 

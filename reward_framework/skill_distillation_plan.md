@@ -27,10 +27,11 @@ and Correction Agent are fixed measurement and distillation tools.
 
 ## Prompt Boundary
 
-The coding agent normally uses the shared benchmark prompt in
-`reward_framework/prompt.txt`. Harness adapters should not fork this task
-prompt unless an experiment explicitly pins a different prompt file. The prompt
-should remain close to the historical README-entry evaluation style:
+The coding agent uses the fixed reward prompt in `reward_framework/prompt.txt`.
+For the current DSH+DeepSeek experiments, this is a DSH-shaped README-entry
+prompt derived from the best historical DSH baseline style. Harness adapters
+should not fork this task prompt unless an experiment explicitly pins a
+different prompt file. The prompt should remain close to that historical style:
 
 - read `/workspace/README.md` first;
 - use `description.txt` as the public issue source linked from the README;

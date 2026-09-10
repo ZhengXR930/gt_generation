@@ -91,7 +91,11 @@ from harness_runtime.deepseek_harness.reachability import (  # noqa: E402
     DEFAULT_REACHABILITY_LOCK_DIR,
     run_reachability_pipeline,
 )
-from harness_runtime.workspace import render_prompt, run_workspace_installer  # noqa: E402
+from harness_runtime.workspace import (  # noqa: E402
+    render_prompt,
+    replace_workspace_path_references,
+    run_workspace_installer,
+)
 
 
 def cleanup_dsh_scratch(scratch: Path, scratch_root: Path) -> None:
@@ -253,9 +257,7 @@ def adapt_readme_for_host_workspace(workspace: Path) -> None:
     if not readme.is_file():
         return
     text = readme.read_text(encoding="utf-8")
-    workspace_text = str(workspace)
-    text = text.replace("/workspace/", f"{workspace_text}/")
-    text = text.replace("/workspace", workspace_text)
+    text = replace_workspace_path_references(text, workspace)
     readme.write_text(text, encoding="utf-8")
 
 
