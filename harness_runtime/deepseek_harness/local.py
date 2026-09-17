@@ -758,6 +758,7 @@ def run_dsh(
     env["DSH_HOME"] = str(dsh_home)
     env["DSH_PERMISSION_MODE"] = "danger-full-access"
     env["DSH_TELEMETRY_DISABLED"] = "1"
+    env["GIT_CEILING_DIRECTORIES"] = str(workspace.resolve())
     env["DEEPSEEK_API_KEY"] = api_key
     if base_url:
         env["DEEPSEEK_BASE_URL"] = base_url

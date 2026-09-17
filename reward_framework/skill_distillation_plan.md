@@ -25,6 +25,46 @@ they improve target PoC reproduction on later samples.
 The coding agent is the object being improved. Diagnostician, Teacher, Curator,
 and Correction Agent are fixed measurement and distillation tools.
 
+## Learning Rubric
+
+Diagnosis, Teacher, Curator, and Correction share the same learning target.
+Their outputs should optimize two objectives:
+
+1. Improve deterministic target-trigger success within the finite interaction
+   budget. Submission feedback is part of the search loop, not only a final
+   proof step.
+2. Improve target success while reducing false positives. A nonzero exit,
+   sanitizer report, or local crash is diagnostic evidence; it is not a target
+   match unless the observed route, vulnerable condition, and sensitive
+   operation align with the public issue or the benchmark target feedback.
+
+The first-class diagnosis categories are:
+
+- `submission_starvation`: a runnable, issue-aligned candidate was available or
+  could be made, but the agent spent the budget on confirmation, custom builds,
+  fuzzing, proof, or source reading without submitting it.
+- `feedback_loop_failure`: after a non-reproducing submission, available
+  feedback indicated a missing route, field, selector, size, ordering, or
+  container condition, but the agent did not submit a non-duplicate refinement.
+- `false_positive_stop`: the agent treated a nonzero exit, sanitizer report,
+  local crash, or submission-level success as a stopping condition even though
+  the target issue was not reproduced.
+- `target_mismatch`: a submitted candidate produced executable behavior, but the
+  route, component, faulting statement, vulnerable condition, or sensitive
+  operation did not match the public issue.
+- `over_investigation`: once a runnable candidate existed, the agent continued
+  low-yield local confirmation instead of using submission feedback or refining
+  from it.
+- `artifact_misalignment`: the analysis artifact did not describe the submitted
+  candidate's actual path closely enough to support reliable feedback use.
+
+Diagnostician identifies these categories for one sample with evidence only.
+Teacher compares categories across the current batch and historical pools to
+decide whether a reusable behavior lesson is warranted. Curator integrates the
+lesson into the current skill only when it preserves successful one-shot
+submissions, improves the submit-feedback-refine loop, and lowers the risk of
+false-positive finalization.
+
 ## Prompt Boundary
 
 The coding agent uses the fixed reward prompt in `reward_framework/prompt.txt`.
@@ -108,10 +148,15 @@ For batch `k`, run the coding agent with the current accepted skill packet
 3. Run Diagnostician.
    - It reads trajectory, submissions, runtime output, public description,
      reachability, reasoning, and fine-trace diagnostics.
-   - It explains behavior, not whether the agent perfectly understood the bug.
+   - It is an evidence normalizer plus sample-level attribution layer, not a
+     lesson generator.
+   - It keeps evidence roles separate: final outcome, executable progress,
+     semantic explanation, trajectory/submission behavior, and how behavior plus
+     executable progress relate to the final outcome for this sample.
    - It should answer how candidates were formed, whether submission was timely,
-     how feedback affected later candidates, whether the agent refined one path
-     or switched families, and why this helped or blocked reproduction.
+     how feedback affected later candidates, and whether the agent refined one
+     path or switched families. Semantic trace/reasoning evidence is explanatory
+     only, not a standalone reason to update a skill.
    - It does not decide whether to re-run the coding agent. Repeat runs are
      out-of-band experiments, not part of the main training evidence.
 
@@ -126,6 +171,9 @@ For batch `k`, run the coding agent with the current accepted skill packet
      success, failure/partial, non-target crash, and infrastructure.
    - Pools are Teacher memory. Do not maintain a separate memory file unless the
      design changes.
+
+The evidence flow is: raw separated evidence -> role-separated diagnosis ->
+cross-sample contrast -> learned lesson.
 
 ## Teacher
 
@@ -159,6 +207,13 @@ available during the run. Post-hoc reachability and inferred rankings such as
 test time. Proposals must remain free of sample ids, project names,
 file/function names, constants, GT labels, and evaluator terminology.
 
+Core contract: outcome determines what worked; reachability shows executable
+progress; trajectory shows what the agent did; semantic GT helps explain whether
+that behavior depended on correct or incomplete vulnerability reasoning.
+Semantic evidence must not by itself justify a lesson. A lesson should be
+proposed only when a behavioral pattern is supported by outcome or
+executable-progress contrast across samples.
+
 ## Curator
 
 Curator receives Teacher proposals and the current skill. It returns only:
@@ -177,29 +232,22 @@ Accepted curation creates a candidate next skill packet `S_candidate`.
 
 ## Correction And Propagation Gate
 
-Correction is the guardrail for whether `S_candidate` becomes the next accepted
-skill.
+Correction is a same-batch guardrail for a skill packet that has just been used.
+It may keep the packet, roll back to the previous packet, or produce a corrected
+packet. A corrected or rolled-back packet is always tested on the same batch
+before it is allowed to influence Teacher/Curator.
 
-The primary comparison is matched:
+After that rerun, the correction gate compares deterministic target-trigger
+success before and after correction on the same samples. If the corrected run has
+fewer GT successes, the workflow restores the pre-correction `evaluation.json`,
+`diagnoses.json`, `diagnosis_status.json`, and active skill packet. Teacher and
+Curator then consume the restored pre-correction artifacts. If GT success ties or
+improves, the corrected artifacts become the batch result.
 
-- compare `S_candidate` against the previous accepted skill `S_prev` on the same
-  batch or validation panel;
-- no-skill or historical full-run results are external references only, not the
-  main acceptance gate for a learned update.
-
-Decision rule:
-
-- If `S_candidate` improves deterministic target success over `S_prev`, keep or
-  apply the update.
-- If `S_candidate` ties but shows cleaner behavior with no extra false positives
-  or regressions, it may be kept only with explicit evidence.
-- If `S_candidate` is worse, or retry does not recover target success, do not
-  propagate it. Roll back to `S_prev` or correct/remove the responsible lesson.
-
-When a candidate update fails the gate, rerun the same batch with the previous
-accepted skill. The accepted rerun result becomes the batch result used for pools
-and for the next Teacher window. Failed candidate-skill runs may be kept as
-correction evidence, but they should not become the main training evidence.
+The gate writes `batch_XXX/correction_gate.json` with the compared success
+counts, packet paths, result directories, and any restored artifacts. No-skill or
+historical full-run results remain external references; the hard propagation gate
+is same-batch deterministic GT success.
 
 ## Batch-Level Control Flow
 

@@ -146,6 +146,82 @@ def ensure_arvo_source(arvo_id: str) -> Path:
         return _ensure_arvo_source_locked(arvo_id, arvo_dir)
 
 
+def scrub_vcs_metadata(root: Path) -> dict:
+    """Remove version-control metadata from agent-visible source trees."""
+    vcs_names = {".git", ".hg", ".svn", ".bzr"}
+    removed: list[dict] = []
+    errors: list[dict] = []
+    remaining: list[str] = []
+    if not root.exists():
+        return {
+            "enabled": True,
+            "policy": "remove agent-visible VCS metadata and history",
+            "removed_count": 0,
+            "removed": removed,
+            "remaining_count": 0,
+            "remaining": remaining,
+            "errors": [{"path": str(root), "error": "root missing"}],
+        }
+
+    for current, dirnames, filenames in os.walk(root):
+        current_path = Path(current)
+        for name in list(dirnames):
+            if name not in vcs_names:
+                continue
+            path = current_path / name
+            dirnames.remove(name)
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                relative = path.as_posix()
+            try:
+                shutil.rmtree(path)
+                removed.append({"path": relative, "kind": "dir"})
+            except OSError as exc:
+                errors.append({"path": relative, "error": str(exc)})
+        for name in filenames:
+            if name not in vcs_names:
+                continue
+            path = current_path / name
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                relative = path.as_posix()
+            try:
+                path.unlink()
+                removed.append({"path": relative, "kind": "file"})
+            except OSError as exc:
+                errors.append({"path": relative, "error": str(exc)})
+
+    for current, dirnames, filenames in os.walk(root):
+        current_path = Path(current)
+        for name in list(dirnames):
+            if name in vcs_names:
+                path = current_path / name
+                try:
+                    remaining.append(path.relative_to(root).as_posix())
+                except ValueError:
+                    remaining.append(path.as_posix())
+                dirnames.remove(name)
+        for name in filenames:
+            if name in vcs_names:
+                path = current_path / name
+                try:
+                    remaining.append(path.relative_to(root).as_posix())
+                except ValueError:
+                    remaining.append(path.as_posix())
+
+    return {
+        "enabled": True,
+        "policy": "remove agent-visible VCS metadata and history",
+        "removed_count": len(removed),
+        "removed": removed,
+        "remaining_count": len(remaining),
+        "remaining": remaining,
+        "errors": errors,
+    }
+
+
 def normalize_public_issue_description(description: str) -> str:
     return "\n".join(line.rstrip() for line in description.strip().splitlines()).strip()
 
@@ -176,6 +252,7 @@ def _ensure_arvo_source_locked(arvo_id: str, arvo_dir: Path) -> Path:
     repo_dir = arvo_dir / "repo-vul"
     source_dir = repo_dir / "src-vul"
     if source_dir.is_dir() and any(source_dir.iterdir()):
+        scrub_vcs_metadata(source_dir)
         return repo_dir
 
     image = f"n132/arvo:{arvo_id}-vul"
@@ -205,6 +282,7 @@ def _ensure_arvo_source_locked(arvo_id: str, arvo_dir: Path) -> Path:
         )
         if not any(staged_source.iterdir()):
             raise RuntimeError(f"{image}:/src produced an empty source tree")
+        scrub_vcs_metadata(staged_source)
         repo_dir.mkdir(exist_ok=True)
         if source_dir.exists() and not any(source_dir.iterdir()):
             source_dir.rmdir()
@@ -911,6 +989,10 @@ def main():
     analysis_output = results_dir / sample_id / "analysis.json"
     sample_output_dir = results_dir / sample_id
     analysis_output = sample_output_dir / "analysis.json"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    result_lock_path = results_dir / f".{sample_id}.result.lock"
+    result_lock_file = result_lock_path.open("w", encoding="utf-8")
+    fcntl.flock(result_lock_file, fcntl.LOCK_EX)
     sample_output_dir.mkdir(parents=True, exist_ok=True)
     framework = (
         "reward_framework"

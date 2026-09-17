@@ -66,6 +66,7 @@ from harness_runtime.openhands.arvo import (  # noqa: E402
     clear_previous_result,
     ensure_arvo_source,
     materialize_attempt_analysis_files,
+    scrub_vcs_metadata,
 )
 from harness_runtime.deepseek_harness.reachability import (  # noqa: E402
     DEFAULT_REACHABILITY_LOCK_DIR,
@@ -221,8 +222,15 @@ def prepare_arvo_workspace(
         )
     )
     sample_id = f"arvo_{arvo_id}"
-    adapt_arvo_workspace_for_host(workspace, sample_id)
     task_dump = task.model_dump()
+    vcs_scrub = scrub_vcs_metadata(workspace / "repo-vul")
+    task_dump["vcs_metadata_scrub"] = vcs_scrub
+    if vcs_scrub.get("remaining_count", 0):
+        examples = ", ".join(vcs_scrub.get("remaining", [])[:5])
+        raise RuntimeError(
+            f"agent-visible VCS metadata remained after scrub for {sample_id}: {examples}"
+        )
+    adapt_arvo_workspace_for_host(workspace, sample_id)
     task_dump["public_testcase_scrub"] = scrub_agent_visible_public_testcases(workspace)
     return workspace, task_dump
 

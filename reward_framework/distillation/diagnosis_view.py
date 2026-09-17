@@ -10,11 +10,23 @@ from __future__ import annotations
 import re
 from typing import Any
 
-BEHAVIOR_SECTIONS = (
-    "search_behavior",
-    "candidate_behavior",
-    "feedback_behavior",
+DIAGNOSIS_SECTIONS = (
+    "outcome_evidence",
+    "executable_progress_evidence",
+    "semantic_explanatory_evidence",
+    "behavioral_evidence",
     "outcome_diagnosis",
+)
+
+RUBRIC_FINDINGS_KEY = "rubric_findings"
+
+RUBRIC_CATEGORIES = (
+    "submission_starvation",
+    "feedback_loop_failure",
+    "false_positive_stop",
+    "target_mismatch",
+    "over_investigation",
+    "artifact_misalignment",
 )
 
 _LEARNING_KEYS = (
@@ -22,7 +34,8 @@ _LEARNING_KEYS = (
     "outcome",
     "issue_description",
     "vulnerability_type",
-    *BEHAVIOR_SECTIONS,
+    *DIAGNOSIS_SECTIONS,
+    RUBRIC_FINDINGS_KEY,
 )
 
 _REPLACEMENTS = (
@@ -76,7 +89,7 @@ def learning_diagnosis(diagnosis: dict[str, Any], outcome_record: dict[str, Any]
             continue
         if key == "issue_description":
             out[key] = abstract_text(value)
-        elif key in BEHAVIOR_SECTIONS:
+        elif key in DIAGNOSIS_SECTIONS:
             out[key] = abstract_value(value)
         else:
             out[key] = value
@@ -89,7 +102,9 @@ def learning_evaluation(eval_report: dict[str, Any]) -> dict[str, Any]:
     """Small evaluator view for Correction without raw stage labels or traces."""
     rows = []
     for row in eval_report.get("rows") or []:
-        det = row.get("deterministic_outcome") or {}
+        det = row.get("deterministic_outcome")
+        if not isinstance(det, dict):
+            det = row
         rows.append({
             "sample_id": row.get("sample_id"),
             "outcome": det.get("outcome"),

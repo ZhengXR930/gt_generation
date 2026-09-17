@@ -6,9 +6,22 @@ from pathlib import Path
 from reward_framework.distillation.lint import lint_lesson_text, load_literal_index
 from reward_framework.distillation.outcome import classify_outcome, diagnostics_summary
 from reward_framework.distillation.pools import build_validation_panel, empty_pools, teacher_view, update_pools
-from reward_framework.distillation.artifacts import write_json
-from reward_framework.distillation.cli import _copy_baseline_split, _diagnosis_quality_error, _normalize_diagnosis_for_outcome
-from reward_framework.distillation.diagnosis_view import abstract_text, learning_diagnosis, learning_evaluation
+from reward_framework.distillation.artifacts import read_json, write_json
+from reward_framework.distillation.cli import (
+    _copy_baseline_split,
+    _diagnosis_quality_error,
+    _deterministic_gt_success_count,
+    _gate_correction_result,
+    _normalize_diagnosis_for_outcome,
+    _teacher_pool_cutoff,
+)
+from reward_framework.distillation.diagnosis_view import (
+    RUBRIC_CATEGORIES,
+    RUBRIC_FINDINGS_KEY,
+    abstract_text,
+    learning_diagnosis,
+    learning_evaluation,
+)
 from reward_framework.distillation.prompts import load_template, role_task_prompt
 from reward_framework.distillation.roles import (
     build_correction_role,
@@ -41,11 +54,20 @@ def _section(summary, evidence="evidence"):
 
 def _behavioral_fields(prefix="behavior"):
     return {
-        "search_behavior": _section(f"{prefix} search", f"{prefix} search evidence"),
-        "candidate_behavior": _section(f"{prefix} candidate", f"{prefix} candidate evidence"),
-        "feedback_behavior": _section(f"{prefix} feedback", f"{prefix} feedback evidence"),
-        "outcome_diagnosis": _section(f"{prefix} outcome", f"{prefix} outcome evidence"),
+        "outcome_evidence": _section(f"{prefix} outcome", f"{prefix} outcome evidence"),
+        "executable_progress_evidence": _section(f"{prefix} progress", f"{prefix} progress evidence"),
+        "semantic_explanatory_evidence": _section(f"{prefix} semantic", f"{prefix} semantic evidence"),
+        "behavioral_evidence": _section(f"{prefix} behavior", f"{prefix} behavior evidence"),
+        "outcome_diagnosis": _section(f"{prefix} attribution", f"{prefix} attribution evidence"),
     }
+
+
+def _rubric_findings(category="feedback_loop_failure", present=True):
+    return [{
+        "category": category,
+        "present": present,
+        "evidence": f"{category} evidence" if present else "",
+    }]
 
 
 def test_split_falls_back_to_corpus_order_without_dates(tmp_path):
@@ -71,6 +93,13 @@ def test_split_orders_by_commit_date(tmp_path):
     assert values == sorted(values), "split must be ascending in commit date"
     assert split.dates[split.train[-1]] <= split.dates[split.test[0]]
     assert not split.undated
+
+
+def test_teacher_pool_cutoff_excludes_the_diagnosis_window():
+    assert _teacher_pool_cutoff(0, 3) == -1
+    assert _teacher_pool_cutoff(2, 3) == -1
+    assert _teacher_pool_cutoff(3, 3) == 0
+    assert _teacher_pool_cutoff(3, 3, explicit_diagnoses=True) == 2
 
 
 def test_baseline_split_can_initialize_a_run(tmp_path):
@@ -267,6 +296,61 @@ def test_outcome_is_deterministic_from_reachability():
     assert broken["outcome"] == "infrastructure"
 
 
+def test_correction_gate_reverts_when_gt_success_drops(tmp_path):
+    batch_dir = tmp_path / "batch_001"
+    pre_eval = batch_dir / "pre_correction_evaluation.json"
+    post_eval = batch_dir / "post_correction_evaluation.json"
+    write_json(pre_eval, {"rows": [
+        {"deterministic_outcome": {"outcome": "success"}},
+        {"deterministic_outcome": {"outcome": "success"}},
+    ]})
+    write_json(post_eval, {"rows": [
+        {"deterministic_outcome": {"outcome": "success"}},
+        {"deterministic_outcome": {"outcome": "failure"}},
+    ]})
+    write_json(batch_dir / "evaluation.json", {"rows": [
+        {"deterministic_outcome": {"outcome": "success"}},
+    ]})
+    write_json(batch_dir / "pre_correction_diagnoses.json", [{"sample_id": "before"}])
+    write_json(batch_dir / "diagnoses.json", [{"sample_id": "after"}])
+
+    gate = _gate_correction_result(
+        batch_dir=batch_dir,
+        pre_evaluation=pre_eval,
+        post_evaluation=post_eval,
+        pre_results_dir=tmp_path / "pre_results",
+        post_results_dir=tmp_path / "post_results",
+        pre_packet=tmp_path / "pre_packet",
+        post_packet=tmp_path / "post_packet",
+    )
+
+    assert gate["decision"] == "REVERT"
+    assert _deterministic_gt_success_count(batch_dir / "evaluation.json") == 2
+    assert read_json(batch_dir / "diagnoses.json") == [{"sample_id": "before"}]
+    assert "evaluation.json" in gate["restored_artifacts"]
+
+
+def test_correction_gate_accepts_ties(tmp_path):
+    batch_dir = tmp_path / "batch_002"
+    pre_eval = batch_dir / "pre_correction_evaluation.json"
+    post_eval = batch_dir / "post_correction_evaluation.json"
+    write_json(pre_eval, {"deterministic_outcomes": {"success": 2}, "rows": 10})
+    write_json(post_eval, {"deterministic_outcomes": {"success": 2}, "rows": 10})
+
+    gate = _gate_correction_result(
+        batch_dir=batch_dir,
+        pre_evaluation=pre_eval,
+        post_evaluation=post_eval,
+        pre_results_dir=tmp_path / "pre_results",
+        post_results_dir=tmp_path / "post_results",
+        pre_packet=tmp_path / "pre_packet",
+        post_packet=tmp_path / "post_packet",
+    )
+
+    assert gate["decision"] == "ACCEPT"
+    assert gate["restored_artifacts"] == []
+
+
 def test_pools_keep_sample_level_records_without_failure_mode_gate():
     pools = empty_pools()
     update_pools(pools, 0, [
@@ -293,18 +377,20 @@ def test_pools_keep_sample_level_records_without_failure_mode_gate():
         },
     ])
     view = teacher_view(pools)
-    assert view["protocol"] == "teacher-pools-view-v5"
+    assert view["protocol"] == "teacher-pools-view"
     assert "eligible_failure_modes" not in view
     assert "failure_modes" not in view
+    assert view["comparison_policy"]["rubric_categories"] == list(RUBRIC_CATEGORIES)
     assert view["counts"] == {
         "failure_pool": 1,
         "success_pool": 1,
-        "crash_pool": 0,
+        "false_positive_pool": 0,
         "infrastructure_pool": 1,
         "batches_seen": 1,
     }
     assert view["failure_pool"][0]["sample_id"] == "a"
-    assert view["failure_pool"][0]["search_behavior"]["summary"] == "partial search"
+    assert view["failure_pool"][0]["behavioral_evidence"]["summary"] == "partial behavior"
+    assert view["false_positive_pool"] == []
     assert view["crash_pool"] == []
     assert view["success_pool"][0]["sample_id"] == "b"
     assert view["infrastructure_pool"][0]["sample_id"] == "c"
@@ -329,6 +415,29 @@ def test_success_pool_keeps_sample_level_diagnosis_records():
         **_behavioral_fields("success"),
     }]
 
+def test_false_positive_pool_keeps_rubric_findings_as_first_class_evidence():
+    pools = empty_pools()
+    update_pools(pools, 0, [{
+        "sample_id": "fp1",
+        "project": "p1",
+        "vulnerability_type": "uaf",
+        "outcome": "partial",
+        **_behavioral_fields("false positive"),
+        RUBRIC_FINDINGS_KEY: _rubric_findings("false_positive_stop"),
+        "outcome_record": {
+            "outcome": "partial",
+            "false_positive": True,
+            "false_positive_pocs": 1,
+        },
+    }])
+    view = teacher_view(pools)
+
+    assert view["counts"]["false_positive_pool"] == 1
+    assert view["counts"]["failure_pool"] == 0
+    assert view["false_positive_pool"] == view["crash_pool"]
+    assert view["false_positive_pool"][0][RUBRIC_FINDINGS_KEY] == _rubric_findings("false_positive_stop")
+
+
 def test_success_diagnosis_outcome_is_normalized_without_failure_type():
     diagnosis = {
         "sample_id": "ok1",
@@ -348,7 +457,7 @@ def test_success_diagnosis_outcome_is_normalized_without_failure_type():
     )
     assert infra["outcome"] == "infrastructure"
     assert "failure_type" not in infra
-    assert "search_behavior" not in infra, "legacy fields must not be synthesized"
+    assert "behavioral_evidence" not in infra, "diagnosis fields must not be synthesized"
 
 
 def test_learning_diagnosis_rewrites_only_evaluator_terms():
@@ -357,13 +466,14 @@ def test_learning_diagnosis_rewrites_only_evaluator_terms():
         "outcome": "partial",
         "issue_description": "public issue",
         "vulnerability_type": "oob",
-        "search_behavior": _section(
+        "executable_progress_evidence": _section(
             "Reached R4 Sink in `src/foo.c:123` and function parse_input before Trigger failed.",
             "R2_source_reached was true in repo-vul/src-vul/lib/a.cc:77.",
         ),
-        "candidate_behavior": _section("manual construction", "See https://example.test and commit abcdef1234567890 for line 55."),
-        "feedback_behavior": _section("Parser feedback was reused", "Source path stayed stable."),
-        "outcome_diagnosis": _section("Sink reached, Trigger missed", "Root Cause label was incomplete."),
+        "behavioral_evidence": _section("manual construction", "See https://example.test and commit abcdef1234567890 for line 55."),
+        "semantic_explanatory_evidence": _section("Parser feedback was reused", "Source path stayed stable."),
+        "outcome_evidence": _section("Sink reached, Trigger missed", "Root Cause label was incomplete."),
+        "outcome_diagnosis": _section("Behavior reached a late runtime point without failure", "The submitted candidate preserved input admission but did not produce the final observable failure."),
     }
     learned = learning_diagnosis(raw, {"outcome": "partial"})
     rendered = json.dumps(learned)
@@ -372,7 +482,7 @@ def test_learning_diagnosis_rewrites_only_evaluator_terms():
     assert "src/foo.c" in rendered and "a.cc" in rendered and "abcdef" in rendered
     assert "observable failure" in rendered
     assert learned["sample_id"] == "arvo_1"
-    assert learned["search_behavior"]["summary"]
+    assert learned["executable_progress_evidence"]["summary"]
 
 def test_learning_evaluation_hides_stage_labels():
     view = learning_evaluation({"batch_index": 1, "rows": [{
@@ -400,7 +510,7 @@ def test_distillation_role_prompts_are_external_templates():
     assert "You are the Sample Behavior Diagnostician." in load_template("diagnostician.md")
     assert "You are the Batch Skill Evolution Teacher." in load_template("teacher.md")
     assert "You are the Skill Update Curator." in load_template("curator.md")
-    assert "You are the Skill Update Corrector." in load_template("correction.md")
+    assert "You are the Skill Correction Auditor." in load_template("correction.md")
 
 
 def test_role_task_prompt_points_at_files_not_inline_payloads():
@@ -448,7 +558,8 @@ def test_teacher_and_curator_workspaces_carry_their_inputs(tmp_path):
 def test_templates_state_the_proposal_evidence_boundary():
     for name in ("teacher.md", "curator.md"):
         text = load_template(name)
-        assert "never written into the packet" in text or "never reaches the packet" in text
+        assert "proposal" in text
+        assert "can enter the skill packet" in text or "can become skill text" in text
     assert "do not generate lessons" in load_template("diagnostician.md")
 
 
@@ -492,7 +603,7 @@ def test_rerunning_a_batch_with_no_results_withdraws_what_it_contributed():
     view = teacher_view(pools)
     assert view["counts"]["failure_pool"] == 1
     assert view["failure_pool"][0]["sample_id"] == "a"
-    assert view["failure_pool"][0]["search_behavior"]["summary"] == "first search"
+    assert view["failure_pool"][0]["behavioral_evidence"]["summary"] == "first behavior"
 
 
 def test_a_sample_disappears_when_its_batch_is_withdrawn():
@@ -598,22 +709,32 @@ _EVAL_ROW = {
 
 
 
-def test_diagnosis_quality_requires_behavior_sections():
-    valid = {"issue_description": "i", **_behavioral_fields("ok")}
+def test_diagnosis_quality_requires_evidence_sections():
+    valid = {"issue_description": "i", **_behavioral_fields("ok"), RUBRIC_FINDINGS_KEY: _rubric_findings()}
     assert _diagnosis_quality_error(valid) is None
 
-    missing_evidence = {"issue_description": "i", **_behavioral_fields("ok")}
-    missing_evidence["candidate_behavior"] = {"summary": "candidate", "evidence": ""}
-    assert "candidate_behavior.evidence" in _diagnosis_quality_error(missing_evidence)
+    missing_evidence = {"issue_description": "i", **_behavioral_fields("ok"), RUBRIC_FINDINGS_KEY: _rubric_findings()}
+    missing_evidence["behavioral_evidence"] = {"summary": "candidate", "evidence": ""}
+    assert "behavioral_evidence.evidence" in _diagnosis_quality_error(missing_evidence)
 
-    missing_section = {"issue_description": "i", **_behavioral_fields("ok")}
-    missing_section.pop("feedback_behavior")
-    assert "feedback_behavior" in _diagnosis_quality_error(missing_section)
+    missing_section = {"issue_description": "i", **_behavioral_fields("ok"), RUBRIC_FINDINGS_KEY: _rubric_findings()}
+    missing_section.pop("semantic_explanatory_evidence")
+    assert "semantic_explanatory_evidence" in _diagnosis_quality_error(missing_section)
+
+    missing_rubric = {"issue_description": "i", **_behavioral_fields("ok")}
+    assert "rubric_findings" in _diagnosis_quality_error(missing_rubric)
+
+    missing_rubric_evidence = {
+        "issue_description": "i",
+        **_behavioral_fields("ok"),
+        RUBRIC_FINDINGS_KEY: [{"category": "submission_starvation", "present": True}],
+    }
+    assert "evidence is required" in _diagnosis_quality_error(missing_rubric_evidence)
 
 
 def test_diagnosis_quality_rejects_evaluator_stage_terms_in_behavior_text():
-    diagnosis = {"issue_description": "i", **_behavioral_fields("ok")}
-    diagnosis["outcome_diagnosis"] = {
+    diagnosis = {"issue_description": "i", **_behavioral_fields("ok"), RUBRIC_FINDINGS_KEY: _rubric_findings()}
+    diagnosis["executable_progress_evidence"] = {
         "summary": "The candidate reached R4 Sink before missing Trigger.",
         "evidence": "The runtime report said R0 and R4_sink_reached were observed.",
     }
@@ -621,8 +742,8 @@ def test_diagnosis_quality_rejects_evaluator_stage_terms_in_behavior_text():
     assert "evaluator-only" in error
     assert "R0" in error and "R4" in error and "Sink" in error
 
-    natural = {"issue_description": "i", **_behavioral_fields("ok")}
-    natural["search_behavior"] = {
+    natural = {"issue_description": "i", **_behavioral_fields("ok"), RUBRIC_FINDINGS_KEY: _rubric_findings()}
+    natural["behavioral_evidence"] = {
         "summary": "The agent searched the parser implementation but described progress behaviorally.",
         "evidence": "Lowercase parser is ordinary project vocabulary, not an evaluator label.",
     }

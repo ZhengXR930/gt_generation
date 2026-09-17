@@ -1,4 +1,4 @@
-"""Distillation roles as Codex subsessions.
+"""Distillation roles as agent subsessions.
 
 The diagnostician, Teacher, and Curator are agents, not one-shot completions.
 Each gets a working directory of input files and writes one JSON artifact back,
@@ -8,16 +8,18 @@ instead of a truncated excerpt, every role can grep and diff its inputs with
 real tools, and all four agents in the pipeline run on the same harness and
 model, so provenance stays comparable.
 
-Role workspaces deliberately get a clean `CODEX_HOME`: the PoC reproduction and
+Role workspaces deliberately get isolated agent state: the PoC reproduction and
 submission skills belong to the agent under study, not to the roles studying it.
 """
 from __future__ import annotations
 
+import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from harness_runtime.auth import load_env_key
 from harness_runtime.subsession import SubsessionSpec, run_codex_subsession
 
 from .artifacts import GT_RESULTS, REPO_ROOT, load_json_if_exists, write_json
@@ -157,7 +159,9 @@ class _Workspace:
     def copy(self, source: Path, name: str, description: str) -> bool:
         if not source.is_file():
             return False
-        shutil.copy2(source, self.inputs / name)
+        target = self.inputs / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
         self.index.append((f"inputs/{name}", description))
         return True
 
@@ -306,17 +310,114 @@ def build_teacher_role(
     space.copy_packet(packet)
     space.put("batch_diagnoses.json", diagnoses, "this batch's per-sample diagnoses")
     space.put("pools.json", pools_view,
-              "accumulated sample-level failure, success, and infrastructure diagnoses")
+              "accumulated target-reproduction, false-positive, failure, and infrastructure diagnoses")
     return space.finish("teacher", "teacher.md")
 
 
-def build_curator_role(workspace: Path, packet: Path, candidate_updates: list[dict[str, Any]]) -> RoleRun:
+def build_curator_role(
+    workspace: Path,
+    packet: Path,
+    candidate_updates: list[dict[str, Any]],
+    pools_view: dict[str, Any] | None = None,
+) -> RoleRun:
     space = _Workspace(workspace)
     space.copy_packet(packet)
     space.put("candidate_updates.json", candidate_updates,
               "the Teacher's proposals with their evidence")
+    if pools_view is not None:
+        space.put("pools.json", pools_view,
+                  "accumulated target-reproduction, false-positive, failure, and infrastructure diagnoses")
     return space.finish("curator", "curator.md")
 
+
+FINAL_BATCH_FILES = (
+    ("evaluation.json", "batch deterministic outcome and diagnostics report"),
+    ("diagnoses.json", "batch sample-level evidence abstractions"),
+    ("teacher_candidate_updates.json", "batch Teacher proposals with evidence"),
+    ("curator_decisions.json", "batch Curator decisions"),
+    ("correction_decision.json", "batch Correction audit, if any"),
+    ("applied_updates.json", "updates applied after this batch"),
+    ("training_loop.json", "training-loop event metadata"),
+)
+
+
+def _copy_final_stage_inputs(
+    space: _Workspace,
+    *,
+    initial_packet: Path,
+    latest_packet: Path,
+    run_dir: Path,
+    through_batch: int,
+    comparison_paths: list[Path] | None,
+) -> None:
+    space.copy_packet_as(initial_packet, "initial_skill",
+                         "the starting skill packet before training",
+                         snapshot_name="initial_lessons_snapshot.json")
+    space.copy_packet_as(latest_packet, "latest_skill",
+                         "the latest trained skill packet being curated",
+                         snapshot_name="latest_lessons_snapshot.json")
+    space.put("finalization_context.json", {
+        "through_batch": through_batch,
+        "initial_packet": str(initial_packet),
+        "latest_packet": str(latest_packet),
+    }, "metadata for this final-stage curation run")
+    space.copy(run_dir / "batch_summary.json", "batch_summary.json",
+               "baseline and batch ordering summary for the training split")
+    space.copy(run_dir / "pools.json", "pools.json",
+               "accumulated TRAIN success, failure, non-target-crash, and infrastructure pools")
+    for batch_index in range(through_batch + 1):
+        batch_dir = run_dir / f"batch_{batch_index:03d}"
+        for name, description in FINAL_BATCH_FILES:
+            space.copy(batch_dir / name, f"training_batches/batch_{batch_index:03d}/{name}", description)
+    for index, path in enumerate(comparison_paths or [], start=1):
+        if path.is_file():
+            space.copy(path, f"comparisons/comparison_{index:02d}.json",
+                       "optional held-out or validation comparison for final skill quality")
+
+
+def build_final_teacher_role(
+    workspace: Path,
+    *,
+    initial_packet: Path,
+    latest_packet: Path,
+    run_dir: Path,
+    through_batch: int,
+    comparison_paths: list[Path] | None = None,
+) -> RoleRun:
+    space = _Workspace(workspace)
+    _copy_final_stage_inputs(
+        space,
+        initial_packet=initial_packet,
+        latest_packet=latest_packet,
+        run_dir=run_dir,
+        through_batch=through_batch,
+        comparison_paths=comparison_paths,
+    )
+    return space.finish("final_teacher", "final_teacher.md")
+
+
+def build_final_curator_role(
+    workspace: Path,
+    *,
+    initial_packet: Path,
+    latest_packet: Path,
+    run_dir: Path,
+    through_batch: int,
+    final_teacher_review: Path,
+    comparison_paths: list[Path] | None = None,
+) -> RoleRun:
+    space = _Workspace(workspace)
+    _copy_final_stage_inputs(
+        space,
+        initial_packet=initial_packet,
+        latest_packet=latest_packet,
+        run_dir=run_dir,
+        through_batch=through_batch,
+        comparison_paths=comparison_paths,
+    )
+    space.copy(final_teacher_review, "final_teacher_review.json",
+               "Final Teacher lesson-level evidence review; primary curation input")
+    return space.finish("final_curator", "final_curator.md")
 
 
 
@@ -344,7 +445,7 @@ def build_correction_role(
     space.put("applied_updates.json", applied_updates,
               "updates that produced the tentative/current packet, if available")
     space.put("pools.json", pools_view,
-              "accumulated success, failure, crash, and infrastructure pools")
+              "accumulated target-reproduction, false-positive, failure, and infrastructure pools")
     if baseline_evaluations:
         space.put("baseline_evaluations.json", baseline_evaluations,
                   "optional baseline or initial-skill evaluations for comparison")
@@ -354,6 +455,7 @@ def build_correction_role(
 def execute_role(
     run: RoleRun,
     *,
+    harness: str = "codex",
     model: str,
     base_url: str,
     api_key_env: str,
@@ -361,11 +463,59 @@ def execute_role(
     reasoning_effort: str = "medium",
     max_output_tokens: int = 4096,
     timeout: int = 3600,
+    dsh_command: str = "",
 ) -> dict[str, Any]:
-    """Run one role as a Codex subsession and return its status plus artifact."""
+    """Run one role as an agent subsession and return its status plus artifact."""
+    normalized_harness = (harness or "codex").strip().lower()
+    if normalized_harness in {"deepseek_harness", "dsh"}:
+        status = _execute_dsh_role(
+            run,
+            model=model,
+            base_url=base_url,
+            api_key_env=api_key_env,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+            dsh_command=dsh_command,
+        )
+    elif normalized_harness == "codex":
+        status = _execute_codex_role(
+            run,
+            model=model,
+            base_url=base_url,
+            api_key_env=api_key_env,
+            api_version=api_version,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout,
+        )
+    else:
+        raise ValueError(f"unsupported role harness: {harness!r}")
+    parsed = load_json_if_exists(run.output_file) if status["status"] == "ok" else None
+    if status["status"] == "ok" and not isinstance(parsed, dict):
+        status["status"] = "invalid_output"
+        parsed = None
+    # The workspace carries its own last outcome, so a later run can decide
+    # whether to reuse, resume, or start over without consulting anything else.
+    write_json(run.workspace / STATUS_NAME, {k: v for k, v in status.items() if k != "parsed"})
+    status["parsed"] = parsed
+    return status
+
+
+def _execute_codex_role(
+    run: RoleRun,
+    *,
+    model: str,
+    base_url: str,
+    api_key_env: str,
+    api_version: str,
+    reasoning_effort: str,
+    max_output_tokens: int,
+    timeout: int,
+) -> dict[str, Any]:
+    """Run one role as a Codex subsession."""
     codex_home = run.workspace / ".codex_home"
     codex_home.mkdir(parents=True, exist_ok=True)
-    status = run_codex_subsession(SubsessionSpec(
+    return run_codex_subsession(SubsessionSpec(
         name=run.role,
         workspace=run.workspace,
         prompt=run.prompt,
@@ -381,12 +531,89 @@ def execute_role(
         log_dir=run.workspace / "logs",
         extra_env={"CODEX_HOME": str(codex_home)},
     ))
-    parsed = load_json_if_exists(run.output_file) if status["status"] == "ok" else None
-    if status["status"] == "ok" and not isinstance(parsed, dict):
-        status["status"] = "invalid_output"
-        parsed = None
-    # The workspace carries its own last outcome, so a later run can decide
-    # whether to reuse, resume, or start over without consulting anything else.
-    write_json(run.workspace / STATUS_NAME, {k: v for k, v in status.items() if k != "parsed"})
-    status["parsed"] = parsed
-    return status
+
+
+def _execute_dsh_role(
+    run: RoleRun,
+    *,
+    model: str,
+    base_url: str,
+    api_key_env: str,
+    reasoning_effort: str,
+    timeout: int,
+    dsh_command: str = "",
+) -> dict[str, Any]:
+    """Run one role through DeepSeek Harness rather than Codex."""
+    from harness_runtime.deepseek_harness.local import (
+        DEFAULT_DSH_COMMAND,
+        DEFAULT_DSH_NODE_ROOT,
+        run_dsh,
+        write_dsh_settings,
+    )
+
+    logs = run.workspace / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    prompt_path = run.workspace / "PROMPT.txt"
+    prompt_path.write_text(run.prompt, encoding="utf-8")
+
+    dsh_home = run.workspace / ".dsh_home"
+    dsh_effort = "high" if reasoning_effort == "medium" else reasoning_effort
+    write_dsh_settings(dsh_home, model, dsh_effort)
+    started_command = " ".join(
+        shlex.quote(part)
+        for part in [
+            dsh_command or DEFAULT_DSH_COMMAND or "dsh",
+            "--profile",
+            "headless",
+            str(prompt_path),
+        ]
+    )
+    try:
+        returncode, timed_out, stop_reason_hit, seconds = run_dsh(
+            dsh_src=Path(__file__).resolve().parents[2] / "external" / "deepseek-harness",
+            node_root=DEFAULT_DSH_NODE_ROOT,
+            dsh_command=dsh_command or DEFAULT_DSH_COMMAND,
+            dsh_home=dsh_home,
+            workspace=run.workspace,
+            prompt_path=prompt_path,
+            run_dir=logs,
+            api_key=load_env_key(api_key_env),
+            base_url=base_url,
+            timeout=timeout,
+            network_guard_bin=None,
+        )
+    except Exception as exc:
+        return {
+            "subsession": run.role,
+            "harness": "deepseek_harness",
+            "status": "failed",
+            "returncode": None,
+            "workspace": str(run.workspace),
+            "output_file": str(run.output_file),
+            "stdout": str(logs / "dsh_stdout.txt"),
+            "stderr": str(logs / "dsh_stderr.txt"),
+            "command": started_command,
+            "error": str(exc),
+        }
+    if timed_out:
+        status = "timeout"
+    elif returncode != 0:
+        status = "failed"
+    elif not run.output_file.is_file():
+        status = "missing_output"
+    else:
+        status = "ok"
+    return {
+        "subsession": run.role,
+        "harness": "deepseek_harness",
+        "status": status,
+        "returncode": returncode,
+        "workspace": str(run.workspace),
+        "output_file": str(run.output_file),
+        "stdout": str(logs / "dsh_stdout.txt"),
+        "stderr": str(logs / "dsh_stderr.txt"),
+        "command": started_command,
+        "timed_out": timed_out,
+        "stop_reason": stop_reason_hit,
+        "seconds": seconds,
+    }

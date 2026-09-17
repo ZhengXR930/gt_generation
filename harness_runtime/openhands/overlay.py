@@ -56,6 +56,128 @@ def _drop_modelhub_defaults_only_params(kwargs: dict[str, Any], model: str) -> N
         kwargs.pop(key, None)
 
 
+def _is_anthropic_wire_model(model: str) -> bool:
+    normalized = str(model or "").strip().lower()
+    return normalized.startswith("anthropic/") or normalized.startswith("claude-")
+
+
+def _content_blocks(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _assistant_tool_ids(message: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for tool_call in message.get("tool_calls") or []:
+        if not isinstance(tool_call, dict):
+            tool_id = getattr(tool_call, "id", None)
+        else:
+            tool_id = tool_call.get("id")
+        if tool_id:
+            ids.append(str(tool_id))
+    for block in _content_blocks(message.get("content")):
+        if block.get("type") == "tool_use" and block.get("id"):
+            ids.append(str(block["id"]))
+    return ids
+
+
+def _tool_result_ids(message: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    if message.get("role") == "tool" and message.get("tool_call_id"):
+        ids.append(str(message["tool_call_id"]))
+    for block in _content_blocks(message.get("content")):
+        if block.get("type") == "tool_result" and block.get("tool_use_id"):
+            ids.append(str(block["tool_use_id"]))
+    return ids
+
+
+def _strip_anthropic_tool_result_blocks(message: dict[str, Any]) -> dict[str, Any] | None:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    kept = [
+        block
+        for block in content
+        if not (isinstance(block, dict) and block.get("type") == "tool_result")
+    ]
+    if not kept:
+        return None
+    updated = dict(message)
+    updated["content"] = kept
+    return updated
+
+
+def _strip_assistant_tool_calls(message: dict[str, Any]) -> dict[str, Any] | None:
+    updated = dict(message)
+    updated.pop("tool_calls", None)
+    content = updated.get("content")
+    if isinstance(content, list):
+        content = [
+            block
+            for block in content
+            if not (isinstance(block, dict) and block.get("type") == "tool_use")
+        ]
+        updated["content"] = content
+    if updated.get("content") in (None, "", []):
+        return None
+    return updated
+
+
+def _sanitize_anthropic_tool_sequence(messages: Any) -> Any:
+    """Keep Anthropic tool_use/tool_result history strictly paired and adjacent."""
+    if not isinstance(messages, list):
+        return messages
+    sanitized: list[Any] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict):
+            sanitized.append(message)
+            index += 1
+            continue
+
+        tool_ids = _assistant_tool_ids(message) if message.get("role") == "assistant" else []
+        if tool_ids:
+            expected = set(tool_ids)
+            seen: set[str] = set()
+            result_messages: list[dict[str, Any]] = []
+            cursor = index + 1
+            while cursor < len(messages):
+                candidate = messages[cursor]
+                if not isinstance(candidate, dict):
+                    break
+                result_ids = set(_tool_result_ids(candidate))
+                if not result_ids or not result_ids <= expected or seen & result_ids:
+                    break
+                seen |= result_ids
+                result_messages.append(candidate)
+                cursor += 1
+                if seen == expected:
+                    break
+            if seen == expected:
+                sanitized.append(message)
+                sanitized.extend(result_messages)
+                index = cursor
+                continue
+            stripped = _strip_assistant_tool_calls(message)
+            if stripped is not None:
+                sanitized.append(stripped)
+            index += 1
+            continue
+
+        if _tool_result_ids(message):
+            stripped_result = _strip_anthropic_tool_result_blocks(message)
+            if stripped_result is not None and stripped_result.get("role") != "tool":
+                sanitized.append(stripped_result)
+            index += 1
+            continue
+
+        sanitized.append(message)
+        index += 1
+    return sanitized
+
+
 def _capture_enabled() -> bool:
     return (
         os.environ.get("OPENHANDS_HARNESS_MODE", "evaluation") == "evaluation"
@@ -558,12 +680,11 @@ def install_fine_trace_overlay() -> None:
             # deployments, but the endpoint does support OpenAI-compatible
             # tool_calls.  Force OpenHands to actually pass tools.
             self._function_calling_active = True
-        if getattr(self, "_analysis_artifact_modelhub_patch", False):
-            return
-        if not _is_modelhub_defaults_only_model(configured_model):
+        if getattr(self, "_analysis_artifact_completion_patch", False):
             return
         original_completion = self._completion_unwrapped
-        if isinstance(original_completion, partial):
+        modelhub_defaults_only = _is_modelhub_defaults_only_model(configured_model)
+        if modelhub_defaults_only and isinstance(original_completion, partial):
             bound_kwargs = dict(original_completion.keywords or {})
             _drop_modelhub_defaults_only_params(bound_kwargs, self.config.model)
             original_completion = partial(
@@ -572,15 +693,26 @@ def install_fine_trace_overlay() -> None:
                 **bound_kwargs,
             )
 
-        def completion_without_unsupported_defaults(*call_args, **call_kwargs):
+        def completion_with_harness_patches(*call_args, **call_kwargs):
             _drop_modelhub_defaults_only_params(call_kwargs, self.config.model)
+            if _is_anthropic_wire_model(getattr(self.config, "model", "")):
+                if len(call_args) > 1:
+                    call_args = (
+                        call_args[0],
+                        _sanitize_anthropic_tool_sequence(call_args[1]),
+                        *call_args[2:],
+                    )
+                if "messages" in call_kwargs:
+                    call_kwargs["messages"] = _sanitize_anthropic_tool_sequence(
+                        call_kwargs["messages"]
+                    )
             return original_completion(*call_args, **call_kwargs)
 
-        self._completion_unwrapped = completion_without_unsupported_defaults
-        self._completion = completion_without_unsupported_defaults
-        self.config.temperature = None
-        self.config.top_p = None
-        self._analysis_artifact_modelhub_patch = True
+        self._completion_unwrapped = completion_with_harness_patches
+        if modelhub_defaults_only:
+            self.config.temperature = None
+            self.config.top_p = None
+        self._analysis_artifact_completion_patch = True
 
     async def handle_action(controller, action):
         if (

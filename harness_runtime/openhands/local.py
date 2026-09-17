@@ -16,6 +16,7 @@ This is intentionally separate from the ARVO/CyberGym OpenHands runner.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import http.server
 import json
 import logging
@@ -1755,6 +1756,10 @@ def main() -> int:
     results_dir = args.results_dir.expanduser().resolve()
     sample_result_dir = results_dir / args.sample_id
     gt_sample_dir = GT_ROOT / "gt_results" / args.sample_id
+    results_dir.mkdir(parents=True, exist_ok=True)
+    result_lock_path = results_dir / f".{args.sample_id}.result.lock"
+    result_lock_file = result_lock_path.open("w", encoding="utf-8")
+    fcntl.flock(result_lock_file, fcntl.LOCK_EX)
     clear_previous_result(sample_result_dir)
     sample_result_dir.mkdir(parents=True, exist_ok=True)
     framework = (

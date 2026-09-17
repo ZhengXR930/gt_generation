@@ -108,16 +108,21 @@ def result_is_complete(sample_dir: Path) -> bool:
     manifest = sample_dir / "manifest.json"
     analysis = sample_dir / "analysis.json"
     checkpoint = sample_dir / "checkpoint"
-    if not manifest.is_file() or not analysis.is_file() or not checkpoint.is_dir():
+    if not manifest.is_file() or not checkpoint.is_dir():
         return False
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-        artifact = json.loads(analysis.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     if payload.get("status") not in {"success", "iteration_cap", "agent_finished"}:
         return False
     if not payload.get("workspace_adapter"):
+        return False
+    if not analysis.is_file():
+        return True
+    try:
+        artifact = json.loads(analysis.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return False
     return (
         isinstance(artifact, dict)
@@ -171,6 +176,34 @@ def maybe_run_reachability(
     if "error" in result:
         return {"status": "error", "error": result["error"]}
     return {"status": "complete", "summary": result.get("summary") or {}}
+
+
+def update_manifest_reachability(sample_dir: Path, reachability: dict[str, Any]) -> None:
+    manifest_path = sample_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    manifest["reachability"] = reachability
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def existing_reachability(sample_dir: Path) -> dict[str, Any] | None:
+    report_path = sample_dir / "reachability_eval.json"
+    if not report_path.is_file():
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"status": "present", "path": "reachability_eval.json"}
+    if isinstance(report, dict) and isinstance(report.get("summary"), dict):
+        return {"status": "complete", "summary": report["summary"]}
+    return {"status": "present", "path": "reachability_eval.json"}
 
 
 def maybe_write_context_visit(sample_dir: Path) -> dict[str, Any]:
@@ -270,10 +303,13 @@ def run_one(
             "status": "skipped",
             "results_dir": str(sample_dir),
         }
-        if not (sample_dir / "reachability_eval.json").is_file():
-            record["reachability"] = maybe_run_reachability(
+        reachability = existing_reachability(sample_dir)
+        if reachability is None:
+            reachability = maybe_run_reachability(
                 config, run_id=run_id, sample_id=sample_id, sample_dir=sample_dir
             )
+        record["reachability"] = reachability
+        update_manifest_reachability(sample_dir, reachability)
         return record
     if request.skill_packet is not None and not request.skill_packet.is_dir():
         error = f"FileNotFoundError: skill packet not found: {request.skill_packet}"
@@ -391,9 +427,16 @@ def run_one(
     if (sample_dir / "checkpoint").is_dir():
         record["context_visit"] = maybe_write_context_visit(sample_dir)
     if has_sample_artifact:
-        record["reachability"] = maybe_run_reachability(
-            config, run_id=run_id, sample_id=sample_id, sample_dir=sample_dir
-        )
+        if record["status"] == "failed":
+            record["adapter_returncode"] = record["returncode"]
+            record["status"] = "complete"
+        reachability = existing_reachability(sample_dir)
+        if reachability is None:
+            reachability = maybe_run_reachability(
+                config, run_id=run_id, sample_id=sample_id, sample_dir=sample_dir
+            )
+        record["reachability"] = reachability
+        update_manifest_reachability(sample_dir, reachability)
     else:
         if proc is not None and proc.returncode == 0:
             record["status"] = "failed"

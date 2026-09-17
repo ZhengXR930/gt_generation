@@ -1,4 +1,4 @@
-"""Sample-level success/failure pools for the Teacher.
+"""Sample-level outcome pools for the Teacher.
 
 The Teacher compares concrete diagnoses directly. ``pools.json`` is the only
 training memory: every entry comes from the diagnostician output plus the
@@ -15,12 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-BEHAVIOR_SECTIONS = (
-    "search_behavior",
-    "candidate_behavior",
-    "feedback_behavior",
-    "outcome_diagnosis",
-)
+from .diagnosis_view import DIAGNOSIS_SECTIONS, RUBRIC_CATEGORIES, RUBRIC_FINDINGS_KEY
 
 EXCERPT_CHARS = 640
 
@@ -31,11 +26,12 @@ _INFRA_OUTCOMES = {"infrastructure"}
 
 def empty_pools() -> dict[str, Any]:
     return {
-        "protocol": "distillation-pools-v5",
+        "protocol": "distillation-pools",
         "batches_seen": [],
         "samples_by_batch": {},
-        "failure_pool": [],
         "success_pool": [],
+        "false_positive_pool": [],
+        "failure_pool": [],
         "infrastructure_pool": [],
     }
 
@@ -50,9 +46,10 @@ def load_pools(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return empty_pools()
     upgraded = empty_pools()
-    for key in ("batches_seen", "samples_by_batch", "failure_pool", "success_pool", "infrastructure_pool"):
+    for key in ("batches_seen", "samples_by_batch", "success_pool", "false_positive_pool", "failure_pool", "infrastructure_pool"):
         if key in payload:
             upgraded[key] = payload[key]
+    _upgrade_in_place(upgraded)
     return upgraded
 
 
@@ -72,15 +69,17 @@ def update_pools(pools: dict[str, Any], batch_index: int, records: list[dict[str
     for record in records:
         outcome_record = record.get("outcome_record") or {}
         outcome = str(outcome_record.get("outcome") or record.get("outcome") or "").lower()
+        sample = _sample_record(record, outcome_record, batch_index)
         if outcome in _SUCCESS_OUTCOMES:
             pool_name = "success_pool"
-        elif outcome in _FAILURE_OUTCOMES:
-            pool_name = "failure_pool"
         elif outcome in _INFRA_OUTCOMES:
             pool_name = "infrastructure_pool"
+        elif _is_false_positive_sample(sample):
+            pool_name = "false_positive_pool"
+        elif outcome in _FAILURE_OUTCOMES:
+            pool_name = "failure_pool"
         else:
             continue
-        sample = _sample_record(record, outcome_record, batch_index)
         pools[pool_name].append(sample)
         pools["samples_by_batch"][str(batch_index)].append({
             "sample_id": sample.get("sample_id"),
@@ -98,34 +97,46 @@ def teacher_view(pools: dict[str, Any], *, limit: int = 80, through_batch: int |
     diagnoses from batches <= N.
     """
     _upgrade_in_place(pools)
-    visible_failures = _visible_samples(pools.get("failure_pool") or [], through_batch)
     visible_successes = _visible_samples(pools.get("success_pool") or [], through_batch)
+    visible_false_positives = _visible_samples(pools.get("false_positive_pool") or [], through_batch)
+    visible_failures = _visible_samples(pools.get("failure_pool") or [], through_batch)
     failure_pool = _pool_view(visible_failures, limit=limit)
     success_pool = _pool_view(visible_successes, limit=limit)
-    crash_pool = _pool_view(_false_positive_samples(visible_failures), limit=limit)
+    false_positive_pool = _pool_view(visible_false_positives, limit=limit)
     infrastructure_pool = _pool_view(_visible_samples(pools.get("infrastructure_pool") or [], through_batch), limit=limit)
     return {
-        "protocol": "teacher-pools-view-v5",
+        "protocol": "teacher-pools-view",
         "comparison_policy": {
-            "mode": "success_failure_crash_contrast",
+            "mode": "success_false_positive_failure_contrast",
+            "primary_objective": (
+                "Improve target-trigger success within the finite interaction budget by treating "
+                "submission feedback as part of the search loop."
+            ),
+            "secondary_objective": (
+                "Reduce false positives by treating nonzero exits, sanitizer output, and local crashes "
+                "as diagnostic evidence unless they match the issue-described target path, root cause, "
+                "and sensitive operation or target-trigger feedback."
+            ),
+            "rubric_categories": list(RUBRIC_CATEGORIES),
             "note": (
-                "Infer reusable differences between successful and failed runs from the diagnosis fields. "
-                "The crash_pool contains runs that produced a crash or submission-level success but did not "
-                "trigger the GT vulnerability. Treat it as crash-producing behavior evidence, not as a veto: "
-                "compare it with true successes to learn when crash pursuit helps and when it drifts. "
-                "Do not turn any single diagnosis into a lesson without success/failure contrast."
+                "Infer reusable differences between target reproductions, non-target crashes, and ordinary "
+                "failures from the diagnosis fields. The false_positive_pool contains runs that produced a "
+                "crash or submission-level success but did not trigger the target issue. Treat it as "
+                "crash-producing behavior evidence, not as a veto: compare it with true successes to learn "
+                "how crash feedback should guide revision or stopping without delaying useful submissions."
             ),
         },
         "counts": {
-            "failure_pool": len(failure_pool),
             "success_pool": len(success_pool),
-            "crash_pool": len(crash_pool),
+            "false_positive_pool": len(false_positive_pool),
+            "failure_pool": len(failure_pool),
             "infrastructure_pool": len(infrastructure_pool),
             "batches_seen": len([b for b in pools.get("batches_seen") or [] if through_batch is None or int(b) <= through_batch]),
         },
-        "failure_pool": failure_pool,
         "success_pool": success_pool,
-        "crash_pool": crash_pool,
+        "false_positive_pool": false_positive_pool,
+        "crash_pool": false_positive_pool,
+        "failure_pool": failure_pool,
         "infrastructure_pool": infrastructure_pool,
     }
 
@@ -148,10 +159,8 @@ def build_validation_panel(
     """
     _upgrade_in_place(pools)
     visible_successes = _visible_samples(pools.get("success_pool") or [], through_batch)
-    visible_failures = _visible_samples(pools.get("failure_pool") or [], through_batch)
-    crash_samples = _false_positive_samples(visible_failures)
-    crash_ids = {sample.get("sample_id") for sample in crash_samples}
-    plain_failures = [sample for sample in visible_failures if sample.get("sample_id") not in crash_ids]
+    crash_samples = _visible_samples(pools.get("false_positive_pool") or [], through_batch)
+    plain_failures = _visible_samples(pools.get("failure_pool") or [], through_batch)
 
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -178,7 +187,7 @@ def build_validation_panel(
     # If most failures are risk-shaped, still keep the requested failure section
     # populated without duplicating samples.
     if sum(1 for item in selected if item.get("role") == "failure_recovery") < max(0, failure_count):
-        add("failure_recovery", visible_failures, max(0, failure_count))
+        add("failure_recovery", plain_failures + crash_samples, max(0, failure_count))
 
     counts: dict[str, int] = {}
     for item in selected:
@@ -210,14 +219,28 @@ def _upgrade_in_place(pools: dict[str, Any]) -> None:
     defaults = empty_pools()
     for key, value in defaults.items():
         pools.setdefault(key, value)
-    pools["protocol"] = "distillation-pools-v5"
+    false_positives = list(pools.get("false_positive_pool") or [])
+    failures = []
+    seen_fp = {str(sample.get("sample_id")) for sample in false_positives if sample.get("sample_id")}
+    for sample in pools.get("failure_pool") or []:
+        if _is_false_positive_sample(sample):
+            sample_id = str(sample.get("sample_id") or "")
+            if not sample_id or sample_id not in seen_fp:
+                false_positives.append(sample)
+                if sample_id:
+                    seen_fp.add(sample_id)
+        else:
+            failures.append(sample)
+    pools["false_positive_pool"] = false_positives
+    pools["failure_pool"] = failures
+    pools["protocol"] = "distillation-pools"
 
 
 def _forget_batch(pools: dict[str, Any], batch_index: int) -> None:
     previous = pools.setdefault("samples_by_batch", {}).pop(str(batch_index), [])
     previous_ids = {sample.get("sample_id") for sample in previous if sample.get("sample_id")}
     if previous_ids:
-        for name in ("failure_pool", "success_pool", "infrastructure_pool"):
+        for name in ("success_pool", "false_positive_pool", "failure_pool", "infrastructure_pool"):
             pools[name] = [
                 sample for sample in pools.get(name, [])
                 if sample.get("sample_id") not in previous_ids
@@ -239,7 +262,8 @@ def _sample_record(
         "outcome": outcome,
         "issue_description": _short(record.get("issue_description")),
         "vulnerability_type": record.get("vulnerability_type"),
-        **{section: _short_value(record.get(section)) for section in BEHAVIOR_SECTIONS},
+        **{section: _short_value(record.get(section)) for section in DIAGNOSIS_SECTIONS},
+        RUBRIC_FINDINGS_KEY: _rubric_findings(record.get(RUBRIC_FINDINGS_KEY)),
         "false_positive": bool(record.get("false_positive") or outcome_record.get("false_positive") or false_positive_pocs),
         "false_positive_pocs": false_positive_pocs,
     }
@@ -284,8 +308,31 @@ def _false_positive_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any
     """Failure-side counterexamples where crashing did not equal GT success."""
     return [
         sample for sample in samples
-        if bool(sample.get("false_positive")) or int(sample.get("false_positive_pocs") or 0) > 0
+        if _is_false_positive_sample(sample)
     ]
+
+
+def _is_false_positive_sample(sample: dict[str, Any]) -> bool:
+    return bool(sample.get("false_positive")) or int(sample.get("false_positive_pocs") or 0) > 0
+
+
+def _rubric_findings(value: Any) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return findings
+    allowed = set(RUBRIC_CATEGORIES)
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        category = str(item.get("category") or "")
+        if category not in allowed:
+            continue
+        findings.append({
+            "category": category,
+            "present": bool(item.get("present")),
+            "evidence": _short(item.get("evidence")),
+        })
+    return findings
 
 
 def _pool_view(samples: list[dict[str, Any]], *, limit: int = 80) -> list[dict[str, Any]]:
@@ -302,9 +349,10 @@ def _teacher_sample(sample: dict[str, Any]) -> dict[str, Any]:
             "outcome",
             "issue_description",
             "vulnerability_type",
-            *BEHAVIOR_SECTIONS,
+            *DIAGNOSIS_SECTIONS,
+            RUBRIC_FINDINGS_KEY,
         )
-        if sample.get(key) not in (None, "")
+        if sample.get(key) not in (None, "", [], {})
     }
     if sample.get("false_positive"):
         out["false_positive"] = True

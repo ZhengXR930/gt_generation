@@ -26,7 +26,6 @@ def build_command(request: RewardRequest) -> RewardCommand:
         *common_args(request),
         "--reasoning-effort",
         reasoning_effort,
-        "--no-run-reachability-after-generation",
     ]
     if request.skill_packet is not None:
         args += ["--workspace-installer", INSTALLER]
