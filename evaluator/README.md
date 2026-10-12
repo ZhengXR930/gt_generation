@@ -60,27 +60,36 @@ Before any comparison, operands are normalized through the same pipeline:
   rather than ordinary wrong-location claims. `norm_unresolved_rate_all` keeps
   the all-comparisons debug view.
 
-The headline reasoning report uses the same three levels for each dimension:
-`loc`, `partial`, and `full`.
+The headline reasoning report uses `location`/`operand`/`relation` levels for
+source, root cause, and sink. Propagation is reported as node-sequence strength.
 
-- Source: `loc` is file suffix + function + line within tolerance. `full` is
-  `loc` plus source operand match. Source has no separate `partial` layer and
-  no relation score.
-- Propagation: `loc` is chain endpoint coverage in the correct direction.
-  `partial` is `loc` plus carrier operand match. `full` is `partial` plus
-  required edge relation. Edge type is retained as a diagnostic field.
-- Safety obligation: `loc` is the root-cause/safety-obligation location.
-  `partial` is `loc` plus operand match. `full` is `partial` plus exact
-  relation match with normalized left/right operands; flipped-equivalent
-  relations count, for example `lt(a,b)` equals `gt(b,a)`. Operand
-  normalization includes structural aliases, macro/constant aliases, and
-  source-expression containment where it preserves the relation operands.
-- Sink: `loc` is the violation/sink location. `partial` is `loc` plus operand
-  match. `full` is `partial` plus relation match; flipped-equivalent relations
+- Source: `location` is file suffix + function + line within tolerance.
+  `operand` is `location` plus source operand match. Source has no `relation`
+  score because the `vuln_logic` schema does not attach an obligation relation
+  to the source anchor.
+- Propagation: `node_recall` is the fraction of GT propagation nodes recovered
+  by the model's propagation endpoints, `node_precision` is the fraction of
+  model propagation endpoints that match GT nodes, and `ordered_coverage` is the
+  longest model endpoint subsequence that does not violate GT node order divided
+  by the sample's GT node count. Each sample is scored as a ratio first; batch
+  summaries average those per-sample ratios so every sample has equal weight.
+- Root cause: `location` is the GT root-cause anchor. `operand` is `location`
+  plus root-cause operand match. `relation` is `operand` plus the safety
+  obligation relation at that root-cause point; flipped-equivalent relations
   count, for example `lt(a,b)` equals `gt(b,a)`.
+- Sink: `location` is the violation/sink location. `operand` is `location` plus
+  operand match. `relation` is `operand` plus relation match; flipped-equivalent
+  relations count, for example `lt(a,b)` equals `gt(b,a)`.
+
+The formal operand and relation scores are strict 0/1 decisions per sample:
+a prediction must satisfy the configured normalized equivalence check to count.
+
+Source, root-cause, and sink anchors are read directly from `ground_truth.json`;
+the evaluator does not fall back to another invariant role when an anchor is
+missing or ambiguous.
 
 The batch summary exposes these under
-`summary.<model>.reasoning_dimensions.{source,propagation,obligation,sink}`.
+`summary.<model>.reasoning_dimensions.{source,propagation,root_cause,sink}`.
 
 Free-form notes are never read. There is no text similarity, embedding scorer,
 semantic-claim bridge, or LLM judge.

@@ -354,7 +354,7 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     reasoning = [
         item["reasoning"] for item in rows
         if item.get("reasoning", {}).get("evaluation_protocol")
-        == "vuln-logic-invariant-reasoning-v2"
+        == "vuln-logic-invariant-reasoning-v3"
     ]
     fine_trace = [
         item["fine_trace_coverage"] for item in rows
@@ -414,20 +414,6 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     r5_known = [
         item for item in locations if item.get("R5_sanitizer_triggered") is not None
     ]
-    propagation_chain_total = _sum_int(reasoning, "propagation_total")
-    propagation_chain_loc_hits = _sum_int(reasoning, "propagation_loc_hits")
-    propagation_chain_partial_hits = _sum_int(reasoning, "propagation_partial_hits")
-    propagation_chain_carrier_hits = _sum_int(
-        reasoning, "propagation_carrier_hits"
-    )
-    propagation_chain_carrier_partial_hits = _sum_int(
-        reasoning, "propagation_carrier_partial_hits"
-    )
-    propagation_chain_exact_full_hits = _sum_int(
-        reasoning, "propagation_exact_full_hits"
-    )
-    propagation_chain_full_hits = _sum_int(reasoning, "propagation_full_hits")
-    propagation_chain_names = _propagation_chain_names(reasoning)
     depth_distribution = {
         depth: sum(item.get("reachability_depth") == depth for item in locations)
         for depth in ("R0", "R1", "R2", "R3", "R4", "R5")
@@ -464,55 +450,28 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "reasoning_dimensions": {
             "source": {
-                "loc": _mean(reasoning, "source_loc_score"),
-                "partial": None,
-                "full": _mean(reasoning, "source_full_score"),
+                "location": _mean(reasoning, "source_location_score"),
+                "operand": _mean(reasoning, "source_operand_score"),
             },
             "propagation": {
-                "loc": _mean(reasoning, "propagation_loc_score"),
-                "partial": _mean(reasoning, "propagation_partial_score"),
-                "full": _mean(reasoning, "propagation_full_score"),
+                "node_recall": _mean(reasoning, "propagation_node_recall_score"),
+                "node_precision": _mean(reasoning, "propagation_node_precision_score"),
+                "ordered_coverage": _mean(reasoning, "propagation_ordered_coverage_score"),
             },
-            "obligation": {
-                "loc": _mean(reasoning, "obligation_loc_score"),
-                "partial": _mean(reasoning, "obligation_partial_score"),
-                "full": _mean(reasoning, "obligation_full_score"),
+            "root_cause": {
+                "location": _mean(reasoning, "root_cause_location_score"),
+                "operand": _mean(reasoning, "root_cause_operand_score"),
+                "relation": _mean(reasoning, "root_cause_relation_score"),
             },
             "sink": {
-                "loc": _mean(reasoning, "sink_loc_score"),
-                "partial": _mean(reasoning, "sink_partial_score"),
-                "full": _mean(reasoning, "sink_full_score"),
+                "location": _mean(reasoning, "sink_location_score"),
+                "operand": _mean(reasoning, "sink_operand_score"),
+                "relation": _mean(reasoning, "sink_relation_score"),
             },
         },
-        "propagation_gap": _mean(reasoning, "propagation_gap"),
-        "propagation_chain_total": propagation_chain_total,
-        "propagation_chain_loc_hits": propagation_chain_loc_hits,
-        "propagation_chain_loc_rate": _ratio(
-            propagation_chain_loc_hits, propagation_chain_total
-        ),
-        "propagation_chain_partial_hits": propagation_chain_partial_hits,
-        "propagation_chain_partial_rate": _ratio(
-            propagation_chain_partial_hits, propagation_chain_total
-        ),
-        "propagation_chain_carrier_hits": propagation_chain_carrier_hits,
-        "propagation_chain_carrier_rate": _ratio(
-            propagation_chain_carrier_hits, propagation_chain_total
-        ),
-        "propagation_chain_carrier_partial_hits": (
-            propagation_chain_carrier_partial_hits
-        ),
-        "propagation_chain_carrier_partial_rate": _ratio(
-            propagation_chain_carrier_partial_hits, propagation_chain_total
-        ),
-        "propagation_chain_exact_full_hits": propagation_chain_exact_full_hits,
-        "propagation_chain_exact_full_rate": _ratio(
-            propagation_chain_exact_full_hits, propagation_chain_total
-        ),
-        "propagation_chain_full_hits": propagation_chain_full_hits,
-        "propagation_chain_full_rate": _ratio(
-            propagation_chain_full_hits, propagation_chain_total
-        ),
-        "propagation_chain_names": propagation_chain_names,
+        "propagation_node_recall": _mean(reasoning, "propagation_node_recall_score"),
+        "propagation_node_precision": _mean(reasoning, "propagation_node_precision_score"),
+        "propagation_ordered_coverage": _mean(reasoning, "propagation_ordered_coverage_score"),
         "norm_unresolved_rate": _mean(reasoning, "norm_unresolved_rate"),
         "norm_unresolved_rate_all": _mean(reasoning, "norm_unresolved_rate_all"),
         "submitted_unique_pocs": submitted,
@@ -591,28 +550,6 @@ def _mean_stage(rows: list[dict[str, Any]], stage: str) -> float | None:
         if (item.get("stage_coverage") or {}).get(stage) is not None
     ]
     return sum(bool(value) for value in values) / len(values) if values else None
-
-
-def _sum_int(rows: list[dict[str, Any]], key: str) -> int:
-    return sum(int(item.get(key) or 0) for item in rows)
-
-
-def _ratio(numerator: int, denominator: int) -> float | None:
-    return numerator / denominator if denominator else None
-
-
-def _propagation_chain_names(rows: list[dict[str, Any]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for row in rows:
-        diagnostics = row.get("diagnostics")
-        if not isinstance(diagnostics, dict):
-            continue
-        for chain in diagnostics.get("propagation") or []:
-            if not isinstance(chain, dict) or chain.get("available") is False:
-                continue
-            name = str(chain.get("chain") or "unknown")
-            counts[name] = counts.get(name, 0) + 1
-    return dict(sorted(counts.items()))
 
 
 def main(argv: list[str] | None = None) -> int:
