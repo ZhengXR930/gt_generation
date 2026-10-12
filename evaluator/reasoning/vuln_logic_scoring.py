@@ -11,6 +11,7 @@ import ast
 import json
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -278,6 +279,7 @@ def score_vuln_logic(
     normalizer = ExpressionNormalizer(bindings if isinstance(bindings, dict) else {})
 
     nodes = [item for item in invariants.get("nodes", []) if isinstance(item, dict)]
+    edges = [item for item in invariants.get("edges", []) if isinstance(item, dict)]
     source_anchor = _gt_point_anchor(gt.get("source"), "source")
     root_cause_anchor = _gt_point_anchor(gt.get("root_cause"), "root_cause")
     sink_anchor = _gt_point_anchor(gt.get("sink"), "sink")
@@ -308,6 +310,7 @@ def score_vuln_logic(
     )
     propagation_node_scores = _score_propagation_nodes(
         nodes,
+        edges,
         logic.get("propagation"),
         line_tolerance,
     )
@@ -319,7 +322,7 @@ def score_vuln_logic(
     root_cause_scores = _point_scores(root_cause_result, require_relation=True)
     sink_scores = _point_scores(sink_result, require_relation=True)
     propagation_scores = {
-        "mode": "node_sequence",
+        "mode": "node_partial_order",
         "node_recall": propagation_node_scores["node_recall"],
         "node_precision": propagation_node_scores["node_precision"],
         "ordered_coverage": propagation_node_scores["ordered_coverage"],
@@ -410,6 +413,7 @@ def _point_scores(
 
 def _score_propagation_nodes(
     gt_nodes: list[dict[str, Any]],
+    gt_edges: list[dict[str, Any]],
     agent_edges: Any,
     line_tolerance: int,
 ) -> dict[str, Any]:
@@ -420,7 +424,12 @@ def _score_propagation_nodes(
         agent_points,
         line_tolerance,
     )
-    ordered_count = _ordered_location_coverage(sequence, agent_points, line_tolerance)
+    ordered_count = _ordered_location_coverage(
+        sequence,
+        gt_edges,
+        agent_points,
+        line_tolerance,
+    )
     gt_total = len(sequence)
     agent_total = len(agent_points)
     recall = (matched_count / gt_total) if gt_total else None
@@ -439,7 +448,7 @@ def _score_propagation_nodes(
         "matched_nodes": matched_count,
         "ordered_nodes": ordered_count,
         "diagnostics": {
-            "mode": "node_sequence",
+            "mode": "node_partial_order",
             "line_tolerance": line_tolerance,
             "gt_nodes": [
                 {
@@ -489,6 +498,7 @@ def _propagation_gt_node_sequence(
 
 def _agent_propagation_points(agent_edges: Any) -> list[dict[str, Any]]:
     points: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
     agents = agent_edges if isinstance(agent_edges, list) else []
     for edge in agents:
         if not isinstance(edge, dict):
@@ -497,8 +507,10 @@ def _agent_propagation_points(agent_edges: Any) -> list[dict[str, Any]]:
             point = edge.get(endpoint)
             if not isinstance(point, dict) or not _has_location(point):
                 continue
-            if points and _point_dedupe_key(points[-1]) == _point_dedupe_key(point):
+            key = _point_dedupe_key(point)
+            if key in seen:
                 continue
+            seen.add(key)
             points.append(point)
     return points
 
@@ -531,24 +543,111 @@ def _maximum_location_matching(
 
 def _ordered_location_coverage(
     gt_nodes: list[dict[str, Any]],
+    gt_edges: list[dict[str, Any]],
     agent_points: list[dict[str, Any]],
     line_tolerance: int,
 ) -> int:
     if not gt_nodes or not agent_points:
         return 0
-    rows = len(gt_nodes)
-    cols = len(agent_points)
-    dp = [[0] * (cols + 1) for _ in range(rows + 1)]
-    for gt_index, node in enumerate(gt_nodes, start=1):
-        for agent_index, point in enumerate(agent_points, start=1):
-            if _location_matches(_loc(node), _loc(point), line_tolerance):
-                dp[gt_index][agent_index] = dp[gt_index - 1][agent_index - 1] + 1
-            else:
-                dp[gt_index][agent_index] = max(
-                    dp[gt_index - 1][agent_index],
-                    dp[gt_index][agent_index - 1],
-                )
-    return dp[rows][cols]
+    reachable_after = _propagation_reachability_masks(gt_nodes, gt_edges)
+    point_matches = [
+        _matching_gt_mask(gt_nodes, point, line_tolerance)
+        for point in agent_points
+    ]
+
+    @lru_cache(maxsize=None)
+    def best_from(agent_index: int, selected_gt: int) -> int:
+        if agent_index >= len(point_matches):
+            return 0
+        best = best_from(agent_index + 1, selected_gt)
+        candidates = point_matches[agent_index] & ~selected_gt
+        while candidates:
+            bit = candidates & -candidates
+            gt_index = bit.bit_length() - 1
+            candidates ^= bit
+            # Agent order says every previously selected GT node is before this
+            # candidate. That only violates the GT partial order when the
+            # candidate can reach one of those previous nodes in the GT graph.
+            if reachable_after[gt_index] & selected_gt:
+                continue
+            best = max(best, 1 + best_from(agent_index + 1, selected_gt | bit))
+        return best
+
+    return best_from(0, 0)
+
+
+def _matching_gt_mask(
+    gt_nodes: list[dict[str, Any]],
+    agent_point: dict[str, Any],
+    line_tolerance: int,
+) -> int:
+    mask = 0
+    for index, node in enumerate(gt_nodes):
+        if _location_matches(_loc(node), _loc(agent_point), line_tolerance):
+            mask |= 1 << index
+    return mask
+
+
+def _propagation_reachability_masks(
+    gt_nodes: list[dict[str, Any]],
+    gt_edges: list[dict[str, Any]],
+) -> list[int]:
+    node_count = len(gt_nodes)
+    masks = [0] * node_count
+    node_id_to_index = {
+        str(node.get("invariant_id") or ""): index
+        for index, node in enumerate(gt_nodes)
+        if str(node.get("invariant_id") or "")
+    }
+    for edge in gt_edges:
+        from_index = node_id_to_index.get(str(edge.get("from_node") or ""))
+        to_index = node_id_to_index.get(str(edge.get("to_node") or ""))
+        if from_index is None or to_index is None:
+            from_index = _edge_endpoint_index(
+                gt_nodes,
+                edge,
+                prefix="from",
+            )
+            to_index = _edge_endpoint_index(gt_nodes, edge, prefix="to")
+        if from_index is None or to_index is None or from_index == to_index:
+            continue
+        masks[from_index] |= 1 << to_index
+
+    changed = True
+    while changed:
+        changed = False
+        for index in range(node_count):
+            expanded = masks[index]
+            targets = expanded
+            while targets:
+                bit = targets & -targets
+                target_index = bit.bit_length() - 1
+                targets ^= bit
+                expanded |= masks[target_index]
+            if expanded != masks[index]:
+                masks[index] = expanded
+                changed = True
+    return masks
+
+
+def _edge_endpoint_index(
+    gt_nodes: list[dict[str, Any]],
+    edge: dict[str, Any],
+    *,
+    prefix: str,
+) -> int | None:
+    endpoint = {
+        "file": edge.get(f"{prefix}_file"),
+        "function": edge.get(f"{prefix}_function"),
+        "line": edge.get(f"{prefix}_line"),
+    }
+    if not _has_location(endpoint):
+        location = edge.get(f"{prefix}_location")
+        endpoint = location if isinstance(location, dict) else endpoint
+    for index, node in enumerate(gt_nodes):
+        if _point_dedupe_key(node) == _point_dedupe_key(endpoint):
+            return index
+    return None
 
 
 def _has_location(item: dict[str, Any]) -> bool:

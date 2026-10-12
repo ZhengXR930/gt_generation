@@ -345,7 +345,11 @@ def test_propagation_uses_node_recall_precision_and_ordered_coverage(tmp_path):
                     "relation": {"op": "lt", "left": "idx", "right": "cap"},
                 },
             ],
-            "edges": [],
+            "edges": [
+                {"from_node": "N-SOURCE", "to_node": "N-MID", "type": "data"},
+                {"from_node": "N-MID", "to_node": "N-ROOT", "type": "data"},
+                {"from_node": "N-ROOT", "to_node": "N-SINK", "type": "data"},
+            ],
         },
         "field_bindings.json": {"bindings": {}},
     }
@@ -392,6 +396,132 @@ def test_propagation_uses_node_recall_precision_and_ordered_coverage(tmp_path):
     assert "propagation_loc_score" not in result
     assert "propagation_edge_total" not in result
     assert "obligation_loc_score" not in result
+
+
+def test_propagation_ordered_coverage_allows_parallel_branches(tmp_path):
+    documents = {
+        "ground_truth.json": {
+            "sample_id": "sample",
+            "source": {"file": "src/a.c", "function": "parse", "line": 10, "operands": ["src"]},
+            "root_cause": {
+                "file": "src/a.c",
+                "function": "right_branch",
+                "line": 20,
+                "operands": ["right"],
+                "relation": {"op": "lt", "left": "right", "right": "cap"},
+            },
+            "sink": {
+                "file": "src/a.c",
+                "function": "sink",
+                "line": 30,
+                "operands": ["idx", "cap"],
+                "relation": {"op": "lt", "left": "idx", "right": "cap"},
+            },
+            "fine_trace": [],
+        },
+        "verified_invariants.json": {
+            "root_cause_criterion": {"invariant_id": "N-RIGHT"},
+            "nodes": [
+                {
+                    "invariant_id": "N-SOURCE",
+                    "role": "source",
+                    "file": "src/a.c",
+                    "function": "parse",
+                    "line": 10,
+                    "fine_trace_step": 1,
+                    "operands": ["src"],
+                },
+                {
+                    "invariant_id": "N-LEFT",
+                    "role": "intermediate",
+                    "file": "src/a.c",
+                    "function": "left_branch",
+                    "line": 15,
+                    "fine_trace_step": 2,
+                    "operands": ["left"],
+                },
+                {
+                    "invariant_id": "N-RIGHT",
+                    "role": "root_cause",
+                    "file": "src/a.c",
+                    "function": "right_branch",
+                    "line": 20,
+                    "fine_trace_step": 3,
+                    "operands": ["right", "cap"],
+                    "relation": {"op": "lt", "left": "right", "right": "cap"},
+                },
+                {
+                    "invariant_id": "N-SINK",
+                    "role": "sink",
+                    "file": "src/a.c",
+                    "function": "sink",
+                    "line": 30,
+                    "fine_trace_step": 4,
+                    "operands": ["idx", "cap"],
+                    "relation": {"op": "lt", "left": "idx", "right": "cap"},
+                },
+            ],
+            "edges": [
+                {"from_node": "N-SOURCE", "to_node": "N-LEFT", "type": "data"},
+                {"from_node": "N-SOURCE", "to_node": "N-RIGHT", "type": "data"},
+                {"from_node": "N-LEFT", "to_node": "N-SINK", "type": "data"},
+                {"from_node": "N-RIGHT", "to_node": "N-SINK", "type": "data"},
+            ],
+        },
+        "field_bindings.json": {"bindings": {}},
+    }
+    for name, value in documents.items():
+        (tmp_path / name).write_text(json.dumps(value), encoding="utf-8")
+
+    point = lambda function, line, operands: {
+        "file": "src/a.c",
+        "function": function,
+        "line": line,
+        "operands": operands,
+    }
+    logic = {
+        "source": point("parse", 10, ["src"]),
+        "root_cause": {
+            **point("right_branch", 20, ["right", "cap"]),
+            "relation": {"op": "lt", "left": "right", "right": "cap"},
+        },
+        "sink": {
+            **point("sink", 30, ["idx", "cap"]),
+            "relation": {"op": "lt", "left": "idx", "right": "cap"},
+        },
+        "propagation": [
+            {"from": point("parse", 10, ["src"]), "to": point("right_branch", 20, ["right"]), "type": "data"},
+            {"from": point("right_branch", 20, ["right"]), "to": point("left_branch", 15, ["left"]), "type": "data"},
+            {"from": point("left_branch", 15, ["left"]), "to": point("sink", 30, ["idx"]), "type": "data"},
+        ],
+    }
+
+    result = score_vuln_logic("sample", logic, gt_dir=tmp_path)
+    propagation = result["dimension_scores"]["propagation"]
+
+    assert propagation["node_recall"] == 1
+    assert propagation["node_precision"] == 1
+    assert propagation["ordered_coverage"] == 1
+
+
+def test_propagation_precision_uses_unique_agent_endpoints(tmp_path):
+    _write_gt(tmp_path, source_function="parse")
+    logic = _logic("parse")
+    source = logic["source"]
+    root = logic["root_cause"]
+    sink = logic["sink"]
+    logic["propagation"] = [
+        {"from": source, "to": root, "type": "data"},
+        {"from": root, "to": sink, "type": "data"},
+        {"from": source, "to": root, "type": "data"},
+    ]
+
+    result = score_vuln_logic("sample", logic, gt_dir=tmp_path)
+    propagation = result["dimension_scores"]["propagation"]
+
+    assert propagation["matched_nodes"] == 3
+    assert propagation["agent_nodes_total"] == 3
+    assert propagation["node_precision"] == 1
 
 
 def test_propagation_does_not_fallback_to_fine_trace_when_gt_nodes_missing(tmp_path):

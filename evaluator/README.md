@@ -70,9 +70,12 @@ source, root cause, and sink. Propagation is reported as node-sequence strength.
 - Propagation: `node_recall` is the fraction of GT propagation nodes recovered
   by the model's propagation endpoints, `node_precision` is the fraction of
   model propagation endpoints that match GT nodes, and `ordered_coverage` is the
-  longest model endpoint subsequence that does not violate GT node order divided
-  by the sample's GT node count. Each sample is scored as a ratio first; batch
-  summaries average those per-sample ratios so every sample has equal weight.
+  longest model endpoint subsequence that does not violate the GT propagation
+  graph's partial order divided by the sample's GT node count. If the model
+  places node `a` before node `b`, this is a violation only when GT has a path
+  from `b` back to `a`; incomparable branch nodes may appear in either order.
+  Each sample is scored as a ratio first; batch summaries average those
+  per-sample ratios so every sample has equal weight.
 - Root cause: `location` is the GT root-cause anchor. `operand` is `location`
   plus root-cause operand match. `relation` is `operand` plus the safety
   obligation relation at that root-cause point; flipped-equivalent relations
