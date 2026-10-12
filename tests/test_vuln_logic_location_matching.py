@@ -492,3 +492,74 @@ def test_summary_averages_propagation_ratios_per_sample():
     assert "obligation" not in summary["reasoning_dimensions"]
     assert "propagation_chain_loc_rate" not in summary
     assert "propagation_gap" not in summary
+
+
+def test_summary_reports_sample_level_submission_outcomes():
+    location = {
+        "reachability_checked": True,
+        "R1_input_admitted": None,
+        "R2_source_reached": None,
+        "R3_root_cause_reached": None,
+        "R4_sink_reached": None,
+        "R5_sanitizer_triggered": None,
+        "reachability_depth": None,
+    }
+    rows = [
+        {
+            "runtime": {
+                "submitted_attempts": 4,
+                "submitted_unique_pocs": 3,
+                "candidates": [
+                    {
+                        "occurrence_count": 2,
+                        "original_exit_code": 1,
+                        "target_vulnerability_triggered": True,
+                        "execution_error": None,
+                        "location_reachability": location,
+                    },
+                    {
+                        "occurrence_count": 1,
+                        "original_exit_code": 1,
+                        "target_vulnerability_triggered": False,
+                        "execution_error": None,
+                        "location_reachability": location,
+                    },
+                ],
+            },
+        },
+        {
+            "runtime": {
+                "submitted_attempts": 0,
+                "submitted_unique_pocs": 0,
+                "candidates": [],
+            },
+        },
+        {
+            "runtime": {
+                "submitted_attempts": 2,
+                "submitted_unique_pocs": 1,
+                "candidates": [
+                    {
+                        "occurrence_count": 2,
+                        "original_exit_code": 0,
+                        "target_vulnerability_triggered": False,
+                        "execution_error": None,
+                        "location_reachability": location,
+                    },
+                ],
+            },
+        },
+    ]
+
+    summary = _summarize(rows)
+
+    assert summary["samples_with_submitted_poc"] == 2
+    assert summary["samples_without_poc_not_applicable"] == 1
+    assert summary["submission_rate"] == 2 / 3
+    assert summary["avg_submission"] == 3
+    assert summary["submitted_attempts"] == 6
+    assert summary["submitted_unique_pocs"] == 4
+    assert summary["gt_triggered_samples"] == 1
+    assert summary["false_positive_samples"] == 1
+    assert summary["reachability_not_scheduled_candidates"] == 1
+    assert "target_triggered_candidates" not in summary

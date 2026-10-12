@@ -121,6 +121,14 @@ PoC is not applicable, a submitted PoC not yet executed is reachability
 unavailable. A missing or failed location breakpoint is unavailable rather than
 a model failure.
 
+Submission metrics are reported separately from R1-R5 reachability:
+`submission_rate` is the fraction of samples with at least one submission,
+`avg_submission` is the average raw submission-attempt count among submitted
+samples, `gt_triggered_samples` counts samples where at least one submitted PoC
+produced the GT target trigger, and `false_positive_samples` counts samples
+where at least one submitted PoC had a nonzero process exit without the GT
+target trigger.
+
 ## Subject analysis artifacts
 
 The subject must produce a single `analysis.json` artifact. It contains

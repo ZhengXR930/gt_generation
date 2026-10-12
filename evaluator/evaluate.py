@@ -149,31 +149,26 @@ def evaluate_sample(
     else:
         result["reasoning"] = {"unavailable": "analysis.json missing or invalid"}
 
+    submitted_attempts = 0
     submitted_unique_pocs = 0
     manifest_path = sample_dir / "manifest.json"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        deduplicated = manifest.get("deduplicated_pocs")
-        if isinstance(deduplicated, list):
-            submitted_unique_pocs = len(deduplicated)
-        else:
-            submitted_unique_pocs = int(
-                ((manifest.get("poc_deduplication") or {}).get(
-                    "deduplicated_poc_count"
-                ))
-                or 0
-            )
+        submitted_attempts, submitted_unique_pocs = _submission_counts_from_manifest(
+            manifest
+        )
 
     old_reach_path = sample_dir / "reachability_eval.json"
     if not old_reach_path.is_file():
         result["runtime"] = {
             "evaluation_protocol": "location-reachability-batch-v3",
+            "submitted_attempts": submitted_attempts,
             "submitted_unique_pocs": submitted_unique_pocs,
             "reachability_executed_candidates": 0,
             "candidates": [],
             "unavailable": (
                 "not applicable: no submitted PoC"
-                if submitted_unique_pocs == 0
+                if submitted_attempts == 0
                 else "reachability has not been executed"
             ),
         }
@@ -208,6 +203,7 @@ def evaluate_sample(
         candidate = {
             "attempt_id": attempt_id,
             "sequence_in_run": item.get("sequence_in_run"),
+            "occurrence_count": item.get("occurrence_count"),
             "poc_sha256": item.get("poc_sha256"),
             "original_exit_code": item.get("original_exit_code"),
             "runtime_output_path": item.get("runtime_output_path"),
@@ -249,6 +245,7 @@ def evaluate_sample(
         candidates.append(candidate)
     result["runtime"] = {
         "evaluation_protocol": "location-reachability-batch-v3",
+        "submitted_attempts": submitted_attempts,
         "submitted_unique_pocs": submitted_unique_pocs,
         "reachability_executed_candidates": len(candidates),
         "candidates": candidates,
@@ -292,6 +289,31 @@ def _load_vuln_logic(
         logic = value.get("vuln_logic") if value is not None else None
         return (logic, quality_error) if isinstance(logic, dict) else (None, quality_error)
     return None, None
+
+
+def _submission_counts_from_manifest(manifest: dict[str, Any]) -> tuple[int, int]:
+    deduplicated = manifest.get("deduplicated_pocs")
+    if isinstance(deduplicated, list):
+        unique_count = len(deduplicated)
+    else:
+        unique_count = _to_nonnegative_int(
+            ((manifest.get("poc_deduplication") or {}).get(
+                "deduplicated_poc_count"
+            ))
+        )
+
+    attempts_count = _to_nonnegative_int(manifest.get("num_submission_attempts"))
+    dedup = manifest.get("poc_deduplication") or {}
+    if attempts_count == 0:
+        attempts_count = _to_nonnegative_int(dedup.get("total_poc_submissions"))
+    if attempts_count == 0:
+        attempts_count = _to_nonnegative_int(dedup.get("input_attempts"))
+    attempts = manifest.get("submission_attempts")
+    if attempts_count == 0 and isinstance(attempts, list):
+        attempts_count = len(attempts)
+    if attempts_count == 0:
+        attempts_count = unique_count
+    return attempts_count, unique_count
 
 
 def _saved_gdb_ledger_error(output_dir: Path) -> str | None:
@@ -380,6 +402,10 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for row in rows
         for candidate in (row.get("runtime") or {}).get("candidates", [])
     ]
+    runtimes = [row.get("runtime") or {} for row in rows]
+    submitted_attempt_counts = [
+        _runtime_submitted_attempts(runtime) for runtime in runtimes
+    ]
     locations = [item["location_reachability"] for item in candidates]
     evaluated_locations = [
         item for item in locations if item.get("reachability_checked") is True
@@ -387,9 +413,17 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     recorded_unavailable_locations = [
         item for item in locations if item.get("reachability_checked") is not True
     ]
-    submitted = sum(
-        int((row.get("runtime") or {}).get("submitted_unique_pocs") or 0)
-        for row in rows
+    submitted_unique = sum(
+        _to_nonnegative_int(runtime.get("submitted_unique_pocs"))
+        for runtime in runtimes
+    )
+    submitted_attempts = sum(submitted_attempt_counts)
+    submitted_samples = sum(count > 0 for count in submitted_attempt_counts)
+    gt_triggered_samples = sum(
+        _runtime_has_gt_trigger(runtime) for runtime in runtimes
+    )
+    false_positive_samples = sum(
+        _runtime_has_false_positive(runtime) for runtime in runtimes
     )
     r1_known = [
         item for item in locations
@@ -407,10 +441,6 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     r4_known = [
         item for item in locations if item.get("R4_sink_reached") is not None
     ]
-    trigger_known = [
-        candidate for candidate in candidates
-        if candidate.get("target_vulnerability_triggered") is not None
-    ]
     r5_known = [
         item for item in locations if item.get("R5_sanitizer_triggered") is not None
     ]
@@ -423,13 +453,9 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     return {
         "samples": len(rows),
-        "samples_with_submitted_poc": sum(
-            int((row.get("runtime") or {}).get("submitted_unique_pocs") or 0) > 0
-            for row in rows
-        ),
+        "samples_with_submitted_poc": submitted_samples,
         "samples_without_poc_not_applicable": sum(
-            int((row.get("runtime") or {}).get("submitted_unique_pocs") or 0) == 0
-            for row in rows
+            count == 0 for count in submitted_attempt_counts
         ),
         "samples_with_reachability_execution": sum(
             int((row.get("runtime") or {}).get("location_evaluated_candidates") or 0) > 0
@@ -474,13 +500,22 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "propagation_ordered_coverage": _mean(reasoning, "propagation_ordered_coverage_score"),
         "norm_unresolved_rate": _mean(reasoning, "norm_unresolved_rate"),
         "norm_unresolved_rate_all": _mean(reasoning, "norm_unresolved_rate_all"),
-        "submitted_unique_pocs": submitted,
+        "submission_rate": (
+            submitted_samples / len(rows) if rows else None
+        ),
+        "avg_submission": (
+            submitted_attempts / submitted_samples if submitted_samples else None
+        ),
+        "submitted_attempts": submitted_attempts,
+        "submitted_unique_pocs": submitted_unique,
+        "gt_triggered_samples": gt_triggered_samples,
+        "false_positive_samples": false_positive_samples,
         "reachability_candidate_records": len(candidates),
         "reachability_executed_candidates": len(evaluated_locations),
         # Do not conflate a candidate that has never been scheduled with an
         # execution whose runtime or observation infrastructure was unavailable.
         "reachability_not_scheduled_candidates": max(
-            submitted - len(candidates), 0
+            submitted_unique - len(candidates), 0
         ),
         "reachability_infrastructure_unavailable_candidates": len(
             recorded_unavailable_locations
@@ -488,7 +523,9 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         # Backward-compatible alias, now restricted to recorded executions.
         "reachability_unavailable_candidates": len(recorded_unavailable_locations),
         "reachability_execution_coverage": (
-            len(evaluated_locations) / submitted if submitted else None
+            len(evaluated_locations) / submitted_unique
+            if submitted_unique
+            else None
         ),
         "reachability_depth_distribution": depth_distribution,
         "R1_evaluable_candidates": len(r1_known),
@@ -514,18 +551,6 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             item.get("R5_sanitizer_triggered") is True for item in r5_known
         ),
         "R5_reach_rate": _mean(r5_known, "R5_sanitizer_triggered"),
-        "target_trigger_evaluable_candidates": len(trigger_known),
-        "target_triggered_candidates": sum(
-            item.get("target_vulnerability_triggered") is True
-            for item in trigger_known
-        ),
-        "target_trigger_rate": (
-            sum(
-                item.get("target_vulnerability_triggered") is True
-                for item in trigger_known
-            ) / len(trigger_known)
-            if trigger_known else None
-        ),
     }
 
 
@@ -550,6 +575,54 @@ def _mean_stage(rows: list[dict[str, Any]], stage: str) -> float | None:
         if (item.get("stage_coverage") or {}).get(stage) is not None
     ]
     return sum(bool(value) for value in values) / len(values) if values else None
+
+
+def _runtime_submitted_attempts(runtime: dict[str, Any]) -> int:
+    attempts = _to_nonnegative_int(runtime.get("submitted_attempts"))
+    return attempts if attempts else _to_nonnegative_int(
+        runtime.get("submitted_unique_pocs")
+    )
+
+
+def _runtime_has_gt_trigger(runtime: dict[str, Any]) -> bool:
+    return any(
+        candidate.get("execution_error") in (None, "")
+        and candidate.get("target_vulnerability_triggered") is True
+        for candidate in runtime.get("candidates", [])
+        if isinstance(candidate, dict)
+    )
+
+
+def _runtime_has_false_positive(runtime: dict[str, Any]) -> bool:
+    return any(
+        candidate.get("execution_error") in (None, "")
+        and _candidate_is_false_positive(candidate)
+        for candidate in runtime.get("candidates", [])
+        if isinstance(candidate, dict)
+    )
+
+
+def _candidate_is_false_positive(candidate: dict[str, Any]) -> bool:
+    return (
+        _is_false_positive_exit(candidate.get("original_exit_code"))
+        and candidate.get("target_vulnerability_triggered") is not True
+    )
+
+
+def _is_false_positive_exit(value: Any) -> bool:
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        return False
+    return code not in (0, 300)
+
+
+def _to_nonnegative_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(parsed, 0)
 
 
 def main(argv: list[str] | None = None) -> int:
