@@ -15,7 +15,7 @@ what is already generated and what they should run next. Run it standalone, or
 let gt_plugin.py call it before a batch to refresh the doc and skip done samples.
 
     python3 gt_generation/gt_status.py
-    python3 gt_generation/gt_status.py --selection dataset/selected_1000.json
+    python3 gt_generation/gt_status.py --selection dataset/selected_500.json
 """
 from __future__ import annotations
 
@@ -134,7 +134,7 @@ def write_status_doc(buckets: dict[str, list[tuple[str, str]]], total: int, sele
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--selection", type=Path, default=REPO_ROOT / "dataset" / "selected_1000.json")
+    ap.add_argument("--selection", type=Path, default=REPO_ROOT / "dataset" / "selected_500.json")
     ap.add_argument("--quiet", action="store_true", help="Only write the doc, no stdout table.")
     args = ap.parse_args(argv)
 
