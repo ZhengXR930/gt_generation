@@ -9,17 +9,17 @@
       "var": "regs[a+1]",
       "code": "mrb_value splat = mrb_ary_splat(mrb, regs[a+1]);",
       "role": "source",
-      "note": "OP_ARYCAT invokes mrb_ary_splat on a non-array value with a to_a method, triggering a nested VM call via mrb_funcall_argv"
+      "note": "OP_ARYCAT calls mrb_ary_splat with user-controlled object"
     },
     {
       "step": 2,
       "file": "src/array.c",
       "function": "mrb_ary_splat",
-      "line": 1237,
-      "var": "ary",
+      "line": 1236,
+      "var": "v",
       "code": "mrb_value ary = mrb_funcall_argv(mrb, v, MRB_SYM(to_a), 0, NULL);",
       "role": "intermediate",
-      "note": "mrb_ary_splat calls mrb_funcall_argv to invoke to_a, which triggers a nested mrb_vm_exec and cipush calls that can reallocate cibase"
+      "note": "mrb_ary_splat calls custom to_a method via mrb_funcall_argv, triggering nested VM execution"
     },
     {
       "step": 3,
@@ -29,17 +29,37 @@
       "var": "c->cibase",
       "code": "c->cibase = (mrb_callinfo*)mrb_realloc(mrb, c->cibase, sizeof(mrb_callinfo)*size*2);",
       "role": "root_cause",
-      "note": "cipush reallocates cibase when callinfo stack is full, freeing old cibase memory; the outer mrb_vm_exec local ci variable still points to the old freed cibase and is not refreshed"
+      "note": "During nested execution, cipush reallocates the callinfo stack, invalidating the cached ci pointer"
     },
     {
       "step": 4,
       "file": "src/vm.c",
+      "function": "cipush",
+      "line": 350,
+      "var": "ci",
+      "code": "c->ci = ci = c->cibase + size;",
+      "role": "intermediate",
+      "note": "ci pointer updated to new location after reallocation"
+    },
+    {
+      "step": 5,
+      "file": "src/vm.c",
       "function": "mrb_vm_exec",
-      "line": 2672,
-      "var": "regs[a]",
-      "code": "if (mrb_nil_p(regs[a])) {",
+      "line": 1408,
+      "var": "ci",
+      "code": "mrb_callinfo *ci = mrb->c->ci;",
+      "role": "intermediate",
+      "note": "Outer VM frame caches ci pointer before entering dispatch loop"
+    },
+    {
+      "step": 6,
+      "file": "src/vm.c",
+      "function": "mrb_vm_exec",
+      "line": 2671,
+      "var": "ci->stack",
+      "code": "mrb_value splat = mrb_ary_splat(mrb, regs[a+1]);",
       "role": "sink",
-      "note": "After mrb_ary_splat returns, regs macro expands to ci->stack; the stale ci points to freed cibase, so regs[a] is a heap-use-after-free READ"
+      "note": "After nested call returns, outer VM uses stale cached ci pointer via regs macro (defined as ci->stack), accessing freed memory"
     }
   ],
   "vuln_logic": {
@@ -47,36 +67,28 @@
       "file": "src/vm.c",
       "function": "mrb_vm_exec",
       "line": 2671,
-      "operands": [
-        "regs[a+1]"
-      ]
+      "operands": ["regs[a+1]"]
     },
     "root_cause": {
       "file": "src/vm.c",
       "function": "cipush",
       "line": 349,
-      "operands": [
-        "ci",
-        "c->ciend"
-      ],
+      "operands": ["c->cibase", "size"],
       "relation": {
-        "op": "lt",
-        "left": "ci",
-        "right": "c->ciend"
+        "op": "ge",
+        "left": "size",
+        "right": "MRB_CALL_LEVEL_MAX"
       }
     },
     "sink": {
       "file": "src/vm.c",
       "function": "mrb_vm_exec",
-      "line": 2672,
-      "operands": [
-        "regs[a]",
-        "mrb_nil_p"
-      ],
+      "line": 2671,
+      "operands": ["ci->stack", "a+1"],
       "relation": {
-        "op": "ne",
-        "left": "regs[a]",
-        "right": "NULL"
+        "op": "same_object",
+        "left": "ci",
+        "right": "freed_cibase"
       }
     },
     "propagation": [
@@ -85,66 +97,63 @@
           "file": "src/vm.c",
           "function": "mrb_vm_exec",
           "line": 2671,
-          "operands": [
-            "regs[a+1]"
-          ]
+          "operands": ["regs[a+1]"]
         },
         "to": {
           "file": "src/array.c",
           "function": "mrb_ary_splat",
-          "line": 1237,
-          "operands": [
-            "v"
-          ]
+          "line": 1236,
+          "operands": ["v"]
         },
         "type": "data",
-        "via": [
-          "mrb_ary_splat"
-        ]
+        "via": ["regs[a+1]"],
+        "relation": {
+          "op": "eq",
+          "left": "v",
+          "right": "regs[a+1]"
+        }
       },
       {
         "from": {
           "file": "src/array.c",
           "function": "mrb_ary_splat",
-          "line": 1237,
-          "operands": [
-            "mrb_funcall_argv"
-          ]
+          "line": 1236,
+          "operands": ["v"]
         },
         "to": {
           "file": "src/vm.c",
           "function": "cipush",
           "line": 349,
-          "operands": [
-            "c->cibase"
-          ]
+          "operands": ["c->cibase"]
         },
-        "type": "data",
-        "via": [
-          "mrb_funcall_argv"
-        ]
+        "type": "control",
+        "via": ["mrb_funcall_argv"],
+        "relation": {
+          "op": "gt",
+          "left": "call_depth",
+          "right": "realloc_threshold"
+        }
       },
       {
         "from": {
           "file": "src/vm.c",
           "function": "cipush",
           "line": 349,
-          "operands": [
-            "c->cibase"
-          ]
+          "operands": ["c->cibase"]
         },
         "to": {
           "file": "src/vm.c",
           "function": "mrb_vm_exec",
-          "line": 2672,
-          "operands": [
-            "regs[a]"
-          ]
+          "line": 2671,
+          "operands": ["ci->stack"]
         },
-        "type": "data",
-        "via": [
-          "regs"
-        ]
+        "type": "order",
+        "via": ["reallocation"],
+        "relation": {
+          "op": "ne",
+          "left": "old_cibase",
+          "right": "new_cibase"
+        }
       }
     ]
   }
