@@ -39,8 +39,8 @@ TARGETS: dict[str, Section] = {
     "submission:S.C": Section("submission_skill/SKILL.md", "## S.C Learned Submission Lessons", 8),
 }
 
-# The curator vocabulary is MODIFY / SKIP. ACCEPT and MERGE are tolerated as
-# legacy spellings of MODIFY rather than rejected as malformed.
+# The curator vocabulary is MODIFY / REMOVE / SKIP. ACCEPT and MERGE are
+# tolerated as legacy spellings of MODIFY rather than rejected as malformed.
 _WRITES = {"MODIFY", "ACCEPT", "MERGE"}
 
 _LESSON_RE = re.compile(r"^-\s+\[([A-Za-z0-9.#_-]+)\]\s*(.*)$")
@@ -245,13 +245,19 @@ def _remove_lesson(packet: Path, target: str, lesson_id: str) -> dict[str, Any]:
 def _apply_one(packet: Path, decision: dict[str, Any], index: dict[str, Any] | None) -> dict[str, Any]:
     """Apply one decision, returning either a written record or a skip reason."""
     action = str(decision.get("decision") or decision.get("action") or "").upper()
+    operation = str(decision.get("operation") or "").upper()
     target = str(decision.get("target") or "")
     proposal = str(decision.get("proposal") or decision.get("content") or "").strip()
 
     if action == "SKIP":
         return {"skip_reason": "curator chose SKIP"}
+    if action in {"REMOVE", "DELETE"} or operation == "DELETE":
+        if target not in TARGETS:
+            return {"skip_reason": f"unknown or non-writable target {target!r}"}
+        lesson_id = str(decision.get("target_lesson_id") or decision.get("lesson_id") or "").strip()
+        return _remove_lesson(packet, target, lesson_id)
     if action not in _WRITES:
-        return {"skip_reason": f"unsupported decision {action!r}; use MODIFY or SKIP"}
+        return {"skip_reason": f"unsupported decision {action!r}; use MODIFY, REMOVE, or SKIP"}
     if target not in TARGETS:
         return {"skip_reason": f"unknown or non-writable target {target!r}"}
     if not proposal:

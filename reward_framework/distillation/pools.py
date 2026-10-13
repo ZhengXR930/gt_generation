@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .diagnosis_view import DIAGNOSIS_SECTIONS
+from .diagnosis_view import LEARNING_DIAGNOSIS_SECTIONS
 
 EXCERPT_CHARS = 640
 
@@ -265,7 +265,7 @@ def _sample_record(
         "outcome": outcome,
         "issue_description": _short(record.get("issue_description")),
         "vulnerability_type": record.get("vulnerability_type"),
-        **{section: _short_value(record.get(section)) for section in DIAGNOSIS_SECTIONS},
+        **{section: _short_value(record.get(section)) for section in LEARNING_DIAGNOSIS_SECTIONS},
         "false_positive": bool(record.get("false_positive") or outcome_record.get("false_positive") or false_positive_pocs),
         "false_positive_pocs": false_positive_pocs,
     }
@@ -332,7 +332,7 @@ def _teacher_sample(sample: dict[str, Any]) -> dict[str, Any]:
             "outcome",
             "issue_description",
             "vulnerability_type",
-            *DIAGNOSIS_SECTIONS,
+            *LEARNING_DIAGNOSIS_SECTIONS,
         )
         if sample.get(key) not in (None, "", [], {})
     }

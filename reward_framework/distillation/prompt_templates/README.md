@@ -18,7 +18,7 @@ Python code appends machine-readable JSON payloads to these templates. Edit thes
 
 **The outcome is not an opinion.** `outcome`, `deepest_stage`, and `first_failed_stage` come from `reward_framework/distillation/outcome.py`, which reads the executed reachability ladder. The diagnostician is given that verdict and records what happened; it does not produce the verdict or turn it into a lesson.
 
-**Evidence roles stay separate.** Outcome is the final objective, reachability is executable progress, trace and reasoning diagnostics are supporting explanation, and trajectory plus submission history are behavioral evidence. Teacher performs the cross-sample contrast; Diagnostician does not write learning implications.
+**Evidence roles stay separate.** Outcome is the final objective, reachability is executable progress, trace and reasoning diagnostics are supporting explanation, and trajectory plus submission history are behavioral evidence. Teacher performs the cross-sample contrast; Diagnostician does not write learning advice.
 
 **The shared frame is feedback-chain behavior.** Diagnosis, Teacher, and Curator all optimize the same two goals: improve target reproduction within the finite interaction budget, and reduce false positives without suppressing useful submissions. Diagnostician explains each sample through pre-submit behavior, reachability gap, and post-submit action. Teacher performs cross-sample contrast across successes, partial progress, non-target crashes, no-submission failures, and ordinary failures. Curator keeps only compact, observable behavior policies that should transfer to unseen samples.
 

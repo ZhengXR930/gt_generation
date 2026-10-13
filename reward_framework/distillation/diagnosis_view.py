@@ -11,21 +11,40 @@ import re
 from typing import Any
 
 DIAGNOSIS_SECTIONS = (
+    "submission",
+    "closest_candidate",
+    "candidate_construction",
+    "feedback_response",
+    "outcome_attribution",
+)
+
+DIAGNOSIS_REQUIRED_FIELDS = {
+    "submission": (),
+    "closest_candidate": ("execution_progress", "missing_condition", "evidence"),
+    "candidate_construction": ("context_gap", "understanding_gap", "observed_effect", "evidence"),
+    "feedback_response": ("behavior", "evidence"),
+    "outcome_attribution": ("reason", "evidence_strength", "supporting_evidence"),
+}
+
+LEGACY_DIAGNOSIS_SECTIONS = (
+    "reproduction_process",
+    "capability_diagnosis",
+    "feedback_behavior",
     "outcome_evidence",
     "submission_evidence",
     "executable_progress_evidence",
     "feedback_loop_evidence",
     "failure_attribution",
-    "policy_implication",
-    "dangerous_to_learn",
 )
+
+LEARNING_DIAGNOSIS_SECTIONS = (*DIAGNOSIS_SECTIONS, *LEGACY_DIAGNOSIS_SECTIONS)
 
 _LEARNING_KEYS = (
     "sample_id",
     "outcome",
     "issue_description",
     "vulnerability_type",
-    *DIAGNOSIS_SECTIONS,
+    *LEARNING_DIAGNOSIS_SECTIONS,
 )
 
 _DIAGNOSIS_ALIASES = {
@@ -87,7 +106,7 @@ def learning_diagnosis(diagnosis: dict[str, Any], outcome_record: dict[str, Any]
             continue
         if key == "issue_description":
             out[key] = abstract_text(value)
-        elif key in DIAGNOSIS_SECTIONS:
+        elif key in LEARNING_DIAGNOSIS_SECTIONS:
             out[key] = abstract_value(value)
         else:
             out[key] = value

@@ -74,9 +74,10 @@ Do not claim causality unless the trajectory explicitly shows the agent using a
 lesson or matched comparison evidence is supplied. Without that, describe
 consistency between skill text and observed behavior.
 
-Use `dangerous_to_learn` fields from diagnoses as rollback/correction evidence:
-if a lesson resembles an overgeneralization the diagnostician warned against,
-soften or remove that part.
+Use diagnosis uncertainty, false-positive behavior, failed revisions,
+no-submission evidence, and missing execution conditions as
+rollback/correction evidence: if a lesson resembles an unsupported
+overgeneralization, soften or remove that part.
 
 For `CORRECT`, the rewritten text must remain general, short, and visible at
 test time. Do not include sample-specific facts, project names, file/function

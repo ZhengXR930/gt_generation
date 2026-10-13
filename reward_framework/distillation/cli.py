@@ -23,7 +23,9 @@ from evaluator.evaluate import evaluate_sample  # noqa: E402
 from reward_framework.distillation.artifacts import GT_RESULTS, load_json_if_exists, read_json, sample_project, write_json  # noqa: E402
 from reward_framework.distillation.audit import audit_framework  # noqa: E402
 from reward_framework.distillation.diagnosis_view import (  # noqa: E402
+    DIAGNOSIS_REQUIRED_FIELDS,
     DIAGNOSIS_SECTIONS,
+    LEARNING_DIAGNOSIS_SECTIONS,
     learning_diagnosis,
     learning_evaluation,
 )
@@ -1039,7 +1041,7 @@ def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
         if not isinstance(value, dict):
             missing.append(section)
             continue
-        for field in ("summary", "evidence"):
+        for field in DIAGNOSIS_REQUIRED_FIELDS.get(section, ("summary", "evidence")):
             if not str(value.get(field) or "").strip():
                 missing.append(f"{section}.{field}")
     if missing:
@@ -1237,7 +1239,7 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
             **false_positive,
             "issue_description": learning.get("issue_description"),
             "vulnerability_type": learning.get("vulnerability_type"),
-            **{section: learning.get(section) for section in DIAGNOSIS_SECTIONS},
+            **{section: learning.get(section) for section in LEARNING_DIAGNOSIS_SECTIONS},
             "attempts": attempts,
             "selected_attempt": selected["attempt"],
             "outcome_record": outcome_record,
