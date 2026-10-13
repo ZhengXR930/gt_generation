@@ -235,7 +235,7 @@ def evaluate_models(
             "reachability_denominator": "samples with submitted deduplicated PoCs and evaluated reachability only",
             "no_poc_reachability": "samples without submitted PoCs are excluded from R1-R4/GT/FP denominators",
             "submission_metrics": "submission_rate and GT/FP outcomes are sample-level; avg_submission uses raw submission attempts among submitted samples",
-            "context_denominator": "samples with context_gt.json and context_visit.json available",
+            "context_denominator": "samples with ground_truth.json fine_trace and context_visit.json available",
         },
     }
 

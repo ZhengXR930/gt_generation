@@ -15,7 +15,10 @@ from evaluator.reasoning.analysis_artifact import (
 )
 from evaluator.reasoning.vuln_logic_scoring import score_vuln_logic
 from evaluator.reasoning.fine_trace_coverage import score_fine_trace_coverage
-from evaluator.reasoning.context_recall import score_context_recall
+from evaluator.reasoning.context_recall import (
+    EVALUATION_PROTOCOL as CONTEXT_RECALL_PROTOCOL,
+    score_context_recall,
+)
 from evaluator.reachability.core import evaluate_r1_r5
 from evaluator.reachability.probes import compile_runtime_probes
 
@@ -386,7 +389,7 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     context_recall = [
         item["context_recall"] for item in rows
         if item.get("context_recall", {}).get("evaluation_protocol")
-        == "context-function-recall-v1"
+        == CONTEXT_RECALL_PROTOCOL
         and not item.get("context_recall", {}).get("unavailable")
     ]
     context_recoverable = [

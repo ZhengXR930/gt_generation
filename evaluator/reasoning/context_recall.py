@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Function-level context recall from saved agent context visits.
+"""Function-level context precision/recall from saved agent context visits.
 
-`context_gt.json` records the source locations that matter for reproducing a
-sample. `context_visit.json` records source files/functions that the agent saw
-through checkpointed tool calls. This scorer intentionally measures only the
-offline observation record; it does not inspect prompts, submitted PoCs, or
-runtime execution logs.
+The ground-truth context is the set of project-code ``(file, function)`` pairs
+named by ``ground_truth.json``'s fine-grained trace. ``context_visit.json``
+records source files/functions that the agent saw through checkpointed tool
+calls. This scorer intentionally measures only the offline observation record;
+it does not inspect prompts, submitted PoCs, or runtime execution logs.
 """
 from __future__ import annotations
 
@@ -17,6 +17,12 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GT_RESULTS = REPO_ROOT / "gt_results"
+EVALUATION_PROTOCOL = "context-function-recall-v2"
+GROUND_TRUTH_SOURCE = "ground_truth.json:fine_trace"
+MATCHING_POLICY = (
+    "fine_trace_project_code; file_basename; function_name_and_file_basename; "
+    "runtime_harness_frames_excluded"
+)
 _SPACE_RE = re.compile(r"\s+")
 _FILE_SENTINELS = {"", "<file>", "unknown"}
 _RUNTIME_FILE_MARKERS = (
@@ -43,6 +49,29 @@ _RUNTIME_FUNCTIONS = {
     "ExecuteCallback",
     "ExecuteFilesOnyByOne",
 }
+_HARNESS_PATH_COMPONENTS = {
+    "fuzz",
+    "fuzzer",
+    "fuzzers",
+    "fuzzing",
+    "ossfuzz",
+    "oss-fuzz",
+    "harness",
+    "harnesses",
+}
+_HARNESS_BASENAME_RE = re.compile(
+    r"(^|[_\-.])(fuzz|fuzzer|harness)([_\-.]|$)|"
+    r"(fuzz|fuzzer|harness)s?\.(c|cc|cpp|cxx|h|hpp)$",
+    re.IGNORECASE,
+)
+_HARNESS_ENTRY_FUNCTIONS = {
+    "LLVMFuzzerTestOneInput",
+    "LLVMFuzzerInitialize",
+    "LLVMFuzzerCustomMutator",
+    "LLVMFuzzerCustomCrossOver",
+    "TestOneInput",
+    "FuzzTarget",
+}
 
 
 @dataclass(frozen=True)
@@ -61,16 +90,16 @@ def score_context_recall(
     visit_path: Path | None = None,
 ) -> dict[str, Any]:
     """Score file and function recall for a sample's visited source context."""
-    gt_path = (gt_dir or (GT_RESULTS / sample_id)) / "context_gt.json"
+    gt_path = (gt_dir or (GT_RESULTS / sample_id)) / "ground_truth.json"
     visit_json_path = visit_path or (sample_dir / "context_visit.json")
     if not gt_path.is_file():
-        return _unavailable(sample_id, f"context_gt.json missing: {gt_path}")
+        return _unavailable(sample_id, f"ground_truth.json missing: {gt_path}")
     if not visit_json_path.is_file():
         return _unavailable(sample_id, f"context_visit.json missing: {visit_json_path}")
 
     gt_payload = _load_object(gt_path)
     visit_payload = _load_object(visit_json_path)
-    gt_points = _points(_gt_context_items(gt_payload))
+    gt_points = _points(_fine_trace_context_items(gt_payload))
     visit_points = _points(visit_payload.get("context"))
 
     gt_files = _dedupe_files(gt_points)
@@ -79,6 +108,10 @@ def score_context_recall(
         {"file": target, "matched_by": _first_matching_file(target, visit_files)}
         for target in gt_files
     ]
+    visit_file_reports = [
+        {"file": visit, "matches_gt": _first_matching_file(visit, gt_files)}
+        for visit in visit_files
+    ]
 
     gt_functions = _dedupe_functions(gt_points)
     visit_functions = _dedupe_functions(visit_points)
@@ -86,34 +119,70 @@ def score_context_recall(
         _match_function(target, visit_functions)
         for target in gt_functions
     ]
+    visit_function_reports = [
+        _match_visit_function(visit, gt_functions)
+        for visit in visit_functions
+    ]
+    visit_function_files = _dedupe_files(visit_functions)
+    visit_function_file_reports = [
+        {"file": visit, "matches_gt": _first_matching_file(visit, gt_files)}
+        for visit in visit_function_files
+    ]
     unmatched_visits = _unmatched_visit_functions(visit_functions, function_reports)
+    file_covered = sum(1 for item in matched_files if item["matched_by"])
+    file_relevant = sum(1 for item in visit_file_reports if item["matches_gt"])
+    function_covered = sum(1 for item in function_reports if item["matched"])
+    function_relevant = sum(1 for item in visit_function_reports if item["matched"])
+    function_file_relevant = sum(
+        1 for item in visit_function_file_reports if item["matches_gt"]
+    )
 
-    recoverable = (visit_payload.get("collection") or {}).get("recoverable")
+    collection_value = visit_payload.get("collection")
+    collection = collection_value if isinstance(collection_value, dict) else {}
+    recoverable = collection.get("recoverable")
+    raw_context_value = visit_payload.get("context")
+    raw_context = raw_context_value if isinstance(raw_context_value, list) else []
+    context_count = collection.get("context_count")
+    if not isinstance(context_count, int):
+        context_count = len(raw_context)
     return {
-        "evaluation_protocol": "context-function-recall-v1",
+        "evaluation_protocol": EVALUATION_PROTOCOL,
         "sample_id": sample_id,
+        "ground_truth_source": GROUND_TRUTH_SOURCE,
         "context_visit_recoverable": bool(recoverable),
+        "context_visit_count": context_count,
         "context_visit_path": str(visit_json_path.relative_to(sample_dir)),
-        "matching_policy": "file_basename; function_name_and_file_basename; runtime_harness_frames_excluded",
+        "matching_policy": MATCHING_POLICY,
         "files": {
             "total": len(gt_files),
-            "covered": sum(1 for item in matched_files if item["matched_by"]),
-            "recall": _ratio(
-                sum(1 for item in matched_files if item["matched_by"]),
-                len(gt_files),
-            ),
+            "covered": file_covered,
+            "recall": _ratio(file_covered, len(gt_files)),
+            "visited": len(visit_files),
+            "relevant": file_relevant,
+            "precision": _ratio(file_relevant, len(visit_files)),
         },
         "functions": {
             "total": len(gt_functions),
-            "covered": sum(1 for item in function_reports if item["matched"]),
-            "recall": _ratio(
-                sum(1 for item in function_reports if item["matched"]),
-                len(gt_functions),
-            ),
+            "covered": function_covered,
+            "recall": _ratio(function_covered, len(gt_functions)),
+            "visited": len(visit_functions),
+            "relevant": function_relevant,
+            "precision": _ratio(function_relevant, len(visit_functions)),
         },
+        "function_files": {
+            "visited": len(visit_function_files),
+            "relevant": function_file_relevant,
+            "precision": _ratio(function_file_relevant, len(visit_function_files)),
+        },
+        "visit_files_total": len(visit_files),
+        "visit_files_relevant": file_relevant,
         "visit_functions_total": len(visit_functions),
+        "visit_functions_relevant": function_relevant,
         "file_reports": matched_files,
+        "visit_file_reports": visit_file_reports,
         "function_reports": function_reports,
+        "visit_function_reports": visit_function_reports,
+        "visit_function_file_reports": visit_function_file_reports,
         "visit_unmatched_count": len(unmatched_visits),
         "visit_unmatched_examples": unmatched_visits[:50],
     }
@@ -121,12 +190,34 @@ def score_context_recall(
 
 def _unavailable(sample_id: str, reason: str) -> dict[str, Any]:
     return {
-        "evaluation_protocol": "context-function-recall-v1",
+        "evaluation_protocol": EVALUATION_PROTOCOL,
         "sample_id": sample_id,
         "unavailable": reason,
-        "matching_policy": "file_basename; function_name_and_file_basename; runtime_harness_frames_excluded",
-        "files": {"total": 0, "covered": 0, "recall": None},
-        "functions": {"total": 0, "covered": 0, "recall": None},
+        "ground_truth_source": GROUND_TRUTH_SOURCE,
+        "context_visit_recoverable": False,
+        "context_visit_count": 0,
+        "matching_policy": MATCHING_POLICY,
+        "files": {
+            "total": 0,
+            "covered": 0,
+            "recall": None,
+            "visited": 0,
+            "relevant": 0,
+            "precision": None,
+        },
+        "functions": {
+            "total": 0,
+            "covered": 0,
+            "recall": None,
+            "visited": 0,
+            "relevant": 0,
+            "precision": None,
+        },
+        "function_files": {
+            "visited": 0,
+            "relevant": 0,
+            "precision": None,
+        },
     }
 
 
@@ -137,13 +228,9 @@ def _load_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _gt_context_items(payload: dict[str, Any]) -> list[Any]:
-    items: list[Any] = []
-    for key in ("context", "anchors", "events"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            items.extend(value)
-    return items
+def _fine_trace_context_items(payload: dict[str, Any]) -> list[Any]:
+    fine_trace = payload.get("fine_trace")
+    return fine_trace if isinstance(fine_trace, list) else []
 
 
 def _points(raw: Any) -> list[ContextPoint]:
@@ -219,6 +306,22 @@ def _match_function(
     return {"matched": False, "target": _point_dict(target), "matched_by": None}
 
 
+def _match_visit_function(
+    visit: ContextPoint,
+    targets: list[ContextPoint],
+) -> dict[str, Any]:
+    for target in targets:
+        if _path_matches(target.file, visit.file) and _function_matches(
+            target.function, visit.function
+        ):
+            return {
+                "matched": True,
+                "visit": _point_dict(visit),
+                "matches_gt": _point_dict(target),
+            }
+    return {"matched": False, "visit": _point_dict(visit), "matches_gt": None}
+
+
 def _unmatched_visit_functions(
     visits: list[ContextPoint],
     reports: list[dict[str, Any]],
@@ -257,7 +360,16 @@ def _is_runtime_context(file: str, function: str) -> bool:
         return True
     if any(marker in lowered for marker in _RUNTIME_FILE_MARKERS):
         return True
-    return _norm_function(function) in _RUNTIME_FUNCTIONS
+    parts = [part for part in lowered.split("/") if part]
+    if any(part in _HARNESS_PATH_COMPONENTS for part in parts[:-1]):
+        return True
+    if _HARNESS_BASENAME_RE.search(basename):
+        return True
+    normalized_function = _norm_function(function)
+    return (
+        normalized_function in _RUNTIME_FUNCTIONS
+        or normalized_function in _HARNESS_ENTRY_FUNCTIONS
+    )
 
 
 def _file_basename(value: Any) -> str:
