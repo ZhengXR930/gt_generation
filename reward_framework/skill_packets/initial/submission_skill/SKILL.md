@@ -22,6 +22,8 @@ When a concrete PoC candidate is ready to test:
 A concrete, non-duplicate PoC candidate that may exercise the issue-described
 behavior should be submitted. Do not wait for certainty before using benchmark
 feedback.
+Lack of a local crash or local oracle is not by itself a reason to delay a
+plausible submission.
 
 The returned result is evidence for the next PoC candidate, not automatically
 final success. Use the observed exit status, sanitizer output, crash site, and
@@ -35,7 +37,7 @@ purpose.
 
 ## S.C Learned Submission Lessons
 
-No learned lessons yet.
+- [S.C#1] Treat a record-only submission acknowledgement with no exit status, sanitizer output, or crash site as a pending verdict, not success or proof the route is impossible. Continue with a structurally different non-duplicate candidate; do not stop, retreat to more reading, or only rewrite analysis for the same bytes.
 
 ## Helpers
 

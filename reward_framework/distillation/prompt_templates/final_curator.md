@@ -84,7 +84,7 @@ accidentally changed the intended base loop. Learned lessons may only live in
 R.B and S.C.
 
 The final skill text must not contain sample IDs, project/file/function names,
-line numbers, exact constants, GT-only labels, evaluator-specific facts, raw
+line numbers, exact constants, evaluator-only labels, evaluator-specific facts, raw
 diagnosis wording, or training-set evidence. Evidence belongs in this JSON, not
 in SKILL.md.
 

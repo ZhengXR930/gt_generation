@@ -24,7 +24,7 @@ Read:
   The authoritative list of learned lesson IDs and text to review.
 
 - `inputs/batch_summary.json`
-  Baseline GT-success and batch ordering summary.
+  Baseline target-success and batch ordering summary.
 
 - `inputs/pools.json`
   Accumulated success, failure, non-target-crash, and infrastructure diagnoses.
@@ -40,8 +40,9 @@ Read:
 ## Evidence Principle
 
 Outcome determines what worked; reachability shows executable progress;
-trajectory shows what the agent did; semantic GT helps explain whether that
-behavior depended on correct or incomplete vulnerability reasoning.
+trajectory shows what the agent did; semantic reference diagnostics help
+explain whether that behavior depended on correct or incomplete vulnerability
+reasoning.
 
 Semantic evidence must not by itself justify a lesson. A lesson should be
 supported by outcome or executable-progress contrast across samples, or by a

@@ -330,6 +330,58 @@ def build_curator_role(
     return space.finish("curator", "curator.md")
 
 
+def build_seed_author_role(
+    workspace: Path,
+    base_packet: Path,
+    seed_diagnoses: list[dict[str, Any]],
+    seed_evaluation: dict[str, Any],
+    seed_selection: dict[str, Any],
+) -> RoleRun:
+    """Build the one-shot role that authors an initial seed.
+
+    This role distills the first learned lessons from baseline behavior, before
+    the incremental batch-update loop begins.
+    """
+    space = _Workspace(workspace)
+    space.copy_packet_as(
+        base_packet,
+        "base_skill",
+        "fixed two-skill scaffold; keep R.A, S.A, and S.B unchanged",
+        snapshot_name="base_lessons_snapshot.json",
+    )
+    space.put("seed_diagnoses.json", seed_diagnoses,
+              "diagnoses for the selected baseline seed-distillation samples")
+    space.put("seed_evaluation.json", seed_evaluation,
+              "deterministic evaluation rows for those selected baseline samples")
+    space.put("seed_selection.json", seed_selection,
+              "how the 50-sample seed set was stratified across success and failure modes")
+    return space.finish("seed_author", "seed_author.md")
+
+
+def build_scaffold_author_role(
+    workspace: Path,
+    reference_packet: Path,
+    seed_diagnoses: list[dict[str, Any]],
+    seed_evaluation: dict[str, Any],
+    seed_selection: dict[str, Any],
+) -> RoleRun:
+    """Build the role that authors a harness-compatible initial scaffold."""
+    space = _Workspace(workspace)
+    space.copy_packet_as(
+        reference_packet,
+        "reference_scaffold",
+        "reference two-skill packet showing required files, helper scripts, and empty learned-lesson sections",
+        snapshot_name="reference_lessons_snapshot.json",
+    )
+    space.put("seed_diagnoses.json", seed_diagnoses,
+              "diagnoses for the selected baseline scaffold-distillation samples")
+    space.put("seed_evaluation.json", seed_evaluation,
+              "deterministic evaluation rows for those selected baseline samples")
+    space.put("seed_selection.json", seed_selection,
+              "how the scaffold-distillation set was stratified across success and failure modes")
+    return space.finish("scaffold_author", "scaffold_author.md")
+
+
 FINAL_BATCH_FILES = (
     ("evaluation.json", "batch deterministic outcome and diagnostics report"),
     ("diagnoses.json", "batch sample-level evidence abstractions"),
@@ -558,7 +610,13 @@ def _execute_dsh_role(
 
     dsh_home = run.workspace / ".dsh_home"
     dsh_effort = "high" if reasoning_effort == "medium" else reasoning_effort
-    write_dsh_settings(dsh_home, model, dsh_effort)
+    write_dsh_settings(
+        dsh_home,
+        model,
+        dsh_effort,
+        base_url=base_url,
+        api_key_env=api_key_env,
+    )
     started_command = " ".join(
         shlex.quote(part)
         for part in [
@@ -578,6 +636,7 @@ def _execute_dsh_role(
             prompt_path=prompt_path,
             run_dir=logs,
             api_key=load_env_key(api_key_env),
+            api_key_env=api_key_env,
             base_url=base_url,
             timeout=timeout,
             network_guard_bin=None,

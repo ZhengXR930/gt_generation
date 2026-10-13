@@ -24,6 +24,8 @@ Interpret Feedback -> Revise or Finalize
 
    Local diagnostics are useful when they make the next PoC candidate concrete;
    they should not become a separate open-ended build or fuzzing project.
+   If local execution is unavailable or slow, use relevant in-workspace corpus
+   inputs or small format-preserving mutations as concrete candidates.
 
 3. Submit concrete PoC candidates to get benchmark feedback. Do not spend the
    whole run proving a path before the first submission.
@@ -42,4 +44,4 @@ Interpret Feedback -> Revise or Finalize
 
 ## R.B Learned Reproduction Lessons
 
-No learned lessons yet.
+- [R.B#1] Preserve framing that got a candidate admitted or into relevant code, and change only the dimension blocking the next step. If the route is still unreached, vary the structural selector or required container/table element; if the vulnerable operation is reached but no failure fires, keep the structure and vary boundary magnitude such as size, offset, or count.

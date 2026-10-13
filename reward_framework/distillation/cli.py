@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import random
 import re
 import shlex
 import shutil
@@ -19,12 +20,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from evaluator.evaluate import evaluate_sample  # noqa: E402
-from reward_framework.distillation.artifacts import load_json_if_exists, read_json, sample_project, write_json  # noqa: E402
+from reward_framework.distillation.artifacts import GT_RESULTS, load_json_if_exists, read_json, sample_project, write_json  # noqa: E402
 from reward_framework.distillation.audit import audit_framework  # noqa: E402
 from reward_framework.distillation.diagnosis_view import (  # noqa: E402
     DIAGNOSIS_SECTIONS,
-    RUBRIC_CATEGORIES,
-    RUBRIC_FINDINGS_KEY,
     learning_diagnosis,
     learning_evaluation,
 )
@@ -56,6 +55,8 @@ from reward_framework.distillation.roles import (  # noqa: E402
     build_diagnosis_role,
     build_final_curator_role,
     build_final_teacher_role,
+    build_scaffold_author_role,
+    build_seed_author_role,
     build_teacher_role,
     execute_role,
     plan_role,
@@ -71,6 +72,7 @@ from reward_framework.distillation.skill_packet import (  # noqa: E402
     read_lessons,
 )
 from reward_framework.distillation.splits import (  # noqa: E402
+    DEV_SELECTION_SEED,
     build_chronological_split,
     freeze_split,
     load_frozen_split,
@@ -187,9 +189,9 @@ def _run_checked_step(
 
 def cmd_freeze_split(args: argparse.Namespace) -> int:
     """Compute the chronological order once and pin it next to valid_gt.json."""
-    from reward_framework.distillation.splits import TEST_GT, TRAIN_GT
+    from reward_framework.distillation.splits import DEV_GT, TEST_GT, TRAIN_GT
 
-    existing = [path for path in (TRAIN_GT, TEST_GT) if path.is_file()]
+    existing = [path for path in (TRAIN_GT, DEV_GT, TEST_GT) if path.is_file()]
     if existing and not args.force:
         raise SystemExit(
             f"{[str(path) for path in existing]} already exist. The split is meant to be pinned "
@@ -218,15 +220,92 @@ def _attempt_specs(args: argparse.Namespace, samples: list[str]) -> list[dict[st
     return specs
 
 
+_REACHABILITY_KEYS = (
+    "R1_input_admitted",
+    "R2_source_reached",
+    "R3_root_cause_reached",
+    "R4_sink_reached",
+    "R5_sanitizer_triggered",
+)
+
+
+def _runtime_from_reachability_eval(sample_dir: Path, fallback_runtime: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Use the per-sample reachability report as the distillation runtime source.
+
+    ``evaluate_sample`` can recompute location reachability from saved debugger
+    hit ledgers. Older/current DSH runs often keep only the already computed
+    ``reachability_eval.json`` report, so recomputation degrades R4 near-misses
+    into "no rung observed". Distillation diagnosis should consume the executed
+    report directly.
+    """
+    path = sample_dir / "reachability_eval.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    summary = payload.get("summary") or {}
+    fallback = fallback_runtime or {}
+    candidates: list[dict[str, Any]] = []
+    for item in payload.get("candidates") or []:
+        if not isinstance(item, dict):
+            continue
+        reachability = {
+            "evaluation_protocol": "location-reachability-v3",
+            **{key: item.get(key) for key in _REACHABILITY_KEYS},
+            "target_vulnerability_triggered": item.get("target_vulnerability_triggered"),
+            "reachability_depth": item.get("reachability_depth"),
+            "failure_stage": item.get("failure_stage"),
+            "report_path": item.get("report_path"),
+            "reachability_checked": True,
+        }
+        candidate = {
+            "attempt_id": item.get("attempt_id"),
+            "sequence_in_run": item.get("sequence_in_run"),
+            "poc_sha256": item.get("poc_sha256"),
+            "original_exit_code": item.get("original_exit_code"),
+            "poc_path": item.get("poc_path"),
+            "analysis_path": item.get("analysis_path"),
+            "runtime_output_path": item.get("runtime_output_path"),
+            "execution_status": item.get("execution_status") or "executed",
+            "execution_error": item.get("error"),
+            "target_vulnerability_triggered": item.get("target_vulnerability_triggered"),
+            "location_reachability": reachability,
+        }
+        candidates.append(candidate)
+    return {
+        "evaluation_protocol": "location-reachability-batch-v3",
+        "submitted_unique_pocs": summary.get("submitted_unique_pocs", payload.get("submitted_unique_pocs", 0)),
+        "reachability_executed_candidates": summary.get("evaluated_unique_pocs", len(candidates)),
+        "candidates": candidates,
+        "location_evaluated_candidates": summary.get("evaluated_unique_pocs", len(candidates)),
+        "nonzero_exit_false_positives": summary.get("nonzero_exit_false_positives", 0),
+        "any_reached": summary.get("any_reached"),
+        "any_target_vulnerability_triggered": summary.get("any_target_vulnerability_triggered"),
+        "primary_attempt_id": summary.get("primary_attempt_id"),
+        "best_attempt_id": summary.get("best_attempt_id"),
+        "submission_outcome": fallback.get("submission_outcome"),
+        "reachability_eval_path": "reachability_eval.json",
+    }
+
+
+def _evaluate_distillation_sample(namespace: str, sample_dir: Path) -> dict[str, Any]:
+    row = evaluate_sample(namespace, sample_dir, require_analysis_quality=False)
+    runtime = _runtime_from_reachability_eval(sample_dir, row.get("runtime") or {})
+    if runtime is not None:
+        row["runtime"] = runtime
+    row["deterministic_outcome"] = classify_outcome(row)
+    return row
+
+
 def _evaluate_attempt_rows(namespace: str, results_dir: Path, samples: list[str]) -> dict[str, dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
     for sample_id in samples:
         sample_dir = results_dir / sample_id
         if not sample_dir.is_dir():
             continue
-        row = evaluate_sample(namespace, sample_dir, require_analysis_quality=False)
-        row["deterministic_outcome"] = classify_outcome(row)
-        rows[sample_id] = row
+        rows[sample_id] = _evaluate_distillation_sample(namespace, sample_dir)
     return rows
 
 
@@ -257,6 +336,7 @@ def cmd_init_run(args: argparse.Namespace) -> int:
         split_payload = _copy_baseline_split(run_dir, args.baseline_dir.resolve())
         split_source = str(args.baseline_dir.resolve())
         train = [str(item) for item in split_payload.get("train") or []]
+        dev = [str(item) for item in split_payload.get("dev") or []]
         test = [str(item) for item in split_payload.get("test") or []]
         batches = split_payload.get("batches") or []
         ordering = str(split_payload.get("ordering") or "baseline split_manifest.json")
@@ -265,6 +345,7 @@ def cmd_init_run(args: argparse.Namespace) -> int:
         split = load_frozen_split()
         write_split_manifest(run_dir / "split_manifest.json", split)
         train = split.train
+        dev = split.dev
         test = split.test
         batches = split.batches
         ordering = split.ordering
@@ -286,6 +367,7 @@ def cmd_init_run(args: argparse.Namespace) -> int:
         "run_dir": str(run_dir),
         "ordering": ordering,
         "train": len(train),
+        "dev": len(dev),
         "test": len(test),
         "batches": len(batches),
         "undated_samples": len(undated),
@@ -302,11 +384,47 @@ def _copy_baseline_split(run_dir: Path, baseline_dir: Path) -> dict[str, Any]:
     if not isinstance(split_payload.get("batches"), list):
         raise ValueError(f"baseline split has no batches: {split_file}")
     run_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(split_file, run_dir / "split_manifest.json")
+    split_payload = _normalize_legacy_split_manifest(split_payload)
+    write_json(run_dir / "split_manifest.json", split_payload)
     summary_file = baseline_dir / "batch_summary.json"
     if summary_file.is_file():
         shutil.copy2(summary_file, run_dir / "batch_summary.json")
     return split_payload
+
+
+def _normalize_legacy_split_manifest(split_payload: dict[str, Any]) -> dict[str, Any]:
+    """Split legacy 300/200 train/test manifests into 300/30/170.
+
+    Historical baseline artifacts keep the original 200-sample held-out set
+    under ``test``. New runs use a small dev gate randomly sampled from that
+    held-out set and reserve the remaining samples for final test.
+    """
+    if split_payload.get("dev"):
+        return split_payload
+    test = [str(item) for item in split_payload.get("test") or []]
+    if len(test) != 200:
+        return split_payload
+    dev_set = set(random.Random(DEV_SELECTION_SEED).sample(test, 30))
+    dev = [sample for sample in test if sample in dev_set]
+    final_test = [sample for sample in test if sample not in dev_set]
+    out = dict(split_payload)
+    out["dev_size"] = len(dev)
+    out["test_size"] = len(final_test)
+    out["dev_selection"] = {
+        "source": "random sample from legacy split_manifest.test",
+        "seed": DEV_SELECTION_SEED,
+    }
+    out["dev"] = dev
+    out["test"] = final_test
+    out["dev_date_range"] = _manifest_date_range(dev, out)
+    out["test_date_range"] = _manifest_date_range(final_test, out)
+    return out
+
+
+def _manifest_date_range(samples: list[str], manifest: dict[str, Any]) -> dict[str, str | None]:
+    dates = manifest.get("sample_dates") or {}
+    values = sorted(str(dates[s]) for s in samples if s in dates)
+    return {"first": values[0] if values else None, "last": values[-1] if values else None}
 
 
 # --------------------------------------------------------------------------- training loop
@@ -331,8 +449,7 @@ def cmd_evaluate_batch(args: argparse.Namespace) -> int:
     results_dir = args.results_dir.resolve()
     rows = []
     for sample_id in _batch_samples(run_dir, args.batch_index):
-        row = evaluate_sample(results_dir.parent.name, results_dir / sample_id, require_analysis_quality=False)
-        row["deterministic_outcome"] = classify_outcome(row)
+        row = _evaluate_distillation_sample(results_dir.parent.name, results_dir / sample_id)
         rows.append(row)
     report = {"protocol": "reward-distillation-batch-eval-v1", "batch_index": args.batch_index, "rows": rows}
     write_json(run_dir / f"batch_{args.batch_index:03d}" / "evaluation.json", report)
@@ -357,6 +474,443 @@ def cmd_evaluate_batch(args: argparse.Namespace) -> int:
         "submission_success_samples": submission_success,
         "submission_only_success_samples": submission_only_success,
     }, indent=2))
+    return 0
+
+
+SEED_BUCKET_QUOTAS = {
+    "success": 10,
+    "no_submit_failure": 10,
+    "submitted_no_progress": 10,
+    "partial_progress": 10,
+    "near_miss_or_false_positive": 10,
+}
+
+
+def _load_sample_list(path: Path, *, key: str = "samples") -> list[str]:
+    payload = read_json(path)
+    if isinstance(payload, list):
+        return [str(item) for item in payload if str(item).strip()]
+    if isinstance(payload, dict):
+        values = payload.get(key)
+        if values is None and key != "samples":
+            values = payload.get("samples")
+        if isinstance(values, list):
+            return [str(item) for item in values if str(item).strip()]
+    raise SystemExit(f"{path} must be a JSON list or object with a {key!r} list")
+
+
+def _seed_reachability_row(sample_id: str, results_dir: Path) -> dict[str, Any]:
+    sample_dir = results_dir / sample_id
+    report = load_json_if_exists(sample_dir / "reachability_eval.json")
+    summary = report.get("summary") if isinstance(report, dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    any_reached = summary.get("any_reached") if isinstance(summary.get("any_reached"), dict) else {}
+    depth = 0
+    if any_reached.get("R1_input_admitted"):
+        depth = 1
+    if any_reached.get("R2_source_reached"):
+        depth = 2
+    if any_reached.get("R3_root_cause_reached"):
+        depth = 3
+    if any_reached.get("R4_sink_reached"):
+        depth = 4
+    submitted = int(summary.get("submitted_unique_pocs") or 0)
+    false_positive_pocs = int(summary.get("nonzero_exit_false_positives") or 0)
+    gt = bool(summary.get("any_target_vulnerability_triggered"))
+    if not sample_dir.is_dir() or not report:
+        bucket = "missing_reachability"
+    elif gt:
+        bucket = "success"
+    elif submitted == 0:
+        bucket = "no_submit_failure"
+    elif false_positive_pocs > 0 or depth >= 3:
+        bucket = "near_miss_or_false_positive"
+    elif depth >= 1:
+        bucket = "partial_progress"
+    else:
+        bucket = "submitted_no_progress"
+    return {
+        "sample_id": sample_id,
+        "present": sample_dir.is_dir(),
+        "reachability_present": bool(report),
+        "bucket": bucket,
+        "gt": gt,
+        "submitted_unique_pocs": submitted,
+        "evaluated_unique_pocs": int(summary.get("evaluated_unique_pocs") or 0),
+        "false_positive_pocs": false_positive_pocs,
+        "candidate_errors": int(summary.get("candidate_errors") or 0),
+        "depth": depth,
+        "r1": bool(any_reached.get("R1_input_admitted")),
+        "r2": bool(any_reached.get("R2_source_reached")),
+        "r3": bool(any_reached.get("R3_root_cause_reached")),
+        "r4": bool(any_reached.get("R4_sink_reached")),
+    }
+
+
+def _seed_quota_overrides(raw: list[str] | None) -> dict[str, int]:
+    quotas = dict(SEED_BUCKET_QUOTAS)
+    for item in raw or []:
+        name, sep, value = item.partition("=")
+        if not sep or name not in quotas:
+            raise SystemExit(
+                "--bucket-quota must be bucket=count for one of "
+                + ", ".join(sorted(quotas))
+            )
+        quotas[name] = int(value)
+    return quotas
+
+
+def cmd_select_seed_set(args: argparse.Namespace) -> int:
+    run_dir = args.run_dir.resolve()
+    results_dir = args.results_dir.resolve()
+    train_file = args.train_file.resolve()
+    train_samples = _load_sample_list(train_file)
+    quotas = _seed_quota_overrides(args.bucket_quota)
+    rng = random.Random(args.seed)
+
+    rows = [_seed_reachability_row(sample_id, results_dir) for sample_id in train_samples]
+    by_bucket: dict[str, list[dict[str, Any]]] = {name: [] for name in quotas}
+    missing: list[dict[str, Any]] = []
+    for row in rows:
+        bucket = row["bucket"]
+        if bucket in by_bucket:
+            by_bucket[bucket].append(row)
+        else:
+            missing.append(row)
+    for items in by_bucket.values():
+        rng.shuffle(items)
+
+    selected: list[str] = []
+    selected_by_bucket: dict[str, list[str]] = {}
+    deficits: dict[str, int] = {}
+    for bucket, quota in quotas.items():
+        chosen = [row["sample_id"] for row in by_bucket[bucket][:quota]]
+        selected_by_bucket[bucket] = chosen
+        selected.extend(chosen)
+        if len(chosen) < quota:
+            deficits[bucket] = quota - len(chosen)
+
+    selected_set = set(selected)
+    target_total = int(args.total or sum(quotas.values()))
+    backfill_pool = [
+        row for row in rows
+        if row["sample_id"] not in selected_set and row["bucket"] in quotas
+    ]
+    rng.shuffle(backfill_pool)
+    backfill: list[str] = []
+    for row in backfill_pool:
+        if len(selected) >= target_total:
+            break
+        selected.append(row["sample_id"])
+        selected_set.add(row["sample_id"])
+        backfill.append(row["sample_id"])
+
+    selected_rows = [row for row in rows if row["sample_id"] in selected_set]
+    selected_rows_by_id = {row["sample_id"]: row for row in selected_rows}
+    selected = [sample_id for sample_id in selected if sample_id in selected_rows_by_id]
+
+    batch_dir = run_dir / "batch_000"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    (batch_dir / "samples.txt").write_text("\n".join(selected) + "\n", encoding="utf-8")
+
+    selection = {
+        "protocol": "reward-framework-seed-selection-v1",
+        "purpose": "initial seed distillation from baseline behavior",
+        "results_dir": str(results_dir),
+        "train_file": str(train_file),
+        "seed": args.seed,
+        "target_total": target_total,
+        "quotas": quotas,
+        "selected": selected,
+        "selected_by_bucket": selected_by_bucket,
+        "backfill": backfill,
+        "deficits": deficits,
+        "available_counts": {bucket: len(items) for bucket, items in by_bucket.items()},
+        "missing_reachability": [row["sample_id"] for row in missing],
+        "rows": rows,
+    }
+    write_json(batch_dir / "seed_selection.json", selection)
+
+    split_payload = {
+        "protocol": "reward-framework-seed-distillation-split-v1",
+        "train_file": str(train_file),
+        "train": train_samples,
+        "batches": [{"batch_index": 0, "purpose": "seed_distillation", "samples": selected}],
+        "seed_selection": {
+            "file": "batch_000/seed_selection.json",
+            "sample_count": len(selected),
+            "seed": args.seed,
+        },
+    }
+    write_json(run_dir / "split_manifest.json", split_payload)
+
+    eval_rows = [
+        _evaluate_distillation_sample(results_dir.parent.name, results_dir / sample_id)
+        for sample_id in selected
+    ]
+    evaluation = {"protocol": "reward-distillation-seed-eval-v1", "batch_index": 0, "rows": eval_rows}
+    write_json(batch_dir / "evaluation.json", evaluation)
+
+    selected_counts: dict[str, int] = {}
+    for sample_id in selected:
+        bucket = selected_rows_by_id[sample_id]["bucket"]
+        selected_counts[bucket] = selected_counts.get(bucket, 0) + 1
+    print(json.dumps({
+        "status": "seed_set_selected",
+        "run_dir": str(run_dir),
+        "samples": len(selected),
+        "selected_counts": selected_counts,
+        "deficits": deficits,
+        "samples_file": str(batch_dir / "samples.txt"),
+        "selection": str(batch_dir / "seed_selection.json"),
+        "evaluation": str(batch_dir / "evaluation.json"),
+    }, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _seed_author_items(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    values = payload.get(key) or []
+    if isinstance(values, dict):
+        values = values.get("lessons") or []
+    if not isinstance(values, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in values:
+        if isinstance(item, str):
+            proposal = item.strip()
+            item = {"proposal": proposal}
+        elif isinstance(item, dict):
+            proposal = str(item.get("proposal") or item.get("lesson") or item.get("text") or "").strip()
+            item = {**item, "proposal": proposal}
+        else:
+            continue
+        if proposal:
+            out.append(item)
+    return out
+
+
+def _seed_author_decisions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    decisions: list[dict[str, Any]] = []
+    for target, key in (
+        ("reproduction:R.B", "reproduction_lessons"),
+        ("submission:S.C", "submission_lessons"),
+    ):
+        for item in _seed_author_items(payload, key):
+            decisions.append({
+                "decision": "MODIFY",
+                "target": target,
+                "target_lesson_id": "",
+                "proposal": item["proposal"],
+                "seed_evidence": item.get("evidence"),
+                "success_guardrail": item.get("success_guardrail"),
+                "risk": item.get("risk"),
+            })
+    return decisions
+
+
+def _compare_seed_to_handwritten(handwritten_packet: Path, seed_packet: Path) -> dict[str, Any]:
+    handwritten = lessons_snapshot(handwritten_packet)
+    learned = lessons_snapshot(seed_packet)
+    return {
+        "protocol": "reward-framework-initial-seed-comparison-v1",
+        "handwritten_packet": str(handwritten_packet),
+        "learned_seed_packet": str(seed_packet),
+        "fixed_sections_policy": "R.A, S.A, and S.B are inherited from the handwritten scaffold; only R.B and S.C differ.",
+        "handwritten_lessons": handwritten,
+        "learned_seed_lessons": learned,
+        "learned_counts": {
+            target: learned[target]["used"]
+            for target in TARGETS
+        },
+        "handwritten_counts": {
+            target: handwritten[target]["used"]
+            for target in TARGETS
+        },
+    }
+
+
+_LESSON_BULLET_RE = re.compile(r"^\s*-\s+\[(?:R\.B|S\.C)#\d+\]", re.MULTILINE)
+
+
+def _learned_section_body(markdown: str, heading: str) -> str:
+    lines = markdown.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == heading:
+            start = index + 1
+            break
+    if start is None:
+        raise ValueError(f"missing heading {heading!r}")
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].startswith("## ") and index > start:
+            end = index
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def _validate_scaffold_markdown(reproduction: str, submission: str) -> list[str]:
+    errors: list[str] = []
+    if not reproduction.strip():
+        errors.append("missing reproduction_skill_md")
+    if not submission.strip():
+        errors.append("missing submission_skill_md")
+    for label, text, heading in (
+        ("reproduction_skill_md", reproduction, "## R.B Learned Reproduction Lessons"),
+        ("submission_skill_md", submission, "## S.C Learned Submission Lessons"),
+    ):
+        if _LESSON_BULLET_RE.search(text):
+            errors.append(f"{label} contains learned lesson bullets")
+        try:
+            body = _learned_section_body(text, heading)
+        except ValueError as exc:
+            errors.append(f"{label}: {exc}")
+            continue
+        if body != "No learned lessons yet.":
+            errors.append(
+                f"{label}: learned-lesson section must be exactly 'No learned lessons yet.'"
+            )
+    return errors
+
+
+def _write_scaffold_packet(reference_packet: Path, decision: dict[str, Any], out_packet: Path) -> dict[str, Any]:
+    reproduction = str(decision.get("reproduction_skill_md") or "").strip()
+    submission = str(decision.get("submission_skill_md") or "").strip()
+    errors = _validate_scaffold_markdown(reproduction, submission)
+    if errors:
+        return {"written": False, "errors": errors}
+    if out_packet.exists():
+        shutil.rmtree(out_packet)
+    shutil.copytree(reference_packet, out_packet, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    (out_packet / "reproduction_skill").mkdir(parents=True, exist_ok=True)
+    (out_packet / "submission_skill").mkdir(parents=True, exist_ok=True)
+    (out_packet / "reproduction_skill" / "SKILL.md").write_text(reproduction + "\n", encoding="utf-8")
+    (out_packet / "submission_skill" / "SKILL.md").write_text(submission + "\n", encoding="utf-8")
+    normalize_packet(out_packet)
+    lessons = lessons_snapshot(out_packet)
+    if any(lessons[target]["used"] for target in TARGETS):
+        return {"written": False, "errors": ["scaffold contains learned lessons after normalization"]}
+    write_json(out_packet / "SCAFFOLD_META.json", {
+        "scaffold_name": decision.get("scaffold_name"),
+        "rationale": decision.get("rationale"),
+        "guardrails": decision.get("guardrails") or [],
+        "deferred_to_lessons": decision.get("deferred_to_lessons") or [],
+        "gate_expectation": decision.get("gate_expectation"),
+    })
+    return {"written": True, "packet": str(out_packet), "lessons_after": lessons}
+
+
+def _compare_scaffold_to_reference(reference_packet: Path, scaffold_packet: Path, decision: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "protocol": "reward-framework-initial-scaffold-comparison-v1",
+        "reference_packet": str(reference_packet),
+        "generated_scaffold_packet": str(scaffold_packet),
+        "policy": "Generated scaffold may rewrite fixed instruction text, but R.B and S.C must remain empty.",
+        "reference_lessons": lessons_snapshot(reference_packet),
+        "generated_lessons": lessons_snapshot(scaffold_packet),
+        "scaffold_name": decision.get("scaffold_name"),
+        "rationale": decision.get("rationale"),
+        "guardrails": decision.get("guardrails") or [],
+        "deferred_to_lessons": decision.get("deferred_to_lessons") or [],
+        "gate_expectation": decision.get("gate_expectation"),
+    }
+
+
+def cmd_author_initial_scaffold(args: argparse.Namespace) -> int:
+    run_dir = args.run_dir.resolve()
+    batch_dir = run_dir / f"batch_{args.batch_index:03d}"
+    diagnoses_path = args.diagnoses.resolve() if args.diagnoses else batch_dir / "diagnoses.json"
+    evaluation_path = args.evaluation.resolve() if args.evaluation else batch_dir / "evaluation.json"
+    selection_path = args.seed_selection.resolve() if args.seed_selection else batch_dir / "seed_selection.json"
+    if not diagnoses_path.is_file():
+        raise SystemExit(f"missing scaffold diagnoses: {diagnoses_path}")
+    diagnoses_payload = read_json(diagnoses_path)
+    diagnoses = diagnoses_payload.get("diagnoses", diagnoses_payload) if isinstance(diagnoses_payload, dict) else diagnoses_payload
+    if not isinstance(diagnoses, list) or not diagnoses:
+        raise SystemExit(f"{diagnoses_path} must contain a non-empty diagnosis list")
+    diagnoses = [learning_diagnosis(item) for item in diagnoses if isinstance(item, dict)]
+    evaluation = learning_evaluation(read_json(evaluation_path))
+    selection = read_json(selection_path)
+    reference_packet = args.reference_packet.resolve()
+
+    out_json = batch_dir / "scaffold_author_output.json"
+    workspace = batch_dir / "subsessions" / "scaffold_author"
+    status = _run_role(
+        args,
+        "scaffold_author",
+        workspace,
+        out_json=out_json,
+        build=lambda: build_scaffold_author_role(workspace, reference_packet, diagnoses, evaluation, selection),
+    )
+    result: dict[str, Any] = {"scaffold_author": status}
+    if status.get("status") == "workspace_prepared":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if status.get("status") not in {"ok", "reused"} or not out_json.is_file():
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 1
+
+    payload = read_json(out_json)
+    out_packet = (args.out_packet or run_dir / "skill_packets" / "generated_initial_scaffold").resolve()
+    written = _write_scaffold_packet(reference_packet, payload, out_packet)
+    write_json(batch_dir / "scaffold_author_applied.json", written)
+    result["scaffold"] = written
+    if written.get("written"):
+        comparison = _compare_scaffold_to_reference(reference_packet, out_packet, payload)
+        write_json(batch_dir / "scaffold_vs_reference_comparison.json", comparison)
+        result["comparison"] = str(batch_dir / "scaffold_vs_reference_comparison.json")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if written.get("written") else 1
+
+
+def cmd_author_initial_seed(args: argparse.Namespace) -> int:
+    run_dir = args.run_dir.resolve()
+    batch_dir = run_dir / f"batch_{args.batch_index:03d}"
+    diagnoses_path = args.diagnoses.resolve() if args.diagnoses else batch_dir / "diagnoses.json"
+    evaluation_path = args.evaluation.resolve() if args.evaluation else batch_dir / "evaluation.json"
+    selection_path = args.seed_selection.resolve() if args.seed_selection else batch_dir / "seed_selection.json"
+    if not diagnoses_path.is_file():
+        raise SystemExit(f"missing seed diagnoses: {diagnoses_path}")
+    diagnoses_payload = read_json(diagnoses_path)
+    diagnoses = diagnoses_payload.get("diagnoses", diagnoses_payload) if isinstance(diagnoses_payload, dict) else diagnoses_payload
+    if not isinstance(diagnoses, list) or not diagnoses:
+        raise SystemExit(f"{diagnoses_path} must contain a non-empty diagnosis list")
+    diagnoses = [learning_diagnosis(item) for item in diagnoses if isinstance(item, dict)]
+    evaluation = learning_evaluation(read_json(evaluation_path))
+    selection = read_json(selection_path)
+    base_packet = args.base_packet.resolve()
+
+    out_json = batch_dir / "seed_author_output.json"
+    workspace = batch_dir / "subsessions" / "seed_author"
+    status = _run_role(
+        args,
+        "seed_author",
+        workspace,
+        out_json=out_json,
+        build=lambda: build_seed_author_role(workspace, base_packet, diagnoses, evaluation, selection),
+    )
+    result: dict[str, Any] = {"seed_author": status}
+    if status.get("status") == "workspace_prepared":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if status.get("status") not in {"ok", "reused"} or not out_json.is_file():
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 1
+
+    payload = read_json(out_json)
+    decisions = _seed_author_decisions(payload)
+    out_packet = (args.out_packet or run_dir / "skill_packets" / "learned_initial_seed").resolve()
+    applied = apply_curator_decisions(base_packet, decisions, out_packet=out_packet)
+    write_json(batch_dir / "seed_author_applied.json", applied)
+    comparison = _compare_seed_to_handwritten(base_packet, out_packet)
+    write_json(batch_dir / "seed_vs_handwritten_comparison.json", comparison)
+    result.update({
+        "packet": str(out_packet),
+        "applied": applied["applied"],
+        "skipped": applied["skipped"],
+        "comparison": str(batch_dir / "seed_vs_handwritten_comparison.json"),
+    })
+    print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -470,7 +1024,9 @@ def _diagnosis_retry_note(error: str) -> str:
         "using behavior-language only. Do not use evaluator-only terms such as "
         "R0, R1, R2, R3, R4, R5, Parser, Source, Root Cause, Sink, Trigger, or GT. "
         "Use terms like accepted input, issue-relevant path, vulnerable condition, "
-        "sensitive operation, observable failure, target issue, or non-target crash."
+        "sensitive operation, observable failure, target issue, or non-target crash. "
+        "Before writing OUTPUT.json, inspect every string value and remove any token "
+        "matching R[0-5] or the stage-label words listed above."
     )
 
 
@@ -488,21 +1044,6 @@ def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
                 missing.append(f"{section}.{field}")
     if missing:
         return "diagnosis missing required evidence field(s): " + ", ".join(missing)
-    rubric_findings = diagnosis.get(RUBRIC_FINDINGS_KEY)
-    if not isinstance(rubric_findings, list):
-        return f"diagnosis missing {RUBRIC_FINDINGS_KEY}"
-    allowed_categories = set(RUBRIC_CATEGORIES)
-    for index, finding in enumerate(rubric_findings):
-        if not isinstance(finding, dict):
-            return f"{RUBRIC_FINDINGS_KEY}[{index}] must be an object"
-        category = str(finding.get("category") or "")
-        if category not in allowed_categories:
-            return f"{RUBRIC_FINDINGS_KEY}[{index}].category must be one of: {', '.join(RUBRIC_CATEGORIES)}"
-        present = finding.get("present")
-        if not isinstance(present, bool):
-            return f"{RUBRIC_FINDINGS_KEY}[{index}].present must be boolean"
-        if present and not str(finding.get("evidence") or "").strip():
-            return f"{RUBRIC_FINDINGS_KEY}[{index}].evidence is required when present is true"
     forbidden = _forbidden_diagnosis_terms(diagnosis)
     if forbidden:
         return "diagnosis uses evaluator-only term(s): " + ", ".join(forbidden)
@@ -533,8 +1074,6 @@ def _normalize_diagnosis_for_outcome(
     for section in DIAGNOSIS_SECTIONS:
         if section in diagnosis:
             normalized[section] = diagnosis.get(section)
-    if RUBRIC_FINDINGS_KEY in diagnosis:
-        normalized[RUBRIC_FINDINGS_KEY] = diagnosis.get(RUBRIC_FINDINGS_KEY)
     return normalized
 
 def cmd_diagnose_batch(args: argparse.Namespace) -> int:
@@ -577,25 +1116,32 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
             build=lambda: build_diagnosis_role(workspace, sample_id, results_dir, eval_row, outcome_record),
         )
         if args.execute and out_json.is_file():
-            diagnosis = _normalize_diagnosis_for_outcome(
-                read_json(out_json), outcome_record, sample_id=sample_id
-            )
-            quality_error = _diagnosis_quality_error(diagnosis)
-            if quality_error:
+            quality_rejections: list[dict[str, Any]] = []
+            for _attempt in range(3):
+                diagnosis = _normalize_diagnosis_for_outcome(
+                    read_json(out_json), outcome_record, sample_id=sample_id
+                )
+                quality_error = _diagnosis_quality_error(diagnosis)
+                if not quality_error:
+                    break
+                quality_rejections.append({
+                    "status": status.get("status"),
+                    "error": quality_error,
+                })
                 if out_json.exists():
                     out_json.unlink()
                 retry_args = argparse.Namespace(**vars(args))
                 retry_args.redo = True
-                retry_status = _run_role(
+                status = _run_role(
                     retry_args, "diagnose", workspace, out_json=out_json,
                     build=lambda: build_diagnosis_role(workspace, sample_id, results_dir, eval_row, outcome_record),
                     retry_note=_diagnosis_retry_note(quality_error),
                 )
-                retry_status["retry_of_invalid_output"] = {
-                    "status": status.get("status"),
-                    "error": quality_error,
-                }
-                status = retry_status
+                if not out_json.is_file():
+                    break
+            if quality_rejections:
+                status["quality_rejections"] = quality_rejections
+                status["retry_of_invalid_output"] = quality_rejections[-1]
         return {
             "sample_id": sample_id,
             "attempt": label,
@@ -1307,9 +1853,6 @@ def _run_batch_correction(
     applied = run_dir / f"batch_{max(batch_index - 1, 0):03d}" / "applied_updates.json"
     if applied.is_file():
         cmd.extend(["--applied-updates", applied])
-    baseline = batch_dir / "baseline_deepseek_harness_v4_flash_evaluation.json"
-    if baseline.is_file():
-        cmd.extend(["--baseline-evaluation", f"historical={baseline}"])
     _append_role_cli_args(cmd, args)
     _run_checked_step(
         f"batch_{batch_index:03d}:correction",
@@ -1577,16 +2120,25 @@ def _bare_packet(source: Path, out: Path) -> Path:
     return out
 
 
+def _split_samples_for_eval(run_dir: Path, split_name: str) -> list[str]:
+    split_name = str(split_name or "test")
+    if split_name not in {"dev", "test"}:
+        raise ValueError("--split must be dev or test")
+    samples = [str(item) for item in _split(run_dir).get(split_name) or []]
+    if not samples:
+        raise ValueError(f"split_manifest.json has no {split_name} samples")
+    return samples
+
+
 def cmd_run_test(args: argparse.Namespace) -> int:
     """Run the held-out test split once, with one frozen packet. No learning."""
     run_dir = args.run_dir.resolve()
-    samples = [str(item) for item in _split(run_dir).get("test") or []]
+    split_name = str(getattr(args, "split", "test") or "test")
+    samples = _split_samples_for_eval(run_dir, split_name)
     if args.limit:
         samples = samples[: args.limit]
-    if not samples:
-        raise ValueError("split_manifest.json has no test samples")
 
-    arm_dir = run_dir / "test" / args.arm
+    arm_dir = run_dir / split_name / args.arm
     arm_dir.mkdir(parents=True, exist_ok=True)
     sample_file = arm_dir / "samples.txt"
     sample_file.write_text("\n".join(samples) + "\n", encoding="utf-8")
@@ -1602,42 +2154,237 @@ def cmd_run_test(args: argparse.Namespace) -> int:
         packet = packets[-1]
     normalize_packet(packet)
 
-    run_id = args.reward_run_id or f"test_{run_dir.name}_{args.arm}"
+    run_id = args.reward_run_id or f"{split_name}_{run_dir.name}_{args.arm}"
     cmd = _harness_command(args, run_id=run_id, sample_file=sample_file, packet=packet)
     write_json(arm_dir / "run_command.json", {
+        "split": split_name,
         "arm": args.arm,
         "packet": str(packet),
         "lessons": lessons_snapshot(packet),
         "samples": len(samples),
         "command": cmd,
     })
-    print(json.dumps({"arm": args.arm, "packet": str(packet), "samples": len(samples)}, indent=2))
+    print(json.dumps({"split": split_name, "arm": args.arm, "packet": str(packet), "samples": len(samples)}, indent=2))
     return subprocess.run(cmd, cwd=REPO_ROOT, text=True, check=False).returncode
 
 
 def cmd_evaluate_test(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.resolve()
     results_dir = args.results_dir.resolve()
-    samples = [str(item) for item in _split(run_dir).get("test") or []]
+    split_name = str(getattr(args, "split", "test") or "test")
+    samples = _split_samples_for_eval(run_dir, split_name)
     rows, counts = [], {}
     for sample_id in samples:
         if not (results_dir / sample_id).is_dir():
             continue
-        row = evaluate_sample(results_dir.parent.name, results_dir / sample_id, require_analysis_quality=False)
-        row["deterministic_outcome"] = classify_outcome(row)
+        row = _evaluate_distillation_sample(results_dir.parent.name, results_dir / sample_id)
         rows.append(row)
         key = row["deterministic_outcome"]["outcome"]
         counts[key] = counts.get(key, 0) + 1
     report = {
         "protocol": "reward-distillation-test-eval-v1",
+        "split": split_name,
         "arm": args.arm,
         "evaluated": len(rows),
         "outcomes": counts,
         "trigger_rate": (counts.get("success", 0) / len(rows)) if rows else None,
         "rows": rows,
     }
-    write_json(run_dir / "test" / args.arm / "evaluation.json", report)
-    print(json.dumps({k: report[k] for k in ("arm", "evaluated", "outcomes", "trigger_rate")}, indent=2))
+    write_json(run_dir / split_name / args.arm / "evaluation.json", report)
+    print(json.dumps({k: report[k] for k in ("split", "arm", "evaluated", "outcomes", "trigger_rate")}, indent=2))
+    return 0
+
+
+_REACHABILITY_ORDER = [
+    ("R1_input_admitted", "r1_samples", 1),
+    ("R2_source_reached", "r2_samples", 2),
+    ("R3_root_cause_reached", "r3_samples", 3),
+    ("R4_sink_reached", "r4_samples", 4),
+]
+
+
+def _reachability_gate_row(sample_id: str, results_dir: Path) -> dict[str, Any]:
+    sample_dir = results_dir / sample_id
+    report = load_json_if_exists(sample_dir / "reachability_eval.json")
+    summary = (report or {}).get("summary") if isinstance(report, dict) else None
+    summary = summary if isinstance(summary, dict) else {}
+    any_reached = summary.get("any_reached") if isinstance(summary.get("any_reached"), dict) else {}
+    reachability_present = bool(report)
+    submitted = int(summary.get("submitted_unique_pocs") or 0)
+    evaluated = int(summary.get("evaluated_unique_pocs") or 0)
+    candidate_errors = int(summary.get("candidate_errors") or 0)
+    false_positives = int(summary.get("nonzero_exit_false_positives") or 0)
+    depth = 0
+    reached: dict[str, bool] = {}
+    for key, out_key, value in _REACHABILITY_ORDER:
+        hit = bool(any_reached.get(key))
+        reached[out_key] = hit
+        if hit:
+            depth = value
+    return {
+        "sample_id": sample_id,
+        "present": sample_dir.is_dir(),
+        "reachability_present": reachability_present,
+        "submitted_unique_pocs": submitted,
+        "evaluated_unique_pocs": evaluated,
+        "candidate_errors": candidate_errors,
+        "false_positive_pocs": false_positives,
+        "has_submission": reachability_present and submitted > 0,
+        "no_submission": reachability_present and submitted == 0,
+        "gt": bool(summary.get("any_target_vulnerability_triggered")),
+        "depth": depth,
+        **reached,
+    }
+
+
+def _summarize_gate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = {
+        "samples": len(rows),
+        "present_samples": sum(1 for row in rows if row["present"]),
+        "reachability_samples": sum(1 for row in rows if row["reachability_present"]),
+        "missing_samples": sum(1 for row in rows if not row["reachability_present"]),
+        "submitted_samples": sum(1 for row in rows if row["has_submission"]),
+        "no_submit_samples": sum(1 for row in rows if row["no_submission"]),
+        "gt_samples": sum(1 for row in rows if row["gt"]),
+        "candidate_error_samples": sum(1 for row in rows if row["candidate_errors"] > 0),
+        "false_positive_samples": sum(1 for row in rows if row["false_positive_pocs"] > 0),
+        "depth_sum": sum(int(row["depth"]) for row in rows),
+    }
+    for _, out_key, _ in _REACHABILITY_ORDER:
+        summary[out_key] = sum(1 for row in rows if row[out_key])
+    return summary
+
+
+def _gate_regressions(baseline: dict[str, Any], candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    regressions: list[dict[str, Any]] = []
+    lower_is_bad = [
+        "reachability_samples",
+        "r1_samples",
+        "r2_samples",
+        "r3_samples",
+        "r4_samples",
+        "depth_sum",
+    ]
+    higher_is_bad = ["missing_samples", "candidate_error_samples", "false_positive_samples"]
+    for metric in lower_is_bad:
+        if int(candidate.get(metric) or 0) < int(baseline.get(metric) or 0):
+            regressions.append({
+                "metric": metric,
+                "baseline": baseline.get(metric),
+                "candidate": candidate.get(metric),
+                "direction": "lower",
+            })
+    for metric in higher_is_bad:
+        if int(candidate.get(metric) or 0) > int(baseline.get(metric) or 0):
+            regressions.append({
+                "metric": metric,
+                "baseline": baseline.get(metric),
+                "candidate": candidate.get(metric),
+                "direction": "higher",
+            })
+    return regressions
+
+
+def _gate_warnings(baseline: dict[str, Any], candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    if int(candidate.get("submitted_samples") or 0) < int(baseline.get("submitted_samples") or 0):
+        warnings.append({
+            "metric": "submitted_samples",
+            "baseline": baseline.get("submitted_samples"),
+            "candidate": candidate.get("submitted_samples"),
+            "direction": "lower",
+        })
+    if int(candidate.get("no_submit_samples") or 0) > int(baseline.get("no_submit_samples") or 0):
+        warnings.append({
+            "metric": "no_submit_samples",
+            "baseline": baseline.get("no_submit_samples"),
+            "candidate": candidate.get("no_submit_samples"),
+            "direction": "higher",
+        })
+    return warnings
+
+
+def cmd_validate_dev(args: argparse.Namespace) -> int:
+    run_dir = args.run_dir.resolve()
+    split_name = str(getattr(args, "split", "dev") or "dev")
+    samples = _split_samples_for_eval(run_dir, split_name)
+    baseline_results = args.baseline_results_dir.resolve()
+    candidate_results = args.candidate_results_dir.resolve()
+
+    baseline_rows = [_reachability_gate_row(sample_id, baseline_results) for sample_id in samples]
+    candidate_rows = [_reachability_gate_row(sample_id, candidate_results) for sample_id in samples]
+    baseline_summary = _summarize_gate_rows(baseline_rows)
+    candidate_summary = _summarize_gate_rows(candidate_rows)
+
+    baseline_by_sample = {row["sample_id"]: row for row in baseline_rows}
+    candidate_by_sample = {row["sample_id"]: row for row in candidate_rows}
+    wins = [sample_id for sample_id in samples if candidate_by_sample[sample_id]["gt"] and not baseline_by_sample[sample_id]["gt"]]
+    losses = [sample_id for sample_id in samples if baseline_by_sample[sample_id]["gt"] and not candidate_by_sample[sample_id]["gt"]]
+    unchanged_success = [
+        sample_id for sample_id in samples if baseline_by_sample[sample_id]["gt"] and candidate_by_sample[sample_id]["gt"]
+    ]
+    unchanged_failure = [
+        sample_id for sample_id in samples if not baseline_by_sample[sample_id]["gt"] and not candidate_by_sample[sample_id]["gt"]
+    ]
+
+    regressions = _gate_regressions(baseline_summary, candidate_summary)
+    warnings = _gate_warnings(baseline_summary, candidate_summary)
+    gt_delta = int(candidate_summary["gt_samples"]) - int(baseline_summary["gt_samples"])
+    if candidate_summary["missing_samples"] or baseline_summary["missing_samples"]:
+        decision = "INCOMPLETE"
+        reason_codes = ["missing_reachability"]
+    elif gt_delta < 0:
+        decision = "REJECT"
+        reason_codes = ["gt_regression"]
+    elif regressions:
+        decision = "REJECT"
+        reason_codes = ["reachability_regression"]
+    else:
+        decision = "ACCEPT"
+        reason_codes = ["gt_non_decreasing", "reachability_non_decreasing"]
+        if gt_delta > 0:
+            reason_codes.append("gt_improved")
+
+    report = {
+        "protocol": "reward-framework-dev-gate-v1",
+        "split": split_name,
+        "baseline_label": args.baseline_label,
+        "candidate_label": args.candidate_label or args.arm,
+        "baseline_results_dir": str(baseline_results),
+        "candidate_results_dir": str(candidate_results),
+        "samples": samples,
+        "decision": decision,
+        "reason_codes": reason_codes,
+        "gt_delta": gt_delta,
+        "regressions": regressions,
+        "warnings": warnings,
+        "baseline": baseline_summary,
+        "candidate": candidate_summary,
+        "sample_deltas": {
+            "wins": wins,
+            "losses": losses,
+            "unchanged_success": unchanged_success,
+            "unchanged_failure": unchanged_failure,
+        },
+        "rows": {
+            "baseline": baseline_rows,
+            "candidate": candidate_rows,
+        },
+    }
+    out = args.out
+    if out is None:
+        out = run_dir / split_name / args.arm / "dev_decision.json"
+    write_json(out.resolve(), report)
+    print(json.dumps({
+        "decision": decision,
+        "split": split_name,
+        "baseline_gt": baseline_summary["gt_samples"],
+        "candidate_gt": candidate_summary["gt_samples"],
+        "gt_delta": gt_delta,
+        "regressions": regressions,
+        "warnings": warnings,
+        "out": str(out.resolve()),
+    }, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -1743,11 +2490,24 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--results-dir", type=Path, required=True)
     evaluate.set_defaults(func=cmd_evaluate_batch)
 
+    seed_select = sub.add_parser("select-seed-set")
+    seed_select.add_argument("--run-dir", type=Path, required=True)
+    seed_select.add_argument("--results-dir", type=Path, required=True,
+                             help="baseline results directory for this coding-agent setting")
+    seed_select.add_argument("--train-file", type=Path, default=GT_RESULTS / "train_gt.json")
+    seed_select.add_argument("--total", type=int, default=50)
+    seed_select.add_argument("--seed", type=int, default=20261006)
+    seed_select.add_argument("--bucket-quota", action="append", default=[],
+                             help="override one quota, e.g. success=10; may be repeated")
+    seed_select.set_defaults(func=cmd_select_seed_set)
+
     diagnose = sub.add_parser("diagnose-batch")
     diagnose.add_argument("--run-dir", type=Path, required=True)
     diagnose.add_argument("--batch-index", type=int, required=True)
     diagnose.add_argument("--results-dir", type=Path, required=True)
     diagnose.add_argument("--evaluation", type=Path)
+    diagnose.add_argument("--baseline-evaluation", type=Path,
+                          help="deprecated: initial/baseline comparisons are no longer fed into skill learning")
     diagnose.add_argument("--attempt", action="append", default=[],
                           help="optional retry attempt as label=results_dir; may be repeated")
     diagnose.add_argument("--attempt-only", action="store_true",
@@ -1755,6 +2515,30 @@ def main(argv: list[str] | None = None) -> int:
     diagnose.add_argument("--parallel", type=int, default=1)
     _add_role_args(diagnose)
     diagnose.set_defaults(func=cmd_diagnose_batch)
+
+    scaffold_author = sub.add_parser("author-initial-scaffold")
+    scaffold_author.add_argument("--run-dir", type=Path, required=True)
+    scaffold_author.add_argument("--batch-index", type=int, default=0)
+    scaffold_author.add_argument("--reference-packet", type=Path, default=INITIAL_PACKET,
+                                 help="reference packet that provides required file layout and helper scripts")
+    scaffold_author.add_argument("--diagnoses", type=Path)
+    scaffold_author.add_argument("--evaluation", type=Path)
+    scaffold_author.add_argument("--seed-selection", type=Path)
+    scaffold_author.add_argument("--out-packet", type=Path)
+    _add_role_args(scaffold_author)
+    scaffold_author.set_defaults(func=cmd_author_initial_scaffold)
+
+    seed_author = sub.add_parser("author-initial-seed")
+    seed_author.add_argument("--run-dir", type=Path, required=True)
+    seed_author.add_argument("--batch-index", type=int, default=0)
+    seed_author.add_argument("--base-packet", type=Path, default=INITIAL_PACKET,
+                             help="two-skill scaffold to inherit R.A/S.A/S.B from")
+    seed_author.add_argument("--diagnoses", type=Path)
+    seed_author.add_argument("--evaluation", type=Path)
+    seed_author.add_argument("--seed-selection", type=Path)
+    seed_author.add_argument("--out-packet", type=Path)
+    _add_role_args(seed_author)
+    seed_author.set_defaults(func=cmd_author_initial_seed)
 
     propose = sub.add_parser("propose-updates")
     propose.add_argument("--run-dir", type=Path, required=True)
@@ -1875,6 +2659,8 @@ def main(argv: list[str] | None = None) -> int:
     run_test = sub.add_parser("run-test", help="run the held-out test split once with a frozen packet")
     run_test.add_argument("--run-dir", type=Path, required=True)
     run_test.add_argument("--arm", required=True, help="arm label, e.g. initial / distilled / bare")
+    run_test.add_argument("--split", choices=("dev", "test"), default="test",
+                          help="held-out split to run; dev is for negative gating, test is final")
     run_test.add_argument("--packet", type=Path)
     run_test.add_argument("--bare", action="store_true", help="strip every learned lesson from the packet")
     run_test.add_argument("--limit", type=int, default=0)
@@ -1884,8 +2670,23 @@ def main(argv: list[str] | None = None) -> int:
     eval_test = sub.add_parser("evaluate-test")
     eval_test.add_argument("--run-dir", type=Path, required=True)
     eval_test.add_argument("--arm", required=True)
+    eval_test.add_argument("--split", choices=("dev", "test"), default="test")
     eval_test.add_argument("--results-dir", type=Path, required=True)
     eval_test.set_defaults(func=cmd_evaluate_test)
+
+    validate_dev = sub.add_parser(
+        "validate-dev",
+        help="deterministically gate a candidate packet against a held-out split",
+    )
+    validate_dev.add_argument("--run-dir", type=Path, required=True)
+    validate_dev.add_argument("--arm", required=True, help="candidate arm label used for the default output path")
+    validate_dev.add_argument("--split", choices=("dev", "test"), default="dev")
+    validate_dev.add_argument("--baseline-results-dir", type=Path, required=True)
+    validate_dev.add_argument("--candidate-results-dir", type=Path, required=True)
+    validate_dev.add_argument("--baseline-label", default="baseline")
+    validate_dev.add_argument("--candidate-label")
+    validate_dev.add_argument("--out", type=Path)
+    validate_dev.set_defaults(func=cmd_validate_dev)
 
     freeze = sub.add_parser("freeze-split", help="pin the chronological split into gt_results (run once)")
     freeze.add_argument("--valid-gt", type=Path, default=REPO_ROOT / "gt_results" / "valid_gt.json")

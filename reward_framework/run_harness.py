@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -178,6 +179,79 @@ def maybe_run_reachability(
     return {"status": "complete", "summary": result.get("summary") or {}}
 
 
+def cleanup_completed_sample_storage(
+    config: dict[str, Any],
+    *,
+    sample_id: str,
+    sample_dir: Path,
+) -> dict[str, Any]:
+    """Drop bulky per-sample artifacts after final reachability is persisted."""
+    if not config.get("cleanup_after_reachability", True):
+        return {"status": "disabled"}
+    if not (sample_dir / "reachability_eval.json").is_file():
+        return {"status": "skipped", "reason": "reachability_eval.json missing"}
+
+    result: dict[str, Any] = {
+        "status": "complete",
+        "reachability_dir_removed": False,
+        "target_image": None,
+        "containers_removed": [],
+        "image_removed": False,
+    }
+    reachability_dir = sample_dir / "reachability"
+    if reachability_dir.is_dir():
+        shutil.rmtree(reachability_dir, ignore_errors=True)
+        result["reachability_dir_removed"] = not reachability_dir.exists()
+
+    if not sample_id.startswith("arvo_"):
+        return result
+
+    arvo_id = sample_id.removeprefix("arvo_")
+    image = f"n132/arvo:{arvo_id}-vul"
+    result["target_image"] = image
+    ps = subprocess.run(
+        ["docker", "ps", "-a", "--filter", f"ancestor={image}", "--format", "{{.ID}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if ps.returncode == 0:
+        for container_id in [line.strip() for line in ps.stdout.splitlines() if line.strip()]:
+            rm = subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if rm.returncode == 0:
+                result["containers_removed"].append(container_id)
+            else:
+                result.setdefault("container_errors", []).append(
+                    {"container": container_id, "stderr": rm.stderr[-1000:]}
+                )
+    else:
+        result["container_list_error"] = ps.stderr[-1000:]
+
+    rmi = subprocess.run(
+        ["docker", "image", "rm", "-f", image],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if rmi.returncode == 0:
+        result["image_removed"] = True
+    else:
+        stderr = rmi.stderr[-1000:]
+        if "No such image" in stderr or "No such image" in rmi.stdout:
+            result["image_remove_error"] = "not present"
+        else:
+            result["image_remove_error"] = stderr
+    return result
+
+
 def update_manifest_reachability(sample_dir: Path, reachability: dict[str, Any]) -> None:
     manifest_path = sample_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -200,7 +274,7 @@ def existing_reachability(sample_dir: Path) -> dict[str, Any] | None:
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"status": "present", "path": "reachability_eval.json"}
+        return None
     if isinstance(report, dict) and isinstance(report.get("summary"), dict):
         return {"status": "complete", "summary": report["summary"]}
     return {"status": "present", "path": "reachability_eval.json"}
@@ -252,6 +326,7 @@ def build_request(
     results_dir = run_dir / "results"
     max_effective = _config_value(args, config, "max_effective_submits")
     extra_args = [str(item) for item in config.get("extra_args", [])]
+    extra_args.extend(str(item) for item in getattr(args, "extra_arg", []) if str(item))
     extra_args.extend(route.extra_args)
     return RewardRequest(
         harness=harness,
@@ -303,6 +378,11 @@ def run_one(
             "status": "skipped",
             "results_dir": str(sample_dir),
         }
+        if (
+            (sample_dir / "checkpoint").is_dir()
+            and not (sample_dir / "context_visit.json").is_file()
+        ):
+            record["context_visit"] = maybe_write_context_visit(sample_dir)
         reachability = existing_reachability(sample_dir)
         if reachability is None:
             reachability = maybe_run_reachability(
@@ -310,6 +390,19 @@ def run_one(
             )
         record["reachability"] = reachability
         update_manifest_reachability(sample_dir, reachability)
+        cleanup = cleanup_completed_sample_storage(
+            config,
+            sample_id=sample_id,
+            sample_dir=sample_dir,
+        )
+        record["cleanup"] = cleanup
+        try:
+            (sample_dir / "target_image_cleanup.json").write_text(
+                json.dumps(cleanup, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
         return record
     if request.skill_packet is not None and not request.skill_packet.is_dir():
         error = f"FileNotFoundError: skill packet not found: {request.skill_packet}"
@@ -394,6 +487,7 @@ def run_one(
     log_path = logs_dir / f"{sample_id}.log"
     proc: subprocess.CompletedProcess[str] | None = None
     run_error: str | None = None
+    command_env = dict(command.env)
     with log_path.open("w", encoding="utf-8") as log:
         log.write("COMMAND " + json.dumps(command.redacted(), ensure_ascii=False) + "\n")
         log.flush()
@@ -401,7 +495,7 @@ def run_one(
             proc = subprocess.run(
                 command.command,
                 cwd=command.cwd,
-                env=dict(command.env),
+                env=command_env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -424,12 +518,17 @@ def run_one(
         (sample_dir / "manifest.json").is_file()
         and (sample_dir / "checkpoint").is_dir()
     )
+    manifest_status = None
+    if (sample_dir / "manifest.json").is_file():
+        manifest_payload = _load_json(sample_dir / "manifest.json")
+        manifest_status = manifest_payload.get("status") if manifest_payload else None
     if (sample_dir / "checkpoint").is_dir():
         record["context_visit"] = maybe_write_context_visit(sample_dir)
     if has_sample_artifact:
         if record["status"] == "failed":
             record["adapter_returncode"] = record["returncode"]
-            record["status"] = "complete"
+            if manifest_status not in {"error", "incomplete"}:
+                record["status"] = "complete"
         reachability = existing_reachability(sample_dir)
         if reachability is None:
             reachability = maybe_run_reachability(
@@ -437,6 +536,19 @@ def run_one(
             )
         record["reachability"] = reachability
         update_manifest_reachability(sample_dir, reachability)
+        cleanup = cleanup_completed_sample_storage(
+            config,
+            sample_id=sample_id,
+            sample_dir=sample_dir,
+        )
+        record["cleanup"] = cleanup
+        try:
+            (sample_dir / "target_image_cleanup.json").write_text(
+                json.dumps(cleanup, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
     else:
         if proc is not None and proc.returncode == 0:
             record["status"] = "failed"
@@ -594,6 +706,7 @@ def main() -> int:
     parser.add_argument("--server")
     parser.add_argument("--difficulty")
     parser.add_argument("--parallel", type=int, default=1)
+    parser.add_argument("--extra-arg", action="append", default=[])
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

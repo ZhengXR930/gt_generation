@@ -25,7 +25,7 @@ def build_command(request: RewardRequest) -> RewardCommand:
     ]
     if request.skill_packet is not None:
         args += ["--workspace-installer", INSTALLER]
-    if request.reasoning_effort:
+    if request.reasoning_effort and "--codex-reasoning-effort" not in request.extra_args:
         args += ["--codex-reasoning-effort", request.reasoning_effort]
     args += list(request.extra_args)
     return RewardCommand(NAME, tuple(args), env=reward_environment(request))

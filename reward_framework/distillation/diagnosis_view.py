@@ -12,21 +12,12 @@ from typing import Any
 
 DIAGNOSIS_SECTIONS = (
     "outcome_evidence",
+    "submission_evidence",
     "executable_progress_evidence",
-    "semantic_explanatory_evidence",
-    "behavioral_evidence",
-    "outcome_diagnosis",
-)
-
-RUBRIC_FINDINGS_KEY = "rubric_findings"
-
-RUBRIC_CATEGORIES = (
-    "submission_starvation",
-    "feedback_loop_failure",
-    "false_positive_stop",
-    "target_mismatch",
-    "over_investigation",
-    "artifact_misalignment",
+    "feedback_loop_evidence",
+    "failure_attribution",
+    "policy_implication",
+    "dangerous_to_learn",
 )
 
 _LEARNING_KEYS = (
@@ -35,8 +26,12 @@ _LEARNING_KEYS = (
     "issue_description",
     "vulnerability_type",
     *DIAGNOSIS_SECTIONS,
-    RUBRIC_FINDINGS_KEY,
 )
+
+_DIAGNOSIS_ALIASES = {
+    "submission_evidence": "pre_submit_evidence",
+    "feedback_loop_evidence": "post_submit_evidence",
+}
 
 _REPLACEMENTS = (
     (re.compile(r"\bR0\b"), "no target-path progress"),
@@ -82,9 +77,12 @@ def learning_diagnosis(diagnosis: dict[str, Any], outcome_record: dict[str, Any]
     """Return the abstract per-sample diagnosis consumed by learning roles."""
     out: dict[str, Any] = {}
     for key in _LEARNING_KEYS:
-        if key not in diagnosis:
+        source_key = key
+        if source_key not in diagnosis and key in _DIAGNOSIS_ALIASES:
+            source_key = _DIAGNOSIS_ALIASES[key]
+        if source_key not in diagnosis:
             continue
-        value = diagnosis.get(key)
+        value = diagnosis.get(source_key)
         if value in (None, "", [], {}):
             continue
         if key == "issue_description":

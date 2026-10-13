@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .diagnosis_view import DIAGNOSIS_SECTIONS, RUBRIC_CATEGORIES, RUBRIC_FINDINGS_KEY
+from .diagnosis_view import DIAGNOSIS_SECTIONS
 
 EXCERPT_CHARS = 640
 
@@ -46,7 +46,14 @@ def load_pools(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return empty_pools()
     upgraded = empty_pools()
-    for key in ("batches_seen", "samples_by_batch", "success_pool", "false_positive_pool", "failure_pool", "infrastructure_pool"):
+    for key in (
+        "batches_seen",
+        "samples_by_batch",
+        "success_pool",
+        "false_positive_pool",
+        "failure_pool",
+        "infrastructure_pool",
+    ):
         if key in payload:
             upgraded[key] = payload[key]
     _upgrade_in_place(upgraded)
@@ -88,7 +95,6 @@ def update_pools(pools: dict[str, Any], batch_index: int, records: list[dict[str
     return pools
 
 
-
 def teacher_view(pools: dict[str, Any], *, limit: int = 80, through_batch: int | None = None) -> dict[str, Any]:
     """Bounded sample-level view handed to the Teacher.
 
@@ -117,7 +123,12 @@ def teacher_view(pools: dict[str, Any], *, limit: int = 80, through_batch: int |
                 "as diagnostic evidence unless they match the issue-described target path, root cause, "
                 "and sensitive operation or target-trigger feedback."
             ),
-            "rubric_categories": list(RUBRIC_CATEGORIES),
+            "diagnosis_protocol": "feedback-chain behavioral attribution",
+            "comparison_axes": [
+                "pre-submit behavior: when a concrete candidate existed, when it was submitted, and what delayed it",
+                "reachability gap: what the closest submitted candidate actually reached and what issue-described condition was missing",
+                "post-submit behavior: whether feedback produced a non-duplicate refinement, preserved useful progress, or led to stopping/switching",
+            ],
             "note": (
                 "Infer reusable differences between target reproductions, non-target crashes, and ordinary "
                 "failures from the diagnosis fields. The false_positive_pool contains runs that produced a "
@@ -141,7 +152,6 @@ def teacher_view(pools: dict[str, Any], *, limit: int = 80, through_batch: int |
     }
 
 
-
 def build_validation_panel(
     pools: dict[str, Any],
     *,
@@ -151,12 +161,7 @@ def build_validation_panel(
     failure_count: int = 2,
     panel_index: int = 0,
 ) -> dict[str, Any]:
-    """Build a deterministic proposal-validation panel from sample pools.
-
-    The panel is intentionally separate from Teacher/Curator prompting. It gives
-    every candidate packet the same small regression check: preserve successes,
-    preserve successes, compare crash-producing runs, and improve ordinary failures.
-    """
+    """Build a deterministic proposal-validation panel from sample pools."""
     _upgrade_in_place(pools)
     visible_successes = _visible_samples(pools.get("success_pool") or [], through_batch)
     crash_samples = _visible_samples(pools.get("false_positive_pool") or [], through_batch)
@@ -184,8 +189,6 @@ def build_validation_panel(
     add("crash_reference", crash_samples, max(0, crash_count))
     add("failure_recovery", plain_failures, max(0, failure_count))
 
-    # If most failures are risk-shaped, still keep the requested failure section
-    # populated without duplicating samples.
     if sum(1 for item in selected if item.get("role") == "failure_recovery") < max(0, failure_count):
         add("failure_recovery", plain_failures + crash_samples, max(0, failure_count))
 
@@ -199,7 +202,7 @@ def build_validation_panel(
         "panel_index": panel_index,
         "selection_policy": {
             "success_preservation": "recent successful samples",
-            "crash_reference": "recent failed/partial samples with explicit crash/submission evidence but no GT trigger",
+            "crash_reference": "recent failed/partial samples with explicit crash/submission evidence but no target reproduction",
             "failure_recovery": "recent failed/partial samples not already selected as false positives when available",
         },
         "requested_counts": {
@@ -263,7 +266,6 @@ def _sample_record(
         "issue_description": _short(record.get("issue_description")),
         "vulnerability_type": record.get("vulnerability_type"),
         **{section: _short_value(record.get(section)) for section in DIAGNOSIS_SECTIONS},
-        RUBRIC_FINDINGS_KEY: _rubric_findings(record.get(RUBRIC_FINDINGS_KEY)),
         "false_positive": bool(record.get("false_positive") or outcome_record.get("false_positive") or false_positive_pocs),
         "false_positive_pocs": false_positive_pocs,
     }
@@ -305,7 +307,7 @@ def _visible_samples(samples: list[dict[str, Any]], through_batch: int | None) -
 
 
 def _false_positive_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Failure-side counterexamples where crashing did not equal GT success."""
+    """Failure-side counterexamples where crashing did not equal target reproduction."""
     return [
         sample for sample in samples
         if _is_false_positive_sample(sample)
@@ -314,25 +316,6 @@ def _false_positive_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any
 
 def _is_false_positive_sample(sample: dict[str, Any]) -> bool:
     return bool(sample.get("false_positive")) or int(sample.get("false_positive_pocs") or 0) > 0
-
-
-def _rubric_findings(value: Any) -> list[dict[str, Any]]:
-    findings: list[dict[str, Any]] = []
-    if not isinstance(value, list):
-        return findings
-    allowed = set(RUBRIC_CATEGORIES)
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        category = str(item.get("category") or "")
-        if category not in allowed:
-            continue
-        findings.append({
-            "category": category,
-            "present": bool(item.get("present")),
-            "evidence": _short(item.get("evidence")),
-        })
-    return findings
 
 
 def _pool_view(samples: list[dict[str, Any]], *, limit: int = 80) -> list[dict[str, Any]]:
@@ -350,7 +333,6 @@ def _teacher_sample(sample: dict[str, Any]) -> dict[str, Any]:
             "issue_description",
             "vulnerability_type",
             *DIAGNOSIS_SECTIONS,
-            RUBRIC_FINDINGS_KEY,
         )
         if sample.get(key) not in (None, "", [], {})
     }
