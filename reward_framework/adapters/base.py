@@ -11,7 +11,7 @@ from typing import Mapping
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_FILE = REPO_ROOT / "reward_framework" / "prompt.txt"
 DEFAULT_RUNS_ROOT = REPO_ROOT / "reward_framework" / "harness_runs"
-DEFAULT_SKILL_PACKET = REPO_ROOT / "reward_framework" / "skill_packets" / "initial"
+DEFAULT_SKILL_PACKET = REPO_ROOT / "reward_framework" / "skill_packets" / "dsh_deepseek_initial_100_100"
 SERVER_ROOT = REPO_ROOT / "harness_runtime" / "server"
 OPENHANDS_RUNNER = REPO_ROOT / "harness_runtime" / "openhands" / "arvo.py"
 OPENHANDS_LOCAL_RUNNER = REPO_ROOT / "harness_runtime" / "openhands" / "local.py"
@@ -36,7 +36,12 @@ def substitute_skill_path_placeholders(
         "${STATE_DIR}": str(state_dir),
         "${WORKSPACE}": str(workspace),
     }
-    for skill in root.rglob("SKILL.md"):
+    for skill in root.rglob("*.md"):
+        # The stable framework and individual lesson resources are both
+        # agent-visible instruction text.  Do not rewrite packet README or
+        # changelog prose merely because it happens to be Markdown.
+        if skill.name != "SKILL.md" and "lessons" not in skill.parts:
+            continue
         text = skill.read_text(encoding="utf-8", errors="replace")
         for old, new in replacements.items():
             text = text.replace(old, new)
@@ -147,7 +152,9 @@ def common_args(request: RewardRequest, prompt_file: Path = PROMPT_FILE) -> list
 def arvo_args(request: RewardRequest) -> list[str]:
     return [
         "--arvo-id", request.arvo_id,
-        "--max-attempts", str(request.max_attempts),
+        # The subject agent runs once.  `max_attempts` is reserved for the
+        # checkpoint-based analysis finalizer invoked by the frontend.
+        "--max-attempts", "1",
         "--server", request.server,
         "--difficulty", request.difficulty,
         "--server-root", str(SERVER_ROOT),
@@ -157,4 +164,4 @@ def arvo_args(request: RewardRequest) -> list[str]:
 def sample_args(request: RewardRequest) -> list[str]:
     if request.is_arvo:
         return arvo_args(request)
-    return ["--sample-id", request.sample_id, "--max-attempts", str(request.max_attempts)]
+    return ["--sample-id", request.sample_id, "--max-attempts", "1"]

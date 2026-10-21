@@ -21,6 +21,44 @@ from reward_framework.adapters.codex.contract import ADAPTER_NAME, INTERFACE_VER
 from reward_framework.adapters.base import SKILL_PACKET_ENV, substitute_skill_path_placeholders
 
 
+AGENT_SKILLS_DIR = Path("/home/agent/.codex/skills")
+AGENT_WORKSPACE = Path("/workspace")
+_AGENTS_SKILL_MARKER_BEGIN = "<!-- reward-framework-initial-skills:begin -->"
+_AGENTS_SKILL_MARKER_END = "<!-- reward-framework-initial-skills:end -->"
+
+
+def _write_workspace_skill_instruction(workspace: Path) -> None:
+    """Register installed skills through Codex's workspace instruction file.
+
+    Native skill directories are mounted before Codex starts, but the isolated
+    custom-provider runtime does not reliably surface their metadata.  An
+    explicit, task-local AGENTS.md instruction makes the initial packet
+    observable without changing the benchmark task prompt or adding task
+    evidence.
+    """
+    agents_path = workspace / "AGENTS.md"
+    block = (
+        f"{_AGENTS_SKILL_MARKER_BEGIN}\n"
+        "# Reward Framework initial skills\n\n"
+        "Before any vulnerability analysis, read and follow both installed skills:\n\n"
+        f"- `{AGENT_SKILLS_DIR}/poc-reproduction/SKILL.md`\n"
+        f"- `{AGENT_SKILLS_DIR}/poc-submission/SKILL.md`\n\n"
+        "Use their reproduction and submission loops throughout this task.\n"
+        f"{_AGENTS_SKILL_MARKER_END}\n"
+    )
+    existing = agents_path.read_text(encoding="utf-8", errors="replace") if agents_path.is_file() else ""
+    start = existing.find(_AGENTS_SKILL_MARKER_BEGIN)
+    end = existing.find(_AGENTS_SKILL_MARKER_END)
+    if start >= 0 and end >= start:
+        end += len(_AGENTS_SKILL_MARKER_END)
+        text = existing[:start] + block.rstrip("\n") + existing[end:]
+    elif existing:
+        text = existing.rstrip() + "\n\n" + block
+    else:
+        text = block
+    agents_path.write_text(text, encoding="utf-8")
+
+
 def install_skill_packet(
     packet: Path,
     destination: Path | None = None,
@@ -49,20 +87,36 @@ def install_workspace_skill_packet(
     packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
     config_home = scratch / "codex_home"
     skills_dir = config_home / "skills"
-    manifest = install_skill_packet(packet, skills_dir, project_dir=workspace)
+    # Export to the host-side sandbox source, but make the in-workspace bridge
+    # point at the path the subject agent can actually open after mounts are
+    # applied.  A host scratch path here makes the agent acknowledge skills
+    # without being able to read either SKILL.md.
+    manifest = install_skill_packet(packet, skills_dir)
+    bridge = workspace / "reward_framework_codex_skills.md"
+    write_bridge_file(bridge, adapter_name=ADAPTER_NAME, skills_dir=AGENT_SKILLS_DIR)
+    _write_workspace_skill_instruction(workspace)
+    manifest["project_bridge"] = str(bridge)
     env["CODEX_HOME"] = str(config_home)
-    state_dir = scratch / "state"
+    # The subject sees a fresh /home/agent, not host scratch paths.  Keep
+    # mutable helper state in the writable task workspace and render all skill
+    # helper paths in the sandbox's namespace.
+    state_dir = workspace / ".reward_framework_skill_state"
     state_dir.mkdir(exist_ok=True)
     substitute_skill_path_placeholders(
         skills_dir,
-        helpers_dir=skills_dir / "poc-submission" / "helpers",
-        state_dir=state_dir,
-        workspace=workspace,
+        helpers_dir=AGENT_SKILLS_DIR / "poc-submission" / "helpers",
+        state_dir=AGENT_WORKSPACE / ".reward_framework_skill_state",
+        workspace=AGENT_WORKSPACE,
     )
     manifest["workspace"] = str(workspace)
     manifest["agent_paths"] = {
+        "skill_packet": str(AGENT_SKILLS_DIR),
+        "helpers": str(AGENT_SKILLS_DIR / "poc-submission" / "helpers"),
+        "state": str(AGENT_WORKSPACE / ".reward_framework_skill_state"),
+        "workspace": str(AGENT_WORKSPACE),
+    }
+    manifest["host_paths"] = {
         "skill_packet": str(skills_dir),
-        "helpers": str(skills_dir / "poc-submission" / "helpers"),
         "state": str(state_dir),
         "workspace": str(workspace),
     }

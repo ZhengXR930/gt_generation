@@ -1,13 +1,14 @@
 """Skill packet copy, lesson addressing, and curator-update application.
 
-Lessons carry stable ids (``- [R.B#3] ...``) so a curator decision can replace
-an existing lesson instead of only ever appending one. That is what makes
-``MODIFY`` real: merging two lessons is expressed as replacing one of them with
-combined text. Each writable section also has a capacity, so once it is full the
-only way to say something new is to say it *instead of* something else.
+Lessons carry stable ids so a curator decision can replace an existing lesson
+instead of only ever appending one.  Packets predating the modular layout keep
+their ``- [R.B#3] ...`` entries in ``SKILL.md`` and remain readable.  New
+packets may put each learned rule in ``lessons/<condition>-<purpose>.md`` while
+``SKILL.md`` remains the stable routing framework.  This keeps learned content
+separate without turning every lesson into a separate native agent skill.
 
-Only the proposal text ever reaches ``SKILL.md``. Evidence stays in the run
-artifacts, because ``SKILL.md`` is an input to the agent at test time.
+Only proposal text reaches agent-visible packet resources.  Evidence stays in
+run artifacts, never in the packet.
 """
 from __future__ import annotations
 
@@ -22,11 +23,12 @@ from .lint import lint_lesson_text, load_literal_index
 
 
 class Section(NamedTuple):
-    """One writable region of one SKILL.md."""
+    """One writable lesson collection attached to a stable ``SKILL.md``."""
 
     path: str
     heading: str
     capacity: int
+    lesson_dir: str
 
     @property
     def slug(self) -> str:
@@ -35,12 +37,18 @@ class Section(NamedTuple):
 
 
 TARGETS: dict[str, Section] = {
-    "reproduction:R.B": Section("reproduction_skill/SKILL.md", "## R.B Learned Reproduction Lessons", 12),
-    "submission:S.C": Section("submission_skill/SKILL.md", "## S.C Learned Submission Lessons", 8),
+    "reproduction:R.B": Section(
+        "reproduction_skill/SKILL.md", "## R.B Learned Reproduction Lessons", 12,
+        "reproduction_skill/lessons",
+    ),
+    "submission:S.C": Section(
+        "submission_skill/SKILL.md", "## S.C Learned Submission Lessons", 8,
+        "submission_skill/lessons",
+    ),
 }
 
-# The curator vocabulary is MODIFY / SKIP. ACCEPT and MERGE are tolerated as
-# legacy spellings of MODIFY rather than rejected as malformed.
+# The curator vocabulary is MODIFY / REMOVE / SKIP. ACCEPT and MERGE are
+# tolerated as legacy spellings of MODIFY rather than rejected as malformed.
 _WRITES = {"MODIFY", "ACCEPT", "MERGE"}
 
 _LESSON_RE = re.compile(r"^-\s+\[([A-Za-z0-9.#_-]+)\]\s*(.*)$")
@@ -52,6 +60,41 @@ class Lesson(NamedTuple):
     line: int
     lesson_id: str
     text: str
+    path: str = ""
+
+
+_MODULE_RE = re.compile(r"\A---\n(?P<header>.*?)\n---\n(?P<body>.*)\Z", re.DOTALL)
+_ROUTER = """## Learned lesson routing
+
+Read `lessons/INDEX.md` after loading this skill and immediately before the
+first submission. Immediately after every submission response, before any new
+source investigation or other action, re-read the index; for every condition
+supported by information you can see, read its lesson file and use it to choose
+the next action. Do not use unavailable evaluator or ground-truth information
+as a condition.
+"""
+
+# These descriptive names are deliberately based on signals visible to the
+# agent.  They are presentation metadata only: the lesson body is copied
+# byte-for-byte from the prior packet so a layout experiment does not alter the
+# learned instruction itself.
+_KNOWN_MODULE_METADATA = {
+    ("reproduction:R.B", "R.B#1"): (
+        "candidate runs without a sanitizer report",
+        "change a structural precondition",
+        "clean-run-change-precondition.md",
+    ),
+    ("reproduction:R.B", "R.B#2"): (
+        "returned crash differs from the issue-stated failure",
+        "switch to a focused source-grounded hypothesis",
+        "near-miss-crash-switch-hypothesis.md",
+    ),
+    ("submission:S.C", "S.C#1"): (
+        "submission returns only a runner or container error",
+        "retry an untested candidate",
+        "runner-error-retry-candidate.md",
+    ),
+}
 
 
 # --------------------------------------------------------------------------- packets
@@ -66,26 +109,112 @@ def copy_initial_packet(out: Path, source: Path = INITIAL_PACKET) -> Path:
 
 
 def normalize_packet(packet: Path) -> None:
-    """Give every existing lesson bullet a stable id. Idempotent."""
+    """Normalize writable sections without changing their learned meaning.
+
+    Legacy packets can contain a duplicated section heading or an exact copy of
+    a lesson.  The former makes ``_bounds`` see an empty section, while the
+    latter makes the agent read the same instruction twice.  Keep the first
+    occurrence of an exact lesson, retain distinct lessons, and give every
+    retained lesson a unique stable id.
+    """
     for section in TARGETS.values():
+        if _is_modular(packet, section):
+            _normalize_modules(packet, section)
+            continue
         path = packet / section.path
         if not path.is_file():
             continue
         lines = path.read_text(encoding="utf-8").splitlines()
-        taken = {lesson.lesson_id for lesson in _read_section(lines, section)}
-        next_number = 1
         changed = False
+
+        # A repeated section heading terminates the first section under the
+        # Markdown-boundary parser.  There is only one writable section with
+        # each of these headings, so retaining the first is unambiguous.
+        heading_seen = False
+        compacted: list[str] = []
+        for line in lines:
+            if line == section.heading:
+                if heading_seen:
+                    changed = True
+                    continue
+                heading_seen = True
+            compacted.append(line)
+        lines = compacted
+
+        # Preserve the first exact lesson and drop only byte-content
+        # duplicates modulo whitespace.  This is deliberately not semantic
+        # deduplication: two differently worded rules may be meaningfully
+        # distinct even if they look related.
+        duplicate_lines: list[int] = []
+        seen_text: set[str] = set()
+        for lesson in _read_section(lines, section):
+            key = _lesson_key(lesson.text)
+            if key in seen_text:
+                duplicate_lines.append(lesson.line)
+            else:
+                seen_text.add(key)
+        for line_index in reversed(duplicate_lines):
+            del lines[line_index]
+            changed = True
+
+        taken: set[str] = set()
+        next_number = 1
         for index, text in _bullets(lines, _bounds(lines, section.heading)):
-            if _LESSON_RE.match(lines[index]):
+            match = _LESSON_RE.match(lines[index])
+            if match and match.group(1) not in taken:
+                taken.add(match.group(1))
                 continue
             while f"{section.slug}#{next_number}" in taken:
                 next_number += 1
             lesson_id = f"{section.slug}#{next_number}"
             taken.add(lesson_id)
-            lines[index] = f"- [{lesson_id}] {text}"
+            lesson_text = match.group(2).strip() if match else text
+            lines[index] = f"- [{lesson_id}] {lesson_text}"
             changed = True
         if changed:
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def materialize_modular_lessons(packet: Path) -> dict[str, list[dict[str, str]]]:
+    """Move learned rules into per-lesson Markdown resources.
+
+    The stable skill framework retains its fixed loop and gains a short router.
+    Existing lesson bodies are preserved verbatim.  This is intentionally
+    explicit rather than an implicit part of ``normalize_packet``: historical
+    packets retain their original layout, while a layout experiment gets a
+    separately named packet and an auditable conversion point.
+    """
+    for target, section in TARGETS.items():
+        if _is_modular(packet, section):
+            _normalize_modules(packet, section)
+            continue
+        path = packet / section.path
+        lines = _lines(path)
+        lessons = _read_section(lines, section)
+        start, end = _bounds(lines, section.heading)
+        if not start and not end:
+            raise ValueError(f"cannot materialize lessons: missing {section.heading!r} in {path}")
+
+        lesson_root = packet / section.lesson_dir
+        lesson_root.mkdir(parents=True, exist_ok=True)
+        for lesson in lessons:
+            condition, purpose, filename = _module_metadata(target, lesson.lesson_id, lesson.text)
+            _write_module(
+                lesson_root / filename,
+                lesson_id=lesson.lesson_id,
+                target=target,
+                condition=condition,
+                purpose=purpose,
+                text=lesson.text,
+            )
+
+        # Replace exactly the old learned section, retaining all fixed material
+        # before and after it (including the submission helpers).
+        lines[start - 1:end] = _ROUTER.rstrip("\n").splitlines()
+        _write(path, lines)
+        _write_lesson_index(packet, target, section)
+    normalize_packet(packet)
+    return read_lessons(packet)
 
 
 def read_lessons(packet: Path) -> dict[str, list[dict[str, str]]]:
@@ -93,7 +222,7 @@ def read_lessons(packet: Path) -> dict[str, list[dict[str, str]]]:
     return {
         target: [
             {"lesson_id": lesson.lesson_id, "text": lesson.text}
-            for lesson in _read_section(_lines(packet / section.path), section)
+            for lesson in _read_target_lessons(packet, section)
         ]
         for target, section in TARGETS.items()
     }
@@ -229,6 +358,20 @@ def _remove_lesson(packet: Path, target: str, lesson_id: str) -> dict[str, Any]:
     if not lesson_id:
         return {"skip_reason": "missing target_lesson_id for REMOVE"}
     section = TARGETS[target]
+    if _is_modular(packet, section):
+        lessons = _read_target_lessons(packet, section)
+        existing = next((lesson for lesson in lessons if lesson.lesson_id == lesson_id), None)
+        if existing is None:
+            return {"skip_reason": f"target_lesson_id {lesson_id!r} does not exist in {target}"}
+        Path(existing.path).unlink()
+        _write_lesson_index(packet, target, section)
+        return {
+            "decision": "REMOVE",
+            "mode": "remove",
+            "lesson_id": lesson_id,
+            "path": str(Path(section.lesson_dir) / Path(existing.path).name),
+        }
+
     path = packet / section.path
     lines = _lines(path)
     lessons = _read_section(lines, section)
@@ -246,12 +389,22 @@ def _apply_one(packet: Path, decision: dict[str, Any], index: dict[str, Any] | N
     """Apply one decision, returning either a written record or a skip reason."""
     action = str(decision.get("decision") or decision.get("action") or "").upper()
     target = str(decision.get("target") or "")
+    operation = str(decision.get("operation") or "").strip().lower()
+    requested = str(decision.get("target_lesson_id") or decision.get("lesson_id") or "").strip()
     proposal = str(decision.get("proposal") or decision.get("content") or "").strip()
+
+    # Curator output has both a top-level decision and an edit operation.  A
+    # deletion carries no lesson text, so it must be dispatched before the
+    # generic empty-proposal guard used by add/revise operations.
+    if operation in {"delete", "remove"}:
+        action = "REMOVE"
 
     if action == "SKIP":
         return {"skip_reason": "curator chose SKIP"}
+    if action == "REMOVE":
+        return _remove_lesson(packet, target, requested)
     if action not in _WRITES:
-        return {"skip_reason": f"unsupported decision {action!r}; use MODIFY or SKIP"}
+        return {"skip_reason": f"unsupported decision {action!r}; use MODIFY, REMOVE, or SKIP"}
     if target not in TARGETS:
         return {"skip_reason": f"unknown or non-writable target {target!r}"}
     if not proposal:
@@ -263,17 +416,27 @@ def _apply_one(packet: Path, decision: dict[str, Any], index: dict[str, Any] | N
 
     section = TARGETS[target]
     path = packet / section.path
+    lessons = _read_target_lessons(packet, section)
+    if _is_modular(packet, section):
+        return _apply_one_to_modules(packet, target, section, lessons, requested, proposal)
+
     lines = _lines(path)
-    lessons = _read_section(lines, section)
-    requested = str(decision.get("target_lesson_id") or decision.get("lesson_id") or "").strip()
 
     if requested:
         existing = next((lesson for lesson in lessons if lesson.lesson_id == requested), None)
         if existing is None:
             return {"skip_reason": f"target_lesson_id {requested!r} does not exist in {target}"}
+        if any(
+            lesson.lesson_id != requested and _lesson_key(lesson.text) == _lesson_key(proposal)
+            for lesson in lessons
+        ):
+            return {"skip_reason": "proposal duplicates an existing lesson"}
         lines[existing.line] = f"- [{requested}] {proposal}"
         _write(path, lines)
         return {"decision": "MODIFY", "mode": "replace", "lesson_id": requested, "path": section.path}
+
+    if any(_lesson_key(lesson.text) == _lesson_key(proposal) for lesson in lessons):
+        return {"skip_reason": "proposal duplicates an existing lesson"}
 
     if len(lessons) >= section.capacity:
         return {"skip_reason": f"{target} is at capacity {section.capacity}; "
@@ -288,6 +451,11 @@ def _apply_one(packet: Path, decision: dict[str, Any], index: dict[str, Any] | N
 def _next_number(lessons: list[Lesson]) -> int:
     tails = [lesson.lesson_id.partition("#")[2] for lesson in lessons]
     return max((int(tail) for tail in tails if tail.isdigit()), default=0) + 1
+
+
+def _lesson_key(text: str) -> str:
+    """Stable key for exact lesson deduplication, ignoring formatting only."""
+    return " ".join(text.split())
 
 
 def _insert_at(lines: list[str], section: Section, lessons: list[Lesson]) -> int:
@@ -322,6 +490,205 @@ def _write_packet_changelog(packet: Path, applied: list[dict[str, Any]]) -> None
         previous.rstrip() + "\n\n" + json.dumps({"applied": redacted}, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+
+
+# -------------------------------------------------------------------- lesson modules
+
+
+def _is_modular(packet: Path, section: Section) -> bool:
+    """Whether this target uses an explicit ``lessons/`` collection."""
+    return (packet / section.lesson_dir / "INDEX.md").is_file()
+
+
+def _read_target_lessons(packet: Path, section: Section) -> list[Lesson]:
+    if not _is_modular(packet, section):
+        return _read_section(_lines(packet / section.path), section)
+    root = packet / section.lesson_dir
+    lessons: list[Lesson] = []
+    for path in sorted(root.glob("*.md")):
+        if path.name == "INDEX.md":
+            continue
+        parsed = _read_module(path)
+        if parsed is not None:
+            lessons.append(parsed)
+    return sorted(lessons, key=lambda lesson: (_lesson_number(lesson.lesson_id), lesson.lesson_id))
+
+
+def _read_module(path: Path) -> Lesson | None:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    match = _MODULE_RE.match(text)
+    if not match:
+        return None
+    header = _parse_header(match.group("header"))
+    lesson_id = header.get("lesson_id", "").strip()
+    if not lesson_id:
+        return None
+    return Lesson(-1, lesson_id, match.group("body").strip(), str(path))
+
+
+def _parse_header(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip():
+            values[key.strip()] = value.strip()
+    return values
+
+
+def _module_metadata(target: str, lesson_id: str, text: str) -> tuple[str, str, str]:
+    known = _KNOWN_MODULE_METADATA.get((target, lesson_id))
+    if known is not None:
+        return known
+    first_sentence = re.split(r"(?<=[.!?])\s+", text.strip(), maxsplit=1)[0]
+    words = re.findall(r"[A-Za-z0-9]+", first_sentence.lower())
+    condition = " ".join(words[:7]) or "observed candidate feedback"
+    purpose_words = re.findall(r"[A-Za-z0-9]+", text.lower())
+    purpose = " ".join(purpose_words[-5:]) or "choose the next revision"
+    stem = "-".join(words[:7]) or f"lesson-{lesson_id.lower().replace('#', '-') }"
+    return condition, purpose, f"{stem[:72].rstrip('-')}.md"
+
+
+def _write_module(
+    path: Path,
+    *,
+    lesson_id: str,
+    target: str,
+    condition: str,
+    purpose: str,
+    text: str,
+) -> None:
+    path.write_text(
+        "---\n"
+        f"lesson_id: {lesson_id}\n"
+        f"target: {target}\n"
+        f"condition: {condition}\n"
+        f"purpose: {purpose}\n"
+        "---\n"
+        f"{text.strip()}\n",
+        encoding="utf-8",
+    )
+
+
+def _write_lesson_index(packet: Path, target: str, section: Section) -> None:
+    root = packet / section.lesson_dir
+    root.mkdir(parents=True, exist_ok=True)
+    entries: list[tuple[Lesson, dict[str, str], Path]] = []
+    for path in sorted(root.glob("*.md")):
+        if path.name == "INDEX.md":
+            continue
+        parsed = _read_module(path)
+        if parsed is None:
+            continue
+        match = _MODULE_RE.match(path.read_text(encoding="utf-8", errors="replace"))
+        assert match is not None
+        entries.append((parsed, _parse_header(match.group("header")), path))
+    entries.sort(key=lambda item: (_lesson_number(item[0].lesson_id), item[0].lesson_id))
+
+    lines = [
+        "# Learned lesson index",
+        "",
+        "Read a lesson only when its **Use when** condition is supported by information you can see in the issue, workspace, your candidate, or returned submission feedback.",
+        "",
+    ]
+    if not entries:
+        lines.append("No learned lessons yet.")
+    else:
+        for lesson, header, path in entries:
+            lines.extend([
+                f"## {lesson.lesson_id}",
+                "",
+                f"**Use when:** {header.get('condition', 'the condition described by this lesson')}",
+                f"**Purpose:** {header.get('purpose', 'choose the next action')}",
+                f"**Read:** `{path.name}`",
+                "",
+            ])
+    (root / "INDEX.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _normalize_modules(packet: Path, section: Section) -> None:
+    root = packet / section.lesson_dir
+    seen_ids: set[str] = set()
+    seen_text: set[str] = set()
+    for path in sorted(root.glob("*.md")):
+        if path.name == "INDEX.md":
+            continue
+        lesson = _read_module(path)
+        if lesson is None or lesson.lesson_id in seen_ids or _lesson_key(lesson.text) in seen_text:
+            path.unlink()
+            continue
+        seen_ids.add(lesson.lesson_id)
+        seen_text.add(_lesson_key(lesson.text))
+    target = next(name for name, candidate in TARGETS.items() if candidate == section)
+    _write_lesson_index(packet, target, section)
+
+
+def _module_path_for(
+    packet: Path,
+    section: Section,
+    filename: str,
+    *,
+    exclude: Path | None = None,
+) -> Path:
+    root = packet / section.lesson_dir
+    candidate = root / filename
+    number = 2
+    while candidate.exists() and candidate != exclude:
+        candidate = root / f"{Path(filename).stem}-{number}{Path(filename).suffix or '.md'}"
+        number += 1
+    return candidate
+
+
+def _apply_one_to_modules(
+    packet: Path,
+    target: str,
+    section: Section,
+    lessons: list[Lesson],
+    requested: str,
+    proposal: str,
+) -> dict[str, Any]:
+    if requested:
+        existing = next((lesson for lesson in lessons if lesson.lesson_id == requested), None)
+        if existing is None:
+            return {"skip_reason": f"target_lesson_id {requested!r} does not exist in {target}"}
+        if any(lesson.lesson_id != requested and _lesson_key(lesson.text) == _lesson_key(proposal)
+               for lesson in lessons):
+            return {"skip_reason": "proposal duplicates an existing lesson"}
+        old_path = Path(existing.path)
+        condition, purpose, filename = _module_metadata(target, requested, proposal)
+        new_path = _module_path_for(packet, section, filename, exclude=old_path)
+        _write_module(new_path, lesson_id=requested, target=target, condition=condition, purpose=purpose, text=proposal)
+        if new_path != old_path:
+            old_path.unlink()
+        _write_lesson_index(packet, target, section)
+        return {
+            "decision": "MODIFY",
+            "mode": "replace",
+            "lesson_id": requested,
+            "path": str(Path(section.lesson_dir) / new_path.name),
+        }
+
+    if any(_lesson_key(lesson.text) == _lesson_key(proposal) for lesson in lessons):
+        return {"skip_reason": "proposal duplicates an existing lesson"}
+    if len(lessons) >= section.capacity:
+        return {"skip_reason": f"{target} is at capacity {section.capacity}; "
+                               "supply target_lesson_id to replace a lesson"}
+
+    lesson_id = f"{section.slug}#{_next_number(lessons)}"
+    condition, purpose, filename = _module_metadata(target, lesson_id, proposal)
+    new_path = _module_path_for(packet, section, filename)
+    _write_module(new_path, lesson_id=lesson_id, target=target, condition=condition, purpose=purpose, text=proposal)
+    _write_lesson_index(packet, target, section)
+    return {
+        "decision": "MODIFY",
+        "mode": "append",
+        "lesson_id": lesson_id,
+        "path": str(Path(section.lesson_dir) / new_path.name),
+    }
+
+
+def _lesson_number(lesson_id: str) -> int:
+    tail = lesson_id.partition("#")[2]
+    return int(tail) if tail.isdigit() else 10**9
 
 
 # --------------------------------------------------------------------------- markdown

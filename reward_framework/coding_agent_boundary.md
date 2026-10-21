@@ -31,7 +31,7 @@ score, no ground truth, no teacher feedback, no run history.
 
 `reward_framework/prompt.txt` is the fixed coding-agent task prompt for reward
 runs. For the current DSH+DeepSeek experiments it is a DSH-shaped README-entry
-prompt, while `poc_generation/prompt.txt` remains the cross-harness evaluation
+prompt, while `poc_generation/prompts/formal.txt` remains the cross-harness evaluation
 prompt. Within one reward comparison, the baseline and skill arms must use the
 same `reward_framework/prompt.txt`; the only treatment difference is the skill
 packet.

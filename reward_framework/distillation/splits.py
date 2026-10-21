@@ -1,4 +1,4 @@
-"""The chronological train/test split, and the frozen files that pin it.
+"""Utilities for legacy chronological splits and frozen split files.
 
 The split is ordered by the committer date of each sample's ``vulnerable_commit``
 - the state of the repository the agent is actually handed. Samples whose date

@@ -28,6 +28,7 @@ from reward_framework.distillation.diagnosis_view import (  # noqa: E402
     learning_diagnosis,
     learning_evaluation,
 )
+from reward_framework.distillation.teacher_evidence import build_teacher_evidence  # noqa: E402
 from reward_framework.distillation.defaults import (  # noqa: E402
     DEFAULT_CODING_API_KEY_ENV,
     DEFAULT_CODING_BASE_URL,
@@ -37,11 +38,21 @@ from reward_framework.distillation.defaults import (  # noqa: E402
     DEFAULT_DISTILLER_API_KEY_ENV,
     DEFAULT_DISTILLER_BASE_URL,
     DEFAULT_DISTILLER_MODEL,
+    DEFAULT_DISTILLATION_SPLIT,
+    DEFAULT_INITIAL_TEST_RESULTS_DIR,
+    DEFAULT_INITIAL_TRAIN_RESULTS_DIR,
+    DEFAULT_NO_SKILL_RESULTS_DIR,
     DEFAULT_ROLE_HARNESS,
     DEFAULT_RUN_ROOT,
     INITIAL_PACKET,
 )
-from reward_framework.distillation.outcome import classify_outcome  # noqa: E402
+from reward_framework.distillation.outcome import (  # noqa: E402
+    DIAGNOSIS_FAILURE_SOURCES,
+    DIAGNOSIS_FAILURE_TYPES,
+    OBSERVED_STAGE_ORDER,
+    classify_outcome,
+    diagnosis_case_profile,
+)
 from reward_framework.distillation.pools import (  # noqa: E402
     build_validation_panel,
     load_pools,
@@ -118,6 +129,7 @@ def _harness_command(args: argparse.Namespace, *, run_id: str, sample_file: Path
         "--max-iter", str(args.max_iter),
         "--max-attempts", str(args.max_attempts),
         "--timeout", str(args.timeout),
+        "--max-output-tokens", str(args.max_output_tokens),
     ]
     if getattr(args, "no_skill", False):
         cmd.append("--no-skill")
@@ -334,7 +346,12 @@ def cmd_evaluate_batch(args: argparse.Namespace) -> int:
         row = evaluate_sample(results_dir.parent.name, results_dir / sample_id, require_analysis_quality=False)
         row["deterministic_outcome"] = classify_outcome(row)
         rows.append(row)
-    report = {"protocol": "reward-distillation-batch-eval-v1", "batch_index": args.batch_index, "rows": rows}
+    report = {
+        "protocol": "reward-distillation-batch-eval-v1",
+        "batch_index": args.batch_index,
+        "source_results_dir": str(results_dir),
+        "rows": rows,
+    }
     write_json(run_dir / f"batch_{args.batch_index:03d}" / "evaluation.json", report)
     counts: dict[str, int] = {}
     for row in rows:
@@ -358,6 +375,346 @@ def cmd_evaluate_batch(args: argparse.Namespace) -> int:
         "submission_only_success_samples": submission_only_success,
     }, indent=2))
     return 0
+
+
+def _batch_evaluation_report(run_dir: Path, batch_index: int, results_dir: Path) -> dict[str, Any]:
+    """Evaluate exactly the frozen roster for one batch.
+
+    Missing result directories are an infrastructure error, not failed agent
+    samples; callers must not silently score an incomplete batch.
+    """
+    samples = _batch_samples(run_dir, batch_index)
+    missing = [sample_id for sample_id in samples if not (results_dir / sample_id).is_dir()]
+    if missing:
+        raise ValueError("missing result directories: " + ", ".join(missing))
+    rows = []
+    for sample_id in samples:
+        row = evaluate_sample(results_dir.parent.name, results_dir / sample_id, require_analysis_quality=False)
+        row["deterministic_outcome"] = classify_outcome(row)
+        rows.append(row)
+    return {"protocol": "reward-distillation-batch-eval-v1", "batch_index": batch_index, "rows": rows}
+
+
+def _assert_evaluation_roster(run_dir: Path, batch_index: int, evaluation: dict[str, Any]) -> None:
+    expected = set(_batch_samples(run_dir, batch_index))
+    actual = {str(row.get("sample_id")) for row in (evaluation.get("rows") or []) if isinstance(row, dict)}
+    if expected != actual:
+        raise ValueError(f"evaluation roster does not match batch {batch_index:03d}: expected {sorted(expected)}, got {sorted(actual)}")
+
+
+def _rolling_comparison(
+    *,
+    run_dir: Path,
+    batch_index: int,
+    current_evaluation: Path,
+    window_size: int,
+    historical_evaluations: dict[int, Path] | None = None,
+    initial_train_results_dir: Path | None = None,
+    initial_test_results_dir: Path | None = None,
+    no_skill_results_dir: Path | None = None,
+    split_manifest: Path | None = None,
+) -> dict[str, Any]:
+    """Build same-sample evolving/initial/no-skill controls for Correction.
+
+    The evolving evaluation is already produced by the batch runner.  Initial
+    and no-skill controls are durable harness result directories, so they are
+    evaluated locally and cached as compact per-sample rows.  This keeps the
+    Correction input reproducible without copying raw trajectories into every
+    batch.
+    """
+
+    def _normalise_evaluation(path: Path) -> dict[str, Any]:
+        payload = read_json(path)
+        if isinstance(payload, dict) and str(payload.get("protocol") or "").startswith(
+            "abstract-learning-evaluation"
+        ):
+            return payload
+        return learning_evaluation(payload if isinstance(payload, dict) else {"rows": []})
+
+    def _compact_row(row: dict[str, Any]) -> dict[str, Any]:
+        progress = row.get("candidate_progress") or {}
+        sequence = []
+        for item in progress.get("sequence") or []:
+            if not isinstance(item, dict):
+                continue
+            sequence.append({
+                "sequence": item.get("sequence"),
+                "observed_stage": item.get("observed_stage"),
+                "deepest_stage": item.get("deepest_stage"),
+                "stage_delta_from_previous": item.get("stage_delta_from_previous"),
+                "target_stage_delta_from_previous": item.get(
+                    "target_stage_delta_from_previous"
+                ),
+                "is_duplicate_submission": bool(
+                    item.get("is_duplicate_submission")
+                ),
+            })
+        return {
+            "sample_id": row.get("sample_id"),
+            "outcome": row.get("outcome"),
+            "triggered": bool(row.get("triggered")),
+            "false_positive": bool(row.get("false_positive")),
+            "false_positive_pocs": int(row.get("false_positive_pocs") or 0),
+            "submitted_unique_pocs": int(row.get("submitted_unique_pocs") or 0),
+            "executed_candidates": int(row.get("executed_candidates") or 0),
+            "submitted_occurrences": int(row.get("submitted_occurrences") or len(sequence)),
+            "candidate_progress": {
+                "target_stage": progress.get("target_stage") or "none",
+                "observed_stage": progress.get("observed_stage") or "none",
+                "sequence": sequence,
+            },
+            "progress_summary": row.get("progress_summary"),
+        }
+
+    def _baseline_row(
+        source_dir: Path | None,
+        sample_id: str,
+        label: str,
+        cache_dir: Path,
+    ) -> dict[str, Any] | None:
+        if source_dir is None or not source_dir.is_dir():
+            return None
+        sample_dir = source_dir / sample_id
+        if not sample_dir.is_dir():
+            return None
+        cache_path = cache_dir / f"{label}_{sample_id}.json"
+        cached = load_json_if_exists(cache_path)
+        if isinstance(cached, dict) and cached.get("sample_id") == sample_id:
+            return cached
+        try:
+            raw = evaluate_sample(label, sample_dir, require_analysis_quality=False)
+            # ``evaluate_sample`` exposes runtime facts, while the learning
+            # view intentionally reads the deterministic outcome separately.
+            # Baseline rows must go through the same conversion as batch
+            # evaluation or every control would appear untriggered.
+            raw["deterministic_outcome"] = classify_outcome(raw)
+            learned = learning_evaluation({
+                "protocol": "baseline-evaluation-source-v1",
+                "source_results_dir": str(source_dir),
+                "rows": [raw],
+            })
+            rows = learned.get("rows") or []
+            if not rows:
+                return None
+            compact = _compact_row(rows[0])
+            write_json(cache_path, compact)
+            return compact
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+
+    def _metrics(row: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(row, dict):
+            return {
+                "available": False,
+                "target_stage": "none",
+                "target_depth": 0,
+                "triggered": False,
+                "false_positive": False,
+                "false_positive_pocs": 0,
+                "submitted_unique_pocs": 0,
+                "submitted_occurrences": 0,
+                "duplicate_submissions": 0,
+            }
+        progress = row.get("candidate_progress") or {}
+        target = str(progress.get("target_stage") or "none")
+        sequence = progress.get("sequence") or []
+        return {
+            "available": True,
+            "target_stage": target,
+            "target_depth": (
+                OBSERVED_STAGE_ORDER.index(target)
+                if target in OBSERVED_STAGE_ORDER
+                else 0
+            ),
+            "triggered": bool(row.get("triggered")),
+            "false_positive": bool(row.get("false_positive")),
+            "false_positive_pocs": int(row.get("false_positive_pocs") or 0),
+            "submitted_unique_pocs": int(row.get("submitted_unique_pocs") or 0),
+            "submitted_occurrences": int(
+                row.get("submitted_occurrences") or len(sequence)
+            ),
+            "duplicate_submissions": sum(
+                1 for item in sequence
+                if isinstance(item, dict) and item.get("is_duplicate_submission")
+            ),
+        }
+
+    def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        metrics = [_metrics(row) for row in rows]
+        return {
+            "evaluated_rows": len(rows),
+            "target_depth_by_sample": {
+                str(row.get("sample_id")): _metrics(row)["target_depth"]
+                for row in rows
+                if row.get("sample_id")
+            },
+            "gt_success": sum(item["triggered"] for item in metrics),
+            "false_positive_samples": sum(item["false_positive"] for item in metrics),
+            "false_positive_pocs": sum(item["false_positive_pocs"] for item in metrics),
+            "submitted_unique_pocs": sum(item["submitted_unique_pocs"] for item in metrics),
+            "submitted_occurrences": sum(item["submitted_occurrences"] for item in metrics),
+            "duplicate_submissions": sum(item["duplicate_submissions"] for item in metrics),
+        }
+
+    split_payload = load_json_if_exists(
+        Path(split_manifest) if split_manifest else run_dir / "split_manifest.json"
+    ) or load_json_if_exists(DEFAULT_DISTILLATION_SPLIT) or {}
+    train_ids = set(str(item) for item in split_payload.get("train") or [])
+    test_ids = set(str(item) for item in split_payload.get("test") or [])
+    initial_train = Path(initial_train_results_dir) if initial_train_results_dir else None
+    initial_test = Path(initial_test_results_dir) if initial_test_results_dir else None
+    no_skill = Path(no_skill_results_dir) if no_skill_results_dir else None
+    cache_dir = run_dir / "baseline_evaluation_cache"
+
+    def _initial_source(sample_id: str) -> Path | None:
+        if sample_id in test_ids and sample_id not in train_ids:
+            return initial_test
+        if sample_id in train_ids and sample_id not in test_ids:
+            return initial_train
+        if initial_train is not None and (initial_train / sample_id).is_dir():
+            return initial_train
+        if initial_test is not None and (initial_test / sample_id).is_dir():
+            return initial_test
+        return None
+
+    def _provenance(
+        source_dir: Path | None,
+        sample_ids: list[str],
+        *,
+        label: str,
+        output_tokens: int | None,
+    ) -> dict[str, Any]:
+        available = [
+            sample_id for sample_id in sample_ids
+            if source_dir is not None and (source_dir / sample_id).is_dir()
+        ]
+        return {
+            "kind": "fixed_baseline" if source_dir is not None else "unavailable",
+            "label": label,
+            "source_results_dir": str(source_dir) if source_dir is not None else None,
+            "required_samples": sample_ids,
+            "available_samples": len(available),
+            "required_count": len(sample_ids),
+            "max_output_tokens": output_tokens,
+            "harness": "deepseek_harness",
+            "model": "deepseek-v4-flash",
+        }
+
+    batches: list[dict[str, Any]] = []
+    history = historical_evaluations or {}
+    start = max(0, int(batch_index) - max(1, int(window_size or 1)) + 1)
+    missing_initial: list[int] = []
+    missing_no_skill: list[int] = []
+    comparable_batches: list[int] = []
+    for index in range(start, int(batch_index) + 1):
+        path = history.get(index) if index < batch_index else current_evaluation
+        if path is None:
+            candidate = run_dir / f"batch_{index:03d}" / "evaluation.json"
+            path = candidate if candidate.is_file() else None
+        if path is None or not Path(path).is_file():
+            continue
+        path = Path(path)
+        evolving_payload = _normalise_evaluation(path)
+        evolving_rows = [
+            _compact_row(row) for row in evolving_payload.get("rows") or []
+            if isinstance(row, dict) and row.get("sample_id")
+        ]
+        sample_ids = sorted(str(row["sample_id"]) for row in evolving_rows)
+        initial_rows: list[dict[str, Any]] = []
+        no_skill_rows: list[dict[str, Any]] = []
+        initial_by_id: dict[str, dict[str, Any] | None] = {}
+        no_skill_by_id: dict[str, dict[str, Any] | None] = {}
+        for sample_id in sample_ids:
+            initial_by_id[sample_id] = _baseline_row(
+                _initial_source(sample_id), sample_id, "initial_skill", cache_dir
+            )
+            no_skill_by_id[sample_id] = _baseline_row(
+                no_skill, sample_id, "no_skill", cache_dir
+            )
+            if initial_by_id[sample_id] is not None:
+                initial_rows.append(initial_by_id[sample_id])
+            if no_skill_by_id[sample_id] is not None:
+                no_skill_rows.append(no_skill_by_id[sample_id])
+        initial_available = len(initial_rows) == len(sample_ids)
+        no_skill_available = len(no_skill_rows) == len(sample_ids)
+        evolving_available = len(evolving_rows) == len(sample_ids)
+        comparable = bool(sample_ids) and initial_available and no_skill_available and evolving_available
+        if not initial_available:
+            missing_initial.append(index)
+        if not no_skill_available:
+            missing_no_skill.append(index)
+        if comparable:
+            comparable_batches.append(index)
+        pairs = []
+        evolving_by_id = {str(row["sample_id"]): row for row in evolving_rows}
+        for sample_id in sample_ids:
+            pairs.append({
+                "sample_id": sample_id,
+                "initial_skill": _metrics(initial_by_id.get(sample_id)),
+                "evolving": _metrics(evolving_by_id.get(sample_id)),
+                "no_skill": _metrics(no_skill_by_id.get(sample_id)),
+            })
+        initial_sources = {
+            str(_initial_source(sample_id)) for sample_id in sample_ids
+            if _initial_source(sample_id) is not None
+        }
+        batches.append({
+            "batch_index": index,
+            "evolving": {
+                "path": str(path),
+                "sample_ids": sample_ids,
+                "rows": evolving_rows,
+                "summary": _aggregate(evolving_rows),
+            },
+            "initial_skill_evaluation": (
+                sorted(initial_sources)[0] if len(initial_sources) == 1 else None
+            ),
+            "no_skill_evaluation": str(no_skill) if no_skill is not None else None,
+            "initial_skill_provenance": _provenance(
+                _initial_source(sample_ids[0]) if sample_ids else initial_train,
+                sample_ids,
+                label="initial_skill",
+                output_tokens=4096 if any(
+                    sample_id in train_ids for sample_id in sample_ids
+                ) else 32768,
+            ),
+            "no_skill_provenance": _provenance(
+                no_skill, sample_ids, label="no_skill_poc_generation", output_tokens=4096
+            ),
+            "initial_skill_available": initial_available,
+            "no_skill_available": no_skill_available,
+            "evolving_available": evolving_available,
+            "comparable": comparable,
+            "initial": _aggregate(initial_rows),
+            "evolving_summary": _aggregate(evolving_rows),
+            "no_skill": _aggregate(no_skill_rows),
+            "pairs": pairs,
+        })
+    return {
+        "protocol": "correction-rolling-comparison-v2",
+        "window": {
+            "start_batch": start,
+            "end_batch": int(batch_index),
+            "requested_batches": max(1, int(window_size or 1)),
+        },
+        "comparison": (
+            "same-sample fixed-initial-skill versus evolving-skill and no-skill controls"
+        ),
+        "baseline_sources": {
+            "initial_train_results_dir": str(initial_train) if initial_train else None,
+            "initial_test_results_dir": str(initial_test) if initial_test else None,
+            "no_skill_results_dir": str(no_skill) if no_skill else None,
+            "split_manifest": str(split_manifest or DEFAULT_DISTILLATION_SPLIT),
+        },
+        "comparable_batches": comparable_batches,
+        "missing_initial_skill_batches": missing_initial,
+        "missing_no_skill_batches": missing_no_skill,
+        "batches": batches,
+        "note": (
+            "Only batches with all three same-sample arms are comparable. "
+            "Missing controls must not be used to claim an initial-versus-evolving trend."
+        ),
+    }
 
 
 def _run_role(
@@ -396,8 +753,10 @@ def _run_role(
         api_key_env=args.api_key_env,
         api_version=args.api_version,
         reasoning_effort=args.reasoning_effort,
+        max_output_tokens=getattr(args, "role_max_output_tokens", 4096),
         timeout=args.role_timeout,
         dsh_command=getattr(args, "dsh_command", ""),
+        dsh_provider=getattr(args, "dsh_provider", "deepseek-official"),
     )
     parsed = status.pop("parsed", None)
     if parsed is not None:
@@ -456,7 +815,9 @@ def _diagnosis_text_values(value: Any) -> list[str]:
 
 def _forbidden_diagnosis_terms(diagnosis: dict[str, Any]) -> list[str]:
     hits: set[str] = set()
-    for section in DIAGNOSIS_SECTIONS:
+    for section in (*DIAGNOSIS_SECTIONS, "outcome_evidence", "executable_progress_evidence",
+                    "semantic_explanatory_evidence", "behavioral_evidence",
+                    "outcome_diagnosis"):
         for text in _diagnosis_text_values(diagnosis.get(section)):
             for pattern in _FORBIDDEN_DIAGNOSIS_TERMS:
                 for match in pattern.finditer(text):
@@ -470,39 +831,116 @@ def _diagnosis_retry_note(error: str) -> str:
         "using behavior-language only. Do not use evaluator-only terms such as "
         "R0, R1, R2, R3, R4, R5, Parser, Source, Root Cause, Sink, Trigger, or GT. "
         "Use terms like accepted input, issue-relevant path, vulnerable condition, "
-        "sensitive operation, observable failure, target issue, or non-target crash."
+        "sensitive operation, observable failure, target issue, or non-target crash. "
+        "When a target candidate exists but the agent selected a different crash, "
+        "use target_hit_unrecognized. In candidate_sequence use observed_stage, "
+        "stage_delta_from_previous, and target_stage_delta_from_previous; do not "
+        "use the ambiguous legacy names stage or stage_change."
     )
 
 
-def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
-    if not str(diagnosis.get("issue_description") or "").strip():
-        return "diagnosis missing issue_description"
-    missing: list[str] = []
-    for section in DIAGNOSIS_SECTIONS:
-        value = diagnosis.get(section)
-        if not isinstance(value, dict):
-            missing.append(section)
+def _canonicalize_diagnosis_stage_fields(diagnosis: dict[str, Any]) -> dict[str, Any]:
+    """Migrate legacy ``stage``/``stage_change`` to the shared contract.
+
+    The evaluator input has always exposed two axes.  Older diagnostician
+    outputs collapsed them into ambiguous names; accept those artifacts during
+    the migration, but materialize the unambiguous names consumed by Teacher
+    and Correction.
+    """
+    sequence = diagnosis.get("candidate_sequence")
+    if not isinstance(sequence, list):
+        return diagnosis
+    canonical: list[Any] = []
+    for raw in sequence:
+        if not isinstance(raw, dict):
+            canonical.append(raw)
             continue
-        for field in ("summary", "evidence"):
-            if not str(value.get(field) or "").strip():
-                missing.append(f"{section}.{field}")
+        item = dict(raw)
+        if not item.get("observed_stage") and item.get("stage"):
+            item["observed_stage"] = item.get("stage")
+        if not item.get("deepest_stage"):
+            # Legacy output had one collapsed stage axis.  Preserve it as the
+            # best available target view, while new output must copy the
+            # evaluator-provided value explicitly.
+            item["deepest_stage"] = item.get("observed_stage") or item.get("stage") or "none"
+        if not item.get("stage_delta_from_previous") and item.get("stage_change"):
+            item["stage_delta_from_previous"] = item.get("stage_change")
+        if not item.get("target_stage_delta_from_previous"):
+            item["target_stage_delta_from_previous"] = item.get("stage_delta_from_previous") or "unknown"
+        canonical.append(item)
+    diagnosis["candidate_sequence"] = canonical
+    return diagnosis
+
+
+def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
+    # Read older pool/fixture artifacts during the schema migration.  New
+    # diagnosticians use the evaluator-owned `case` contract below.
+    if "case" not in diagnosis and "issue_description" in diagnosis:
+        missing: list[str] = []
+        for section in ("outcome_evidence", "executable_progress_evidence",
+                        "semantic_explanatory_evidence", "behavioral_evidence",
+                        "outcome_diagnosis"):
+            value = diagnosis.get(section)
+            if not isinstance(value, dict):
+                missing.append(section)
+                continue
+            for field in ("summary", "evidence"):
+                if not str(value.get(field) or "").strip():
+                    missing.append(f"{section}.{field}")
+        if missing:
+            return "diagnosis missing required evidence field(s): " + ", ".join(missing)
+        findings = diagnosis.get(RUBRIC_FINDINGS_KEY)
+        if not isinstance(findings, list):
+            return f"diagnosis missing {RUBRIC_FINDINGS_KEY}"
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, dict):
+                return f"{RUBRIC_FINDINGS_KEY}[{index}] must be an object"
+            if finding.get("category") not in set(RUBRIC_CATEGORIES):
+                return f"{RUBRIC_FINDINGS_KEY}[{index}].category must be one of: {', '.join(RUBRIC_CATEGORIES)}"
+            if not isinstance(finding.get("present"), bool):
+                return f"{RUBRIC_FINDINGS_KEY}[{index}].present must be boolean"
+            if finding.get("present") and not str(finding.get("evidence") or "").strip():
+                return f"{RUBRIC_FINDINGS_KEY}[{index}].evidence is required when present is true"
+        forbidden = _forbidden_diagnosis_terms(diagnosis)
+        return "diagnosis uses evaluator-only term(s): " + ", ".join(forbidden) if forbidden else None
+    _canonicalize_diagnosis_stage_fields(diagnosis)
+    if not isinstance(diagnosis.get("case"), dict):
+        return "diagnosis missing evaluator-owned case object"
+    required = ("primary_failure_type", "failure_source", "harness_group",
+                "vulnerability_group", "candidate_sequence", "progress_events",
+                "turning_events", "initial_comparison", "one_sentence_explanation",
+                "why_no_submission", "why_not_reached", "why_false_positive",
+                "why_stopped", "why_succeeded", "submission_review",
+                "visible_signals", "evidence", "uncertainty")
+    missing = [key for key in required if key not in diagnosis]
     if missing:
-        return "diagnosis missing required evidence field(s): " + ", ".join(missing)
-    rubric_findings = diagnosis.get(RUBRIC_FINDINGS_KEY)
-    if not isinstance(rubric_findings, list):
-        return f"diagnosis missing {RUBRIC_FINDINGS_KEY}"
-    allowed_categories = set(RUBRIC_CATEGORIES)
-    for index, finding in enumerate(rubric_findings):
-        if not isinstance(finding, dict):
-            return f"{RUBRIC_FINDINGS_KEY}[{index}] must be an object"
-        category = str(finding.get("category") or "")
-        if category not in allowed_categories:
-            return f"{RUBRIC_FINDINGS_KEY}[{index}].category must be one of: {', '.join(RUBRIC_CATEGORIES)}"
-        present = finding.get("present")
-        if not isinstance(present, bool):
-            return f"{RUBRIC_FINDINGS_KEY}[{index}].present must be boolean"
-        if present and not str(finding.get("evidence") or "").strip():
-            return f"{RUBRIC_FINDINGS_KEY}[{index}].evidence is required when present is true"
+        return "diagnosis missing required field(s): " + ", ".join(missing)
+    failure_type = str(diagnosis.get("primary_failure_type") or "")
+    if failure_type not in DIAGNOSIS_FAILURE_TYPES:
+        return "primary_failure_type must be one of: " + ", ".join(DIAGNOSIS_FAILURE_TYPES)
+    failure_source = str(diagnosis.get("failure_source") or "")
+    if failure_source not in DIAGNOSIS_FAILURE_SOURCES:
+        return "failure_source must be one of: " + ", ".join(DIAGNOSIS_FAILURE_SOURCES)
+    for field in ("harness_group", "vulnerability_group", "initial_comparison"):
+        if not isinstance(diagnosis.get(field), dict):
+            return f"{field} must be an object"
+    for field in ("candidate_sequence", "progress_events", "turning_events"):
+        if not isinstance(diagnosis.get(field), list):
+            return f"{field} must be an array"
+    for index, item in enumerate(diagnosis["candidate_sequence"]):
+        if not isinstance(item, dict):
+            return f"candidate_sequence[{index}] must be an object"
+        stage = str(item.get("observed_stage") or "")
+        if stage not in {"none", "accepted_input", "relevant_path", "vulnerable_condition", "sensitive_operation", "observable_failure", "target_issue"}:
+            return f"candidate_sequence[{index}].observed_stage is invalid"
+        change = str(item.get("stage_delta_from_previous") or "")
+        if change not in {"first", "advanced", "unchanged", "regressed", "unknown"}:
+            return f"candidate_sequence[{index}].stage_delta_from_previous is invalid"
+        target_change = str(item.get("target_stage_delta_from_previous") or "")
+        if target_change not in {"first", "advanced", "unchanged", "regressed", "unknown"}:
+            return f"candidate_sequence[{index}].target_stage_delta_from_previous is invalid"
+    if not str(diagnosis.get("one_sentence_explanation") or "").strip():
+        return "diagnosis missing one_sentence_explanation"
     forbidden = _forbidden_diagnosis_terms(diagnosis)
     if forbidden:
         return "diagnosis uses evaluator-only term(s): " + ", ".join(forbidden)
@@ -516,6 +954,7 @@ def _normalize_diagnosis_for_outcome(
     sample_id: str = "",
 ) -> dict[str, Any]:
     """Attach deterministic facts without accepting legacy diagnosis fields."""
+    _canonicalize_diagnosis_stage_fields(diagnosis)
     normalized: dict[str, Any] = {}
     raw_sample_id = diagnosis.get("sample_id") or sample_id
     if raw_sample_id:
@@ -523,13 +962,8 @@ def _normalize_diagnosis_for_outcome(
     outcome = str((outcome_record or {}).get("outcome") or diagnosis.get("outcome") or "").lower()
     if outcome:
         normalized["outcome"] = outcome
-    issue = str(diagnosis.get("issue_description") or "").strip()
-    if not issue and sample_id:
-        issue = _sample_issue_description(sample_id)
-    if issue:
-        normalized["issue_description"] = issue
-    if diagnosis.get("vulnerability_type") not in (None, ""):
-        normalized["vulnerability_type"] = diagnosis.get("vulnerability_type")
+    if isinstance(diagnosis.get("case"), dict):
+        normalized["case"] = diagnosis.get("case")
     for section in DIAGNOSIS_SECTIONS:
         if section in diagnosis:
             normalized[section] = diagnosis.get(section)
@@ -781,6 +1215,13 @@ def cmd_propose_updates(args: argparse.Namespace) -> int:
             diagnoses = diagnoses.get("diagnoses", diagnoses)
     else:
         diagnoses = _diagnoses_for_window(run_dir, args.batch_index, args.diagnosis_window_size)
+    eval_report_path = batch_dir / "evaluation.json"
+    eval_report = read_json(eval_report_path) if eval_report_path.is_file() else {
+        "batch_index": args.batch_index,
+        "source_results_dir": str(batch_dir / "results"),
+        "rows": [],
+    }
+    teacher_evidence = build_teacher_evidence(eval_report, diagnoses)
     diagnoses = [learning_diagnosis(item) for item in diagnoses if isinstance(item, dict)]
     pools_view = teacher_view(
         load_pools(run_dir / POOLS_FILE),
@@ -794,7 +1235,7 @@ def cmd_propose_updates(args: argparse.Namespace) -> int:
     workspace = batch_dir / "subsessions" / "teacher"
     status = _run_role(
         args, "teacher", workspace, out_json=out_json,
-        build=lambda: build_teacher_role(workspace, packet, diagnoses, pools_view),
+        build=lambda: build_teacher_role(workspace, packet, diagnoses, pools_view, teacher_evidence),
     )
     print(json.dumps(status, indent=2))
     return 0
@@ -805,13 +1246,22 @@ def cmd_curate_updates(args: argparse.Namespace) -> int:
     batch_dir = run_dir / f"batch_{args.batch_index:03d}"
     packet = _packet_for(run_dir, args.batch_index, args.skill_packet)
     payload = read_json(args.updates.resolve() if args.updates else batch_dir / "teacher_candidate_updates.json")
-    updates = payload.get("candidate_updates", payload if isinstance(payload, list) else [])
+    # Preserve the complete Teacher payload, including `findings`, for the
+    # Curator.  The Curator still receives the proposals under the same
+    # `candidate_updates` key; legacy list-only artifacts remain accepted.
+    teacher_payload = payload if isinstance(payload, dict) else {
+        "candidate_updates": payload if isinstance(payload, list) else [],
+    }
+    diagnoses_path = batch_dir / "diagnoses.json"
+    diagnoses_payload = read_json(diagnoses_path) if diagnoses_path.is_file() else []
+    diagnoses = diagnoses_payload.get("diagnoses", diagnoses_payload) if isinstance(diagnoses_payload, dict) else diagnoses_payload
+    diagnoses = [learning_diagnosis(item) for item in diagnoses if isinstance(item, dict)] if isinstance(diagnoses, list) else []
     pools_view = teacher_view(load_pools(run_dir / POOLS_FILE), through_batch=args.batch_index)
     out_json = batch_dir / "curator_decisions.json"
     workspace = batch_dir / "subsessions" / "curator"
     status = _run_role(
         args, "curator", workspace, out_json=out_json,
-        build=lambda: build_curator_role(workspace, packet, updates, pools_view),
+        build=lambda: build_curator_role(workspace, packet, teacher_payload, diagnoses, pools_view),
     )
     print(json.dumps(status, indent=2))
     return 0
@@ -923,6 +1373,17 @@ def cmd_correct_skill(args: argparse.Namespace) -> int:
     eval_report = learning_evaluation(eval_report)
     applied_updates = read_json(applied_path) if applied_path.is_file() else {}
     pools_view = teacher_view(load_pools(run_dir / POOLS_FILE), through_batch=args.batch_index - 1)
+    rolling_comparison = _rolling_comparison(
+        run_dir=run_dir,
+        batch_index=args.batch_index,
+        current_evaluation=args.evaluation.resolve() if args.evaluation else batch_dir / "evaluation.json",
+        window_size=args.rolling_window_size,
+        initial_train_results_dir=args.initial_train_results_dir,
+        initial_test_results_dir=args.initial_test_results_dir,
+        no_skill_results_dir=args.no_skill_results_dir,
+        split_manifest=args.rolling_split_manifest,
+    )
+    write_json(batch_dir / "rolling_comparison.json", rolling_comparison)
     out_json = batch_dir / "correction_decision.json"
     workspace = batch_dir / "subsessions" / "correction"
     status = _run_role(
@@ -936,6 +1397,7 @@ def cmd_correct_skill(args: argparse.Namespace) -> int:
             applied_updates,
             pools_view,
             _read_baseline_evaluations(args.baseline_evaluation),
+            rolling_comparison,
         ),
     )
     print(json.dumps(status, indent=2))
@@ -1069,12 +1531,15 @@ def _append_role_cli_args(cmd: list[str], args: argparse.Namespace) -> list[str]
         "--base-url", args.role_base_url,
         "--api-key-env", args.role_api_key_env,
         "--reasoning-effort", args.role_reasoning_effort,
+        "--role-max-output-tokens", str(args.role_max_output_tokens),
         "--role-timeout", str(args.role_timeout),
     ])
     if args.role_api_version:
         cmd.extend(["--api-version", args.role_api_version])
     if getattr(args, "dsh_command", ""):
         cmd.extend(["--dsh-command", args.dsh_command])
+    if getattr(args, "dsh_provider", ""):
+        cmd.extend(["--dsh-provider", args.dsh_provider])
     if args.redo_roles:
         cmd.append("--redo")
     return cmd
@@ -1091,6 +1556,7 @@ def _append_harness_cli_args(cmd: list[str], args: argparse.Namespace) -> list[s
         "--max-attempts", str(args.max_attempts),
         "--timeout", str(args.timeout),
         "--reasoning-effort", args.reasoning_effort,
+        "--max-output-tokens", str(args.max_output_tokens),
     ])
     if args.overwrite:
         cmd.append("--overwrite")
@@ -1171,6 +1637,61 @@ def _evaluated_rows_count(evaluation: Path | dict[str, Any]) -> int:
     return 0
 
 
+_CORRECTION_TARGET_STAGE_ORDER = (
+    "none",
+    "accepted_input",
+    "relevant_path",
+    "vulnerable_condition",
+    "sensitive_operation",
+    "target_issue",
+)
+
+
+def _correction_progress_metrics(evaluation: Path | dict[str, Any]) -> dict[str, Any]:
+    """Return the machine-checkable progress view used by the correction gate.
+
+    The role receives the same view through ``batch_evaluation.json`` and
+    ``rolling_comparison.json``.  The gate recomputes it from the raw
+    evaluation so a role response cannot accidentally bypass the propagation
+    safety check.  Older evaluations without an explicit candidate-progress
+    field are normalized through ``learning_evaluation``.
+    """
+    payload = read_json(evaluation) if isinstance(evaluation, Path) else evaluation
+    normalized = learning_evaluation(payload if isinstance(payload, dict) else {"rows": []})
+    rows: dict[str, dict[str, Any]] = {}
+    for row in normalized.get("rows") or []:
+        if not isinstance(row, dict) or not row.get("sample_id"):
+            continue
+        sample_id = str(row["sample_id"])
+        progress = row.get("candidate_progress") or {}
+        target_stage = str(progress.get("target_stage") or "none")
+        if target_stage not in _CORRECTION_TARGET_STAGE_ORDER:
+            target_stage = "none"
+        sequence = progress.get("sequence") or []
+        duplicate_count = sum(
+            1 for item in sequence
+            if isinstance(item, dict) and item.get("is_duplicate_submission") is True
+        )
+        rows[sample_id] = {
+            "target_stage": target_stage,
+            "target_depth": _CORRECTION_TARGET_STAGE_ORDER.index(target_stage),
+            "triggered": bool(row.get("triggered")),
+            "duplicate_submissions": duplicate_count,
+            "submitted_occurrences": int(row.get("submitted_occurrences") or len(sequence)),
+        }
+    return {
+        "available": bool(rows),
+        "sample_count": len(rows),
+        "sample_metrics": rows,
+        "gt_success": sum(item["triggered"] for item in rows.values()),
+        "target_depth_sum": sum(item["target_depth"] for item in rows.values()),
+        "duplicate_submissions": sum(item["duplicate_submissions"] for item in rows.values()),
+        # Voluntary-stop evidence is not yet a field in batch evaluation.  It
+        # must remain explicit rather than being inferred from an exit code.
+        "voluntary_stops": {"available": False, "count": None},
+    }
+
+
 def _gate_correction_result(
     *,
     batch_dir: Path,
@@ -1181,19 +1702,55 @@ def _gate_correction_result(
     pre_packet: Path,
     post_packet: Path,
 ) -> dict[str, Any]:
-    pre_success = _deterministic_gt_success_count(pre_evaluation)
-    post_success = _deterministic_gt_success_count(post_evaluation)
-    decision = "ACCEPT" if post_success >= pre_success else "REVERT"
+    pre_metrics = _correction_progress_metrics(pre_evaluation)
+    post_metrics = _correction_progress_metrics(post_evaluation)
+    pre_success = int(pre_metrics["gt_success"])
+    post_success = int(post_metrics["gt_success"])
+    pre_samples = pre_metrics["sample_metrics"]
+    post_samples = post_metrics["sample_metrics"]
+    common_samples = sorted(set(pre_samples) & set(post_samples))
+    missing_pre = sorted(set(post_samples) - set(pre_samples))
+    missing_post = sorted(set(pre_samples) - set(post_samples))
+    target_depth_drops = [
+        sample_id for sample_id in common_samples
+        if post_samples[sample_id]["target_depth"] < pre_samples[sample_id]["target_depth"]
+    ]
+    duplicate_rise = post_metrics["duplicate_submissions"] > pre_metrics["duplicate_submissions"]
+    comparable = bool(common_samples) and not missing_pre and not missing_post
+    decision = (
+        "ACCEPT"
+        if comparable
+        and not target_depth_drops
+        and post_success >= pre_success
+        and not duplicate_rise
+        else "REVERT"
+    )
     restored: list[str] = []
     if decision == "REVERT":
         restored = _restore_pre_correction(batch_dir)
     gate = {
-        "protocol": "correction-gate-v1",
-        "metric": "deterministic_gt_success",
+        "protocol": "correction-gate-v2",
+        "policy": (
+            "accept only when same-roster per-sample target depth and aggregate GT "
+            "success do not decrease, and duplicate submissions do not increase"
+        ),
         "decision": decision,
+        "comparable": comparable,
+        "regressions": {
+            "target_depth_drops": target_depth_drops,
+            "missing_pre_samples": missing_pre,
+            "missing_post_samples": missing_post,
+            "gt_success_drop": max(pre_success - post_success, 0),
+            "duplicate_submissions_rise": duplicate_rise,
+            "voluntary_stops": {
+                "available": False,
+                "reason": "batch evaluation does not yet persist voluntary-stop counts",
+            },
+        },
         "pre_correction": {
             "gt_success": pre_success,
             "evaluated_rows": _evaluated_rows_count(pre_evaluation),
+            "progress": pre_metrics,
             "evaluation": str(pre_evaluation),
             "results_dir": str(pre_results_dir),
             "skill_packet": str(pre_packet),
@@ -1201,6 +1758,7 @@ def _gate_correction_result(
         "post_correction": {
             "gt_success": post_success,
             "evaluated_rows": _evaluated_rows_count(post_evaluation),
+            "progress": post_metrics,
             "evaluation": str(post_evaluation),
             "results_dir": str(post_results_dir),
             "skill_packet": str(post_packet),
@@ -1304,6 +1862,15 @@ def _run_batch_correction(
         "--evaluation", evaluation,
         "--diagnoses", diagnoses,
     )
+    for option, value in (
+        ("--initial-train-results-dir", getattr(args, "initial_train_results_dir", None)),
+        ("--initial-test-results-dir", getattr(args, "initial_test_results_dir", None)),
+        ("--no-skill-results-dir", getattr(args, "no_skill_results_dir", None)),
+        ("--rolling-split-manifest", getattr(args, "rolling_split_manifest", None)),
+    ):
+        if value:
+            cmd.extend([option, value])
+    cmd.extend(["--rolling-window-size", str(getattr(args, "rolling_window_size", 3))])
     applied = run_dir / f"batch_{max(batch_index - 1, 0):03d}" / "applied_updates.json"
     if applied.is_file():
         cmd.extend(["--applied-updates", applied])
@@ -1684,9 +2251,18 @@ def _add_role_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--api-key-env", default=DEFAULT_DISTILLER_API_KEY_ENV)
     parser.add_argument("--api-version", default="2024-03-01-preview")
     parser.add_argument("--reasoning-effort", default="medium")
+    parser.add_argument(
+        "--role-max-output-tokens",
+        type=int,
+        choices=(4096, 32768),
+        default=4096,
+        help="maximum output tokens for diagnosis/Teacher/Curator/Correction role sessions",
+    )
     parser.add_argument("--role-timeout", type=int, default=3600)
     parser.add_argument("--dsh-command", default="",
                         help="optional DeepSeek Harness CLI command for role subsessions")
+    parser.add_argument("--dsh-provider", default="deepseek-official",
+                        help="DeepSeek Harness provider for role subsessions")
 
 
 def _add_harness_args(parser: argparse.ArgumentParser) -> None:
@@ -1699,6 +2275,13 @@ def _add_harness_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-attempts", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=10800)
     parser.add_argument("--reasoning-effort", default="medium")
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        choices=(4096, 32768),
+        default=4096,
+        help="coding-agent output-token cap (default: 4096)",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reward-run-id")
@@ -1714,10 +2297,10 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument(
         "--baseline-dir",
         type=Path,
-        default=None,
+        default=DEFAULT_DSH_BASELINE_DIR,
         help=(
-            "optional tracked baseline directory containing split_manifest.json; "
-            f"for current DSH experiments use {DEFAULT_DSH_BASELINE_DIR}"
+            "tracked baseline directory containing split_manifest.json; "
+            f"defaults to the canonical failure-balanced controls at {DEFAULT_DSH_BASELINE_DIR}"
         ),
     )
     init.add_argument("--coding-harness", default=DEFAULT_CODING_HARNESS)
@@ -1792,6 +2375,20 @@ def main(argv: list[str] | None = None) -> int:
     correct.add_argument("--applied-updates", type=Path)
     correct.add_argument("--baseline-evaluation", action="append", default=[],
                          help="optional label=path comparison evaluation; may be repeated")
+    correct.add_argument("--initial-train-results-dir", type=Path,
+                         default=DEFAULT_INITIAL_TRAIN_RESULTS_DIR,
+                         help="fixed initial-skill DSH+DeepSeek 4096 TRAIN results")
+    correct.add_argument("--initial-test-results-dir", type=Path,
+                         default=DEFAULT_INITIAL_TEST_RESULTS_DIR,
+                         help="fixed initial-skill DSH+DeepSeek 32768 TEST results")
+    correct.add_argument("--no-skill-results-dir", type=Path,
+                         default=DEFAULT_NO_SKILL_RESULTS_DIR,
+                         help="formal DSH+DeepSeek no-skill poc_generation results")
+    correct.add_argument("--rolling-split-manifest", type=Path,
+                         default=None,
+                         help="split used to choose the initial train/test control")
+    correct.add_argument("--rolling-window-size", type=int, default=3,
+                         help="number of recent batches in Correction's matched window")
     _add_role_args(correct)
     correct.set_defaults(func=cmd_correct_skill)
 
@@ -1841,6 +2438,13 @@ def main(argv: list[str] | None = None) -> int:
     train.add_argument("--max-attempts", type=int, default=1)
     train.add_argument("--timeout", type=int, default=10800)
     train.add_argument("--reasoning-effort", default="medium")
+    train.add_argument(
+        "--max-output-tokens",
+        type=int,
+        choices=(4096, 32768),
+        default=4096,
+        help="coding-agent output-token cap (default: 4096)",
+    )
     train.add_argument("--overwrite", action="store_true")
     train.add_argument("--reward-run-prefix", default="")
     train.add_argument("--dsh-command", default="",
@@ -1852,12 +2456,33 @@ def main(argv: list[str] | None = None) -> int:
     train.add_argument("--role-api-key-env", default=DEFAULT_DISTILLER_API_KEY_ENV)
     train.add_argument("--role-api-version", default="")
     train.add_argument("--role-reasoning-effort", default="medium")
+    train.add_argument(
+        "--role-max-output-tokens",
+        type=int,
+        choices=(4096, 32768),
+        default=4096,
+        help="maximum output tokens for diagnosis/Teacher/Curator/Correction role sessions",
+    )
     train.add_argument("--role-timeout", type=int, default=1800)
     train.add_argument("--role-parallel", type=int, default=3)
     train.add_argument("--role-retries", type=int, default=1,
                        help="retry role steps that return zero but fail to write the expected JSON")
     train.add_argument("--redo-roles", action="store_true",
                        help="force role subsessions to start over for every role step")
+    train.add_argument("--initial-train-results-dir", type=Path,
+                       default=DEFAULT_INITIAL_TRAIN_RESULTS_DIR,
+                       help="fixed initial-skill DSH+DeepSeek 4096 TRAIN results")
+    train.add_argument("--initial-test-results-dir", type=Path,
+                       default=DEFAULT_INITIAL_TEST_RESULTS_DIR,
+                       help="fixed initial-skill DSH+DeepSeek 32768 TEST results")
+    train.add_argument("--no-skill-results-dir", type=Path,
+                       default=DEFAULT_NO_SKILL_RESULTS_DIR,
+                       help="formal DSH+DeepSeek no-skill poc_generation results")
+    train.add_argument("--rolling-split-manifest", type=Path,
+                       default=None,
+                       help="split used to choose the initial train/test control")
+    train.add_argument("--rolling-window-size", type=int, default=3,
+                       help="number of recent batches in Correction's matched window")
     train.set_defaults(func=cmd_train_batches)
 
     panel = sub.add_parser("build-validation-panel")

@@ -23,15 +23,21 @@ def role_task_prompt(
     inputs: Iterable[tuple[str, str]],
     output_rel: str = "OUTPUT.json",
 ) -> str:
-    """Role template plus an index of what is on disk and where to write."""
-    lines = [load_template(template_name).rstrip(), "", "## Inputs", "",
+    """Role template plus a non-overlapping index of workspace files.
+
+    Role templates own the semantic ``Inputs``/``Output`` contracts.  The
+    renderer must not append a second copy of either heading: doing so made the
+    rendered prompt diverge from the reviewed template and gave roles two
+    competing output instructions.
+    """
+    lines = [load_template(template_name).rstrip(), "", "## Workspace files", "",
              "Everything you need is already in this directory. Read it with real tools;"
              " nothing has been truncated for you.", ""]
     for relative, description in inputs:
         lines.append(f"- `{relative}` — {description}")
     lines += [
         "",
-        "## Output",
+        "## Workspace output",
         "",
         f"Write exactly one JSON object to `{output_rel}` in this directory, with the keys"
         " described above and no Markdown around it. That file is the result: do not rely"

@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 from reward_framework.adapters.base import substitute_skill_path_placeholders
+from reward_framework.adapters.agent_skill_export import compile_modular_lessons_for_agent
 
 from .contract import (
     SKILL_PACKET_ENV,
@@ -46,6 +47,10 @@ def install_workspace_skill_packet(
         packet_dst,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
+    # The source packet may store learned rules as modules.  OpenHands receives
+    # a workspace-local copy, so compile those rules into its first-read skill
+    # text just as native-skill adapters do.
+    compile_modular_lessons_for_agent(packet_dst)
 
     helpers_dst = workspace / WORKSPACE_HELPERS_DIR
     if helpers_dst.exists():

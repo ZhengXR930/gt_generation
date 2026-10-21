@@ -111,16 +111,21 @@ def install_workspace_skill_packet(
         "native_skill_export": native_manifest,
         "native_skill_root": str(skills_dir.resolve()),
     }
-    state_dir = scratch / "state"
+    # These helpers are invoked by DSH inside the agent mount namespace.  Keep
+    # their mutable state under the task workspace rather than the host-only
+    # runner scratch directory, and substitute only guest-visible paths.
+    agent_workspace = Path("/workspace")
+    agent_skills_dir = agent_workspace / ".dsh" / "skills"
+    state_dir = skills_dir.parent / "state"
     state_dir.mkdir(exist_ok=True)
     patch_file = scratch / "dsh_native_skills.patch.yml"
-    write_native_skill_patch(patch_file, skills_dir)
+    write_native_skill_patch(patch_file, agent_skills_dir)
     env["HARNESS_DSH_PATCH_FILE"] = str(patch_file)
     substitute_skill_path_placeholders(
         skills_dir,
-        helpers_dir=skills_dir / "poc-submission" / "helpers",
-        state_dir=state_dir,
-        workspace=workspace,
+        helpers_dir=agent_skills_dir / "poc-submission" / "helpers",
+        state_dir=agent_workspace / ".dsh" / "state",
+        workspace=agent_workspace,
     )
     manifest["agent_paths"] = {
         "skill_packet": str(skills_dir),
@@ -128,6 +133,13 @@ def install_workspace_skill_packet(
         "state": str(state_dir),
         "workspace": str(workspace),
         "dsh_patch_file": str(patch_file),
+    }
+    manifest["agent_paths"] = {
+        "skill_packet": str(agent_skills_dir),
+        "helpers": str(agent_skills_dir / "poc-submission" / "helpers"),
+        "state": str(agent_workspace / ".dsh" / "state"),
+        "workspace": str(agent_workspace),
+        "dsh_patch_file": "/run/gt-dsh-runtime/patch.yml",
     }
     return manifest
 

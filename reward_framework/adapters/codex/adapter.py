@@ -22,6 +22,9 @@ def build_command(request: RewardRequest) -> RewardCommand:
         *common_args(request),
         "--max-output-tokens",
         str(request.max_output_tokens),
+        # Keep the reward framework on the same API-call iteration boundary
+        # as poc_generation rather than letting Codex run after proxy refusal.
+        "--codex-enforce-max-iter",
     ]
     if request.skill_packet is not None:
         args += ["--workspace-installer", INSTALLER]

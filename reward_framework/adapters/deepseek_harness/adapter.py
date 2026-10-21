@@ -26,6 +26,8 @@ def build_command(request: RewardRequest) -> RewardCommand:
         *common_args(request),
         "--reasoning-effort",
         reasoning_effort,
+        "--max-output-tokens",
+        str(request.max_output_tokens),
     ]
     if request.skill_packet is not None:
         args += ["--workspace-installer", INSTALLER]

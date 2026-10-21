@@ -58,6 +58,41 @@ def save_pools(path: Path, pools: dict[str, Any]) -> None:
     path.write_text(json.dumps(pools, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def merge_pools(*pool_sets: dict[str, Any]) -> dict[str, Any]:
+    """Merge persisted pool snapshots, with later snapshots owning a batch.
+
+    A post-hoc diagnosis directory may contain only the current batch.  Its
+    Correction still needs the immediately preceding TRAIN batches, while a
+    rerun of a batch must replace—not double count—its older pool records.
+    """
+    merged = empty_pools()
+    for payload in pool_sets:
+        if not isinstance(payload, dict):
+            continue
+        # Upgrading legacy payloads must not mutate a caller-owned object.
+        source = json.loads(json.dumps(payload))
+        _upgrade_in_place(source)
+        for raw_batch in source.get("batches_seen") or []:
+            try:
+                batch = int(raw_batch)
+            except (TypeError, ValueError):
+                continue
+            _forget_batch(merged, batch)
+            merged["batches_seen"] = [item for item in merged["batches_seen"] if int(item) != batch]
+            merged["samples_by_batch"][str(batch)] = list(
+                (source.get("samples_by_batch") or {}).get(str(batch), [])
+            )
+            for name in ("success_pool", "false_positive_pool", "failure_pool", "infrastructure_pool"):
+                merged[name].extend(
+                    sample for sample in source.get(name, [])
+                    if str(sample.get("batch")) == str(batch)
+                )
+            merged["batches_seen"].append(batch)
+    merged["batches_seen"] = sorted({int(item) for item in merged["batches_seen"]})
+    _upgrade_in_place(merged)
+    return merged
+
+
 def update_pools(pools: dict[str, Any], batch_index: int, records: list[dict[str, Any]]) -> dict[str, Any]:
     """Fold one batch of deterministic outcomes plus diagnoses into sample pools."""
     _upgrade_in_place(pools)
@@ -94,36 +129,43 @@ def teacher_view(pools: dict[str, Any], *, limit: int = 80, through_batch: int |
 
     When regenerating old batches after later batches have been folded into
     pools.json, keep the Teacher's view chronological: batch N may only see
-    diagnoses from batches <= N.
+    diagnoses from batches <= N. `limit` is a total input budget, not a
+    separate allowance for every outcome pool. Keep all counterexamples when
+    possible; they are the evidence needed to learn and gate safe lessons.
     """
     _upgrade_in_place(pools)
     visible_successes = _visible_samples(pools.get("success_pool") or [], through_batch)
     visible_false_positives = _visible_samples(pools.get("false_positive_pool") or [], through_batch)
     visible_failures = _visible_samples(pools.get("failure_pool") or [], through_batch)
-    failure_pool = _pool_view(visible_failures, limit=limit)
-    success_pool = _pool_view(visible_successes, limit=limit)
-    false_positive_pool = _pool_view(visible_false_positives, limit=limit)
-    infrastructure_pool = _pool_view(_visible_samples(pools.get("infrastructure_pool") or [], through_batch), limit=limit)
+    visible_infrastructure = _visible_samples(pools.get("infrastructure_pool") or [], through_batch)
+    bounded = _bounded_teacher_pools(
+        visible_successes,
+        visible_false_positives,
+        visible_failures,
+        visible_infrastructure,
+        limit=limit,
+    )
+    failure_pool = _pool_view(bounded["failure_pool"], limit=limit)
+    success_pool = _pool_view(bounded["success_pool"], limit=limit)
+    false_positive_pool = _pool_view(bounded["false_positive_pool"], limit=limit)
+    infrastructure_pool = _pool_view(bounded["infrastructure_pool"], limit=limit)
     return {
         "protocol": "teacher-pools-view",
         "comparison_policy": {
             "mode": "success_false_positive_failure_contrast",
             "primary_objective": (
-                "Improve target-trigger success within the finite interaction budget by treating "
-                "submission feedback as part of the search loop."
+                "Improve labeled reproduction success within the finite interaction budget by treating "
+                "agent-visible submission feedback as part of the search loop."
             ),
             "secondary_objective": (
-                "Reduce false positives by treating nonzero exits, sanitizer output, and local crashes "
-                "as diagnostic evidence unless they match the issue-described target path, root cause, "
-                "and sensitive operation or target-trigger feedback."
+                "Use labeled outcomes to assess candidate behaviors, but make future lessons conditional "
+                "only on public source or issue evidence, local observations, or the actual submission response."
             ),
             "rubric_categories": list(RUBRIC_CATEGORIES),
             "note": (
-                "Infer reusable differences between target reproductions, non-target crashes, and ordinary "
-                "failures from the diagnosis fields. The false_positive_pool contains runs that produced a "
-                "crash or submission-level success but did not trigger the target issue. Treat it as "
-                "crash-producing behavior evidence, not as a veto: compare it with true successes to learn "
-                "how crash feedback should guide revision or stopping without delaying useful submissions."
+                "Use labeled success, crash-producing, and failure pools only as training evidence. A bare "
+                "crash/no-crash status is not future path feedback; use it to choose a source-informed next "
+                "step, and reserve path comparison for locally or remotely visible crash details."
             ),
         },
         "counts": {
@@ -131,6 +173,19 @@ def teacher_view(pools: dict[str, Any], *, limit: int = 80, through_batch: int |
             "false_positive_pool": len(false_positive_pool),
             "failure_pool": len(failure_pool),
             "infrastructure_pool": len(infrastructure_pool),
+            "visible_before_limit": sum(len(items) for items in (
+                visible_successes,
+                visible_false_positives,
+                visible_failures,
+                visible_infrastructure,
+            )),
+            "returned_total": sum(len(items) for items in (
+                success_pool,
+                false_positive_pool,
+                failure_pool,
+                infrastructure_pool,
+            )),
+            "total_limit": max(0, int(limit)),
             "batches_seen": len([b for b in pools.get("batches_seen") or [] if through_batch is None or int(b) <= through_batch]),
         },
         "success_pool": success_pool,
@@ -139,6 +194,46 @@ def teacher_view(pools: dict[str, Any], *, limit: int = 80, through_batch: int |
         "failure_pool": failure_pool,
         "infrastructure_pool": infrastructure_pool,
     }
+
+
+def correction_view(
+    pools: dict[str, Any],
+    *,
+    batch_index: int,
+    window_size: int = 3,
+    limit: int = 80,
+) -> dict[str, Any]:
+    """Return Correction's bounded *full-history* evidence view.
+
+    Correction still uses the rolling matched comparison to decide whether an
+    already-applied update should be kept, narrowed, or rolled back.  It must
+    nevertheless see the same accumulated pool as Teacher: otherwise a
+    recurring operational gap can be mistaken for an isolated current-batch
+    accident, and generic existing advice is too easily treated as coverage.
+
+    ``window_size`` remains in the signature for CLI compatibility.  It only
+    governs the separately supplied matched comparison, not what behavioral
+    evidence Correction may inspect.
+    """
+    del window_size
+    view = teacher_view(pools, limit=limit, through_batch=int(batch_index))
+    view["protocol"] = "correction-full-history-pools-view-v2"
+    view["scope"] = {
+        "through_batch": int(batch_index),
+        "history": "all accumulated TRAIN evidence available through this batch",
+        "total_limit": max(0, int(limit)),
+    }
+    view["comparison_policy"] = {
+        **(view.get("comparison_policy") or {}),
+        "mode": "full_history_failure_coverage_plus_recent_matched_calibration",
+        "note": (
+            "Use the complete bounded history to identify recurring observable gaps and "
+            "the separately supplied matched rolling comparison to decide rollback or "
+            "same-batch calibration. This is offline TRAIN evidence and must never be "
+            "copied into a future lesson."
+        ),
+    }
+    return view
 
 
 
@@ -337,6 +432,57 @@ def _rubric_findings(value: Any) -> list[dict[str, Any]]:
 
 def _pool_view(samples: list[dict[str, Any]], *, limit: int = 80) -> list[dict[str, Any]]:
     return [_teacher_sample(sample) for sample in samples[-limit:]]
+
+
+def _bounded_teacher_pools(
+    successes: list[dict[str, Any]],
+    false_positives: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    infrastructure: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Cap a Teacher view globally while retaining outcome counterexamples.
+
+    Successes are useful contrast, but ordinary failures and false-positive
+    crashes expose the behavior a new lesson must correct.  Retain every
+    non-success record whenever it fits; then fill the remaining budget with
+    the most recent successes.  The exceptional all-non-success case is
+    balanced across the three non-success pools rather than silently dropping
+    an outcome type.
+    """
+    budget = max(0, int(limit))
+    groups = {
+        "success_pool": successes,
+        "false_positive_pool": false_positives,
+        "failure_pool": failures,
+        "infrastructure_pool": infrastructure,
+    }
+    total = sum(len(items) for items in groups.values())
+    if total <= budget:
+        return groups
+
+    non_success_names = ("false_positive_pool", "failure_pool", "infrastructure_pool")
+    non_success_total = sum(len(groups[name]) for name in non_success_names)
+    if non_success_total <= budget:
+        kept = {name: list(groups[name]) for name in non_success_names}
+        kept["success_pool"] = list(successes[-(budget - non_success_total):])
+        return kept
+
+    # Rare with a 100-sample TRAIN split, but make the overflow behavior
+    # explicit and fair: take recent records round-robin across failure modes.
+    selected = {name: [] for name in groups}
+    remaining = {name: list(reversed(groups[name])) for name in non_success_names}
+    while budget > 0 and any(remaining.values()):
+        for name in non_success_names:
+            if budget <= 0:
+                break
+            if remaining[name]:
+                selected[name].append(remaining[name].pop(0))
+                budget -= 1
+    for name in non_success_names:
+        selected[name].reverse()
+    return selected
 
 
 def _teacher_sample(sample: dict[str, Any]) -> dict[str, Any]:

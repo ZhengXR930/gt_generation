@@ -8,8 +8,9 @@ an adapter reports in ``agent_paths`` rather than against any one layout.
 
 Two rules carry the weight:
 
-- the installed SKILL.md must equal the source modulo path substitution, so no
-  adapter can quietly edit, truncate, or re-order a lesson;
+- the installed skill framework and every learned lesson resource must equal
+  the source modulo path substitution, so no adapter can quietly edit,
+  truncate, or re-order a lesson;
 - the benchmark's ``submit.sh`` must be the benchmark's own. An adapter that
   wraps it changes the exit codes and gating the agent observes, which makes
   its arm incomparable both with the other harnesses and with the
@@ -21,6 +22,7 @@ import re
 from pathlib import Path
 
 from reward_framework.adapters.base import SKILL_PATH_PLACEHOLDERS
+from reward_framework.distillation.skill_packet import TARGETS, read_lessons
 
 SKILL_FILES = ("reproduction_skill/SKILL.md", "submission_skill/SKILL.md")
 NATIVE_SKILL_DIRS = {"reproduction_skill": "poc-reproduction", "submission_skill": "poc-submission"}
@@ -58,8 +60,31 @@ def _check_skills(source_packet: Path, installed_root: Path) -> list[str]:
             source.read_text(encoding="utf-8", errors="replace"),
             installed_text=text,
         )
-        if not _same_lessons(source_text, text):
+        if not _same_lessons(source_packet, relative, source_text, text):
             errors.append(f"{relative} content differs from the source packet beyond path substitution")
+        errors.extend(_check_lesson_resources(source, installed, relative))
+    return errors
+
+
+def _check_lesson_resources(source_skill: Path, installed_skill: Path, relative: str) -> list[str]:
+    """Compare modular lesson resources exactly; they are agent-visible text."""
+    source_root = source_skill.parent / "lessons"
+    if not source_root.is_dir():
+        return []
+    installed_root = installed_skill.parent / "lessons"
+    if not installed_root.is_dir():
+        return [f"installed packet is missing lessons for {relative}"]
+    source_files = sorted(path.relative_to(source_root) for path in source_root.rglob("*.md"))
+    installed_files = sorted(path.relative_to(installed_root) for path in installed_root.rglob("*.md"))
+    if source_files != installed_files:
+        return [f"lesson resources differ for {relative}: source={source_files}, installed={installed_files}"]
+    errors: list[str] = []
+    for child in source_files:
+        source_text = (source_root / child).read_text(encoding="utf-8", errors="replace")
+        installed_text = (installed_root / child).read_text(encoding="utf-8", errors="replace")
+        source_text = _substitute_placeholders_for_compare(source_text, installed_text=installed_text)
+        if source_text != installed_text:
+            errors.append(f"lesson resource differs from source: {relative.rsplit('/', 1)[0]}/lessons/{child}")
     return errors
 
 
@@ -72,7 +97,7 @@ def _find_installed_skill(root: Path, relative: str) -> Path | None:
     return native if native.is_file() else None
 
 
-def _same_lessons(source_text: str, installed_text: str) -> bool:
+def _same_lessons(source_packet: Path, relative: str, source_text: str, installed_text: str) -> bool:
     """Compare every bullet, which is where the skill's instructions live.
 
     Native exports legitimately add YAML frontmatter and an adapter prelude, and
@@ -82,7 +107,19 @@ def _same_lessons(source_text: str, installed_text: str) -> bool:
     either one. A packet straight from ``skill_packets/initial`` has no lesson
     ids yet, so this must not depend on them.
     """
-    return bullet_lines(source_text) == bullet_lines(installed_text)
+    expected = bullet_lines(source_text)
+    source_dir = relative.split("/", 1)[0]
+    target = next(
+        (name for name, section in TARGETS.items()
+         if Path(section.path).parent.as_posix() == source_dir),
+        None,
+    )
+    if target is not None and (source_packet / TARGETS[target].lesson_dir / "INDEX.md").is_file():
+        expected.extend(
+            f"- [{lesson['lesson_id']}] {lesson['text']}"
+            for lesson in read_lessons(source_packet)[target]
+        )
+    return expected == bullet_lines(installed_text)
 
 
 def _substitute_placeholders_for_compare(source_text: str, *, installed_text: str) -> str:

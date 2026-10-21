@@ -16,9 +16,21 @@ Python code appends machine-readable JSON payloads to these templates. Edit thes
 
 ## Two invariants the templates must keep stating
 
-**The outcome is not an opinion.** `outcome`, `deepest_stage`, and `first_failed_stage` come from `reward_framework/distillation/outcome.py`, which reads the executed R1..R5 reachability ladder. The diagnostician is given that verdict and records what happened; it does not produce the verdict or turn it into a lesson.
+**The outcome is not an opinion.** Sample-level `outcome`, `deepest_stage`, and
+`first_failed_stage` come from `reward_framework/distillation/outcome.py`,
+which reads the executed reachability ladder. In the ordered candidate view,
+`deepest_stage` is the target-ladder axis, `observed_stage` is the actual
+behavior axis, and `stage_delta_from_previous` compares observed progress to
+the immediately preceding submission occurrence. The diagnostician is given
+that verdict and records what happened; it does not produce the verdict or
+turn it into a lesson.
 
 **Evidence roles stay separate.** Outcome is the final objective, reachability is executable progress, fine trace and reasoning are semantic explanation, and trajectory plus submission history are behavioral evidence. Teacher performs the cross-sample contrast; Diagnostician does not write learning implications.
+
+**Diagnosis is structured.** The Diagnostician must emit the harness/process
+checklist, vulnerability-distance checklist, ordered candidate sequence,
+progress events, turning events, and an explicit initial-skill comparison when
+one is supplied. Free-form prose cannot replace those records.
 
 **The shared rubric is search-policy first.** Diagnosis, Teacher, and Curator all optimize the same two goals: improve target reproduction within the finite interaction budget, and reduce false positives without suppressing useful submissions. They should explicitly reason about submission starvation, feedback-loop failure, false-positive stopping, target mismatch, over-investigation, and artifact misalignment.
 

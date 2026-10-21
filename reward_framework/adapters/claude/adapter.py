@@ -20,6 +20,8 @@ def build_command(request: RewardRequest) -> RewardCommand:
         NAME,
         *sample_args(request),
         *common_args(request),
+        "--max-output-tokens",
+        str(request.max_output_tokens),
     ]
     if request.skill_packet is not None:
         args += ["--workspace-installer", INSTALLER]

@@ -12,8 +12,8 @@ We distill compact behavioral skills from the TRAIN split and evaluate whether
 they improve target PoC reproduction on later samples.
 
 - Dataset: `gt_results/valid_gt.json`, 500 valid samples.
-- Split: chronological TRAIN 300 / TEST 200, pinned in `gt_results/train_gt.json`
-  and `gt_results/test_gt.json`.
+- Split: failure-balanced TRAIN 100 / TEST 100, pinned in
+  `reward_framework/experiment_splits/skill_distillation_100_100_failure_balanced_20261016/split_manifest.json`.
 - Operational batch size: 10 samples.
 - Distillation window: the most recent 3 accepted operational batches, usually
   30 diagnoses, plus accumulated pools.
@@ -237,22 +237,22 @@ It may keep the packet, roll back to the previous packet, or produce a corrected
 packet. A corrected or rolled-back packet is always tested on the same batch
 before it is allowed to influence Teacher/Curator.
 
-After that rerun, the correction gate compares deterministic target-trigger
-success before and after correction on the same samples. If the corrected run has
-fewer GT successes, the workflow restores the pre-correction `evaluation.json`,
-`diagnoses.json`, `diagnosis_status.json`, and active skill packet. Teacher and
-Curator then consume the restored pre-correction artifacts. If GT success ties or
-improves, the corrected artifacts become the batch result.
+After that rerun, the correction gate compares the same-sample target-depth
+ladder before and after correction. It accepts only when no sample loses target
+depth, aggregate GT-trigger success does not decrease, and duplicate submissions
+do not increase. Missing rows make the comparison non-comparable and cause a
+revert. Voluntary-stop counts are recorded as unavailable until batch evaluation
+persists them; the gate never infers them from an exit code.
 
-The gate writes `batch_XXX/correction_gate.json` with the compared success
-counts, packet paths, result directories, and any restored artifacts. No-skill or
-historical full-run results remain external references; the hard propagation gate
-is same-batch deterministic GT success.
+The gate writes `batch_XXX/correction_gate.json` with the per-sample depth
+deltas, success counts, duplicate counts, packet paths, result directories, and
+any restored artifacts. No-skill or historical full-run results remain external
+references; the hard propagation gate is the same-sample target-depth contract.
 
 ## Batch-Level Control Flow
 
-The portable DSH baseline split and per-batch summary are tracked at
-`reward_framework/baselines/deepseek_harness_v4_flash/`. Local run outputs under
+The portable DSH baseline split and control sources are tracked at
+`reward_framework/baselines/dsh_deepseek_failure_balanced100/`. Local run outputs under
 `reward_framework/harness_runs/` and `reward_framework/distillation_runs/` are
 not portable by default.
 
@@ -262,7 +262,7 @@ example:
 ```bash
 python -m reward_framework.distillation.cli init-run \
   --run-dir reward_framework/distillation_runs/dsh_deepseek \
-  --baseline-dir reward_framework/baselines/deepseek_harness_v4_flash
+  --baseline-dir reward_framework/baselines/dsh_deepseek_failure_balanced100
 ```
 
 For each batch `k`:
@@ -286,7 +286,10 @@ batches.
 
 Canonical locations:
 
-- `reward_framework/skill_packets/initial/`: hand-written initial packet.
+- `reward_framework/skill_packets/dsh_deepseek_initial_100_100/`: immutable
+  initial packet for the canonical 100/100 DSH experiment.
+- `reward_framework/skill_packets/dsh_deepseek_evolving_100_100/`: stable
+  deployable evolving packet snapshot; its `PACKET_META.json` records hashes.
 - `reward_framework/distillation_runs/<run>/skill_packets/batch_XXX/`: accepted
   or candidate packets for a distillation run.
 - `reward_framework/distillation_runs/<run>/batch_XXX/samples.txt`: batch sample

@@ -8,6 +8,8 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
+from reward_framework.distillation.skill_packet import TARGETS, read_lessons
+
 
 LEVEL_SPECS = (
     {
@@ -61,6 +63,63 @@ def _native_skill_text(name: str, description: str, body: str, adapter_name: str
     )
 
 
+def _inline_modular_lessons(packet: Path, source_dir: str, body: str) -> tuple[str, bool]:
+    """Compile a modular source packet into the first-read agent skill text.
+
+    Lesson files are the editable source of truth for the distillation loop, but
+    DSH (and other native-skill runtimes) inject only ``SKILL.md`` at skill-load
+    time.  Leaving the rules only in child files therefore makes their delivery
+    depend on an extra model-initiated file read.  Export the same lesson bodies
+    inline so the agent receives the exact instruction set that a legacy flat
+    packet delivered.  The source resources remain copied for auditability and
+    future editing; they are not the delivery mechanism.
+    """
+    target = next(
+        (name for name, section in TARGETS.items()
+         if Path(section.path).parent.as_posix() == source_dir),
+        None,
+    )
+    if target is None:
+        return body, False
+    section = TARGETS[target]
+    if not (packet / section.lesson_dir / "INDEX.md").is_file():
+        return body, False
+
+    lessons = read_lessons(packet)[target]
+    rendered = [section.heading, ""]
+    rendered.extend(f"- [{lesson['lesson_id']}] {lesson['text']}" for lesson in lessons)
+    replacement = "\n".join(rendered)
+    pattern = re.compile(
+        r"^## Learned lesson routing\n.*?(?=^## |\Z)",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    compiled, substitutions = pattern.subn(replacement + "\n", body, count=1)
+    if substitutions != 1:
+        raise ValueError(
+            f"modular skill {source_dir} has lessons but no unique learned-lesson router to compile"
+        )
+    return compiled, True
+
+
+def compile_modular_lessons_for_agent(packet: Path) -> dict[str, bool]:
+    """Compile modular learned rules into an agent-facing *copy* of a packet.
+
+    Call this only after a harness has copied the immutable source packet into
+    its own workspace.  The source packet remains modular for curator edits;
+    the copy receives all currently active rules at first skill load.
+    """
+    packet = packet.resolve()
+    compiled: dict[str, bool] = {}
+    for spec in LEVEL_SPECS:
+        skill = packet / spec["source_dir"] / "SKILL.md"
+        body = skill.read_text(encoding="utf-8", errors="replace")
+        agent_body, changed = _inline_modular_lessons(packet, spec["source_dir"], body)
+        if changed:
+            skill.write_text(agent_body, encoding="utf-8")
+        compiled[spec["source_dir"]] = changed
+    return compiled
+
+
 def _validate_source_packet(packet: Path) -> None:
     if not packet.is_dir():
         raise FileNotFoundError(f"missing skill packet: {packet}")
@@ -72,6 +131,14 @@ def _validate_source_packet(packet: Path) -> None:
         for bad in FORBIDDEN_TEXT:
             if bad in text:
                 raise ValueError(f"{skill} contains forbidden stale text {bad!r}")
+        lessons = skill.parent / "lessons"
+        if lessons.exists() and not (lessons / "INDEX.md").is_file():
+            raise FileNotFoundError(f"modular skill is missing lesson index: {lessons / 'INDEX.md'}")
+        for resource in lessons.rglob("*.md") if lessons.is_dir() else ():
+            resource_text = resource.read_text(encoding="utf-8", errors="replace")
+            for bad in FORBIDDEN_TEXT:
+                if bad in resource_text:
+                    raise ValueError(f"{resource} contains forbidden stale text {bad!r}")
 
 
 def export_native_agent_skills(
@@ -96,10 +163,12 @@ def export_native_agent_skills(
                 raise FileExistsError(f"native skill already exists: {dst}")
             shutil.rmtree(dst)
         dst.mkdir(parents=True)
+        source_body = (src / "SKILL.md").read_text(encoding="utf-8", errors="replace")
+        agent_body, lessons_inlined = _inline_modular_lessons(packet, spec["source_dir"], source_body)
         skill_text = _native_skill_text(
             spec["native_name"],
             spec["description"],
-            (src / "SKILL.md").read_text(encoding="utf-8", errors="replace"),
+            agent_body,
             adapter_name,
         )
         (dst / "SKILL.md").write_text(skill_text, encoding="utf-8")
@@ -110,12 +179,20 @@ def export_native_agent_skills(
             shutil.copytree(helpers, dst / "helpers", ignore=ignore)
             shutil.copytree(helpers, dst / "scripts", ignore=ignore)
             helper_files = sorted(p.name for p in helpers.glob("*.py"))
+        lessons = src / "lessons"
+        lesson_files: list[str] = []
+        if lessons.is_dir():
+            ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+            shutil.copytree(lessons, dst / "lessons", ignore=ignore)
+            lesson_files = sorted(str(path.relative_to(lessons)) for path in lessons.rglob("*.md"))
         exported.append(
             {
                 "source": str(src),
                 "name": spec["native_name"],
                 "path": str(dst),
                 "helpers": helper_files,
+                "lessons": lesson_files,
+                "lesson_delivery": "inline-materialized" if lessons_inlined else "source-skill",
             }
         )
 
@@ -156,6 +233,9 @@ def validate_native_agent_skills(destination: Path) -> dict:
                 raise ValueError(f"{skill} contains forbidden stale text {bad!r}")
         for helper in (skill_dir / "helpers").glob("*.py"):
             compile(helper.read_text(encoding="utf-8", errors="replace"), str(helper), "exec")
+        lessons = skill_dir / "lessons"
+        if lessons.exists() and not (lessons / "INDEX.md").is_file():
+            raise FileNotFoundError(f"native skill is missing lesson index: {lessons / 'INDEX.md'}")
         for stale in skill_dir.rglob("__pycache__"):
             raise ValueError(f"native skill export contains stale __pycache__: {stale}")
         for stale in skill_dir.rglob("*.pyc"):
@@ -171,6 +251,10 @@ def write_bridge_file(path: Path, *, adapter_name: str, skills_dir: Path) -> Non
         "# Reward Framework PoC Skills\n\n"
         f"Adapter: `{adapter_name}`\n\n"
         f"Native skills directory: `{skills_dir}`\n\n"
-        "Installed skills: `poc-reproduction`, `poc-submission`.\n",
+        "Installed skills: `poc-reproduction`, `poc-submission`.\n\n"
+        "Before beginning vulnerability analysis, read both installed skill files:\n\n"
+        f"- `{skills_dir}/poc-reproduction/SKILL.md`\n"
+        f"- `{skills_dir}/poc-submission/SKILL.md`\n\n"
+        "Use their reproduction and submission loops throughout this task.\n",
         encoding="utf-8",
     )
