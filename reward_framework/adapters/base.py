@@ -11,7 +11,7 @@ from typing import Mapping
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_FILE = REPO_ROOT / "reward_framework" / "prompt.txt"
 DEFAULT_RUNS_ROOT = REPO_ROOT / "reward_framework" / "harness_runs"
-DEFAULT_SKILL_PACKET = REPO_ROOT / "reward_framework" / "skill_packets" / "dsh_deepseek_initial_100_100"
+DEFAULT_SKILL_PACKET = REPO_ROOT / "reward_framework" / "skill_packets" / "dsh_deepseek_initial_two_layer_staged_100_100"
 SERVER_ROOT = REPO_ROOT / "harness_runtime" / "server"
 OPENHANDS_RUNNER = REPO_ROOT / "harness_runtime" / "openhands" / "arvo.py"
 OPENHANDS_LOCAL_RUNNER = REPO_ROOT / "harness_runtime" / "openhands" / "local.py"

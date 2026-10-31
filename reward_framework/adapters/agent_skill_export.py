@@ -1,4 +1,4 @@
-"""Export two-layer PoC skill packets into native Agent Skill folders."""
+"""Export legacy or five-stage PoC skill packets into native Agent Skill folders."""
 
 from __future__ import annotations
 
@@ -6,9 +6,13 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Iterable
 
-from reward_framework.distillation.skill_packet import TARGETS, read_lessons
+from reward_framework.distillation.skill_packet import (
+    is_direct_stage_packet,
+    is_stage_packet,
+    read_lessons,
+    targets_for_packet,
+)
 
 
 LEVEL_SPECS = (
@@ -30,6 +34,84 @@ LEVEL_SPECS = (
     },
 )
 
+STAGE_SPECS = tuple(
+    {
+        "source_dir": f"skills/{stage}",
+        "native_name": f"poc-{stage.replace('_', '-')}",
+        "description": f"Use when working on the {stage.replace('_', ' ')} stage of PoC reproduction.",
+    }
+    for stage in (
+        "construct_input",
+        "reach_vulnerable_code",
+        "trigger_condition",
+        "verify_result",
+        "iterate",
+    )
+)
+
+# A stage packet is split into five files for the distillation loop, not into
+# five independent agent actions.  Native skill runtimes discover each
+# immediate child of their skill root as a separate callable skill, so expose
+# one lifecycle skill to the agent and keep the five source files as the
+# editable/auditable packet.
+STAGE_BUNDLE_SPEC = {
+    "source_dir": "skills",
+    "native_name": "poc-lifecycle",
+    "description": "Use the complete PoC reproduction stage scaffold.",
+}
+
+
+def packet_specs(packet: Path) -> tuple[dict[str, str], ...]:
+    """Return the source skill layout for a legacy or five-stage packet."""
+    return STAGE_SPECS if is_stage_packet(packet) else LEVEL_SPECS
+
+
+def native_packet_specs(packet: Path) -> tuple[dict[str, str], ...]:
+    """Return the skills actually exposed to a native agent runtime.
+
+    Five stage files remain the source layout used by Teacher/Curator.  They
+    are deliberately compiled into one agent-facing skill so loading the
+    initial scaffold does not cause one model tool call per empty stage.
+    """
+    return (STAGE_BUNDLE_SPEC,) if is_stage_packet(packet) else LEVEL_SPECS
+
+
+def packet_helper_spec(packet: Path) -> dict[str, str] | None:
+    """Return the source and native helper location for a packet.
+
+    The legacy two-layer packet carries submission bookkeeping helpers.  The
+    five-stage packet is intentionally just its five stage ``SKILL.md`` files;
+    its harness records submissions independently and therefore has no
+    agent-facing helper skill.
+    """
+    if is_stage_packet(packet) or is_direct_stage_packet(packet):
+        return None
+    return {"source": "submission_skill/helpers", "native_name": "poc-submission"}
+
+
+def inject_stage_skills_into_prompt(packet: Path, env: dict[str, str], output_dir: Path) -> str | None:
+    """Append every five-stage skill to the task prompt before the agent starts.
+
+    Native skill directories remain installed for filesystem provenance, but the
+    active stage packet is deliberately delivered eagerly: the coding agent
+    receives all five Goal sections and learned rules in its initial context,
+    rather than relying on a later skill-tool read.
+    """
+    packet = packet.resolve()
+    if not is_stage_packet(packet):
+        return None
+    source = Path(str(env.get("HARNESS_TASK_PROMPT_FILE") or "")).expanduser()
+    if not source.is_file():
+        return None
+    body, _ = stage_bundle_body(packet)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / "reward_framework_prompt_with_stages.txt"
+    prompt = source.read_text(encoding="utf-8", errors="replace").rstrip()
+    prompt += "\n\n" + body
+    destination.write_text(prompt, encoding="utf-8")
+    env["HARNESS_TASK_PROMPT_FILE"] = str(destination)
+    return str(destination)
+
 FORBIDDEN_TEXT = (
     ".gt_skill_state",
     "Static GT PoC",
@@ -46,6 +128,24 @@ def _strip_frontmatter(text: str) -> str:
         if end >= 0:
             return text[end + len("\n---\n") :].lstrip()
     return text
+
+
+def stage_bundle_body(packet: Path) -> tuple[str, bool]:
+    """Return the five stage documents as one agent-facing body.
+
+    The body is made only from the source ``SKILL.md`` files.  No routing
+    instruction or behavioral lesson is synthesized here; stage headings and
+    learned lessons stay exactly where Teacher/Curator placed them.
+    """
+    sections: list[str] = []
+    lessons_inlined = False
+    for spec in STAGE_SPECS:
+        source = packet / spec["source_dir"] / "SKILL.md"
+        body = source.read_text(encoding="utf-8", errors="replace")
+        body, changed = _inline_modular_lessons(packet, spec["source_dir"], body)
+        lessons_inlined = lessons_inlined or changed
+        sections.append(_strip_frontmatter(body).strip())
+    return "\n\n---\n\n".join(sections) + "\n", lessons_inlined
 
 
 def _yaml_single_quote(value: str) -> str:
@@ -75,13 +175,13 @@ def _inline_modular_lessons(packet: Path, source_dir: str, body: str) -> tuple[s
     future editing; they are not the delivery mechanism.
     """
     target = next(
-        (name for name, section in TARGETS.items()
+        (name for name, section in targets_for_packet(packet).items()
          if Path(section.path).parent.as_posix() == source_dir),
         None,
     )
     if target is None:
         return body, False
-    section = TARGETS[target]
+    section = targets_for_packet(packet)[target]
     if not (packet / section.lesson_dir / "INDEX.md").is_file():
         return body, False
 
@@ -110,7 +210,7 @@ def compile_modular_lessons_for_agent(packet: Path) -> dict[str, bool]:
     """
     packet = packet.resolve()
     compiled: dict[str, bool] = {}
-    for spec in LEVEL_SPECS:
+    for spec in packet_specs(packet):
         skill = packet / spec["source_dir"] / "SKILL.md"
         body = skill.read_text(encoding="utf-8", errors="replace")
         agent_body, changed = _inline_modular_lessons(packet, spec["source_dir"], body)
@@ -123,7 +223,10 @@ def compile_modular_lessons_for_agent(packet: Path) -> dict[str, bool]:
 def _validate_source_packet(packet: Path) -> None:
     if not packet.is_dir():
         raise FileNotFoundError(f"missing skill packet: {packet}")
-    for spec in LEVEL_SPECS:
+    if is_stage_packet(packet) and (packet / "helpers").exists():
+        raise ValueError("five-stage packets must contain only stage skills, not agent-facing helpers")
+    specs = packet_specs(packet)
+    for spec in specs:
         skill = packet / spec["source_dir"] / "SKILL.md"
         if not skill.is_file():
             raise FileNotFoundError(f"missing source SKILL.md: {skill}")
@@ -148,14 +251,16 @@ def export_native_agent_skills(
     adapter_name: str,
     overwrite: bool = True,
 ) -> dict:
-    """Export the Reproduction and Submission packet folders as native Agent Skills."""
+    """Export a packet in the native layout expected by its agent runtime."""
     packet = packet.resolve()
     destination = destination.expanduser().resolve()
     _validate_source_packet(packet)
     destination.mkdir(parents=True, exist_ok=True)
 
     exported: list[dict] = []
-    for spec in LEVEL_SPECS:
+    specs = native_packet_specs(packet)
+    helper_spec = packet_helper_spec(packet)
+    for spec in specs:
         src = packet / spec["source_dir"]
         dst = destination / spec["native_name"]
         if dst.exists():
@@ -163,25 +268,33 @@ def export_native_agent_skills(
                 raise FileExistsError(f"native skill already exists: {dst}")
             shutil.rmtree(dst)
         dst.mkdir(parents=True)
-        source_body = (src / "SKILL.md").read_text(encoding="utf-8", errors="replace")
-        agent_body, lessons_inlined = _inline_modular_lessons(packet, spec["source_dir"], source_body)
+        if is_stage_packet(packet):
+            source_body, lessons_inlined = stage_bundle_body(packet)
+        else:
+            source_body = (src / "SKILL.md").read_text(encoding="utf-8", errors="replace")
+            source_body, lessons_inlined = _inline_modular_lessons(
+                packet, spec["source_dir"], source_body
+            )
         skill_text = _native_skill_text(
             spec["native_name"],
             spec["description"],
-            agent_body,
+            source_body,
             adapter_name,
         )
         (dst / "SKILL.md").write_text(skill_text, encoding="utf-8")
-        helpers = src / "helpers"
+        helpers = src / "helpers" if helper_spec else None
         helper_files: list[str] = []
-        if helpers.is_dir():
+        if helpers and helpers.is_dir() and helper_spec and spec["native_name"] == helper_spec["native_name"]:
             ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
             shutil.copytree(helpers, dst / "helpers", ignore=ignore)
             shutil.copytree(helpers, dst / "scripts", ignore=ignore)
             helper_files = sorted(p.name for p in helpers.glob("*.py"))
-        lessons = src / "lessons"
+        # Stage lesson resources are compiled into the one lifecycle skill;
+        # copying them as immediate child skill resources would reintroduce
+        # per-stage on-demand loading in some native runtimes.
+        lessons = src / "lessons" if not is_stage_packet(packet) else None
         lesson_files: list[str] = []
-        if lessons.is_dir():
+        if lessons is not None and lessons.is_dir():
             ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
             shutil.copytree(lessons, dst / "lessons", ignore=ignore)
             lesson_files = sorted(str(path.relative_to(lessons)) for path in lessons.rglob("*.md"))
@@ -201,7 +314,17 @@ def export_native_agent_skills(
         "format": "native-agent-skills",
         "source_packet": str(packet),
         "destination": str(destination),
+        "agent_delivery": "eager-aggregate" if is_stage_packet(packet) else "native-per-skill",
         "skills": exported,
+        "source_stage_skills": [
+            {
+                "source": str(packet / spec["source_dir"] / "SKILL.md"),
+                "name": spec["native_name"],
+            }
+            for spec in STAGE_SPECS
+        ] if is_stage_packet(packet) else [],
+        "helper_skill": helper_spec["native_name"] if helper_spec else None,
+        "helper_source": helper_spec["source"] if helper_spec else None,
     }
     (destination / "reward_framework_skill_export.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
@@ -216,7 +339,8 @@ def validate_native_agent_skills(destination: Path) -> dict:
     if not destination.is_dir():
         raise FileNotFoundError(f"missing native skills destination: {destination}")
     found: list[dict] = []
-    for spec in LEVEL_SPECS:
+    exported_is_stage = (destination / STAGE_BUNDLE_SPEC["native_name"]).is_dir()
+    for spec in ((STAGE_BUNDLE_SPEC,) if exported_is_stage else LEVEL_SPECS):
         skill_dir = destination / spec["native_name"]
         skill = skill_dir / "SKILL.md"
         if not skill.is_file():
@@ -247,14 +371,20 @@ def validate_native_agent_skills(destination: Path) -> dict:
 def write_bridge_file(path: Path, *, adapter_name: str, skills_dir: Path) -> None:
     """Write a small project-level bridge document without mutating native config."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    skill_paths = sorted(
+        child / "SKILL.md"
+        for child in skills_dir.iterdir()
+        if child.is_dir() and (child / "SKILL.md").is_file()
+    ) if skills_dir.is_dir() else []
+    skill_lines = "\n".join(f"- `{item}`" for item in skill_paths)
+    if not skill_lines:
+        skill_lines = f"- `{skills_dir}/*/SKILL.md`"
     path.write_text(
         "# Reward Framework PoC Skills\n\n"
         f"Adapter: `{adapter_name}`\n\n"
         f"Native skills directory: `{skills_dir}`\n\n"
-        "Installed skills: `poc-reproduction`, `poc-submission`.\n\n"
-        "Before beginning vulnerability analysis, read both installed skill files:\n\n"
-        f"- `{skills_dir}/poc-reproduction/SKILL.md`\n"
-        f"- `{skills_dir}/poc-submission/SKILL.md`\n\n"
-        "Use their reproduction and submission loops throughout this task.\n",
+        "Before beginning vulnerability analysis, read every installed skill file:\n\n"
+        f"{skill_lines}\n\n"
+        "Use all of the installed stage guidance throughout this task.\n",
         encoding="utf-8",
     )

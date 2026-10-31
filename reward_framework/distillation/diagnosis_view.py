@@ -14,10 +14,34 @@ from typing import Any
 
 from .outcome import OBSERVED_STAGE_ORDER, ordered_candidate_sequence
 
+# These are the offline routing labels consumed by Teacher and Curator.  They
+# are deliberately separate from the evaluator's target ladder: the first
+# three describe construction bottlenecks, while the last two describe agent
+# behavior after (or instead of) execution.
+FAILURE_STAGES = (
+    "construct_input",
+    "reach_vulnerable_code",
+    "trigger_condition",
+    "verify_result",
+    "submission:when_to_submit",
+    "submission:after_feedback",
+    "submission:when_to_stop",
+    "unknown",
+)
+
+FIRST_MISSING_TO_FAILURE_STAGE = {
+    "accepted_input": "construct_input",
+    "relevant_path": "reach_vulnerable_code",
+    "vulnerable_condition": "trigger_condition",
+    "sensitive_operation": "trigger_condition",
+}
+
 DIAGNOSIS_SECTIONS = (
     "case",
     "primary_failure_type",
     "failure_source",
+    "failure_stage",
+    "failure_stage_evidence",
     "harness_group",
     "vulnerability_group",
     "candidate_sequence",
@@ -98,14 +122,118 @@ def abstract_value(value: Any) -> Any:
 def learning_diagnosis(diagnosis: dict[str, Any], outcome_record: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return the compact case-plus-explanation record used for training."""
     out: dict[str, Any] = {}
+    # These are structural parts of the diagnosis contract, not optional prose.
+    # Keep an explicit empty sequence for no-submission runs so downstream
+    # Teacher/Curator code can distinguish "no candidates" from a dropped
+    # field or an incomplete diagnosis.
+    structural_empty = {"candidate_sequence", "progress_events", "turning_events"}
     for key in _LEARNING_KEYS:
         value = diagnosis.get(key)
-        if value in (None, "", [], {}):
+        if value in (None, "", [], {}) and key not in structural_empty:
             continue
         out[key] = abstract_value(value) if key in DIAGNOSIS_SECTIONS or key in _LEGACY_DIAGNOSIS_KEYS else value
+    # Materialize the per-occurrence efficiency view after normalizing the
+    # diagnostician's sequence.  The role itself may describe the sequence in
+    # prose, but Teacher/Curator need a deterministic count of unchanged or
+    # regressed submissions and the target-depth gain attributable to each
+    # occurrence.  Keep the sequence in the diagnosis and omit the duplicate
+    # nested copy from the summary metrics.
+    sequence = out.get("candidate_sequence")
+    if isinstance(sequence, list):
+        annotated = _annotate_progress_sequence(
+            [item for item in sequence if isinstance(item, dict)]
+        )
+        out["candidate_sequence"] = annotated
+        metrics = candidate_progress_metrics(annotated)
+        metrics.pop("sequence", None)
+        out["progress_metrics"] = metrics
     if outcome_record:
         out["outcome"] = outcome_record.get("outcome") or out.get("outcome")
     return out
+
+
+def _stage_depth(stage: Any) -> int:
+    """Return the ordered target/observable depth for a compact sequence item."""
+    value = str(stage or "none")
+    return OBSERVED_STAGE_ORDER.index(value) if value in OBSERVED_STAGE_ORDER else 0
+
+
+def _annotate_progress_sequence(sequence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add per-occurrence progress and efficiency fields to an evaluator view.
+
+    These are offline measurements.  ``no_progress_submission`` deliberately
+    uses the independently observed behavior axis, not the evaluator target
+    ladder: an unchanged/regressed observable stage is a candidate that did not
+    visibly advance, even if its bytes or hypothesis changed.  The raw sequence
+    and duplicate marker remain available so Correction can distinguish useful
+    exploration from exact repetition.
+    """
+    annotated: list[dict[str, Any]] = []
+    previous_target = 0
+    previous_observed = 0
+    for index, raw in enumerate(sequence):
+        item = dict(raw)
+        target_depth = _stage_depth(item.get("deepest_stage"))
+        observed_depth = _stage_depth(item.get("observed_stage"))
+        target_gain = target_depth - previous_target
+        observed_gain = observed_depth - previous_observed
+        is_first = index == 0
+        stage_delta = str(item.get("stage_delta_from_previous") or "unknown")
+        no_progress = (not is_first) and stage_delta in {"unchanged", "regressed"}
+        item.update({
+            "target_depth_before": previous_target if not is_first else 0,
+            "target_depth_after": target_depth,
+            "target_depth_gain_from_previous": target_gain if not is_first else target_depth,
+            "observed_depth_before": previous_observed if not is_first else 0,
+            "observed_depth_after": observed_depth,
+            "observed_depth_gain_from_previous": observed_gain if not is_first else observed_depth,
+            "no_progress_submission": no_progress,
+        })
+        annotated.append(item)
+        previous_target = target_depth
+        previous_observed = observed_depth
+    return annotated
+
+
+def candidate_progress_metrics(sequence: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Summarize progress cost without treating submission count as progress.
+
+    ``target_depth_gain_per_submission`` is a descriptive efficiency signal,
+    not a hard budget.  A changed hypothesis that remains at the same observed
+    stage is retained as no-progress evidence, while ``duplicate_submissions``
+    separately identifies exact byte-for-byte repetition.
+    """
+    annotated = _annotate_progress_sequence([
+        item for item in (sequence or []) if isinstance(item, dict)
+    ])
+    submitted = len(annotated)
+    comparable = max(submitted - 1, 0)
+    no_progress = sum(bool(item.get("no_progress_submission")) for item in annotated)
+    duplicate = sum(bool(item.get("is_duplicate_submission")) for item in annotated)
+    productive = sum(
+        str(item.get("stage_delta_from_previous") or "") == "advanced"
+        for item in annotated[1:]
+    )
+    target_advances = sum(
+        int(item.get("target_depth_gain_from_previous") or 0) > 0
+        for item in annotated[1:]
+    )
+    target_depth = max(
+        (_stage_depth(item.get("deepest_stage")) for item in annotated),
+        default=0,
+    )
+    return {
+        "submitted_occurrences": submitted,
+        "no_progress_submissions": no_progress,
+        "no_progress_rate": (no_progress / comparable) if comparable else 0.0,
+        "productive_submissions": productive,
+        "productive_submission_rate": (productive / comparable) if comparable else 0.0,
+        "target_depth": target_depth,
+        "target_depth_advances": target_advances,
+        "target_depth_gain_per_submission": (target_depth / submitted) if submitted else 0.0,
+        "duplicate_submissions": duplicate,
+        "sequence": annotated,
+    }
 
 
 def learning_evaluation(eval_report: dict[str, Any]) -> dict[str, Any]:
@@ -133,7 +261,7 @@ def learning_evaluation(eval_report: dict[str, Any]) -> dict[str, Any]:
         det = row.get("deterministic_outcome")
         if not isinstance(det, dict):
             det = row
-        sequence = ordered_candidate_sequence(progress_row)
+        sequence = _annotate_progress_sequence(ordered_candidate_sequence(progress_row))
         observed_max = max(
             (item.get("observed_stage") for item in sequence if item.get("observed_stage") in OBSERVED_STAGE_ORDER),
             key=OBSERVED_STAGE_ORDER.index,
@@ -160,14 +288,24 @@ def learning_evaluation(eval_report: dict[str, Any]) -> dict[str, Any]:
                 "sequence": [
                     {
                         "sequence": item.get("sequence"),
+                        "deepest_stage": item.get("deepest_stage"),
+                        "first_missing_stage": item.get("first_missing_stage"),
                         "observed_stage": item.get("observed_stage"),
                         "stage_delta_from_previous": item.get("stage_delta_from_previous"),
                         "target_stage_delta_from_previous": item.get("target_stage_delta_from_previous"),
                         "is_duplicate_submission": item.get("is_duplicate_submission", False),
+                        "target_depth_before": item.get("target_depth_before", 0),
+                        "target_depth_after": item.get("target_depth_after", 0),
+                        "target_depth_gain_from_previous": item.get("target_depth_gain_from_previous", 0),
+                        "observed_depth_before": item.get("observed_depth_before", 0),
+                        "observed_depth_after": item.get("observed_depth_after", 0),
+                        "observed_depth_gain_from_previous": item.get("observed_depth_gain_from_previous", 0),
+                        "no_progress_submission": bool(item.get("no_progress_submission")),
                     }
                     for item in sequence
                 ],
             },
+            "progress_metrics": candidate_progress_metrics(sequence),
             "progress_summary": _progress_summary(det),
         })
     return {

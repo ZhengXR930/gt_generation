@@ -5,6 +5,8 @@ reward-framework skill packet.
 
 - Skill packets contain learned/reusable behavior.
 - Adapters install and expose those packets inside a concrete harness workspace.
+- Five-stage packets keep five source files for distillation, but native agent
+  runtimes receive one eager lifecycle skill containing all five sections.
 - Adapters build skill-enabled evaluation commands for each harness so batch
   launchers do not patch per-machine scripts.
 - Adapters must not contain sample-specific lessons, GT traces, hidden oracle
@@ -13,7 +15,8 @@ reward-framework skill packet.
 Each adapter should provide:
 
 - a contract module defining workspace paths and interface semantics;
-- an installer that copies skills/helpers and wraps submit safely;
+- an installer that copies the skill packet and preserves the benchmark submit
+  interface;
 - a validator that must pass before model test runs.
 
 
@@ -22,9 +25,10 @@ Current support level:
 | Adapter | Current status | What is validated |
 | --- | --- | --- |
 | OpenHands | Runnable adapter via `harness_runtime/openhands/{arvo,local}.py`. | Skill packet validation, workspace install/wrapper interface, dry-run command path, result-root separation. |
-| Codex | Runnable ARVO adapter via `harness_runtime/cli.py`, plus native skill export. | Command construction, ModelHub bridge path, native skill export, helper copy/validation. |
-| Claude | Runnable ARVO adapter via `harness_runtime/cli.py`, plus native skill export. | Command construction, Claude config/skill export, optional project bridge, helper copy/validation. |
+| Codex | Runnable ARVO adapter via `harness_runtime/cli.py`, plus native skill export. | Command construction, ModelHub bridge path, native skill export, and packet validation. |
+| Claude | Runnable ARVO adapter via `harness_runtime/cli.py`, plus native skill export. | Command construction, Claude config/skill export, optional project bridge, and packet validation. |
 | DeepSeek Harness | Runnable adapter via `harness_runtime/deepseek_harness/{arvo,local}.py`, plus DSH bundle/plugin export. | Command construction, bundle layout, skill export, manifest, Cordis patch/plugin file shape. |
+| ZCode | Runnable adapter via `adapters/zcode/` with native project skill installation and startup preload. | Command construction, `/workspace/.zcode/skills` discovery, deterministic multi-skill native preload, packet validation, and result-root separation. |
 
 Run reward-framework harness evaluations through:
 

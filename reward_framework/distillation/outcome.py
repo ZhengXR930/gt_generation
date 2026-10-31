@@ -3,6 +3,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from poc_generation.gt_trigger_oracle import (
+    REACHABILITY_KEYS,
+    gt_trigger_state,
+    gt_triggered,
+    reachability_depth,
+    reachability_fields,
+)
+
 STAGE_ORDER = ("Parser", "Source", "Root Cause", "Sink", "Trigger")
 _BEHAVIOR_PROGRESS = {
     None: "none", "Parser": "accepted_input", "Source": "relevant_path",
@@ -10,19 +18,42 @@ _BEHAVIOR_PROGRESS = {
     "Trigger": "target_issue",
 }
 OBSERVED_STAGE_ORDER = ("none", "accepted_input", "relevant_path", "vulnerable_condition", "sensitive_operation", "observable_failure", "target_issue")
-_LADDER = (("R1_input_admitted", "Parser"), ("R2_source_reached", "Source"), ("R3_root_cause_reached", "Root Cause"), ("R4_sink_reached", "Sink"), ("R5_sanitizer_triggered", "Trigger"))
+_LADDER = tuple(zip((*REACHABILITY_KEYS, "R5_sanitizer_triggered"), ("Parser", "Source", "Root Cause", "Sink", "Trigger")))
 DIAGNOSIS_FAILURE_TYPES = ("input_rejected", "stalled_at_stage", "wrong_crash_then_stopped", "trace_conflict", "no_submission", "environment_problem", "context_lost", "spinning", "output_truncated", "tool_failure", "target_hit_unrecognized", "target_mismatch", "success", "unknown")
 DIAGNOSIS_FAILURE_SOURCES = ("harness", "vulnerability", "none", "unknown")
 
 def candidate_ladder(candidate: dict[str, Any]) -> tuple[str | None, str | None]:
-    reach = candidate.get("location_reachability") or {}
-    reached = None
-    for key, stage in _LADDER:
-        value = reach.get(key)
-        if value is True: reached = stage
-        elif value is False: return reached, stage
-        else: return reached, None
-    return reached, None
+    """Return deepest matched checkpoint and the next unmatched checkpoint.
+
+    R1--R5 are independently observed checkpoints.  They are presented as a
+    ladder for reporting, but an exact-line miss at R3 must not erase a valid
+    R4 hit.  ``failed`` is consequently only the first missing checkpoint
+    *after* the deepest observed one; it is not a prefix gate.
+    """
+    fields = reachability_fields(candidate)
+    values = [fields[key] for key in REACHABILITY_KEYS]
+    trigger = gt_trigger_state(candidate)
+    values.append(trigger)
+    depth = reachability_depth(candidate)
+    if depth == "R5":
+        return "Trigger", None
+    reached_indices = [index for index, value in enumerate(values) if value is True]
+    if reached_indices:
+        deepest_index = max(reached_indices)
+        failed = next(
+            (
+                stage
+                for value, (_key, stage) in zip(values[deepest_index + 1 :], _LADDER[deepest_index + 1 :])
+                if value is False
+            ),
+            None,
+        )
+        return _LADDER[deepest_index][1], failed
+    failed = next(
+        (stage for value, (_key, stage) in zip(values, _LADDER) if value is False),
+        None,
+    )
+    return (None, None) if failed is None else (None, failed)
 
 def _candidate_has_non_target_crash(candidate: dict[str, Any]) -> bool:
     reachability = candidate.get("location_reachability") or {}
@@ -34,7 +65,7 @@ def _candidate_has_non_target_crash(candidate: dict[str, Any]) -> bool:
     return False
 
 def observed_candidate_stage(candidate: dict[str, Any]) -> str:
-    if candidate.get("target_vulnerability_triggered") is True: return "target_issue"
+    if gt_triggered(candidate): return "target_issue"
     if _candidate_has_non_target_crash(candidate): return "observable_failure"
     deepest, _ = candidate_ladder(candidate)
     return _BEHAVIOR_PROGRESS.get(deepest, "none")
@@ -73,10 +104,9 @@ def candidate_replay_observation(candidate: dict[str, Any]) -> dict[str, Any]:
         "hit_kinds": kinds,
         "exact_checkpoint_hits": exact,
         "target_checkpoint_hit": bool(
-            reach.get("R3_root_cause_reached") is True
-            or reach.get("R4_sink_reached") is True
-            or reach.get("R5_sanitizer_triggered") is True
-            or candidate.get("target_vulnerability_triggered") is True
+            reachability_fields(candidate).get("R3_root_cause_reached") is True
+            or reachability_fields(candidate).get("R4_sink_reached") is True
+            or gt_triggered(candidate)
         ),
     }
 
@@ -85,7 +115,7 @@ def classify_outcome(eval_row: dict[str, Any] | None) -> dict[str, Any]:
     candidates = [item for item in (runtime.get("candidates") or []) if isinstance(item, dict)]
     executed = [item for item in candidates if item.get("execution_status") == "executed"]
     submitted = int(runtime.get("submitted_unique_pocs") or 0); submission = runtime.get("submission_outcome") or {}
-    candidate_false_positives = sum(1 for item in executed if item.get("target_vulnerability_triggered") is not True and _candidate_has_non_target_crash(item))
+    candidate_false_positives = sum(1 for item in executed if not gt_triggered(item) and _candidate_has_non_target_crash(item))
     reachability_false_positives = max(int(runtime.get("nonzero_exit_false_positives") or 0), candidate_false_positives)
     unavailable = str(runtime.get("unavailable") or "")
     def record(outcome: str, *, deepest: str | None = None, failed: str | None = None, reason: str = "") -> dict[str, Any]:
@@ -93,7 +123,7 @@ def classify_outcome(eval_row: dict[str, Any] | None) -> dict[str, Any]:
         row = {"protocol": "deterministic-outcome-v1", "submitted_unique_pocs": submitted, "submission_success": submission.get("success"), "submission_triggered": submission.get("triggered"), "submission_triggered_pocs": submission.get("triggered_pocs"), "submission_crashed_pocs": submission.get("crashed_pocs"), "false_positive": bool(false_positive_pocs), "false_positive_pocs": false_positive_pocs, "executed_candidates": len(executed), "triggered": target_triggered, "outcome": outcome, "deepest_stage": deepest, "first_failed_stage": failed}
         if reason: row["reason"] = reason
         return row
-    if any(item.get("target_vulnerability_triggered") is True for item in candidates): return record("success", deepest="Trigger")
+    if any(gt_triggered(item) for item in candidates): return record("success", deepest="Trigger")
     if not candidates:
         if "reachability has not been executed" in unavailable: return record("infrastructure", reason="reachability not executed")
         if submitted == 0: return record("failure", reason="no candidate was submitted")
@@ -124,7 +154,7 @@ def diagnosis_case_profile(outcome_record: dict[str, Any] | None, eval_row: dict
 def diagnostics_summary(eval_row: dict[str, Any] | None) -> dict[str, Any]:
     row = eval_row or {}; coverage = row.get("fine_trace_coverage") or {}; reasoning = row.get("reasoning") or {}; runtime = row.get("runtime") or {}
     sequence = ordered_candidate_sequence(eval_row)
-    return {"trace_coverage": {"source": "analysis.json.fine_trace", "node_recall": (coverage.get("nodes") or {}).get("recall"), "edge_recall": (coverage.get("edges") or {}).get("recall"), "nodes": coverage.get("nodes"), "edges": coverage.get("edges"), "stage_coverage": coverage.get("stage_coverage"), "unavailable": coverage.get("unavailable")}, "reasoning": {"dimension_scores": reasoning.get("dimension_scores"), "unavailable": reasoning.get("unavailable")}, "reachability": {"source": "runtime.candidates.location_reachability", "submitted_unique_pocs": runtime.get("submitted_unique_pocs"), "submitted_occurrences": len(sequence), "executed_candidates": runtime.get("reachability_executed_candidates"), "unavailable": runtime.get("unavailable"), "candidates": [{"attempt_id": c.get("attempt_id"), "execution_status": c.get("execution_status"), "target_vulnerability_triggered": c.get("target_vulnerability_triggered"), "reachability_depth": (c.get("location_reachability") or {}).get("reachability_depth"), "ladder": {key: (c.get("location_reachability") or {}).get(key) for key, _stage in _LADDER}, "replay_observation": candidate_replay_observation(c)} for c in (runtime.get("candidates") or []) if isinstance(c, dict)]}}
+    return {"trace_coverage": {"source": "analysis.json.fine_trace", "node_recall": (coverage.get("nodes") or {}).get("recall"), "edge_recall": (coverage.get("edges") or {}).get("recall"), "nodes": coverage.get("nodes"), "edges": coverage.get("edges"), "stage_coverage": coverage.get("stage_coverage"), "unavailable": coverage.get("unavailable")}, "reasoning": {"dimension_scores": reasoning.get("dimension_scores"), "unavailable": reasoning.get("unavailable")}, "reachability": {"source": "runtime.candidates.location_reachability", "submitted_unique_pocs": runtime.get("submitted_unique_pocs"), "submitted_occurrences": len(sequence), "executed_candidates": runtime.get("reachability_executed_candidates"), "unavailable": runtime.get("unavailable"), "candidates": [{"attempt_id": c.get("attempt_id"), "execution_status": c.get("execution_status"), "target_vulnerability_triggered": gt_trigger_state(c), "reachability_depth": reachability_depth(c), "ladder": {key: reachability_fields(c).get(key) for key, _stage in _LADDER if key in REACHABILITY_KEYS}, "R5_triggered": gt_trigger_state(c), "replay_observation": candidate_replay_observation(c)} for c in (runtime.get("candidates") or []) if isinstance(c, dict)]}}
 
 def _depth(stage: str | None) -> int:
     return STAGE_ORDER.index(stage) + 1 if stage in STAGE_ORDER else 0
@@ -236,7 +266,7 @@ def ordered_candidate_sequence(
     ordered = sorted(candidates, key=lambda item: (item.get("sequence_in_run") if item.get("sequence_in_run") is not None else 1_000_000_000, item.get("attempt_id") or ""))
     out = []; previous_observed = None; previous_target = None
     for index, candidate in enumerate(ordered, start=1):
-        reach = candidate.get("location_reachability") or {}; deepest, failed = _candidate_progress(candidate); observed = observed_candidate_stage(candidate)
-        out.append({"sequence": candidate.get("sequence_in_run") or index, "attempt_id": candidate.get("attempt_id"), "poc_sha256": candidate.get("poc_sha256"), "poc_path": candidate.get("poc_path"), "analysis_path": candidate.get("analysis_path"), "runtime_output_path": candidate.get("runtime_output_path"), "original_exit_code": candidate.get("original_exit_code"), "execution_status": candidate.get("execution_status"), "deepest_stage": deepest, "first_missing_stage": failed, "observed_stage": observed, "stage_delta_from_previous": _stage_delta(observed, previous_observed), "target_stage_delta_from_previous": _stage_delta(deepest, previous_target), "target_vulnerability_triggered": candidate.get("target_vulnerability_triggered"), "crash_observed": bool(_candidate_has_non_target_crash(candidate) or candidate.get("target_vulnerability_triggered") is True), "replay_observation": candidate_replay_observation(candidate), "replay_available": bool(reach.get("reachability_checked")), "submission_occurrence": bool(candidate.get("submission_occurrence")), "submission_occurrence_index": candidate.get("submission_occurrence_index"), "is_unique_representative": candidate.get("is_unique_representative"), "unique_representative_attempt_id": candidate.get("unique_representative_attempt_id"), "is_duplicate_submission": bool(candidate.get("is_duplicate_submission")), "duplicate_of_sequence": candidate.get("duplicate_of_sequence"), "duplicate_of_attempt_id": candidate.get("duplicate_of_attempt_id")})
+        reach = candidate.get("location_reachability") or {}; deepest, failed = _candidate_progress(candidate); observed = observed_candidate_stage(candidate); target_state = gt_trigger_state(candidate)
+        out.append({"sequence": candidate.get("sequence_in_run") or index, "attempt_id": candidate.get("attempt_id"), "poc_sha256": candidate.get("poc_sha256"), "poc_path": candidate.get("poc_path"), "analysis_path": candidate.get("analysis_path"), "runtime_output_path": candidate.get("runtime_output_path"), "original_exit_code": candidate.get("original_exit_code"), "execution_status": candidate.get("execution_status"), "deepest_stage": deepest, "first_missing_stage": failed, "observed_stage": observed, "stage_delta_from_previous": _stage_delta(observed, previous_observed), "target_stage_delta_from_previous": _stage_delta(deepest, previous_target), "target_vulnerability_triggered": target_state, "crash_observed": bool(_candidate_has_non_target_crash(candidate) or target_state is True), "replay_observation": candidate_replay_observation(candidate), "replay_available": bool(reach.get("reachability_checked")), "submission_occurrence": bool(candidate.get("submission_occurrence")), "submission_occurrence_index": candidate.get("submission_occurrence_index"), "is_unique_representative": candidate.get("is_unique_representative"), "unique_representative_attempt_id": candidate.get("unique_representative_attempt_id"), "is_duplicate_submission": bool(candidate.get("is_duplicate_submission")), "duplicate_of_sequence": candidate.get("duplicate_of_sequence"), "duplicate_of_attempt_id": candidate.get("duplicate_of_attempt_id")})
         previous_observed = observed; previous_target = deepest
     return out

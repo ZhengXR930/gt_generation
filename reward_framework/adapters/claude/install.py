@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from reward_framework.adapters.agent_skill_export import (
     export_native_agent_skills,
+    inject_stage_skills_into_prompt,
     write_bridge_file,
 )
 
@@ -41,8 +42,7 @@ def install_skill_packet(
             marker = "<!-- reward-framework-poc-skills -->"
             block = (
                 f"\n{marker}\n"
-                "Use the installed `poc-reproduction` and "
-                "`poc-submission` skills for benchmark PoC "
+                "Use every installed reward-framework stage skill for benchmark PoC "
                 "reproduction tasks. Details: `.claude/reward_framework_poc_skills.md`.\n"
                 f"{marker.replace('<!--', '<!-- /')}\n"
             )
@@ -63,22 +63,25 @@ def install_workspace_skill_packet(
 ) -> dict:
     del harness, sample_id
     packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
+    inject_stage_skills_into_prompt(packet, env, scratch)
     config_dir = scratch / "claude_config"
     skills_dir = config_dir / "skills"
     manifest = install_skill_packet(packet, skills_dir, project_dir=workspace)
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     state_dir = scratch / "state"
     state_dir.mkdir(exist_ok=True)
-    substitute_skill_path_placeholders(
-        skills_dir,
-        helpers_dir=skills_dir / "poc-submission" / "helpers",
-        state_dir=state_dir,
-        workspace=workspace,
-    )
+    helper_skill = manifest.get("helper_skill")
+    if helper_skill:
+        substitute_skill_path_placeholders(
+            skills_dir,
+            helpers_dir=skills_dir / str(helper_skill) / "helpers",
+            state_dir=state_dir,
+            workspace=workspace,
+        )
     manifest["workspace"] = str(workspace)
     manifest["agent_paths"] = {
         "skill_packet": str(skills_dir),
-        "helpers": str(skills_dir / "poc-submission" / "helpers"),
+        "helpers": str(skills_dir / str(helper_skill) / "helpers") if helper_skill else str(skills_dir / "helpers"),
         "state": str(state_dir),
         "workspace": str(workspace),
     }

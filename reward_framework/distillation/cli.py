@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import os
 import re
@@ -23,12 +24,17 @@ from reward_framework.distillation.artifacts import load_json_if_exists, read_js
 from reward_framework.distillation.audit import audit_framework  # noqa: E402
 from reward_framework.distillation.diagnosis_view import (  # noqa: E402
     DIAGNOSIS_SECTIONS,
+    FAILURE_STAGES,
     RUBRIC_CATEGORIES,
     RUBRIC_FINDINGS_KEY,
+    candidate_progress_metrics,
     learning_diagnosis,
     learning_evaluation,
 )
-from reward_framework.distillation.teacher_evidence import build_teacher_evidence  # noqa: E402
+from reward_framework.distillation.teacher_evidence import (  # noqa: E402
+    build_teacher_evidence,
+    role_visible_evidence,
+)
 from reward_framework.distillation.defaults import (  # noqa: E402
     DEFAULT_CODING_API_KEY_ENV,
     DEFAULT_CODING_BASE_URL,
@@ -73,18 +79,22 @@ from reward_framework.distillation.roles import (  # noqa: E402
     resume_role,
 )
 from reward_framework.distillation.skill_packet import (  # noqa: E402
-    TARGETS,
+    STAGE_NAMES,
     apply_correction_decision,
     apply_curator_decisions,
     copy_initial_packet,
     lessons_snapshot,
     normalize_packet,
     read_lessons,
+    targets_for_packet,
 )
 from reward_framework.distillation.splits import (  # noqa: E402
     build_chronological_split,
     freeze_split,
     load_frozen_split,
+    read_baseline_outcomes,
+    rebalance_training_batches,
+    validate_outcome_balanced_manifest,
     write_split_manifest,
 )
 
@@ -215,6 +225,89 @@ def cmd_freeze_split(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rebalance_split(args: argparse.Namespace) -> int:
+    """Reorder a fixed train roster using the latest saved baseline outcomes."""
+    source = args.source.resolve()
+    output = args.output.resolve()
+    results_dir = args.results_dir.resolve()
+    source_payload = read_json(source)
+    train = [str(item) for item in source_payload.get("train") or []]
+    test = [str(item) for item in source_payload.get("test") or []]
+    if not train or not test:
+        raise ValueError("source split must contain non-empty train and test rosters")
+    outcomes = read_baseline_outcomes(results_dir, train)
+    batches, batch_counts = rebalance_training_batches(
+        train,
+        outcomes,
+        batch_size=int(args.batch_size),
+        target_success_per_batch=int(args.target_success_per_batch),
+        seed=str(args.seed),
+    )
+    flattened_train = [sample for batch in batches for sample in batch]
+    success_count = sum(item["outcome"] == "success" for item in outcomes.values())
+    failure_count = len(outcomes) - success_count
+    payload = dict(source_payload)
+    payload.update({
+        "schema_version": "skill-distillation-split-v3",
+        "name": str(args.name),
+        "created_at": str(args.created_at),
+        "parent_split_manifest": str(source),
+        "parent_split_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "baseline_results": str(results_dir),
+        "baseline_outcomes": outcomes,
+        "train": flattened_train,
+        "batches": [
+            {"batch_index": index, "samples": batch}
+            for index, batch in enumerate(batches)
+        ],
+        "train_batch_outcome_counts": batch_counts,
+        "selection": {
+            **(source_payload.get("selection") or {}),
+            "protocol": "current-live-baseline-outcome-balanced-batching-v1",
+            "baseline_outcome_source": str(results_dir),
+            "baseline_outcome_metric": "any evaluable candidate target_vulnerability_triggered is true",
+            "target_train_outcome": {"failure": failure_count, "success": success_count},
+            "batch_policy": (
+                f"target {int(args.target_success_per_batch)} success and "
+                f"{int(args.batch_size) - int(args.target_success_per_batch)} failure per batch; "
+                "remainder quotas are recorded explicitly"
+            ),
+            "sample_membership_preserved": True,
+        },
+        "invariants": {
+            "train_count": len(flattened_train),
+            "test_count": len(test),
+            "train_test_overlap": len(set(flattened_train) & set(test)),
+            "train_roster_preserved": set(flattened_train) == set(train),
+            "test_roster_preserved": test == [str(item) for item in source_payload.get("test") or []],
+            "train_baseline_failure_count": failure_count,
+            "train_baseline_success_count": success_count,
+            "train_batch_sizes": [item["size"] for item in batch_counts],
+            "train_batch_success_counts": [item["success"] for item in batch_counts],
+            "train_batch_failure_counts": [item["failure"] for item in batch_counts],
+        },
+    })
+    distribution = dict(payload.get("distribution") or {})
+    selected = dict(distribution.get("train_selected") or {})
+    selected["baseline_outcome"] = {"failure": failure_count, "success": success_count}
+    distribution["train_selected"] = selected
+    distribution["train_batch_outcome_counts"] = batch_counts
+    payload["distribution"] = distribution
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_json(output, payload)
+    print(json.dumps({
+        "status": "rebalanced",
+        "source": str(source),
+        "output": str(output),
+        "train": len(flattened_train),
+        "test": len(test),
+        "success": success_count,
+        "failure": failure_count,
+        "batch_counts": batch_counts,
+    }, indent=2, ensure_ascii=False))
+    return 0
+
+
 def _attempt_specs(args: argparse.Namespace, samples: list[str]) -> list[dict[str, Any]]:
     specs = [{"label": "first", "results_dir": args.results_dir.resolve(), "evaluation": None, "samples": samples}]
     for raw in getattr(args, "attempt", []) or []:
@@ -313,6 +406,7 @@ def _copy_baseline_split(run_dir: Path, baseline_dir: Path) -> dict[str, Any]:
     split_payload = read_json(split_file)
     if not isinstance(split_payload.get("batches"), list):
         raise ValueError(f"baseline split has no batches: {split_file}")
+    validate_outcome_balanced_manifest(split_payload)
     run_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(split_file, run_dir / "split_manifest.json")
     summary_file = baseline_dir / "batch_summary.json"
@@ -339,8 +433,22 @@ def cmd_run_batch(args: argparse.Namespace) -> int:
 
 
 def cmd_evaluate_batch(args: argparse.Namespace) -> int:
+    """Build a batch index over the durable per-sample evaluator artifacts.
+
+    ``evaluation.json`` is intentionally an orchestration report: the source
+    evidence remains each sample's analysis.json, reachability_eval.json (and
+    replay files), manifest, and agent trajectory.  Downstream roles use this
+    index to select the fixed roster and avoid recomputing those facts.
+    """
     run_dir = args.run_dir.resolve()
     results_dir = args.results_dir.resolve()
+    arm = str(getattr(args, "arm", "") or "").strip().lower()
+    if not arm:
+        if args.batch_index == 0:
+            raise SystemExit("evaluate-batch requires --arm initial|evolving|no_skill for batch000")
+        arm = "evolving"
+    if arm not in {"initial", "evolving", "no_skill"}:
+        raise SystemExit(f"unsupported evaluation arm: {arm}")
     rows = []
     for sample_id in _batch_samples(run_dir, args.batch_index):
         row = evaluate_sample(results_dir.parent.name, results_dir / sample_id, require_analysis_quality=False)
@@ -349,6 +457,7 @@ def cmd_evaluate_batch(args: argparse.Namespace) -> int:
     report = {
         "protocol": "reward-distillation-batch-eval-v1",
         "batch_index": args.batch_index,
+        "arm": arm,
         "source_results_dir": str(results_dir),
         "rows": rows,
     }
@@ -439,8 +548,9 @@ def _rolling_comparison(
                 continue
             sequence.append({
                 "sequence": item.get("sequence"),
-                "observed_stage": item.get("observed_stage"),
                 "deepest_stage": item.get("deepest_stage"),
+                "first_missing_stage": item.get("first_missing_stage"),
+                "observed_stage": item.get("observed_stage"),
                 "stage_delta_from_previous": item.get("stage_delta_from_previous"),
                 "target_stage_delta_from_previous": item.get(
                     "target_stage_delta_from_previous"
@@ -448,7 +558,19 @@ def _rolling_comparison(
                 "is_duplicate_submission": bool(
                     item.get("is_duplicate_submission")
                 ),
+                "target_depth_before": item.get("target_depth_before", 0),
+                "target_depth_after": item.get("target_depth_after", 0),
+                "target_depth_gain_from_previous": item.get(
+                    "target_depth_gain_from_previous", 0
+                ),
+                "observed_depth_before": item.get("observed_depth_before", 0),
+                "observed_depth_after": item.get("observed_depth_after", 0),
+                "observed_depth_gain_from_previous": item.get(
+                    "observed_depth_gain_from_previous", 0
+                ),
+                "no_progress_submission": bool(item.get("no_progress_submission")),
             })
+        progress_metrics = candidate_progress_metrics(sequence)
         return {
             "sample_id": row.get("sample_id"),
             "outcome": row.get("outcome"),
@@ -463,6 +585,7 @@ def _rolling_comparison(
                 "observed_stage": progress.get("observed_stage") or "none",
                 "sequence": sequence,
             },
+            "progress_metrics": progress_metrics,
             "progress_summary": row.get("progress_summary"),
         }
 
@@ -502,6 +625,27 @@ def _rolling_comparison(
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return None
 
+    def _local_initial_evaluation(index: int) -> tuple[Path, dict[str, Any]] | None:
+        """Load the same-batch two-layer initial control when it exists."""
+        batch_dir = run_dir / f"batch_{index:03d}"
+        path = batch_dir / "evaluation_initial_two_layer.json"
+        if not path.is_file():
+            candidate = batch_dir / "evaluation.json"
+            candidate_payload = load_json_if_exists(candidate)
+            if not isinstance(candidate_payload, dict) or candidate_payload.get("arm") != "initial":
+                return None
+            path = candidate
+        try:
+            raw_payload = read_json(path)
+            payload = _normalise_evaluation(path)
+            if isinstance(raw_payload, dict) and raw_payload.get("source_results_dir"):
+                payload["source_results_dir"] = raw_payload["source_results_dir"]
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+            return None
+        return path, payload
+
     def _metrics(row: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(row, dict):
             return {
@@ -514,10 +658,24 @@ def _rolling_comparison(
                 "submitted_unique_pocs": 0,
                 "submitted_occurrences": 0,
                 "duplicate_submissions": 0,
+                "no_progress_submissions": 0,
+                "no_progress_rate": 0.0,
+                "productive_submissions": 0,
+                "productive_submission_rate": 0.0,
+                "target_depth_advances": 0,
+                "target_depth_gain_per_submission": 0.0,
+                "candidate_progress": {
+                    "target_stage": "none",
+                    "observed_stage": "none",
+                    "sequence": [],
+                },
+                "progress_metrics": candidate_progress_metrics([]),
+                "progress_summary": "unavailable",
             }
         progress = row.get("candidate_progress") or {}
         target = str(progress.get("target_stage") or "none")
         sequence = progress.get("sequence") or []
+        progress_metrics = candidate_progress_metrics(sequence)
         return {
             "available": True,
             "target_stage": target,
@@ -537,10 +695,35 @@ def _rolling_comparison(
                 1 for item in sequence
                 if isinstance(item, dict) and item.get("is_duplicate_submission")
             ),
+            "no_progress_submissions": progress_metrics["no_progress_submissions"],
+            "no_progress_rate": progress_metrics["no_progress_rate"],
+            "productive_submissions": progress_metrics["productive_submissions"],
+            "productive_submission_rate": progress_metrics["productive_submission_rate"],
+            "target_depth_advances": progress_metrics["target_depth_advances"],
+            "target_depth_gain_per_submission": progress_metrics[
+                "target_depth_gain_per_submission"
+            ],
+            # Keep the per-arm candidate progression visible to Teacher,
+            # Curator, and Correction.  This is intentionally compact: raw
+            # trajectories and candidate bytes remain in the arm's own run
+            # artifacts, while the paired view preserves which submission
+            # advanced, stalled, or duplicated.
+            "candidate_progress": {
+                "target_stage": progress.get("target_stage") or "none",
+                "observed_stage": progress.get("observed_stage") or "none",
+                "sequence": sequence,
+            },
+            "progress_metrics": progress_metrics,
+            "progress_summary": row.get("progress_summary"),
         }
 
     def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         metrics = [_metrics(row) for row in rows]
+        submitted_occurrences = sum(item["submitted_occurrences"] for item in metrics)
+        comparable_occurrences = sum(max(item["submitted_occurrences"] - 1, 0) for item in metrics)
+        no_progress = sum(item["no_progress_submissions"] for item in metrics)
+        productive = sum(item["productive_submissions"] for item in metrics)
+        target_depth_sum = sum(item["target_depth"] for item in metrics)
         return {
             "evaluated_rows": len(rows),
             "target_depth_by_sample": {
@@ -552,13 +735,30 @@ def _rolling_comparison(
             "false_positive_samples": sum(item["false_positive"] for item in metrics),
             "false_positive_pocs": sum(item["false_positive_pocs"] for item in metrics),
             "submitted_unique_pocs": sum(item["submitted_unique_pocs"] for item in metrics),
-            "submitted_occurrences": sum(item["submitted_occurrences"] for item in metrics),
+            "submitted_occurrences": submitted_occurrences,
             "duplicate_submissions": sum(item["duplicate_submissions"] for item in metrics),
+            "no_progress_submissions": no_progress,
+            "no_progress_rate": (no_progress / comparable_occurrences) if comparable_occurrences else 0.0,
+            "productive_submissions": productive,
+            "productive_submission_rate": (productive / comparable_occurrences) if comparable_occurrences else 0.0,
+            "target_depth_advances": sum(item["target_depth_advances"] for item in metrics),
+            "target_depth_gain_per_submission": (
+                target_depth_sum / submitted_occurrences
+                if submitted_occurrences else 0.0
+            ),
         }
 
     split_payload = load_json_if_exists(
         Path(split_manifest) if split_manifest else run_dir / "split_manifest.json"
     ) or load_json_if_exists(DEFAULT_DISTILLATION_SPLIT) or {}
+    selection = split_payload.get("selection") or {}
+    distribution = split_payload.get("distribution") or {}
+    selected_distribution = distribution.get("train_selected") or {}
+    batch_failure_counts = (
+        distribution.get("train_batch_failure_counts")
+        or (split_payload.get("invariants") or {}).get("train_batch_failure_counts")
+        or []
+    )
     train_ids = set(str(item) for item in split_payload.get("train") or [])
     test_ids = set(str(item) for item in split_payload.get("test") or [])
     initial_train = Path(initial_train_results_dir) if initial_train_results_dir else None
@@ -567,10 +767,12 @@ def _rolling_comparison(
     cache_dir = run_dir / "baseline_evaluation_cache"
 
     def _initial_source(sample_id: str) -> Path | None:
-        if sample_id in test_ids and sample_id not in train_ids:
-            return initial_test
-        if sample_id in train_ids and sample_id not in test_ids:
-            return initial_train
+        if sample_id in test_ids and sample_id not in train_ids and initial_test is not None:
+            if (initial_test / sample_id).is_dir():
+                return initial_test
+        if sample_id in train_ids and sample_id not in test_ids and initial_train is not None:
+            if (initial_train / sample_id).is_dir():
+                return initial_train
         if initial_train is not None and (initial_train / sample_id).is_dir():
             return initial_train
         if initial_test is not None and (initial_test / sample_id).is_dir():
@@ -614,7 +816,16 @@ def _rolling_comparison(
         if path is None or not Path(path).is_file():
             continue
         path = Path(path)
+        raw_evolving_payload = read_json(path)
         evolving_payload = _normalise_evaluation(path)
+        # An initial or unlabelled batch-000 artifact is not an evolving arm.
+        # Keep it visible but refuse to compare it as progress until a real
+        # post-update run carries explicit arm provenance.
+        raw_arm = str(raw_evolving_payload.get("arm") or "").strip().lower() if isinstance(raw_evolving_payload, dict) else ""
+        if index == 0 and raw_arm != "evolving":
+            evolving_payload = {"rows": [], "source_results_dir": raw_evolving_payload.get("source_results_dir") if isinstance(raw_evolving_payload, dict) else None}
+        elif raw_arm == "initial":
+            evolving_payload = {"rows": [], "source_results_dir": raw_evolving_payload.get("source_results_dir") if isinstance(raw_evolving_payload, dict) else None}
         evolving_rows = [
             _compact_row(row) for row in evolving_payload.get("rows") or []
             if isinstance(row, dict) and row.get("sample_id")
@@ -624,10 +835,18 @@ def _rolling_comparison(
         no_skill_rows: list[dict[str, Any]] = []
         initial_by_id: dict[str, dict[str, Any] | None] = {}
         no_skill_by_id: dict[str, dict[str, Any] | None] = {}
+        local_initial = _local_initial_evaluation(index)
+        local_initial_by_id = {
+            str(row.get("sample_id")): _compact_row(row)
+            for row in (local_initial[1].get("rows") if local_initial else [])
+            if isinstance(row, dict) and row.get("sample_id")
+        }
         for sample_id in sample_ids:
-            initial_by_id[sample_id] = _baseline_row(
-                _initial_source(sample_id), sample_id, "initial_skill", cache_dir
-            )
+            initial_by_id[sample_id] = local_initial_by_id.get(sample_id)
+            if initial_by_id[sample_id] is None:
+                initial_by_id[sample_id] = _baseline_row(
+                    _initial_source(sample_id), sample_id, "initial_skill", cache_dir
+                )
             no_skill_by_id[sample_id] = _baseline_row(
                 no_skill, sample_id, "no_skill", cache_dir
             )
@@ -658,6 +877,8 @@ def _rolling_comparison(
             str(_initial_source(sample_id)) for sample_id in sample_ids
             if _initial_source(sample_id) is not None
         }
+        initial_evaluation_path = str(local_initial[0]) if local_initial else None
+        initial_source_dir = sorted(initial_sources)[0] if len(initial_sources) == 1 else None
         batches.append({
             "batch_index": index,
             "evolving": {
@@ -667,7 +888,7 @@ def _rolling_comparison(
                 "summary": _aggregate(evolving_rows),
             },
             "initial_skill_evaluation": (
-                sorted(initial_sources)[0] if len(initial_sources) == 1 else None
+                initial_evaluation_path or initial_source_dir
             ),
             "no_skill_evaluation": str(no_skill) if no_skill is not None else None,
             "initial_skill_provenance": _provenance(
@@ -690,6 +911,19 @@ def _rolling_comparison(
             "no_skill": _aggregate(no_skill_rows),
             "pairs": pairs,
         })
+        if local_initial:
+            batches[-1]["initial_skill_provenance"] = {
+                "kind": "same_batch_evaluation",
+                "label": "initial_skill",
+                "evaluation_path": str(local_initial[0]),
+                "source_results_dir": local_initial[1].get("source_results_dir"),
+                "required_samples": sample_ids,
+                "available_samples": len(local_initial_by_id),
+                "required_count": len(sample_ids),
+                "max_output_tokens": 4096,
+                "harness": "deepseek_harness",
+                "model": "deepseek-v4-flash",
+            }
     return {
         "protocol": "correction-rolling-comparison-v2",
         "window": {
@@ -706,6 +940,15 @@ def _rolling_comparison(
             "no_skill_results_dir": str(no_skill) if no_skill else None,
             "split_manifest": str(split_manifest or DEFAULT_DISTILLATION_SPLIT),
         },
+        "selection_contract": {
+            "source": str(split_manifest or DEFAULT_DISTILLATION_SPLIT),
+            "frozen_at": split_payload.get("created_at"),
+            "target_train_outcome": selection.get("target_train_outcome"),
+            "frozen_train_outcome": selected_distribution.get("baseline_outcome"),
+            "frozen_batch_failure_counts": batch_failure_counts,
+            "live_no_skill_rows_are_control_outcomes": True,
+            "live_repairs_or_rescoring_do_not_rebalance_the_frozen_split": True,
+        },
         "comparable_batches": comparable_batches,
         "missing_initial_skill_batches": missing_initial,
         "missing_no_skill_batches": missing_no_skill,
@@ -715,6 +958,170 @@ def _rolling_comparison(
             "Missing controls must not be used to claim an initial-versus-evolving trend."
         ),
     }
+
+
+def _paired_control_evidence(
+    *,
+    run_dir: Path,
+    sample_ids: list[str],
+    current_evaluation: dict[str, Any],
+    initial_train_results_dir: Path | None,
+    initial_test_results_dir: Path | None,
+    no_skill_results_dir: Path | None,
+    split_manifest: Path | None,
+    diagnoses: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build one bounded detailed evidence view for the available skill arms.
+
+    ``rolling_comparison`` is intentionally compact and covers multiple
+    batches.  This companion view is for the current batch only, so Teacher,
+    Curator, and Correction can inspect candidate/feedback differences under
+    initial, evolving, and no-skill runs without receiving raw sessions.
+    """
+    current = build_teacher_evidence(current_evaluation, diagnoses)
+    split_payload = load_json_if_exists(
+        Path(split_manifest) if split_manifest else run_dir / "split_manifest.json"
+    ) or load_json_if_exists(DEFAULT_DISTILLATION_SPLIT) or {}
+    train_ids = {str(item) for item in split_payload.get("train") or []}
+    test_ids = {str(item) for item in split_payload.get("test") or []}
+    initial_train = Path(initial_train_results_dir) if initial_train_results_dir else None
+    initial_test = Path(initial_test_results_dir) if initial_test_results_dir else None
+    no_skill = Path(no_skill_results_dir) if no_skill_results_dir else None
+
+    def initial_source(sample_id: str) -> Path | None:
+        if sample_id in test_ids and sample_id not in train_ids and initial_test is not None:
+            if (initial_test / sample_id).is_dir():
+                return initial_test
+        if sample_id in train_ids and sample_id not in test_ids and initial_train is not None:
+            if (initial_train / sample_id).is_dir():
+                return initial_train
+        if initial_train is not None and (initial_train / sample_id).is_dir():
+            return initial_train
+        if initial_test is not None and (initial_test / sample_id).is_dir():
+            return initial_test
+        return None
+
+    def report_for(source: Path | None, label: str) -> dict[str, Any] | None:
+        if source is None or not source.is_dir():
+            return None
+        rows = []
+        for sample_id in sample_ids:
+            sample_dir = source / sample_id
+            if not sample_dir.is_dir():
+                continue
+            try:
+                row = evaluate_sample(
+                    source.parent.name,
+                    sample_dir,
+                    require_analysis_quality=False,
+                )
+                row["deterministic_outcome"] = classify_outcome(row)
+                rows.append(row)
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+        return {
+            "protocol": "paired-arm-evidence-v1",
+            "label": label,
+            "source_results_dir": str(source),
+            "batch_index": current_evaluation.get("batch_index"),
+            "rows": rows,
+        }
+
+    current_arm = str(current_evaluation.get("arm") or "").strip().lower()
+    if not current_arm:
+        source_text = str(current_evaluation.get("source_results_dir") or "").lower()
+        # Historical evaluation files predate the explicit ``arm`` field.
+        # Preserve the current arm in the role-visible projection by inferring
+        # it from the canonical source directory; otherwise an evolving run
+        # loses its complete trace/candidate evidence and Teacher sees only
+        # the Diagnostician summary.
+        if "evolving" in source_text:
+            current_arm = "evolving"
+        elif "initial" in source_text:
+            current_arm = "initial"
+        else:
+            current_arm = "unknown"
+    arms: dict[str, dict[str, Any]] = {}
+    if current_arm == "evolving":
+        arms["evolving"] = {
+            "arm": "evolving",
+            "source_results_dir": current_evaluation.get("source_results_dir"),
+            "samples": current.get("samples") or [],
+        }
+    elif current_arm == "initial":
+        arms["initial_skill"] = {
+            "arm": "initial_skill",
+            "source_results_dir": current_evaluation.get("source_results_dir"),
+            "evaluation_path": current_evaluation.get("evaluation_path"),
+            "samples": current.get("samples") or [],
+        }
+    for label, source in (
+        ("initial_skill", None),
+        ("no_skill", no_skill),
+    ):
+        if label == "initial_skill" and "initial_skill" in arms:
+            continue
+        if label == "initial_skill" and "initial_skill" not in arms:
+            local_batch_dir = run_dir / f"batch_{int(current_evaluation.get('batch_index') or 0):03d}"
+            local_path = local_batch_dir / "evaluation_initial_two_layer.json"
+            if not local_path.is_file():
+                candidate_path = local_batch_dir / "evaluation.json"
+                candidate_payload = load_json_if_exists(candidate_path)
+                if isinstance(candidate_payload, dict) and candidate_payload.get("arm") == "initial":
+                    local_path = candidate_path
+            local_payload = load_json_if_exists(local_path)
+            if isinstance(local_payload, dict) and isinstance(local_payload.get("rows"), list):
+                local_rows = [
+                    row for row in local_payload["rows"]
+                    if isinstance(row, dict) and str(row.get("sample_id")) in set(sample_ids)
+                ]
+                local_report = {
+                    "protocol": local_payload.get("protocol") or "paired-arm-evidence-v1",
+                    "label": label,
+                    "source_results_dir": local_payload.get("source_results_dir"),
+                    "batch_index": current_evaluation.get("batch_index"),
+                    "rows": local_rows,
+                }
+                arms[label] = {
+                    "arm": label,
+                    "source_results_dir": local_payload.get("source_results_dir"),
+                    "evaluation_path": str(local_path),
+                    "samples": build_teacher_evidence(local_report, ()).get("samples") or [],
+                }
+                continue
+            # A batch can straddle train/test only in a custom split. Build
+            # separate reports and merge them into one arm view.
+            grouped: dict[str, list[str]] = {}
+            for sample_id in sample_ids:
+                source_for_sample = initial_source(sample_id)
+                if source_for_sample is not None:
+                    grouped.setdefault(str(source_for_sample), []).append(sample_id)
+            control_samples: list[dict[str, Any]] = []
+            source_names: set[str] = set()
+            for raw_source, ids in grouped.items():
+                report = report_for(Path(raw_source), label)
+                if report is None:
+                    continue
+                source_names.add(raw_source)
+                control_samples.extend(build_teacher_evidence(report, ()).get("samples") or [])
+            arms[label] = {
+                "arm": label,
+                "source_results_dir": sorted(source_names)[0] if len(source_names) == 1 else None,
+                "samples": sorted(control_samples, key=lambda item: str(item.get("sample_id") or "")),
+            }
+            continue
+        report = report_for(source, label)
+        arms[label] = {
+            "arm": label,
+            "source_results_dir": str(source) if source is not None else None,
+            "samples": (build_teacher_evidence(report, ()).get("samples") or []) if report else [],
+        }
+    current["paired_control_detail"] = {
+        "protocol": "same-sample-available-arms-detailed-v1",
+        "arms": arms,
+        "note": "Separate arm files contain agent-visible trace/candidate/feedback evidence; evaluator reachability is reserved for Diagnostician and Correction.",
+    }
+    return current
 
 
 def _run_role(
@@ -734,6 +1141,25 @@ def _run_role(
     """
     if args.redo and out_json.exists():
         out_json.unlink()
+    # A role can finish writing its contract artifact just before the DSH
+    # process itself exits (or is interrupted by the caller).  Recover that
+    # valid JSON instead of rerunning an expensive role session and losing the
+    # completed result at the batch boundary.
+    # ``--redo`` must rebuild the workspace too.  Otherwise removing the
+    # batch artifact is followed by recovery from the old workspace
+    # OUTPUT.json, silently reusing stale evidence (for example an old
+    # checkpoint/agent.log instead of a newly discovered raw trajectory).
+    if not args.redo and not out_json.exists():
+        workspace_output = workspace / "OUTPUT.json"
+        recovered = load_json_if_exists(workspace_output)
+        if isinstance(recovered, dict):
+            write_json(out_json, recovered)
+            return {
+                "status": "recovered",
+                "role": role,
+                "reason": "valid workspace OUTPUT.json recovered",
+                "output": str(out_json),
+            }
     plan, reason = ("fresh", "forced by --redo") if args.redo else plan_role(workspace, out_json)
     if plan == "reuse":
         return {"status": "reused", "role": role, "reason": reason, "output": str(out_json)}
@@ -785,7 +1211,6 @@ def _false_positive_summary(eval_row: dict[str, Any] | None, outcome_record: dic
     }
 
 
-
 _FORBIDDEN_DIAGNOSIS_TERMS = (
     re.compile(r"\bR[0-5](?:_[A-Za-z0-9_]+)?\b"),
     re.compile(r"\bParser\b"),
@@ -815,7 +1240,12 @@ def _diagnosis_text_values(value: Any) -> list[str]:
 
 def _forbidden_diagnosis_terms(diagnosis: dict[str, Any]) -> list[str]:
     hits: set[str] = set()
-    for section in (*DIAGNOSIS_SECTIONS, "outcome_evidence", "executable_progress_evidence",
+    # ``case`` is evaluator-owned and must be copied exactly.  It can contain
+    # immutable function names (for example ``Parser::...``), which are not
+    # diagnostician prose and therefore must not trigger the behavior-language
+    # gate.  Scan only the model-authored sections.
+    sections = tuple(section for section in DIAGNOSIS_SECTIONS if section != "case")
+    for section in (*sections, "outcome_evidence", "executable_progress_evidence",
                     "semantic_explanatory_evidence", "behavioral_evidence",
                     "outcome_diagnosis"):
         for text in _diagnosis_text_values(diagnosis.get(section)):
@@ -832,6 +1262,13 @@ def _diagnosis_retry_note(error: str) -> str:
         "R0, R1, R2, R3, R4, R5, Parser, Source, Root Cause, Sink, Trigger, or GT. "
         "Use terms like accepted input, issue-relevant path, vulnerable condition, "
         "sensitive operation, observable failure, target issue, or non-target crash. "
+        "Include failure_stage and failure_stage_evidence: route submission:when_to_submit "
+        "for no submission, submission:after_feedback for duplicate/no-change "
+        "feedback handling, submission:when_to_stop for voluntary stopping, "
+        "then verify_result, then map first_missing_stage to the first three "
+        "stage skills only for an unresolved run; a confirmed success with no "
+        "actual interpretation error must use unknown even if a stale per-"
+        "candidate ladder reports first_missing_stage. Otherwise use unknown. "
         "When a target candidate exists but the agent selected a different crash, "
         "use target_hit_unrecognized. In candidate_sequence use observed_stage, "
         "stage_delta_from_previous, and target_stage_delta_from_previous; do not "
@@ -867,12 +1304,21 @@ def _canonicalize_diagnosis_stage_fields(diagnosis: dict[str, Any]) -> dict[str,
             item["stage_delta_from_previous"] = item.get("stage_change")
         if not item.get("target_stage_delta_from_previous"):
             item["target_stage_delta_from_previous"] = item.get("stage_delta_from_previous") or "unknown"
+        if not item.get("first_missing_stage"):
+            # A completed target ladder has no missing rung; retain an
+            # explicit behavior label for the Teacher instead of dropping the
+            # field during the learning-view projection.
+            item["first_missing_stage"] = (
+                "target_issue" if item.get("deepest_stage") == "target_issue" else "unknown"
+            )
         canonical.append(item)
     diagnosis["candidate_sequence"] = canonical
     return diagnosis
 
 
-def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
+def _diagnosis_quality_error(
+    diagnosis: dict[str, Any],
+) -> str | None:
     # Read older pool/fixture artifacts during the schema migration.  New
     # diagnosticians use the evaluator-owned `case` contract below.
     if "case" not in diagnosis and "issue_description" in diagnosis:
@@ -906,7 +1352,8 @@ def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
     _canonicalize_diagnosis_stage_fields(diagnosis)
     if not isinstance(diagnosis.get("case"), dict):
         return "diagnosis missing evaluator-owned case object"
-    required = ("primary_failure_type", "failure_source", "harness_group",
+    required = ("primary_failure_type", "failure_source", "failure_stage",
+                "failure_stage_evidence", "harness_group",
                 "vulnerability_group", "candidate_sequence", "progress_events",
                 "turning_events", "initial_comparison", "one_sentence_explanation",
                 "why_no_submission", "why_not_reached", "why_false_positive",
@@ -921,6 +1368,25 @@ def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
     failure_source = str(diagnosis.get("failure_source") or "")
     if failure_source not in DIAGNOSIS_FAILURE_SOURCES:
         return "failure_source must be one of: " + ", ".join(DIAGNOSIS_FAILURE_SOURCES)
+    failure_stage = str(diagnosis.get("failure_stage") or "")
+    if failure_stage not in FAILURE_STAGES:
+        return "failure_stage must be one of: " + ", ".join(FAILURE_STAGES)
+    if not str(diagnosis.get("failure_stage_evidence") or "").strip():
+        return "diagnosis missing failure_stage_evidence"
+    case = diagnosis.get("case") if isinstance(diagnosis.get("case"), dict) else {}
+    confirmed_success = (
+        case.get("target_reproduced") is True
+        or str(case.get("result_kind") or "").lower() == "success"
+    )
+    if (
+        confirmed_success
+        and str(diagnosis.get("primary_failure_type") or "") == "success"
+        and failure_stage in {"construct_input", "reach_vulnerable_code", "trigger_condition"}
+    ):
+        return (
+            "confirmed success cannot route to a construction-stage failure_stage; "
+            "use unknown unless the sequence supports verify_result or iterate"
+        )
     for field in ("harness_group", "vulnerability_group", "initial_comparison"):
         if not isinstance(diagnosis.get(field), dict):
             return f"{field} must be an object"
@@ -939,6 +1405,9 @@ def _diagnosis_quality_error(diagnosis: dict[str, Any]) -> str | None:
         target_change = str(item.get("target_stage_delta_from_previous") or "")
         if target_change not in {"first", "advanced", "unchanged", "regressed", "unknown"}:
             return f"candidate_sequence[{index}].target_stage_delta_from_previous is invalid"
+        first_missing = str(item.get("first_missing_stage") or "unknown")
+        if first_missing not in {"none", "accepted_input", "relevant_path", "vulnerable_condition", "sensitive_operation", "target_issue", "unknown"}:
+            return f"candidate_sequence[{index}].first_missing_stage is invalid"
     if not str(diagnosis.get("one_sentence_explanation") or "").strip():
         return "diagnosis missing one_sentence_explanation"
     forbidden = _forbidden_diagnosis_terms(diagnosis)
@@ -996,6 +1465,7 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
         results_dir = spec["results_dir"]
         eval_row = spec["evaluation"].get(sample_id)
         outcome_record = (eval_row or {}).get("deterministic_outcome") or classify_outcome(eval_row)
+        role_eval_row = eval_row
         workspace = (
             batch_dir / "subsessions" / "diagnose" / sample_id
             if label == "first"
@@ -1008,7 +1478,9 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
         )
         status = _run_role(
             args, "diagnose", workspace, out_json=out_json,
-            build=lambda: build_diagnosis_role(workspace, sample_id, results_dir, eval_row, outcome_record),
+            build=lambda: build_diagnosis_role(
+                workspace, sample_id, results_dir, role_eval_row, outcome_record,
+            ),
         )
         if args.execute and out_json.is_file():
             diagnosis = _normalize_diagnosis_for_outcome(
@@ -1022,7 +1494,9 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
                 retry_args.redo = True
                 retry_status = _run_role(
                     retry_args, "diagnose", workspace, out_json=out_json,
-                    build=lambda: build_diagnosis_role(workspace, sample_id, results_dir, eval_row, outcome_record),
+                    build=lambda: build_diagnosis_role(
+                        workspace, sample_id, results_dir, role_eval_row, outcome_record,
+                    ),
                     retry_note=_diagnosis_retry_note(quality_error),
                 )
                 retry_status["retry_of_invalid_output"] = {
@@ -1153,7 +1627,11 @@ def cmd_diagnose_batch(args: argparse.Namespace) -> int:
         pools_path = run_dir / POOLS_FILE
         pools = update_pools(load_pools(pools_path), args.batch_index, pool_records)
         save_pools(pools_path, pools)
-    print(json.dumps({"status": "diagnosis", "items": len(statuses), "materialized": len(diagnoses)}, indent=2))
+    print(json.dumps({
+        "status": "diagnosis",
+        "items": len(statuses),
+        "materialized": len(diagnoses),
+    }, indent=2))
     return 0
 
 
@@ -1215,13 +1693,49 @@ def cmd_propose_updates(args: argparse.Namespace) -> int:
             diagnoses = diagnoses.get("diagnoses", diagnoses)
     else:
         diagnoses = _diagnoses_for_window(run_dir, args.batch_index, args.diagnosis_window_size)
-    eval_report_path = batch_dir / "evaluation.json"
+    eval_report_path = args.evaluation.resolve() if getattr(args, "evaluation", None) else batch_dir / "evaluation.json"
     eval_report = read_json(eval_report_path) if eval_report_path.is_file() else {
         "batch_index": args.batch_index,
         "source_results_dir": str(batch_dir / "results"),
         "rows": [],
     }
-    teacher_evidence = build_teacher_evidence(eval_report, diagnoses)
+    # Give Teacher the same-sample paired control it needs to separate an
+    # evolving-skill effect from ordinary trajectory variance.  Correction
+    # receives the full rolling window; Teacher only needs the current batch's
+    # compact initial/evolving/no-skill rows here.
+    initial_train = getattr(args, "initial_train_results_dir", DEFAULT_INITIAL_TRAIN_RESULTS_DIR)
+    initial_test = getattr(args, "initial_test_results_dir", DEFAULT_INITIAL_TEST_RESULTS_DIR)
+    no_skill = getattr(args, "no_skill_results_dir", DEFAULT_NO_SKILL_RESULTS_DIR)
+    rolling = _rolling_comparison(
+        run_dir=run_dir,
+        batch_index=args.batch_index,
+        current_evaluation=eval_report_path,
+        window_size=1,
+        initial_train_results_dir=initial_train,
+        initial_test_results_dir=initial_test,
+        no_skill_results_dir=no_skill,
+        split_manifest=getattr(args, "rolling_split_manifest", None),
+    )
+    sample_ids = [str(row.get("sample_id")) for row in eval_report.get("rows") or [] if row.get("sample_id")]
+    teacher_evidence = _paired_control_evidence(
+        run_dir=run_dir,
+        sample_ids=sample_ids,
+        current_evaluation=eval_report,
+        initial_train_results_dir=initial_train,
+        initial_test_results_dir=initial_test,
+        no_skill_results_dir=no_skill,
+        split_manifest=getattr(args, "rolling_split_manifest", None),
+        diagnoses=diagnoses,
+    )
+    # Rolling evaluator comparisons are reserved for Correction.  Teacher's
+    # role workspace receives only the separate agent-visible arm files plus
+    # Diagnostician output; do not inline target depth or trigger labels here.
+    # Persist the exact paired view so Curator verifies the same evidence that
+    # Teacher saw, rather than receiving only Teacher's prose summary.
+    write_json(
+        batch_dir / "teacher_evidence.json",
+        teacher_evidence,
+    )
     diagnoses = [learning_diagnosis(item) for item in diagnoses if isinstance(item, dict)]
     pools_view = teacher_view(
         load_pools(run_dir / POOLS_FILE),
@@ -1235,7 +1749,9 @@ def cmd_propose_updates(args: argparse.Namespace) -> int:
     workspace = batch_dir / "subsessions" / "teacher"
     status = _run_role(
         args, "teacher", workspace, out_json=out_json,
-        build=lambda: build_teacher_role(workspace, packet, diagnoses, pools_view, teacher_evidence),
+        build=lambda: build_teacher_role(
+            workspace, packet, diagnoses, pools_view, teacher_evidence,
+        ),
     )
     print(json.dumps(status, indent=2))
     return 0
@@ -1257,11 +1773,19 @@ def cmd_curate_updates(args: argparse.Namespace) -> int:
     diagnoses = diagnoses_payload.get("diagnoses", diagnoses_payload) if isinstance(diagnoses_payload, dict) else diagnoses_payload
     diagnoses = [learning_diagnosis(item) for item in diagnoses if isinstance(item, dict)] if isinstance(diagnoses, list) else []
     pools_view = teacher_view(load_pools(run_dir / POOLS_FILE), through_batch=args.batch_index)
+    teacher_evidence = load_json_if_exists(batch_dir / "teacher_evidence.json")
     out_json = batch_dir / "curator_decisions.json"
     workspace = batch_dir / "subsessions" / "curator"
     status = _run_role(
         args, "curator", workspace, out_json=out_json,
-        build=lambda: build_curator_role(workspace, packet, teacher_payload, diagnoses, pools_view),
+        build=lambda: build_curator_role(
+            workspace,
+            packet,
+            teacher_payload,
+            diagnoses,
+            pools_view,
+            teacher_evidence,
+        ),
     )
     print(json.dumps(status, indent=2))
     return 0
@@ -1362,7 +1886,8 @@ def cmd_correct_skill(args: argparse.Namespace) -> int:
     batch_dir = run_dir / f"batch_{args.batch_index:03d}"
     previous_packet = _packet_for(run_dir, max(args.batch_index - 1, 0), args.previous_packet)
     current_packet = _packet_for(run_dir, args.batch_index, args.current_packet)
-    eval_report = read_json(args.evaluation.resolve() if args.evaluation else batch_dir / "evaluation.json")
+    raw_eval_report = read_json(args.evaluation.resolve() if args.evaluation else batch_dir / "evaluation.json")
+    eval_report = raw_eval_report
     diagnoses_path = args.diagnoses.resolve() if args.diagnoses else batch_dir / "diagnoses.json"
     diagnoses_payload = read_json(diagnoses_path) if diagnoses_path.is_file() else []
     diagnoses = diagnoses_payload.get("diagnoses", diagnoses_payload) if isinstance(diagnoses_payload, dict) else diagnoses_payload
@@ -1384,6 +1909,27 @@ def cmd_correct_skill(args: argparse.Namespace) -> int:
         split_manifest=args.rolling_split_manifest,
     )
     write_json(batch_dir / "rolling_comparison.json", rolling_comparison)
+    # Correction receives the same current-batch triplet as Teacher and
+    # Curator.  The rolling view is still the authority for the multi-batch
+    # regression window; this detailed view preserves candidate/feedback
+    # differences within the current sample across all three arms.
+    sample_ids = [str(row.get("sample_id")) for row in raw_eval_report.get("rows") or [] if row.get("sample_id")]
+    paired_evidence = _paired_control_evidence(
+        run_dir=run_dir,
+        sample_ids=sample_ids,
+        current_evaluation=raw_eval_report,
+        initial_train_results_dir=args.initial_train_results_dir,
+        initial_test_results_dir=args.initial_test_results_dir,
+        no_skill_results_dir=args.no_skill_results_dir,
+        split_manifest=args.rolling_split_manifest,
+        diagnoses=diagnoses,
+    )
+    # Do not put rolling evaluator comparisons into the Curator workspace.
+    # Correction alone consumes rolling_comparison.json as its regression gate.
+    write_json(
+        batch_dir / "teacher_evidence.json",
+        paired_evidence,
+    )
     out_json = batch_dir / "correction_decision.json"
     workspace = batch_dir / "subsessions" / "correction"
     status = _run_role(
@@ -1398,6 +1944,7 @@ def cmd_correct_skill(args: argparse.Namespace) -> int:
             pools_view,
             _read_baseline_evaluations(args.baseline_evaluation),
             rolling_comparison,
+            paired_evidence,
         ),
     )
     print(json.dumps(status, indent=2))
@@ -1430,9 +1977,29 @@ def cmd_apply_correction(args: argparse.Namespace) -> int:
 def _write_final_skill_packet(source_packet: Path, decision: dict[str, Any], out_packet: Path) -> dict[str, Any]:
     def normalize_final_markdown(text: str) -> str:
         text = text.strip()
-        # Some role outputs preserve stable ids but forget the markdown bullet;
-        # packet parsing requires lessons to be written as "- [R.B#n] ...".
-        return re.sub(r"(?m)^(\s*)\[((?:R\.B|S\.C)#\d+)\]\s+", r"\1- [\2] ", text)
+        # Some role outputs preserve stable ids but forget the markdown bullet.
+        return re.sub(r"(?m)^(\s*)\[([A-Za-z0-9_-]+#\d+)\]\s+", r"\1- [\2] ", text)
+
+    if (source_packet / "skills").is_dir():
+        stage_text = decision.get("final_stage_skill_md") or {}
+        if not isinstance(stage_text, dict):
+            return {"written": False, "reason": "final curator output did not include final_stage_skill_md"}
+        missing = [stage for stage in STAGE_NAMES if not str(stage_text.get(stage) or "").strip()]
+        if missing:
+            return {"written": False, "reason": f"final curator output missing stage files: {missing}"}
+        if out_packet.exists():
+            shutil.rmtree(out_packet)
+        shutil.copytree(source_packet, out_packet, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        for stage in STAGE_NAMES:
+            path = out_packet / "skills" / stage / "SKILL.md"
+            path.write_text(normalize_final_markdown(str(stage_text[stage])) + chr(10), encoding="utf-8")
+        write_json(out_packet / "FINAL_CURATION.json", {
+            "decision": decision.get("decision"),
+            "rationale": decision.get("rationale"),
+            "lesson_decisions": decision.get("lesson_decisions") or [],
+        })
+        normalize_packet(out_packet)
+        return {"written": True, "packet": str(out_packet), "lessons_after": lessons_snapshot(out_packet)}
 
     repro = normalize_final_markdown(str(decision.get("final_reproduction_skill_md") or ""))
     submit = normalize_final_markdown(str(decision.get("final_submission_skill_md") or ""))
@@ -1668,6 +2235,7 @@ def _correction_progress_metrics(evaluation: Path | dict[str, Any]) -> dict[str,
         if target_stage not in _CORRECTION_TARGET_STAGE_ORDER:
             target_stage = "none"
         sequence = progress.get("sequence") or []
+        progress_metrics = candidate_progress_metrics(sequence)
         duplicate_count = sum(
             1 for item in sequence
             if isinstance(item, dict) and item.get("is_duplicate_submission") is True
@@ -1678,14 +2246,38 @@ def _correction_progress_metrics(evaluation: Path | dict[str, Any]) -> dict[str,
             "triggered": bool(row.get("triggered")),
             "duplicate_submissions": duplicate_count,
             "submitted_occurrences": int(row.get("submitted_occurrences") or len(sequence)),
+            "no_progress_submissions": progress_metrics["no_progress_submissions"],
+            "no_progress_rate": progress_metrics["no_progress_rate"],
+            "productive_submissions": progress_metrics["productive_submissions"],
+            "productive_submission_rate": progress_metrics["productive_submission_rate"],
+            "target_depth_advances": progress_metrics["target_depth_advances"],
+            "target_depth_gain_per_submission": progress_metrics[
+                "target_depth_gain_per_submission"
+            ],
         }
+    submitted_occurrences = sum(item["submitted_occurrences"] for item in rows.values())
+    comparable_occurrences = sum(
+        max(item["submitted_occurrences"] - 1, 0) for item in rows.values()
+    )
+    no_progress = sum(item["no_progress_submissions"] for item in rows.values())
+    productive = sum(item["productive_submissions"] for item in rows.values())
+    target_depth_sum = sum(item["target_depth"] for item in rows.values())
     return {
         "available": bool(rows),
         "sample_count": len(rows),
         "sample_metrics": rows,
         "gt_success": sum(item["triggered"] for item in rows.values()),
-        "target_depth_sum": sum(item["target_depth"] for item in rows.values()),
+        "target_depth_sum": target_depth_sum,
         "duplicate_submissions": sum(item["duplicate_submissions"] for item in rows.values()),
+        "no_progress_submissions": no_progress,
+        "no_progress_rate": (no_progress / comparable_occurrences) if comparable_occurrences else 0.0,
+        "productive_submissions": productive,
+        "productive_submission_rate": (productive / comparable_occurrences) if comparable_occurrences else 0.0,
+        "target_depth_advances": sum(item["target_depth_advances"] for item in rows.values()),
+        "target_depth_gain_per_submission": (
+            target_depth_sum / submitted_occurrences
+            if submitted_occurrences else 0.0
+        ),
         # Voluntary-stop evidence is not yet a field in batch evaluation.  It
         # must remain explicit rather than being inferred from an exit code.
         "voluntary_stops": {"available": False, "count": None},
@@ -1716,6 +2308,43 @@ def _gate_correction_result(
         if post_samples[sample_id]["target_depth"] < pre_samples[sample_id]["target_depth"]
     ]
     duplicate_rise = post_metrics["duplicate_submissions"] > pre_metrics["duplicate_submissions"]
+    aggregate_no_progress_rise = (
+        post_metrics["no_progress_submissions"]
+        > pre_metrics["no_progress_submissions"]
+    )
+    efficiency_drop = (
+        post_metrics["target_depth_gain_per_submission"]
+        < pre_metrics["target_depth_gain_per_submission"]
+    )
+    sample_efficiency_regressions: list[str] = []
+    for sample_id in common_samples:
+        before = pre_samples[sample_id]
+        after = post_samples[sample_id]
+        sample_no_progress_rise = (
+            after["no_progress_submissions"]
+            > before["no_progress_submissions"]
+            and after["no_progress_rate"] > before["no_progress_rate"]
+        )
+        before_gain = float(before["target_depth_gain_per_submission"] or 0.0)
+        after_gain = float(after["target_depth_gain_per_submission"] or 0.0)
+        # A same-sample efficiency regression is meaningful only when the
+        # added no-progress cost is accompanied by a material fall in depth
+        # gained per submission and that sample did not reproduce more.  This
+        # deliberately does not impose a submission quota or reject a useful
+        # multi-candidate search whose target outcome improved.
+        gain_drop = (
+            before_gain > 0.0
+            and after_gain < before_gain * 0.75
+        )
+        no_target_outcome_gain = int(after["triggered"]) <= int(before["triggered"])
+        if sample_no_progress_rise and gain_drop and no_target_outcome_gain:
+            sample_efficiency_regressions.append(sample_id)
+    efficiency_regression = (
+        aggregate_no_progress_rise
+        and efficiency_drop
+        and post_metrics["target_depth_sum"] <= pre_metrics["target_depth_sum"]
+        and post_success <= pre_success
+    ) or bool(sample_efficiency_regressions)
     comparable = bool(common_samples) and not missing_pre and not missing_post
     decision = (
         "ACCEPT"
@@ -1723,6 +2352,7 @@ def _gate_correction_result(
         and not target_depth_drops
         and post_success >= pre_success
         and not duplicate_rise
+        and not efficiency_regression
         else "REVERT"
     )
     restored: list[str] = []
@@ -1732,7 +2362,9 @@ def _gate_correction_result(
         "protocol": "correction-gate-v2",
         "policy": (
             "accept only when same-roster per-sample target depth and aggregate GT "
-            "success do not decrease, and duplicate submissions do not increase"
+            "success do not decrease, duplicate submissions do not increase, and "
+            "a no-progress cost increase is not paired with lower target-depth "
+            "gain per submission without outcome gain"
         ),
         "decision": decision,
         "comparable": comparable,
@@ -1742,6 +2374,10 @@ def _gate_correction_result(
             "missing_post_samples": missing_post,
             "gt_success_drop": max(pre_success - post_success, 0),
             "duplicate_submissions_rise": duplicate_rise,
+            "no_progress_submissions_rise": aggregate_no_progress_rise,
+            "target_depth_gain_per_submission_drop": efficiency_drop,
+            "efficiency_regression": efficiency_regression,
+            "same_sample_efficiency_regressions": sample_efficiency_regressions,
             "voluntary_stops": {
                 "available": False,
                 "reason": "batch evaluation does not yet persist voluntary-stop counts",
@@ -1778,6 +2414,19 @@ def _run_batch_generation(
     run_id: str,
     env: dict[str, str],
 ) -> Path:
+    # A batch may already contain the paired two-layer initial result (for
+    # example, when the initial arm was run before the evolving arm). Preserve
+    # it before generation writes the canonical evolving evaluation.json.
+    batch_dir = run_dir / f"batch_{batch_index:03d}"
+    existing_evaluation = batch_dir / "evaluation.json"
+    initial_sidecar = batch_dir / "evaluation_initial_two_layer.json"
+    existing_payload = load_json_if_exists(existing_evaluation)
+    if (
+        isinstance(existing_payload, dict)
+        and existing_payload.get("arm") == "initial"
+        and not initial_sidecar.is_file()
+    ):
+        shutil.copy2(existing_evaluation, initial_sidecar)
     cmd = _distillation_cli_command(
         "run-batch",
         "--run-dir", run_dir,
@@ -1790,12 +2439,20 @@ def _run_batch_generation(
     return _batch_results_dir(run_id)
 
 
+def _packet_sentinel(packet: Path) -> Path:
+    """Return a stable completion marker for either packet layout."""
+    if (packet / "skills").is_dir():
+        return packet / "skills" / "construct_input" / "SKILL.md"
+    return packet / "reproduction_skill" / "SKILL.md"
+
+
 def _run_batch_evaluation(
     *,
     run_dir: Path,
     batch_index: int,
     results_dir: Path,
     env: dict[str, str],
+    arm: str,
 ) -> Path:
     out = run_dir / f"batch_{batch_index:03d}" / "evaluation.json"
     cmd = _distillation_cli_command(
@@ -1803,6 +2460,7 @@ def _run_batch_evaluation(
         "--run-dir", run_dir,
         "--batch-index", batch_index,
         "--results-dir", results_dir,
+        "--arm", arm,
     )
     _run_checked_step(f"batch_{batch_index:03d}:evaluate", cmd, env=env, expected=out)
     return out
@@ -1914,7 +2572,7 @@ def _apply_batch_correction(
         f"batch_{batch_index:03d}:apply-correction",
         cmd,
         env=env,
-        expected=out_packet / "reproduction_skill" / "SKILL.md",
+        expected=_packet_sentinel(out_packet),
     )
     return out_packet
 
@@ -1936,6 +2594,14 @@ def _run_teacher_curator_apply(
         "--skill-packet", packet,
         "--diagnosis-window-size", args.diagnosis_window_size,
     )
+    for option, value in (
+        ("--initial-train-results-dir", getattr(args, "initial_train_results_dir", None)),
+        ("--initial-test-results-dir", getattr(args, "initial_test_results_dir", None)),
+        ("--no-skill-results-dir", getattr(args, "no_skill_results_dir", None)),
+        ("--rolling-split-manifest", getattr(args, "rolling_split_manifest", None)),
+    ):
+        if value:
+            propose.extend([option, value])
     _append_role_cli_args(propose, args)
     _run_checked_step(
         f"batch_{batch_index:03d}:teacher",
@@ -1975,7 +2641,7 @@ def _run_teacher_curator_apply(
         f"batch_{batch_index:03d}:apply-curation",
         apply_cmd,
         env=env,
-        expected=out_packet / "reproduction_skill" / "SKILL.md",
+        expected=_packet_sentinel(out_packet),
     )
     return out_packet
 
@@ -2007,6 +2673,7 @@ def cmd_train_batches(args: argparse.Namespace) -> int:
             batch_index=batch_index,
             results_dir=results_dir,
             env=env,
+            arm="initial" if batch_index == 0 else "evolving",
         )
         diagnoses = _run_batch_diagnosis(
             args,
@@ -2063,6 +2730,7 @@ def cmd_train_batches(args: argparse.Namespace) -> int:
                     batch_index=batch_index,
                     results_dir=results_dir,
                     env=env,
+                    arm="evolving",
                 )
                 diagnoses = _run_batch_diagnosis(
                     args,
@@ -2127,8 +2795,8 @@ def cmd_train_batches(args: argparse.Namespace) -> int:
 def _bare_packet(source: Path, out: Path) -> Path:
     """Control arm: the same scaffold with every learned lesson removed."""
     copy_initial_packet(out, source)
-    for target, (rel, _heading, _cap) in TARGETS.items():
-        path = out / rel
+    for target, section in targets_for_packet(out).items():
+        path = out / section.path
         if not path.is_file():
             continue
         lessons = read_lessons(out).get(target, [])
@@ -2239,13 +2907,13 @@ def cmd_audit_plan(args: argparse.Namespace) -> int:
 
 
 def _add_role_args(parser: argparse.ArgumentParser) -> None:
-    """Role subsessions can run through DSH or Codex."""
+    """Role subsessions can run through DSH, Codex, or isolated ZCode."""
     parser.add_argument("--execute", action="store_true",
                         help="run the role subsession; without it only the role workspace is prepared")
     parser.add_argument("--redo", action="store_true",
                         help="start every role over, discarding artifacts an earlier run produced")
     parser.add_argument("--role-harness", default=DEFAULT_ROLE_HARNESS,
-                        choices=("deepseek_harness", "dsh", "codex"))
+                        choices=("deepseek_harness", "dsh", "codex", "zcode"))
     parser.add_argument("--role-model", default=DEFAULT_DISTILLER_MODEL)
     parser.add_argument("--base-url", default=DEFAULT_DISTILLER_BASE_URL)
     parser.add_argument("--api-key-env", default=DEFAULT_DISTILLER_API_KEY_ENV)
@@ -2324,6 +2992,8 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--run-dir", type=Path, required=True)
     evaluate.add_argument("--batch-index", type=int, required=True)
     evaluate.add_argument("--results-dir", type=Path, required=True)
+    evaluate.add_argument("--arm", choices=("initial", "evolving", "no_skill"),
+                          help="explicit skill arm; required for batch000")
     evaluate.set_defaults(func=cmd_evaluate_batch)
 
     diagnose = sub.add_parser("diagnose-batch")
@@ -2343,9 +3013,18 @@ def main(argv: list[str] | None = None) -> int:
     propose.add_argument("--run-dir", type=Path, required=True)
     propose.add_argument("--batch-index", type=int, required=True)
     propose.add_argument("--skill-packet", type=Path)
+    propose.add_argument("--evaluation", type=Path,
+                         help="current arm evaluation; use evaluation_initial_two_layer.json for batch000")
     propose.add_argument("--diagnoses", type=Path)
     propose.add_argument("--diagnosis-window-size", type=int, default=3,
                          help="number of recent operational batches to feed Teacher when --diagnoses is omitted")
+    propose.add_argument("--initial-train-results-dir", type=Path,
+                         default=DEFAULT_INITIAL_TRAIN_RESULTS_DIR)
+    propose.add_argument("--initial-test-results-dir", type=Path,
+                         default=DEFAULT_INITIAL_TEST_RESULTS_DIR)
+    propose.add_argument("--no-skill-results-dir", type=Path,
+                         default=DEFAULT_NO_SKILL_RESULTS_DIR)
+    propose.add_argument("--rolling-split-manifest", type=Path, default=None)
     _add_role_args(propose)
     propose.set_defaults(func=cmd_propose_updates)
 
@@ -2471,10 +3150,10 @@ def main(argv: list[str] | None = None) -> int:
                        help="force role subsessions to start over for every role step")
     train.add_argument("--initial-train-results-dir", type=Path,
                        default=DEFAULT_INITIAL_TRAIN_RESULTS_DIR,
-                       help="fixed initial-skill DSH+DeepSeek 4096 TRAIN results")
+                       help="optional legacy initial-skill TRAIN results; same-batch two-layer evaluations take precedence")
     train.add_argument("--initial-test-results-dir", type=Path,
                        default=DEFAULT_INITIAL_TEST_RESULTS_DIR,
-                       help="fixed initial-skill DSH+DeepSeek 32768 TEST results")
+                       help="optional legacy initial-skill TEST results; same-batch two-layer evaluations take precedence")
     train.add_argument("--no-skill-results-dir", type=Path,
                        default=DEFAULT_NO_SKILL_RESULTS_DIR,
                        help="formal DSH+DeepSeek no-skill poc_generation results")
@@ -2519,6 +3198,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="refuse to freeze while a training sample still lacks a commit date")
     freeze.add_argument("--force", action="store_true", help="overwrite an existing frozen split")
     freeze.set_defaults(func=cmd_freeze_split)
+
+    rebalance = sub.add_parser(
+        "rebalance-split",
+        help="reorder a fixed training roster so each batch has balanced baseline outcomes",
+    )
+    rebalance.add_argument("--source", type=Path, default=DEFAULT_DISTILLATION_SPLIT)
+    rebalance.add_argument("--results-dir", type=Path, default=DEFAULT_NO_SKILL_RESULTS_DIR)
+    rebalance.add_argument("--output", type=Path, required=True)
+    rebalance.add_argument("--name", default="skill_distillation_100_100_failure_balanced_current")
+    rebalance.add_argument("--created-at", default="2026-10-22")
+    rebalance.add_argument("--seed", default="reward-skill-distillation-rebalanced-20261022")
+    rebalance.add_argument("--batch-size", type=int, default=10)
+    rebalance.add_argument("--target-success-per-batch", type=int, default=6)
+    rebalance.set_defaults(func=cmd_rebalance_split)
 
 
     synth_ref = sub.add_parser("synthesize-reference", help="build a GT-assisted synthetic reference trajectory for distillation roles")

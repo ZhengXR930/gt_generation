@@ -17,12 +17,21 @@ question "why is this sample in train" is answerable from the split alone.
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from .defaults import BATCH_SIZE, REPO_ROOT, TEST_SIZE, TRAIN_SIZE, VALID_GT
+from poc_generation.gt_trigger_oracle import (
+    gt_trigger_state,
+    gt_triggered,
+    reachability_summary_candidate,
+    complete_manifest_reachability_summary,
+    complete_reachability_summary,
+    enrich_submission_oracle,
+)
 
 GT_RESULTS = REPO_ROOT / "gt_results"
 TRAIN_GT = GT_RESULTS / "train_gt.json"
@@ -235,6 +244,195 @@ def _chronological_order(samples: list[str], dates: dict[str, tuple[str, str]]) 
 def write_split_manifest(out: Path, split: ChronologicalSplit) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(split.to_json(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- outcome-balanced training batches
+
+
+_NON_EVALUATED_STATUSES = frozenset(
+    {"infrastructure_failed", "runtime_spec_unavailable", "not_executed"}
+)
+
+
+def _candidate_is_evaluated(candidate: dict[str, Any]) -> bool:
+    return (
+        not candidate.get("error")
+        and candidate.get("execution_status") not in _NON_EVALUATED_STATUSES
+    )
+
+
+def read_baseline_outcomes(
+    results_dir: Path,
+    sample_ids: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    """Read sample-level GT outcome labels from saved reachability artifacts.
+
+    A sample is a baseline ``success`` when at least one evaluable candidate
+    has an explicit GT sanitizer trigger.  Everything else is ``failure``;
+    infrastructure/error rows are not allowed to create a false success or FP
+    label.  This is deliberately independent of the R1--R4 checkpoint ladder,
+    so samples without checkpoints can still participate when their saved GT
+    result is present.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    for raw_sample_id in sample_ids:
+        sample_id = str(raw_sample_id)
+        path = results_dir / sample_id / "reachability_eval.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"missing reachability evaluation for {sample_id}: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid reachability evaluation for {sample_id}: {path}") from exc
+        manifest_path = results_dir / sample_id / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = None
+        payload = enrich_submission_oracle(payload, manifest) or payload
+        candidates = payload.get("candidates") or []
+        evaluated = [item for item in candidates if isinstance(item, dict) and _candidate_is_evaluated(item)]
+        # PoC bytes may be cleaned after evaluation.  In that case a later
+        # reachability_eval.json contains only missing-file errors, while the
+        # manifest retains the complete evaluator summary.  Reuse that saved
+        # summary instead of turning a known run into a false failure.
+        if not evaluated:
+            saved_summary = complete_reachability_summary(payload)
+            if saved_summary is None:
+                saved_summary = complete_manifest_reachability_summary(manifest or {})
+            if isinstance(saved_summary, dict):
+                evaluated = [reachability_summary_candidate(saved_summary)]
+        gt_triggered_count = sum(gt_triggered(item) for item in evaluated)
+        fp_candidates = sum(
+            gt_trigger_state(item) is False
+            and item.get("original_exit_code") not in (None, 0, 300)
+            for item in evaluated
+        )
+        rows[sample_id] = {
+            "outcome": "success" if gt_triggered_count else "failure",
+            "gt_triggered_pocs": gt_triggered_count,
+            "fp_triggered_pocs": fp_candidates,
+            "evaluated_unique_pocs": len(evaluated),
+            "source": str(path),
+            "reachability_source": "manifest.reachability.summary" if len(evaluated) == 1 and evaluated[0].get("execution_status") == "stored_evaluator_summary" else str(path),
+        }
+    return rows
+
+
+def rebalance_training_batches(
+    train_samples: Iterable[str],
+    outcomes: dict[str, dict[str, Any]],
+    *,
+    batch_size: int = BATCH_SIZE,
+    target_success_per_batch: int = 6,
+    seed: str = "reward-skill-distillation-rebalanced-20261022",
+) -> tuple[list[list[str]], list[dict[str, Any]]]:
+    """Partition a fixed train roster into deterministic outcome-balanced batches.
+
+    The sample roster is not changed.  The requested 6-success/4-failure
+    target is applied as evenly as possible; if live labels drift (for example
+    61 successes and 39 failures), the unavoidable remainder is recorded as a
+    single 7/3 batch rather than silently dropping or replacing a sample.
+    """
+    samples = [str(item) for item in train_samples]
+    if not samples or len(samples) % batch_size:
+        raise ValueError("train roster must be non-empty and divisible by batch_size")
+    missing = [sample for sample in samples if sample not in outcomes]
+    if missing:
+        raise ValueError(f"missing outcome labels for: {', '.join(missing)}")
+    if len(set(samples)) != len(samples):
+        raise ValueError("train roster contains duplicate sample IDs")
+
+    batch_count = len(samples) // batch_size
+    success = [sample for sample in samples if outcomes[sample].get("outcome") == "success"]
+    failure = [sample for sample in samples if outcomes[sample].get("outcome") == "failure"]
+    unknown = [sample for sample in samples if outcomes[sample].get("outcome") not in {"success", "failure"}]
+    if unknown:
+        raise ValueError(f"unknown outcome labels for: {', '.join(unknown)}")
+
+    def seeded_order(values: list[str], label: str) -> list[str]:
+        return sorted(
+            values,
+            key=lambda sample: hashlib.sha256(f"{seed}|{label}|{sample}".encode("utf-8")).hexdigest(),
+        )
+
+    success = seeded_order(success, "success")
+    failure = seeded_order(failure, "failure")
+    target = max(0, min(batch_size, int(target_success_per_batch)))
+    success_quotas = [target] * batch_count
+    delta = len(success) - sum(success_quotas)
+    if delta > 0:
+        for index in range(delta):
+            success_quotas[index % batch_count] += 1
+    elif delta < 0:
+        for index in range(-delta):
+            slot = index % batch_count
+            if success_quotas[slot] <= 0:
+                raise ValueError("cannot distribute the live success count across batches")
+            success_quotas[slot] -= 1
+
+    batches: list[list[str]] = []
+    counts: list[dict[str, Any]] = []
+    success_offset = failure_offset = 0
+    for batch_index, success_quota in enumerate(success_quotas):
+        failure_quota = batch_size - success_quota
+        selected_success = success[success_offset:success_offset + success_quota]
+        selected_failure = failure[failure_offset:failure_offset + failure_quota]
+        success_offset += success_quota
+        failure_offset += failure_quota
+        if len(selected_success) != success_quota or len(selected_failure) != failure_quota:
+            raise ValueError("outcome quotas exceed the available labeled samples")
+        batch: list[str] = []
+        for index in range(max(success_quota, failure_quota)):
+            if index < success_quota:
+                batch.append(selected_success[index])
+            if index < failure_quota:
+                batch.append(selected_failure[index])
+        batches.append(batch)
+        counts.append({
+            "batch_index": batch_index,
+            "size": len(batch),
+            "success": success_quota,
+            "failure": failure_quota,
+            "samples": batch,
+        })
+    if success_offset != len(success) or failure_offset != len(failure):
+        raise ValueError("not all labeled samples were assigned to a batch")
+    return batches, counts
+
+
+def validate_outcome_balanced_manifest(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate the recorded baseline labels against every training batch.
+
+    Legacy manifests without ``baseline_outcomes`` remain readable for old
+    runs. New manifests fail fast if a batch roster and its recorded outcome
+    counts disagree.
+    """
+    outcomes = payload.get("baseline_outcomes")
+    batches = payload.get("batches")
+    if not isinstance(outcomes, dict) or not isinstance(batches, list):
+        return {"validated": False, "reason": "legacy_manifest_without_outcome_labels"}
+    seen: list[str] = []
+    counts: list[dict[str, int]] = []
+    recorded_counts = payload.get("train_batch_outcome_counts") or []
+    for index, item in enumerate(batches):
+        samples = [str(sample) for sample in (item.get("samples") or [])]
+        success = sum(outcomes.get(sample, {}).get("outcome") == "success" for sample in samples)
+        failure = sum(outcomes.get(sample, {}).get("outcome") == "failure" for sample in samples)
+        if success + failure != len(samples):
+            raise ValueError(f"batch {index} contains an unlabeled sample")
+        if index >= len(recorded_counts):
+            raise ValueError("train_batch_outcome_counts is incomplete")
+        recorded = recorded_counts[index]
+        if int(recorded.get("success", -1)) != success or int(recorded.get("failure", -1)) != failure:
+            raise ValueError(f"batch {index} outcome counts do not match its roster")
+        seen.extend(samples)
+        counts.append({"batch_index": index, "size": len(samples), "success": success, "failure": failure})
+    if len(seen) != len(set(seen)):
+        raise ValueError("training batches contain duplicate sample IDs")
+    if set(seen) != set(str(item) for item in payload.get("train") or []):
+        raise ValueError("training batches do not cover the recorded train roster")
+    return {"validated": True, "batches": counts}
 
 
 def _counts(values: Iterable[str | None]) -> dict[str, int]:

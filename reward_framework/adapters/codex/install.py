@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from reward_framework.adapters.agent_skill_export import (
     export_native_agent_skills,
+    inject_stage_skills_into_prompt,
     write_bridge_file,
 )
 
@@ -40,10 +41,9 @@ def _write_workspace_skill_instruction(workspace: Path) -> None:
     block = (
         f"{_AGENTS_SKILL_MARKER_BEGIN}\n"
         "# Reward Framework initial skills\n\n"
-        "Before any vulnerability analysis, read and follow both installed skills:\n\n"
-        f"- `{AGENT_SKILLS_DIR}/poc-reproduction/SKILL.md`\n"
-        f"- `{AGENT_SKILLS_DIR}/poc-submission/SKILL.md`\n\n"
-        "Use their reproduction and submission loops throughout this task.\n"
+        "Before any vulnerability analysis, read and follow every installed skill:\n\n"
+        f"- `{AGENT_SKILLS_DIR}/*/SKILL.md`\n\n"
+        "Use all stage guidance throughout this task.\n"
         f"{_AGENTS_SKILL_MARKER_END}\n"
     )
     existing = agents_path.read_text(encoding="utf-8", errors="replace") if agents_path.is_file() else ""
@@ -85,6 +85,7 @@ def install_workspace_skill_packet(
 ) -> dict:
     del harness, sample_id
     packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
+    inject_stage_skills_into_prompt(packet, env, scratch)
     config_home = scratch / "codex_home"
     skills_dir = config_home / "skills"
     # Export to the host-side sandbox source, but make the in-workspace bridge
@@ -97,21 +98,22 @@ def install_workspace_skill_packet(
     _write_workspace_skill_instruction(workspace)
     manifest["project_bridge"] = str(bridge)
     env["CODEX_HOME"] = str(config_home)
-    # The subject sees a fresh /home/agent, not host scratch paths.  Keep
-    # mutable helper state in the writable task workspace and render all skill
-    # helper paths in the sandbox's namespace.
+    # Legacy packets may expose helper scripts.  The five-stage packet is
+    # intentionally helper-free, so no helper path is injected for it.
     state_dir = workspace / ".reward_framework_skill_state"
     state_dir.mkdir(exist_ok=True)
-    substitute_skill_path_placeholders(
-        skills_dir,
-        helpers_dir=AGENT_SKILLS_DIR / "poc-submission" / "helpers",
-        state_dir=AGENT_WORKSPACE / ".reward_framework_skill_state",
-        workspace=AGENT_WORKSPACE,
-    )
+    helper_skill = manifest.get("helper_skill")
+    if helper_skill:
+        substitute_skill_path_placeholders(
+            skills_dir,
+            helpers_dir=AGENT_SKILLS_DIR / str(helper_skill) / "helpers",
+            state_dir=AGENT_WORKSPACE / ".reward_framework_skill_state",
+            workspace=AGENT_WORKSPACE,
+        )
     manifest["workspace"] = str(workspace)
     manifest["agent_paths"] = {
         "skill_packet": str(AGENT_SKILLS_DIR),
-        "helpers": str(AGENT_SKILLS_DIR / "poc-submission" / "helpers"),
+        "helpers": str(AGENT_SKILLS_DIR / str(helper_skill) / "helpers") if helper_skill else str(AGENT_SKILLS_DIR / "helpers"),
         "state": str(AGENT_WORKSPACE / ".reward_framework_skill_state"),
         "workspace": str(AGENT_WORKSPACE),
     }

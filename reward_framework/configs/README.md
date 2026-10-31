@@ -1,19 +1,29 @@
-# DSH + DeepSeek configurations
+# Reward-framework configurations
 
-Only the two canonical runtime configurations are kept here:
+The active directory contains the two canonical DSH + DeepSeek runtime
+configurations and the two preserved ZCode + GLM-5.2 initial-result
+configurations:
 
 - `dsh_deepseek_4096_max.json`
 - `dsh_deepseek_32768_max.json`
+- `zcode_glm52_initial_batch000_4096.json`
+- `zcode_glm52_initial_batch001_4096.json`
 
 Both use DeepSeek's official DSH endpoint, `deepseek-v4-flash`, and
-`reasoning_effort: max`. They default to the immutable initial-skill snapshot
-and expose the current evolving packet through `skill_packets`.
+`reasoning_effort: max`. They default to the immutable two-file staged initial
+packet and expose the latest two-file evolving snapshot through
+`skill_packets`.
+The existing tracked 100/100 baseline artifacts are controls for the current
+two-file staged packet; keep packet provenance in each run manifest when using
+them as a paired baseline.
 The top-level reward runner defaults to the 4096-token file; use the 32768 file
 explicitly for the high-budget arm.
 The 4096 file selects the frozen TRAIN partition and the 32768 file selects the
 disjoint TEST partition. An explicit `--sample`, `--samples-file`, or
 `--sample-selector` overrides that default roster for a smoke run.
-The same choice is available without switching files via
+The historical five-file and complete legacy two-layer packets remain available
+by explicit packet path for reproduction. The same token-budget choice is
+available without switching files via
 `--max-output-tokens 4096` or `--max-output-tokens 32768` (default: 4096).
 
 Select the skill without copying or editing a configuration:
@@ -32,3 +42,6 @@ An explicit `--skill-packet` still takes precedence over the named variant.
 Pass samples on the command line (or through the existing selector/file
 options); the canonical configs intentionally do not pin an old smoke or batch
 roster.
+
+Other Codex/ZCode smoke, retry, and generation-only configurations remain under
+`configs/_archive/non_dsh/`; they are not canonical result configurations.

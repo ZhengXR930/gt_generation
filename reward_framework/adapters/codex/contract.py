@@ -1,7 +1,7 @@
 """Codex adapter contract.
 
 Codex already supports filesystem Agent Skills, so this adapter is intentionally
-thin: export the two-layer packet into native SKILL.md folders and keep
+thin: export the configured packet into native SKILL.md folders and keep
 benchmark submit/telemetry outside the learned lessons.
 """
 

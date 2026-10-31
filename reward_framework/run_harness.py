@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -28,11 +29,23 @@ from harness_runtime.failure_artifact import write_failure_artifact
 from harness_runtime.provider_protocol import resolve_analysis_transport
 from poc_generation.extract_context_visit import write_context_visit
 from reward_framework.adapters import HARNESSES, RewardRequest, build_command
-from reward_framework.adapters.base import DEFAULT_RUNS_ROOT, DEFAULT_SKILL_PACKET
+from reward_framework.adapters.base import DEFAULT_RUNS_ROOT, DEFAULT_SKILL_PACKET, PROMPT_FILE
+from reward_framework.distillation.skill_packet import packet_content_sha256
 from runtime_credentials import credential_value, load_runtime_credentials
 
 
-VALID_CODING_TERMINAL_STATUSES = {"success", "agent_finished", "iteration_cap"}
+# ``incomplete`` is emitted by the coding adapters when the agent checkpoint
+# is preserved but the adapter did not receive a structured terminal message.
+# It is still a terminal *artifact* for reward evaluation: submissions,
+# checkpoint evidence, and reachability can be evaluated without replaying the
+# coding episode.  Treating it as invalid made the batch runner abort after a
+# perfectly usable sample and masked the evaluator output.
+VALID_CODING_TERMINAL_STATUSES = {
+    "success",
+    "agent_finished",
+    "iteration_cap",
+    "incomplete",
+}
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -100,6 +113,70 @@ def _skill_packet_from_config(
     return Path(
         str(_config_value(args, config, "skill_packet", str(DEFAULT_SKILL_PACKET)))
     ).expanduser().resolve()
+
+
+def _resolved_skill_variant(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    skill_packet: Path | None,
+) -> str | None:
+    """Resolve variant metadata without allowing a stale config label to win.
+
+    Distillation invokes the runner with an explicit packet while the config
+    still describes the initial arm.  In that case the packet path/metadata is
+    authoritative; otherwise the explicit/configured named variant remains the
+    source of truth.
+    """
+    if skill_packet is None:
+        return None
+    explicit_variant = getattr(args, "skill_variant", None)
+    if explicit_variant:
+        return str(explicit_variant)
+    explicit_packet = getattr(args, "skill_packet", None)
+    if explicit_packet not in (None, ""):
+        metadata_path = skill_packet / "PACKET_META.json"
+        if metadata_path.is_file():
+            try:
+                metadata = _load_json(metadata_path)
+            except (OSError, ValueError, UnicodeDecodeError):
+                metadata = {}
+            variant = metadata.get("variant") if isinstance(metadata, dict) else None
+            if variant in {"initial", "evolving"}:
+                return str(variant)
+        # Batch packets are materialized by Teacher/Curator and therefore are
+        # evolving snapshots even when the base runtime config says initial.
+        if skill_packet.name.startswith("batch_"):
+            return "evolving"
+        if "initial" in skill_packet.name:
+            return "initial"
+        return "explicit"
+    configured = config.get("skill_variant")
+    return str(configured) if configured else None
+
+
+def _packet_provenance(skill_packet: Path | None) -> dict[str, Any] | None:
+    if skill_packet is None or not skill_packet.is_dir():
+        return None
+    try:
+        digest = packet_content_sha256(skill_packet)
+    except (OSError, ValueError):
+        digest = None
+    metadata_path = skill_packet / "PACKET_META.json"
+    metadata = {}
+    if metadata_path.is_file():
+        try:
+            candidate = _load_json(metadata_path)
+            if isinstance(candidate, dict):
+                metadata = candidate
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
+    return {
+        "path": str(skill_packet),
+        "content_sha256": digest,
+        "metadata_variant": metadata.get("variant"),
+        "packet_name": metadata.get("packet_name") or metadata.get("packet_id"),
+        "hash_protocol": metadata.get("content_hash_protocol"),
+    }
 
 
 def load_samples(args: argparse.Namespace, config: dict[str, Any]) -> list[str]:
@@ -176,9 +253,19 @@ def result_is_complete(sample_dir: Path) -> bool:
         return False
     if not payload.get("workspace_adapter"):
         return False
-    # The coding episode is complete even when its optional artifact is absent
-    # or invalid. The separate finalizer repairs it from checkpoint evidence;
-    # this branch must never authorize a new coding run.
+    # Native skill and submission provenance are hard gates for new CLI runs.
+    # Historical manifests do not contain these fields and remain readable;
+    # once a runner records an explicit incomplete gate, the sample must be
+    # rerun rather than being treated as a reusable terminal artifact.
+    skill_gate = payload.get("skill_load_verification")
+    if isinstance(skill_gate, dict) and skill_gate.get("status") == "incomplete":
+        return False
+    submission_gate = payload.get("submission_feedback")
+    if isinstance(submission_gate, dict) and submission_gate.get("status") == "incomplete":
+        return False
+    # A historical ``incomplete`` episode without the new explicit gates is
+    # still reusable evidence.  New gate failures returned above instead
+    # authorize a rerun, never a reachability score.
     return True
 
 
@@ -218,6 +305,17 @@ def maybe_run_reachability(
 ) -> dict[str, Any]:
     if not config.get("run_reachability_after_generation", True):
         return {"status": "disabled"}
+    # Do not score an episode whose native skills or submission feedback did
+    # not pass the runner's provenance gates.  Those are rerun candidates, not
+    # valid zero/FP behavioral outcomes.
+    try:
+        manifest = _load_json(sample_dir / "manifest.json")
+    except (OSError, json.JSONDecodeError):
+        manifest = {}
+    if (manifest.get("skill_load_verification") or {}).get("status") == "incomplete":
+        return {"status": "skipped", "reason": "required_native_skill_not_loaded"}
+    if (manifest.get("submission_feedback") or {}).get("status") == "incomplete":
+        return {"status": "skipped", "reason": "submission_feedback_incomplete"}
     try:
         from evaluator.reachability.eval_batch import evaluate_model_sample
 
@@ -229,6 +327,32 @@ def maybe_run_reachability(
             debugger_image=str(config.get("reachability_debugger_image") or "gt-memory-env:latest"),
             max_hits_per_event=int(config.get("reachability_max_hits_per_event", 64)),
         )
+        # Older ARVO runs (and the server ledger used by this harness) may
+        # persist the submission result without the immutable image identity.
+        # Strict scoring must not guess in that case, but the candidate itself
+        # can be replayed in the frozen target to recover a submission-
+        # equivalent identity and sanitizer observation without another model
+        # call.  Retry only this explicit infrastructure outcome; do not hide
+        # ordinary candidate or debugger failures.
+        unavailable_rows = [
+            row
+            for row in result.get("candidates", [])
+            if row.get("execution_status") == "not_evaluable_binary_unavailable"
+        ]
+        if (
+            unavailable_rows
+            and result.get("summary", {}).get("candidate_errors")
+            == len(unavailable_rows)
+        ):
+            result = evaluate_model_sample(
+                model=run_id,
+                sample_id=sample_id,
+                sample_dir=sample_dir,
+                timeout=int(config.get("reachability_timeout", 420)),
+                debugger_image=str(config.get("reachability_debugger_image") or "gt-memory-env:latest"),
+                max_hits_per_event=int(config.get("reachability_max_hits_per_event", 64)),
+                replay_existing=True,
+            )
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     if "skipped" in result:
@@ -275,7 +399,7 @@ def existing_reachability(sample_dir: Path) -> dict[str, Any] | None:
 
 
 def maybe_write_context_visit(sample_dir: Path) -> dict[str, Any]:
-    """Materialize context_visit.json from the saved agent checkpoint."""
+    """Materialize context_visit.json from trajectory/checkpoint evidence."""
     if not (sample_dir / "checkpoint").is_dir():
         return {"status": "skipped", "reason": "checkpoint missing"}
     try:
@@ -371,9 +495,12 @@ def maybe_finalize_analysis(
         base_url=str(config.get("analysis_base_url") or request.base_url),
         api_key_env=str(config.get("analysis_api_key_env") or request.api_key_env),
         api_version=str(config.get("analysis_api_version") or request.api_version),
-        reasoning_effort=str(
-            config.get("analysis_reasoning_effort") or request.reasoning_effort or ""
-        ),
+        # Analysis finalization is a bounded JSON summarization call, not the
+        # coding trajectory.  Inheriting the coding run's ``max`` reasoning
+        # effort can consume the entire small output budget with hidden
+        # reasoning and leave the provider with no text block to parse.  Only
+        # an explicitly configured analysis effort should be sent.
+        reasoning_effort=str(config.get("analysis_reasoning_effort") or ""),
         max_output_tokens=int(
             config.get("analysis_max_output_tokens") or request.max_output_tokens or 0
         ),
@@ -401,6 +528,7 @@ def run_one(
             "status": "skipped",
             "results_dir": str(sample_dir),
         }
+        record["agent_terminal_status"] = _agent_terminal_status(sample_dir)
         # The coding trajectory is already terminal.  A missing artifact is
         # finalized in place rather than replaying the coding sample.
         record["analysis_finalization"] = maybe_finalize_analysis(
@@ -556,7 +684,8 @@ def run_one(
             record["status"] = "failed"
             record["error"] = (
                 "invalid coding terminal status: "
-                f"{agent_terminal_status}; only agent_finished or iteration_cap are valid"
+                f"{agent_terminal_status}; expected one of "
+                f"{sorted(VALID_CODING_TERMINAL_STATUSES)}"
             )
         else:
             if record["status"] == "failed":
@@ -674,7 +803,8 @@ def write_run_manifest(
 ) -> None:
     harness = str(_config_value(args, config, "harness", "openhands"))
     skill_packet = _skill_packet_from_config(args, config)
-    skill_variant = getattr(args, "skill_variant", None) or config.get("skill_variant")
+    skill_variant = _resolved_skill_variant(args, config, skill_packet)
+    skill_provenance = _packet_provenance(skill_packet)
     analysis_base_url = str(
         config.get("analysis_base_url") or _config_value(args, config, "base_url", "")
     )
@@ -695,6 +825,10 @@ def write_run_manifest(
         "api_key_env": _config_value(args, config, "api_key_env", ""),
         "skill_packet": str(skill_packet) if skill_packet else None,
         "skill_variant": str(skill_variant) if skill_variant else None,
+        "skill_packet_provenance": skill_provenance,
+        "skill_packet_content_sha256": (
+            skill_provenance.get("content_sha256") if skill_provenance else None
+        ),
         "no_skill": skill_packet is None,
         "max_effective_submits": _config_value(args, config, "max_effective_submits"),
         "coding_attempts_per_sample": 1,
@@ -706,6 +840,8 @@ def write_run_manifest(
         "analysis_transport": analysis_transport,
         "analysis_base_url_configured": bool(analysis_base_url),
         "analysis_protocol": "checkpoint_finalizer_v1",
+        "prompt_file": str(PROMPT_FILE),
+        "prompt_sha256": hashlib.sha256(PROMPT_FILE.read_bytes()).hexdigest(),
         "batch_preflight": batch_preflight,
         "samples": samples,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -731,6 +867,10 @@ def write_run_manifest(
         "dsh_provider": _config_value(args, config, "dsh_provider", ""),
         "skill_packet": str(skill_packet) if skill_packet else None,
         "skill_variant": str(skill_variant) if skill_variant else None,
+        "skill_packet_provenance": skill_provenance,
+        "skill_packet_content_sha256": (
+            skill_provenance.get("content_sha256") if skill_provenance else None
+        ),
         "no_skill": skill_packet is None,
         "max_iter": int(_config_value(args, config, "max_iter", 100)),
         "max_attempts": int(
@@ -742,6 +882,8 @@ def write_run_manifest(
         "reasoning_effort": _config_value(args, config, "reasoning_effort", "medium"),
         "max_output_tokens": int(_config_value(args, config, "max_output_tokens", 4096)),
         "timeout": int(_config_value(args, config, "timeout", 10800)),
+        "prompt_file": str(PROMPT_FILE),
+        "prompt_sha256": hashlib.sha256(PROMPT_FILE.read_bytes()).hexdigest(),
         "parallel": int(args.parallel),
         "samples": samples,
     })
@@ -852,14 +994,31 @@ def main() -> int:
                 try:
                     record = future.result()
                 except Exception as exc:  # noqa: BLE001
-                    record = record_unhandled_sample_failure(
-                        args,
-                        config,
-                        run_id=run_id,
-                        run_dir=run_dir,
-                        sample_id=sample,
-                        exc=exc,
-                    )
+                    # Failure-artifact writing must not be able to abort the
+                    # whole batch.  A malformed/partial sample is recorded as
+                    # one failed occurrence and the remaining futures still
+                    # receive their evaluator results.
+                    try:
+                        record = record_unhandled_sample_failure(
+                            args,
+                            config,
+                            run_id=run_id,
+                            run_dir=run_dir,
+                            sample_id=sample,
+                            exc=exc,
+                        )
+                    except Exception as artifact_exc:  # noqa: BLE001
+                        record = {
+                            "sample": sample,
+                            "status": "failed",
+                            "returncode": None,
+                            "seconds": 0.0,
+                            "results_dir": str(run_dir / "results" / sample),
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "failure_artifact_error": (
+                                f"{type(artifact_exc).__name__}: {artifact_exc}"
+                            ),
+                        }
                 counts[record["status"]] = counts.get(record["status"], 0) + 1
                 line = json.dumps(record, ensure_ascii=False)
                 print(line, flush=True)

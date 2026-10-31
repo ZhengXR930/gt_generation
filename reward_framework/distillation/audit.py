@@ -17,10 +17,19 @@ from reward_framework.adapters.base import DEFAULT_SKILL_PACKET
 
 from .defaults import INITIAL_PACKET, REPO_ROOT
 from .lint import lint_lesson_text, load_literal_index
-from .skill_packet import TARGETS, apply_curator_decisions, copy_initial_packet
+from .skill_packet import (
+    STAGE_NAMES,
+    apply_curator_decisions,
+    copy_initial_packet,
+    is_direct_stage_packet,
+    is_stage_packet,
+    targets_for_packet,
+)
 
 TEMPLATES = REPO_ROOT / "reward_framework" / "distillation" / "prompt_templates"
 REQUIRED_TEMPLATES = ("README.md", "diagnostician.md", "teacher.md", "curator.md", "correction.md")
+# Historical two-layer packets retain their helper contract for reproducible
+# old runs.  Both active staged layouts are intentionally helper-free.
 REQUIRED_HELPERS = ["submit_history.py", "submit_preflight.py"]
 
 # Wording from earlier designs that must not creep back into the agent's task.
@@ -49,26 +58,38 @@ def _layout_errors() -> Iterator[str]:
     if (REPO_ROOT / "reward_framework" / "offline_static_distillation").exists():
         yield "offline_static_distillation still exists"
 
-    required = [
-        INITIAL_PACKET / "reproduction_skill" / "SKILL.md",
-        INITIAL_PACKET / "submission_skill" / "SKILL.md",
-        *(INITIAL_PACKET / "submission_skill" / "helpers" / name for name in REQUIRED_HELPERS),
-        *(TEMPLATES / name for name in REQUIRED_TEMPLATES),
-    ]
+    if is_stage_packet(INITIAL_PACKET):
+        required = [
+            *(INITIAL_PACKET / "skills" / stage / "SKILL.md" for stage in STAGE_NAMES),
+            *(TEMPLATES / name for name in REQUIRED_TEMPLATES),
+        ]
+    else:
+        required = [
+            INITIAL_PACKET / "reproduction_skill" / "SKILL.md",
+            INITIAL_PACKET / "submission_skill" / "SKILL.md",
+            *(TEMPLATES / name for name in REQUIRED_TEMPLATES),
+        ]
+        if not is_direct_stage_packet(INITIAL_PACKET):
+            required.extend(
+                INITIAL_PACKET / "submission_skill" / "helpers" / name
+                for name in REQUIRED_HELPERS
+            )
     yield from (f"missing {path}" for path in required if not path.is_file())
 
 
 def _contract_errors() -> Iterator[str]:
     """Rules the design depends on: helper scope, fixed sections, prompt purity."""
-    repro_helpers = INITIAL_PACKET / "reproduction_skill" / "helpers"
-    if repro_helpers.is_dir() and list(repro_helpers.glob("*.py")):
-        yield "reproduction skill contains helper scripts"
+    if is_stage_packet(INITIAL_PACKET) or is_direct_stage_packet(INITIAL_PACKET):
+        helper_root = INITIAL_PACKET / "helpers"
+        if helper_root.exists():
+            yield "active staged initial packet must not contain agent-facing helpers"
+    else:
+        helper_root = INITIAL_PACKET / "submission_skill" / "helpers"
+        helpers = sorted(path.name for path in helper_root.glob("*.py"))
+        if helpers != REQUIRED_HELPERS:
+            yield f"unexpected skill helpers: {helpers}"
 
-    helpers = sorted(path.name for path in (INITIAL_PACKET / "submission_skill" / "helpers").glob("*.py"))
-    if helpers != REQUIRED_HELPERS:
-        yield f"unexpected submission helpers: {helpers}"
-
-    yield from (f"fixed section {name} is writable" for name in ("reproduction:R.A", "submission:S.A") if name in TARGETS)
+    yield from (f"fixed section {name} is writable" for name in ("reproduction:R.A", "submission:S.A") if name in targets_for_packet(INITIAL_PACKET))
 
     prompt = _text(REPO_ROOT / "reward_framework" / "prompt.txt")
     yield from (f"forbidden prompt text remains: {text}" for text in FORBIDDEN_PROMPT_TEXT if text in prompt)
@@ -106,7 +127,7 @@ def _evidence_leak_errors(index: dict[str, Any]) -> list[str]:
             copy_initial_packet(workdir / "src"),
             [{
                 "decision": "MODIFY",
-                "target": "submission:S.C",
+                "target": next(iter(targets_for_packet(INITIAL_PACKET))),
                 "proposal": "Distinguish parser failure from sink miss when reading a non-triggering result.",
                 "evidence": _SENTINELS[0],
                 "rationale": _SENTINELS[1],

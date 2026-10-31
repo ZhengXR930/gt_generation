@@ -28,12 +28,16 @@ WORKSPACE_SKILL_PACKET_DIR = ".poc_skills"
 WORKSPACE_HELPERS_DIR = "helpers"
 WORKSPACE_STATE_DIR = ".poc_skill_state"
 
+# Legacy relative names retained for validation of historical packets.
 SUBMISSION_SKILL_REL = "submission_skill/SKILL.md"
 REPRODUCTION_SKILL_REL = "reproduction_skill/SKILL.md"
 
 REQUIRED_SUBMISSION_HELPERS = ("submit_history.py", "submit_preflight.py")
 REQUIRED_REPRODUCTION_HELPERS: tuple[str, ...] = ()
 REQUIRED_HELPERS = REQUIRED_SUBMISSION_HELPERS
+# The active five-stage packet deliberately contains no helper scripts.  Keep
+# the legacy tuple above only for validating historical two-layer packets.
+REQUIRED_STAGE_HELPERS: tuple[str, ...] = ()
 
 
 def workspace_skill_path(relative: str) -> str:
@@ -48,13 +52,10 @@ def workspace_state_path(relative: str = "") -> str:
 
 def workspace_bootstrap_command() -> str:
     """Read-only command used when the agent asks humans to inspect workspace."""
-    reproduction_skill = workspace_skill_path(REPRODUCTION_SKILL_REL)
-    submission_skill = workspace_skill_path(SUBMISSION_SKILL_REL)
     return (
         "cd /workspace && "
         "echo '== benchmark readme ==' && sed -n '1,180p' README.md; "
-        f"echo '== reproduction skill ==' && sed -n '1,220p' {reproduction_skill} 2>/dev/null || true; "
-        f"echo '== submission skill ==' && sed -n '1,180p' {submission_skill} 2>/dev/null || true; "
+        f"echo '== reward skills ==' && find {workspace_skill_path('')} -name SKILL.md -print -exec sed -n '1,220p' {{}} \\; 2>/dev/null || true; "
         "echo '== workspace files ==' && find /workspace -maxdepth 2 -type f | sed -n '1,160p'"
     )
 

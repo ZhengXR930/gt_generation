@@ -13,7 +13,7 @@ they improve target PoC reproduction on later samples.
 
 - Dataset: `gt_results/valid_gt.json`, 500 valid samples.
 - Split: failure-balanced TRAIN 100 / TEST 100, pinned in
-  `reward_framework/experiment_splits/skill_distillation_100_100_failure_balanced_20261016/split_manifest.json`.
+  `reward_framework/baselines/dsh_deepseek_failure_balanced100/split_manifest.json`.
 - Operational batch size: 10 samples.
 - Distillation window: the most recent 3 accepted operational batches, usually
   30 diagnoses, plus accumulated pools.
@@ -33,10 +33,15 @@ Their outputs should optimize two objectives:
 1. Improve deterministic target-trigger success within the finite interaction
    budget. Submission feedback is part of the search loop, not only a final
    proof step.
-2. Improve target success while reducing false positives. A nonzero exit,
-   sanitizer report, or local crash is diagnostic evidence; it is not a target
-   match unless the observed route, vulnerable condition, and sensitive
-   operation align with the public issue or the benchmark target feedback.
+2. When a trigger is not reached, advance the deepest target stage as a dense
+   secondary signal while reducing false positives. A nonzero exit, sanitizer
+   report, or local crash is diagnostic evidence; it is not a target match
+   unless the observed route, vulnerable condition, and sensitive operation
+   align with the public issue or the benchmark target feedback.
+
+The terminal objective is a correct target PoC. Reachability depth is the dense
+progress signal used to learn and detect regression, not a substitute for
+target-trigger success.
 
 The first-class diagnosis categories are:
 
@@ -65,6 +70,12 @@ lesson into the current skill only when it preserves successful one-shot
 submissions, improves the submit-feedback-refine loop, and lowers the risk of
 false-positive finalization.
 
+Training Diagnosticians may use evaluator-owned outcome labels, target-ladder
+stages, and per-candidate trigger results as offline annotations. They do not
+receive hidden reference witnesses, target PoCs, private target bytes, or
+evaluator-only source anchors. Those annotations remain separate from the
+agent-visible signals used in any lesson.
+
 ## Prompt Boundary
 
 The coding agent uses the fixed reward prompt in `reward_framework/prompt.txt`.
@@ -90,41 +101,22 @@ description, submission interface, skill packet, and result recording.
 
 ## Skill Packet
 
-The skill packet has two skills.
+The active packet has two runtime skills, installed together. Their fixed
+sections are:
 
-### Reproduction Skill
+- `reproduction_skill/SKILL.md`: `construct_input`, `reach_vulnerable_code`,
+  `trigger_condition`, and `verify_result`;
+- `submission_skill/SKILL.md`: `when_to_submit`, `after_feedback`, and
+  `when_to_stop`.
 
-`reproduction_skill/SKILL.md` contains:
+Each section has a fixed Goal scaffold and at most three learned lessons.
+The historical five-file packet and the older complete two-layer packet remain
+available only by explicit path for reproducibility.
 
-- `R.A Reproduction Loop`: fixed. It gives a light loop: read the description,
-  build a plausible PoC candidate early, submit, interpret feedback, revise or
-  finalize.
-- `R.B Learned Reproduction Lessons`: updateable. These are short behavioral
-  biases for search, candidate construction, mutation, and path switching.
-
-No other reproduction sections are currently writable. Do not reintroduce large
-stage-level rule blocks unless the workflow is explicitly redesigned.
-
-### Submission Skill
-
-`submission_skill/SKILL.md` contains:
-
-- `S.A Submission Loop`: fixed mechanical loop.
-- `S.B Evidence-Gain Principle`: fixed. Submission feedback is evidence for the
-  next candidate, not automatic final success.
-- `S.C Learned Submission Lessons`: updateable. These are short behavioral
-  biases about validation, feedback use, duplicate avoidance, and non-target
-  crash handling.
-
-Helpers are mechanical only:
-
-- `submit_preflight.py`: file existence, exact duplicate detection,
-  near-duplicate warning, structural summary.
-- `submit_history.py`: candidate hash, analysis path, result path, status, and
-  notes.
-
-Helpers must not judge semantic evidence gain, force a submission, expose GT, or
-change feedback semantics across harnesses.
+The active two-layer staged packet contains no agent-facing helpers. Submission
+history and reachability are recorded by the harness/evaluator, not by a helper
+skill. Historical packets may still carry their old helpers for reproducibility;
+those helpers must not change feedback semantics across harnesses.
 
 ## One Operational Batch
 
@@ -183,7 +175,11 @@ Teacher consumes:
 - current lesson snapshot and capacity;
 - diagnoses from the most recent 3 accepted operational batches;
 - retry diagnoses when present;
-- pools.
+- pools;
+- a same-sample paired evidence view containing the initial-skill, evolving,
+  and no-skill arms, with candidate progression and visible-feedback summaries.
+The pairing is at the sample level; candidate sequence numbers across arms do
+not identify the same PoC.
 
 Teacher performs contrastive behavioral learning:
 
@@ -194,10 +190,10 @@ Teacher performs contrastive behavioral learning:
 - productive path switching versus broad drift or wrong-path refinement;
 - timely submission versus prolonged analysis without a concrete test.
 
-Teacher may propose at most two concise updates. Allowed targets are only:
-
-- `reproduction:R.B`
-- `submission:S.C`
+Teacher assigns each update to exactly one of the seven current section
+targets. It may
+propose at most one concise update per supported mechanism, and the Curator
+enforces the three-lesson capacity within each stage.
 
 Teacher must not modify `R.A`, `S.A`, or `S.B`. Every proposal is a conditional
 behavior bias: its condition must be observable from the public issue, source,
@@ -216,7 +212,8 @@ executable-progress contrast across samples.
 
 ## Curator
 
-Curator receives Teacher proposals and the current skill. It returns only:
+Curator receives Teacher proposals, the current skill, the same-sample paired
+evidence view used by Teacher, current diagnoses, and pools. It returns only:
 
 - `MODIFY`: accept by rewriting the lesson into concise, transferable skill text;
 - `SKIP`: reject.
@@ -249,6 +246,11 @@ deltas, success counts, duplicate counts, packet paths, result directories, and
 any restored artifacts. No-skill or historical full-run results remain external
 references; the hard propagation gate is the same-sample target-depth contract.
 
+Its rolling comparison contains the same three arms for every sample:
+`initial_skill`, `evolving`, and `no_skill`. Candidate progression sequences
+are retained in each arm so Correction can distinguish a packet effect from
+ordinary candidate variation.
+
 ## Batch-Level Control Flow
 
 The portable DSH baseline split and control sources are tracked at
@@ -270,14 +272,20 @@ For each batch `k`:
 1. Start from accepted skill `S_k`.
 2. Run batch `k` with `S_k`.
 3. Evaluate and diagnose the accepted batch result.
-4. Add accepted diagnoses to pools.
-5. Teacher proposes updates from the latest 3 accepted batches plus pools.
-6. Curator rewrites or skips proposals.
-7. Apply accepted curation to form `S_candidate` for the next batch.
-8. Validate `S_candidate` against `S_k` on a matched next batch or small panel.
-9. If validation passes, promote `S_candidate` to accepted `S_{k+1}`.
-10. If validation fails, roll back or correct, then rerun the same validation
-    batch with the previous accepted skill before moving forward.
+4. For `k > 0`, Correction compares the current packet with the previous
+   packet using the matched initial/evolving/no-skill rolling window. If it
+   returns `CORRECT` or `ROLLBACK`, apply that decision and rerun the same
+   batch before learning from it; the machine gate restores the pre-correction
+   artifacts if target depth, GT success, or duplicate submissions regress.
+5. Add the accepted (possibly corrected) diagnoses to pools.
+6. Teacher proposes updates from the latest 3 accepted batches plus pools.
+7. Curator verifies the proposals against the same-sample triplets and
+   rewrites or skips them.
+8. Apply accepted curation to form `S_{k+1}`.
+
+Held-out or matched-panel validation of `S_{k+1}` is a separate optional
+experiment (`build-validation-panel`/`run-test`); it is not currently invoked
+automatically by `train-batches`.
 
 This means a non-improving update is not allowed to silently continue into later
 batches.
@@ -286,10 +294,17 @@ batches.
 
 Canonical locations:
 
-- `reward_framework/skill_packets/dsh_deepseek_initial_100_100/`: immutable
-  initial packet for the canonical 100/100 DSH experiment.
-- `reward_framework/skill_packets/dsh_deepseek_evolving_100_100/`: stable
-  deployable evolving packet snapshot; its `PACKET_META.json` records hashes.
+- `reward_framework/skill_packets/dsh_deepseek_initial_two_layer_staged_100_100/`:
+  immutable two-file staged initial packet for the current DSH experiment.
+- `reward_framework/skill_packets/dsh_deepseek_evolving_two_layer_staged_100_100/`:
+  stable two-file evolving snapshot; its `PACKET_META.json` records the
+  content hash.
+- `reward_framework/skill_packets/_archive/historical_packets/`: retained
+  historical five-file and legacy complete-flow packets, never selected by
+  the active defaults.
+- `reward_framework/results/dsh_deepseek/RESULTS_INDEX.json`: the authoritative
+  initial/evolving TRAIN and TEST run registry, including prompt and packet
+  hashes and token-budget caveats.
 - `reward_framework/distillation_runs/<run>/skill_packets/batch_XXX/`: accepted
   or candidate packets for a distillation run.
 - `reward_framework/distillation_runs/<run>/batch_XXX/samples.txt`: batch sample
@@ -298,11 +313,16 @@ Canonical locations:
   deterministic evaluation.
 - `reward_framework/distillation_runs/<run>/batch_XXX/diagnoses.json`: behavior
   diagnoses for accepted first attempts.
+- `reward_framework/distillation_runs/<run>/batch_XXX/teacher_evidence.json`:
+  shared current-batch initial/evolving/no-skill evidence for Correction,
+  Teacher, and Curator.
 - `reward_framework/distillation_runs/<run>/batch_XXX/retry/`: retry sample
   lists and merge reports.
 - `reward_framework/distillation_runs/<run>/batch_XXX/teacher_candidate_updates.json`.
 - `reward_framework/distillation_runs/<run>/batch_XXX/curator_decisions.json`.
 - `reward_framework/distillation_runs/<run>/batch_XXX/correction_decision.json`.
+- `reward_framework/distillation_runs/<run>/batch_XXX/rolling_comparison.json`
+  and `correction_gate.json`.
 - `reward_framework/harness_runs/<run_id>/results/<sample_id>/`: generated PoC
   run artifacts.
 

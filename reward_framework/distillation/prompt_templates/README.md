@@ -14,7 +14,11 @@ of the machinery, it is swappable across all four harnesses, and its prompt is
 
 Python code appends machine-readable JSON payloads to these templates. Edit these documents to change role behavior without changing orchestration code.
 
-## Two invariants the templates must keep stating
+The role templates use one evidence contract. Evaluator-owned reachability is
+available to the Diagnostician and Correction, while Teacher and Curator use
+the bounded role-facing evidence projection built by the orchestrator.
+
+## Invariants the templates must keep stating
 
 **The outcome is not an opinion.** Sample-level `outcome`, `deepest_stage`, and
 `first_failed_stage` come from `reward_framework/distillation/outcome.py`,
@@ -30,8 +34,21 @@ turn it into a lesson.
 **Diagnosis is structured.** The Diagnostician must emit the harness/process
 checklist, vulnerability-distance checklist, ordered candidate sequence,
 progress events, turning events, and an explicit initial-skill comparison when
-one is supplied. Free-form prose cannot replace those records.
+one is supplied. It also emits the normalized offline `failure_stage`: the
+behavior-first `submission:when_to_submit`, `submission:after_feedback`,
+`submission:when_to_stop`, and `reproduction:verify_result` routes take
+priority over first-missing ladder mapping to `construct_input`,
+`reach_vulnerable_code`, or `trigger_condition`. A confirmed success is not
+routed from a stale per-candidate ladder conflict. Free-form prose cannot
+replace those records. Compact learning views preserve explicit empty
+candidate/progress/turning arrays for no-submission samples.
 
-**The shared rubric is search-policy first.** Diagnosis, Teacher, and Curator all optimize the same two goals: improve target reproduction within the finite interaction budget, and reduce false positives without suppressing useful submissions. They should explicitly reason about submission starvation, feedback-loop failure, false-positive stopping, target mismatch, over-investigation, and artifact misalignment.
+**The shared rubric is stage-aware search policy first.** Diagnosis, Teacher,
+and Curator all optimize the same two goals: improve target reproduction within
+the finite interaction budget, and reduce false positives without suppressing
+useful submissions. Teacher assigns each update to one of the seven sections
+in the two runtime skills; they should explicitly reason about submission
+starvation, feedback-loop failure, false-positive stopping, target mismatch,
+over-investigation, and artifact misalignment.
 
 **`proposal` and `evidence` are separated on purpose.** Only `proposal` can reach `SKILL.md`, and `SKILL.md` is read by the agent at test time, so proposals must be transferable and free of source files, function names, line numbers, projects, sample ids, and concrete constants. `evidence` carries the specifics, stays in the run artifacts, and is never packaged. `lint.py` enforces this mechanically; the templates exist so the models do not waste updates on text that will be rejected.

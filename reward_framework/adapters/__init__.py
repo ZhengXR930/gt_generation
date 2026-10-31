@@ -1,10 +1,10 @@
-"""The four reward-framework harness adapters."""
+"""The reward-framework harness adapters."""
 
 from importlib import import_module
 
 from .base import RewardCommand, RewardRequest
 
-HARNESSES = ("openhands", "codex", "claude", "deepseek_harness")
+HARNESSES = ("openhands", "codex", "claude", "deepseek_harness", "zcode")
 
 
 def get_adapter(name: str):

@@ -1,8 +1,8 @@
 """Claude adapter contract.
 
 Claude Code reads skills and project memory from `.claude`/`~/.claude`.
-This adapter exports the two-layer packet as native SKILL.md folders and can
-optionally write a project bridge file.
+This adapter exports legacy or five-stage packets as native SKILL.md folders
+and can optionally write a project bridge file.
 """
 
 from __future__ import annotations

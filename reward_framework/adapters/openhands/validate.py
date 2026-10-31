@@ -16,10 +16,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from reward_framework.adapters.openhands.contract import (  # noqa: E402
     REPRODUCTION_SKILL_REL,
+    REQUIRED_STAGE_HELPERS,
     REQUIRED_SUBMISSION_HELPERS,
     SUBMISSION_SKILL_REL,
     WORKSPACE_STATE_DIR,
 )
+from reward_framework.distillation.skill_packet import is_direct_stage_packet  # noqa: E402
 
 REQUIRED = {
     REPRODUCTION_SKILL_REL: ("PoC Reproduction Skill",),
@@ -55,7 +57,20 @@ def check_packet(packet: Path) -> list[str]:
     notes: list[str] = []
     if not packet.is_dir():
         fail(f"missing packet dir: {packet}")
-    for rel, required_texts in REQUIRED.items():
+    stage_packet = (packet / "skills").is_dir()
+    required = REQUIRED
+    if stage_packet:
+        required = {
+            f"skills/{stage}/SKILL.md": (f"# {stage}", "Goal:")
+            for stage in ("construct_input", "reach_vulnerable_code", "trigger_condition", "verify_result", "iterate")
+        }
+        required.update({f"helpers/{name}": () for name in REQUIRED_STAGE_HELPERS})
+    elif is_direct_stage_packet(packet):
+        required = {
+            REPRODUCTION_SKILL_REL: ("# PoC Reproduction", "## construct_input", "## verify_result"),
+            SUBMISSION_SKILL_REL: ("# PoC Submission", "## when_to_submit", "## when_to_stop"),
+        }
+    for rel, required_texts in required.items():
         path = packet / rel
         if not path.is_file():
             fail(f"missing required packet file: {packet}/{rel}")
@@ -80,46 +95,49 @@ def check_packet(packet: Path) -> list[str]:
         analysis.write_text('{"sample_id":"smoke"}\n', encoding="utf-8")
         result.write_text('{"exit_code":0}\n', encoding="utf-8")
 
-        commands = [
-            [
-                "python3",
-                str(packet / "submission_skill/helpers/submit_preflight.py"),
-                "--candidate",
-                str(candidate),
-                "--history-jsonl",
-                str(state / "submit_history.jsonl"),
-                "--analysis",
-                str(analysis),
-                "--out",
-                str(state / "preflight.json"),
-            ],
-            [
-                "python3",
-                str(packet / "submission_skill/helpers/submit_history.py"),
-                "record",
-                "--candidate",
-                str(candidate),
-                "--analysis",
-                str(analysis),
-                "--history-jsonl",
-                str(state / "submit_history.jsonl"),
-                "--result-json",
-                str(result),
-                "--status",
-                "smoke",
-                "--note",
-                "smoke",
-            ],
-            [
-                "python3",
-                str(packet / "submission_skill/helpers/submit_history.py"),
-                "summarize",
-                "--history-jsonl",
-                str(state / "submit_history.jsonl"),
-                "--out",
-                str(state / "submit_history_summary.json"),
-            ],
-        ]
+        helper_root = packet / ("helpers" if stage_packet else "submission_skill/helpers")
+        commands = []
+        if helper_root.is_dir() and REQUIRED_SUBMISSION_HELPERS:
+            commands = [
+                [
+                    "python3",
+                    str(helper_root / "submit_preflight.py"),
+                    "--candidate",
+                    str(candidate),
+                    "--history-jsonl",
+                    str(state / "submit_history.jsonl"),
+                    "--analysis",
+                    str(analysis),
+                    "--out",
+                    str(state / "preflight.json"),
+                ],
+                [
+                    "python3",
+                    str(helper_root / "submit_history.py"),
+                    "record",
+                    "--candidate",
+                    str(candidate),
+                    "--analysis",
+                    str(analysis),
+                    "--history-jsonl",
+                    str(state / "submit_history.jsonl"),
+                    "--result-json",
+                    str(result),
+                    "--status",
+                    "smoke",
+                    "--note",
+                    "smoke",
+                ],
+                [
+                    "python3",
+                    str(helper_root / "submit_history.py"),
+                    "summarize",
+                    "--history-jsonl",
+                    str(state / "submit_history.jsonl"),
+                    "--out",
+                    str(state / "submit_history_summary.json"),
+                ],
+            ]
         for cmd in commands:
             proc = subprocess.run(cmd, cwd=work, text=True, capture_output=True, check=False)
             if proc.returncode != 0:
@@ -131,10 +149,11 @@ def check_packet(packet: Path) -> list[str]:
                     + "\nstderr="
                     + proc.stderr
                 )
-        for name in ("preflight.json", "submit_history.jsonl", "submit_history_summary.json"):
-            path = state / name
-            if not path.is_file() or path.stat().st_size <= 0:
-                fail(f"helper smoke missing output: {name}")
+        if commands:
+            for name in ("preflight.json", "submit_history.jsonl", "submit_history_summary.json"):
+                path = state / name
+                if not path.is_file() or path.stat().st_size <= 0:
+                    fail(f"helper smoke missing output: {name}")
     notes.append(f"packet ok: {packet}")
     return notes
 
@@ -163,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
 
     packets = [Path(p).resolve() for p in args.packet]
     if not packets:
-        packets = [REPO_ROOT / "reward_framework" / "skill_packets" / "initial"]
+        packets = [REPO_ROOT / "reward_framework" / "skill_packets" / "dsh_deepseek_initial_two_layer_staged_100_100"]
     notes: list[str] = []
     for packet in packets:
         notes.extend(check_packet(packet))

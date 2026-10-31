@@ -8,15 +8,18 @@ instead of a truncated excerpt, every role can grep and diff its inputs with
 real tools, and all four agents in the pipeline run on the same harness and
 model, so provenance stays comparable.
 
-Role workspaces deliberately get isolated agent state: the PoC reproduction and
-submission skills belong to the agent under study, not to the roles studying it.
+Role workspaces deliberately get isolated agent state: the PoC skill packet
+belongs to the agent under study, not to the roles studying it.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
+import subprocess
+import time
 from hashlib import sha256
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,13 +31,16 @@ from harness_runtime.subsession import SubsessionSpec, run_codex_subsession
 from .artifacts import GT_RESULTS, REPO_ROOT, load_json_if_exists, write_json
 from .outcome import (
     OBSERVED_STAGE_ORDER,
+    candidate_occurrence_records,
     classify_outcome,
     diagnosis_case_profile,
     diagnostics_summary,
     ordered_candidate_sequence,
 )
+from .teacher_evidence import role_visible_evidence
+from poc_generation.gt_trigger_oracle import gt_triggered
 from .prompts import role_task_prompt
-from .skill_packet import lessons_snapshot
+from .skill_packet import is_stage_packet, lessons_snapshot
 
 OUTPUT_NAME = "OUTPUT.json"
 STATUS_NAME = "STATUS.json"
@@ -59,6 +65,15 @@ TRAJECTORY_CANDIDATES = (
     "checkpoint/openhands_stdout.txt",
     "checkpoint/codex_stdout.txt",
     "checkpoint/claude_stdout.txt",
+)
+
+# ZCode keeps the actual model/tool exchange under ``runs`` rather than under
+# ``checkpoint``.  It is the primary behavioral record for ZCode; the
+# checkpoint agent.log is only a launcher/terminal log and is retained as
+# supplementary evidence when present.
+ZCODE_TRAJECTORY_PATTERNS = (
+    "runs/zcode_model_io/trajectory.jsonl",
+    "runs/*/trajectory.jsonl",
 )
 
 # The raw agent session is the primary behavioral evidence for a diagnosis.
@@ -102,6 +117,9 @@ def _file_sha256(path: Path) -> str:
 def _jsonl_events(paths: list[Path]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for path in paths:
+        if path.name == "trajectory.jsonl" and "zcode_model_io" in path.parts:
+            events.extend(_zcode_trajectory_events(path))
+            continue
         try:
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
@@ -112,6 +130,142 @@ def _jsonl_events(paths: list[Path]) -> list[dict[str, Any]]:
                     events.append(value)
         except OSError:
             continue
+    return events
+
+
+def _zcode_trajectory_events(path: Path) -> list[dict[str, Any]]:
+    """Normalize ZCode model-I/O JSONL into the event shape used by checks.
+
+    ZCode writes one ``request`` and one SSE ``response`` record per model
+    call.  The response body contains streamed tool-call fragments, so the
+    raw file cannot be consumed by the session-v4 event parser directly.  We
+    retain the raw trajectory for the diagnostician and expose only compact,
+    evaluator-owned tool/message events to the bounded harness checklist.
+    """
+    events: list[dict[str, Any]] = []
+    try:
+        records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError):
+        return events
+
+    name_map = {
+        "Bash": "bash",
+        "Read": "read",
+        "Write": "write",
+        "TodoWrite": "todowrite",
+    }
+    seen_tool_results: set[str] = set()
+    for record_index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        recorded_at = record.get("recorded_at")
+        kind = record.get("kind")
+        if kind == "request":
+            # Each ZCode request contains the full conversation so far.  Only
+            # materialize a tool result once, keyed by its tool_call_id; this
+            # gives the checklist real command output without duplicating the
+            # entire history on every request.
+            payload = record.get("payload") or {}
+            for message in payload.get("messages") or []:
+                if not isinstance(message, dict) or message.get("role") != "tool":
+                    continue
+                tool_call_id = str(message.get("tool_call_id") or "")
+                if not tool_call_id or tool_call_id in seen_tool_results:
+                    continue
+                seen_tool_results.add(tool_call_id)
+                result_content = str(message.get("content") or "")
+                events.append({
+                    "type": "tool/result",
+                    "data": {
+                        "step": record_index // 2,
+                        "recorded_at": recorded_at,
+                        "tool_call_id": tool_call_id,
+                        # Keep the checklist bounded; the raw trajectory is
+                        # copied separately for full inspection.
+                        "content": result_content[:12000],
+                    },
+                })
+            events.append({
+                "type": "request/model",
+                "data": {"step": record_index // 2, "recorded_at": recorded_at},
+            })
+            continue
+        if kind != "response":
+            continue
+        chunks: list[dict[str, Any]] = []
+        body = str(record.get("body") or "")
+        for line in body.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                continue
+            try:
+                value = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                chunks.append(value)
+
+        calls: dict[int, dict[str, str]] = {}
+        finish_reasons: list[str] = []
+        content: list[str] = []
+        for chunk in chunks:
+            for choice in chunk.get("choices") or []:
+                finish_reason = choice.get("finish_reason")
+                if finish_reason not in (None, ""):
+                    finish_reasons.append(str(finish_reason))
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content.append(str(delta["content"]))
+                for tool_call in delta.get("tool_calls") or []:
+                    index = int(tool_call.get("index") or 0)
+                    item = calls.setdefault(index, {"name": "", "arguments": ""})
+                    function = tool_call.get("function") or {}
+                    item["name"] += str(function.get("name") or "")
+                    item["arguments"] += str(function.get("arguments") or "")
+
+        step = record_index // 2
+        for item in calls.values():
+            arguments: Any = item["arguments"]
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                pass
+            events.append({
+                "type": "tool/call",
+                "data": {
+                    "step": step,
+                    "recorded_at": recorded_at,
+                    "message": {
+                        "name": name_map.get(item["name"], item["name"].lower()),
+                        "arguments": arguments,
+                    },
+                },
+            })
+        if content:
+            events.append({
+                "type": "assistant/message",
+                "data": {
+                    "step": step,
+                    "recorded_at": recorded_at,
+                    "content": "".join(content),
+                },
+            })
+        if finish_reasons:
+            events.append({
+                "type": "assistant/finish",
+                "data": {
+                    "step": step,
+                    "recorded_at": recorded_at,
+                    "finish_reason": finish_reasons[-1],
+                    "finish_reasons": finish_reasons,
+                },
+            })
     return events
 
 
@@ -180,6 +334,22 @@ def _is_submit_call(event: dict[str, Any]) -> bool:
     return bool(re.search(r"(?:^|[;&]\s*)(?:bash\s+)?(?:\./)?submit\.sh\b", command))
 
 
+def _environment_signal(text: str) -> bool:
+    """Recognize runtime failures without matching source-code string literals."""
+    # Tool protocol errors and shell/compiler diagnostics are line-oriented;
+    # requiring a line boundary avoids treating a source dump containing the
+    # words ``command not found`` or ``permission denied`` as an environment
+    # failure in its own right.
+    patterns = (
+        r"(?im)^\s*<tool_use_error>[^\n]*",
+        r"(?im)^\s*\[[^\n]*network_guard[^\n]*\]",
+        r"(?im)^\s*(?:/[^:\n]+|[\w./-]+):(?:\s*line\s+\d+:|\s*\d+:)?\s*(?:command not found|permission denied)\b",
+        r"(?im)^\s*(?:g\+\+|gcc|clang|ld|collect2):\s*(?:command not found|error)\b",
+        r"(?im)^\s*(?:compile failed|compilation error|runner error|container error|dependency[^\n]{0,20}missing|timed out|timeout)\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 def _trajectory_harness_checklist(
     sample_dir: Path,
     raw_session_files: list[Path],
@@ -221,13 +391,42 @@ def _trajectory_harness_checklist(
         if event.get("type") in {"tool/result", "assistant/message", "system/message"}
         and re.search(r"output.{0,20}truncat|truncat.{0,20}output|response.{0,20}truncat", text, re.I)
     ]
+    # The authoritative output-limit signal is a final SSE choice chunk;
+    # it is not present in assistant content and was previously undercounted.
+    truncation_hits.extend(
+        text for event, text in zip(events, event_texts)
+        if event.get("type") == "assistant/finish"
+        and str((event.get("data") or {}).get("finish_reason") or "").lower()
+        in {"length", "max_tokens", "max_output_tokens"}
+    )
+    output_texts = [
+        text for event, text in zip(events, event_texts)
+        if event.get("type") in {"tool/result", "system/message"}
+    ]
+    def output_payload(event: dict[str, Any], serialized: str) -> str:
+        data = event.get("data") or {}
+        if isinstance(data, dict):
+            fragments = [
+                data.get(key) for key in ("content", "output", "stdout", "stderr", "message")
+                if data.get(key) not in (None, "")
+            ]
+            if fragments:
+                return "\n".join(str(item) for item in fragments)
+        return serialized
     tool_error_hits = [
-        text for text in event_texts
-        if re.search(r'"isError"\s*:\s*true|tool.{0,20}(error|failed)|permission denied|command not found', text, re.I)
+        text for text in output_texts
+        if re.search(
+            r'"isError"\s*:\s*true|<tool_use_error>|inputvalidationerror|'
+            r'tool.{0,20}(error|failed)|permission denied|command not found|'
+            r'unrecognized option|invalid option|unknown option',
+            text,
+            re.I,
+        )
     ]
     environment_hits = [
-        text for text in event_texts
-        if re.search(r"compile failed|compilation error|runner error|container error|permission denied|timed out|timeout|dependency.{0,20}missing|command not found", text, re.I)
+        output_payload(event, text) for event, text in zip(events, event_texts)
+        if event.get("type") in {"tool/result", "system/message"}
+        and _environment_signal(output_payload(event, text))
     ]
     trajectory = {}
     trajectory_path = sample_dir / "checkpoint" / "trajectory"
@@ -412,11 +611,11 @@ def _vulnerability_checklist(
     candidate_sequence: list[dict[str, Any]],
 ) -> dict[str, Any]:
     runtime = (eval_row or {}).get("runtime") or {}
-    target_hits = sum(item.get("target_vulnerability_triggered") is True for item in candidate_sequence)
+    target_hits = sum(gt_triggered(item) for item in candidate_sequence)
     crashes = sum(bool(item.get("crash_observed")) for item in candidate_sequence)
     conflicts = [
         item.get("sequence") for item in candidate_sequence
-        if item.get("target_vulnerability_triggered") is True
+        if gt_triggered(item)
         and item.get("deepest_stage") not in {"target_issue", "sensitive_operation"}
     ]
     deepest = "none"
@@ -472,34 +671,77 @@ def diagnosis_trajectory_evidence(sample_dir: Path) -> dict[str, Any]:
     """
     manifest = load_json_if_exists(sample_dir / "manifest.json") or {}
     harness = str(manifest.get("harness") or "").strip().lower()
+    sample_root = sample_dir.resolve()
     checkpoint = (sample_dir / "checkpoint").resolve()
     dsh_checkpoint = (checkpoint / "dsh_home").is_dir()
     claude_checkpoint = (checkpoint / "file" / "sessions").is_dir()
     if harness in {"deepseek_harness", "dsh"} or dsh_checkpoint:
         patterns = DSH_SESSION_PATTERNS
+        files = _unique_files(
+            [path for pattern in patterns for path in checkpoint.glob(pattern)]
+        )
     elif claude_checkpoint:
         patterns = CLAUDE_SESSION_PATTERNS
+        files = _unique_files(
+            [path for pattern in patterns for path in checkpoint.glob(pattern)]
+        )
     else:
-        patterns = RAW_TRAJECTORY_PATTERNS
-    files = _unique_files(
-        [path for pattern in patterns for path in checkpoint.glob(pattern)]
-    )
+        # ZCode's model/tool trajectory lives below sample_dir/runs.  Keep
+        # checkpoint logs as supplementary evidence, but never let the small
+        # launcher log replace the full trajectory when both are present.
+        checkpoint_files = [
+            path for pattern in RAW_TRAJECTORY_PATTERNS
+            for path in checkpoint.glob(pattern)
+        ]
+        zcode_files = [
+            path for pattern in ZCODE_TRAJECTORY_PATTERNS
+            for path in sample_dir.glob(pattern)
+        ]
+        files = _unique_files(zcode_files + checkpoint_files)
+        files.sort(key=lambda path: (
+            0 if "zcode_model_io" in path.parts else 1,
+            str(path),
+        ))
+    # Some historical no-skill baseline exports retain the agent-authored
+    # analysis/manifest/submission artifacts but not the raw DSH transcript.
+    # They may be admitted only when the caller explicitly stages the marker;
+    # ordinary TRAIN diagnoses must still fail closed rather than treating
+    # checkpoint metadata as a trajectory.
+    metadata_only_marker = sample_dir / "diagnosis_metadata_only.ok"
+    metadata_only_allowed = metadata_only_marker.is_file()
     # A result with a declared harness or DSH checkpoint is an agent run, not
     # a legacy import.  A raw session/transcript is mandatory for diagnosis.
     required = (sample_dir / "manifest.json").is_file() or dsh_checkpoint
-    if required and not files:
+    if required and not files and not metadata_only_allowed:
         raise ValueError(
             f"diagnosis requires raw agent session evidence for {sample_dir.name} "
             f"(harness={harness or 'unknown'}); checkpoint metadata alone is insufficient"
         )
+    if any("zcode_model_io" in path.parts for path in files):
+        trace_format = "zcode_request_response_sse"
+    elif harness in {"deepseek_harness", "dsh"} or dsh_checkpoint:
+        trace_format = "dsh_session_v4_or_jsonl"
+    elif claude_checkpoint:
+        trace_format = "claude_session_events"
+    else:
+        trace_format = "harness_session_events_or_text"
     return {
         "protocol": "diagnosis-trajectory-evidence-v1",
         "sample_id": sample_dir.name,
         "harness": harness or None,
+        "trace_contract": "harness-normalized-v1",
+        "trace_format": trace_format,
         "raw_session_required": required,
+        "raw_session_available": bool(files),
+        "metadata_only": bool(required and not files and metadata_only_allowed),
+        "metadata_only_note": (
+            "Historical baseline retained no raw agent transcript; infer only from "
+            "agent-authored analysis, manifest, submissions, and returned feedback."
+            if required and not files and metadata_only_allowed else None
+        ),
         "raw_session_files": [
             {
-                "path": str(path.relative_to(checkpoint)),
+                "path": str(path.relative_to(sample_root)),
                 "bytes": path.stat().st_size,
                 "sha256": _file_sha256(path),
             }
@@ -527,6 +769,74 @@ SUBMISSION_FILES = (
     "candidate_trace.response.txt",
     "poc.bin",
 )
+
+
+def _diagnosis_reachability_view(eval_row: dict[str, Any] | None) -> dict[str, Any]:
+    """Return evaluator labels without copying hidden checkpoint witnesses.
+
+    Diagnostician may use target outcome and ladder labels during TRAIN, but a
+    complete ``reachability_eval.json`` also contains expected checkpoint
+    source, code, and breakpoint specifications.  Those are reference
+    evidence, not necessary for attributing the agent's behavior and must not
+    enter a role workspace.
+    """
+    row = eval_row or {}
+    runtime = row.get("runtime") if isinstance(row.get("runtime"), dict) else {}
+    candidates: list[dict[str, Any]] = []
+    for raw in runtime.get("candidates") or []:
+        if not isinstance(raw, dict):
+            continue
+        reach = raw.get("location_reachability")
+        reach = reach if isinstance(reach, dict) else {}
+        safe_reach = {
+            key: reach.get(key)
+            for key in (
+                "reachability_checked", "reachability_depth", "observed_anchor_depth",
+                "R1_input_admitted", "R1_parser_admitted", "R2_source_reached",
+                "R3_root_cause_reached", "R4_sink_reached", "R5_sanitizer_triggered",
+                "target_vulnerability_triggered", "raw_target_vulnerability_triggered",
+                "failure_stage", "reachability_failure_stage", "sanitizer_observed",
+            )
+            if reach.get(key) not in (None, "", [], {})
+        }
+        observed_hits = []
+        for hit in reach.get("hit_locations") or []:
+            if not isinstance(hit, dict):
+                continue
+            # Keep what replay observed, but strip expected/GT breakpoint
+            # fields that would reveal the evaluator's private witness.
+            observed_hits.append({
+                key: hit.get(key)
+                for key in ("kind", "file", "function", "line", "hit_count")
+                if hit.get(key) not in (None, "", [], {})
+            })
+        if observed_hits:
+            safe_reach["hit_locations"] = observed_hits
+        candidates.append({
+            key: raw.get(key)
+            for key in (
+                "attempt_id", "sequence_in_run", "poc_sha256", "original_exit_code",
+                "execution_status", "execution_error", "target_vulnerability_triggered",
+            )
+            if raw.get(key) not in (None, "", [], {})
+        } | {"location_reachability": safe_reach})
+    return {
+        "protocol": "diagnosis-reachability-view-v1",
+        "sample_id": row.get("sample_id"),
+        "offline_evaluator_annotation": True,
+        "summary": {
+            "reachability_source": runtime.get("reachability_source") or "reachability_eval.json",
+            **{
+                key: runtime.get(key)
+                for key in (
+                    "submitted_unique_pocs", "reachability_executed_candidates",
+                    "location_evaluated_candidates", "unavailable",
+                )
+                if runtime.get(key) not in (None, "", [], {})
+            },
+        },
+        "candidates": candidates,
+    }
 
 
 @dataclass(frozen=True)
@@ -669,13 +979,30 @@ class _Workspace:
         if copied:
             self.index.append((f"inputs/{name}/", description))
 
-    def copy_selected_files(self, source: Path, name: str, description: str, *, files: list[Path]) -> None:
-        """Copy an explicit, validated set while preserving paths below source."""
+    def copy_selected_files(
+        self,
+        source: Path | tuple[Path, ...],
+        name: str,
+        description: str,
+        *,
+        files: list[Path],
+    ) -> None:
+        """Copy validated files while preserving paths below one of the roots."""
+        roots = (source,) if isinstance(source, Path) else source
         copied = False
         for item in files:
             if not item.is_file():
                 continue
-            target = self.inputs / name / item.relative_to(source)
+            relative = None
+            for root in roots:
+                try:
+                    relative = item.relative_to(root)
+                    break
+                except ValueError:
+                    continue
+            if relative is None:
+                continue
+            target = self.inputs / name / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
             copied = True
@@ -691,10 +1018,15 @@ class _Workspace:
                      f"lesson ids and capacity for inputs/{name}/")
 
     def copy_packet(self, packet: Path) -> None:
+        packet_description = (
+            "the current five-stage packet as the agent receives it; read all five SKILL.md files"
+            if is_stage_packet(packet)
+            else "the current packet as the agent receives it; read both SKILL.md files"
+        )
         self.copy_packet_as(
             packet,
             "skill_packet",
-            "the current packet as the agent receives it; read both SKILL.md files",
+            packet_description,
             snapshot_name="lessons_snapshot.json",
         )
 
@@ -717,14 +1049,12 @@ def build_diagnosis_role(
     checkpoint_dir = sample_dir / "checkpoint"
     trajectory_evidence = diagnosis_trajectory_evidence(sample_dir)
     raw_session_files = [
-        checkpoint_dir / record["path"]
+        sample_dir / record["path"]
         for record in trajectory_evidence["raw_session_files"]
     ]
     submission_attempts = _manifest_submission_attempts(sample_dir)
     # Keep the evaluator row immutable, but make the complete occurrence
-    # sequence available to every downstream diagnostic view.  This prevents
-    # ``runtime.candidates`` deduplication from changing the stage/sequence
-    # semantics seen by the diagnostician and Correction.
+    # sequence available to the diagnostic view.
     diagnostic_eval_row = eval_row
     if submission_attempts and isinstance(eval_row, dict):
         diagnostic_eval_row = dict(eval_row)
@@ -743,7 +1073,7 @@ def build_diagnosis_role(
     space.copy(sample_dir / "context_visit.json", "context_visit.json",
                "files and functions the coding agent inspected, reconstructed from its checkpoint")
     space.copy_selected_files(
-        checkpoint_dir,
+        (checkpoint_dir, sample_dir),
         "agent_sessions",
         "complete raw coding-agent session/transcript; primary evidence for what the agent observed, reasoned, and did",
         files=raw_session_files,
@@ -756,7 +1086,7 @@ def build_diagnosis_role(
     space.put(
         "harness_checklist.json",
         _trajectory_harness_checklist(sample_dir, raw_session_files, trajectory_evidence),
-        "evaluator-owned harness/process checklist; explain it using raw sessions, do not recalculate it",
+        "trace-derived harness/process checklist; explain it using raw sessions, do not treat it as target reachability",
     )
     space.put(
         "vulnerability_checklist.json",
@@ -766,7 +1096,7 @@ def build_diagnosis_role(
     space.put(
         "candidate_sequence.json",
         candidate_sequence,
-        "ordered candidates with byte-level change summaries; add trajectory-backed interpretation for each item",
+        "ordered candidate progress view with evaluator ladder, observed behavior, and visible feedback",
     )
     summary = diagnostics_summary(diagnostic_eval_row)
     space.put("diagnostics_summary.json", summary,
@@ -802,7 +1132,7 @@ def build_diagnosis_role(
     space.put(
         "initial_comparison.json",
         initial_comparison,
-        "optional evaluator comparison against initial skill; unavailable must remain unknown",
+        "optional initial comparison",
     )
     space.copy_first([sample_dir / rel for rel in TRAJECTORY_CANDIDATES], "trajectory_metadata.txt",
                      "runner trajectory metadata or fallback log; use inputs/agent_sessions/ as the primary behavioral record")
@@ -815,25 +1145,57 @@ def build_diagnosis_role(
     space.copy_tree(sample_dir / "submissions", "submissions",
                     "one directory per submitted candidate: request, candidate provenance, result, analysis, runtime output, and raw PoC bytes",
                     keep=SUBMISSION_FILES)
-    # The agent-facing submit service may have been unavailable even though the
-    # runner's one-shot reachability replay executed the same persisted PoC
-    # successfully.  Give the diagnostician those durable replay records so it
-    # can distinguish a submit-service failure from the candidate's observed
-    # execution, without re-submitting or requiring the target image again.
-    space.copy(sample_dir / "reachability_eval.json", "reachability_eval.json",
-               "evaluator-owned per-candidate replay summary; not agent-visible feedback")
-    space.copy_glob_tree(sample_dir / "reachability", "reachability",
-                         "durable per-candidate replay traces: GDB stdout/stderr and hit ledgers; not agent-visible feedback",
-                         patterns=(
-                             "*/gdb_stdout.txt",
-                             "*/gdb_stderr.txt",
-                             "*/reachability_hits.json",
-                         ))
-
-    space.put("case_profile.json", diagnosis_case_profile(outcome_record, diagnostic_eval_row),
-              "compact evaluator-owned result and diagnostic summaries selecting the diagnosis branch; copy it exactly, do not recalculate it")
+    space.put(
+        "reachability_eval.json",
+        _diagnosis_reachability_view(diagnostic_eval_row),
+        "sanitized evaluator reachability labels and observed replay locations; not agent-visible feedback",
+    )
+    case_profile = diagnosis_case_profile(outcome_record, diagnostic_eval_row)
+    case_description = "compact evaluator-owned result and diagnostic summaries selecting the diagnosis branch; copy it exactly, do not recalculate it"
+    template = "diagnostician.md"
+    space.put("case_profile.json", case_profile, case_description)
     space.put("sample.json", {"sample_id": sample_id}, "the sample id to echo back")
-    return space.finish("diagnose", "diagnostician.md")
+    return space.finish("diagnose", template)
+
+
+def _evidence_index(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Return the role-facing index without inlining any arm trace."""
+    index = role_visible_evidence(evidence)
+    # The current/evolving samples are materialized in the evolving arm too;
+    # keep the top-level file an index so a role cannot confuse a control trace
+    # with the packet physically mounted at inputs/skill_packet/.
+    index.pop("samples", None)
+    detail = index.pop("paired_control_detail", None)
+    index.pop("paired_control", None)
+    arms = detail.get("arms") if isinstance(detail, dict) else None
+    if isinstance(arms, dict):
+        index["paired_control_paths"] = {
+            str(name): f"paired_controls/{name}.json" for name in arms
+        }
+        if "evolving" in arms:
+            index["current_arm_path"] = "paired_controls/evolving.json"
+        elif "initial_skill" in arms:
+            index["current_arm_path"] = "paired_controls/initial_skill.json"
+    index["paired_control_note"] = (
+        "Each arm is a separate file under inputs/paired_controls; "
+        "inputs/skill_packet is the only packet under test."
+    )
+    return index
+
+
+def _put_arm_evidence(space: _Workspace, evidence: dict[str, Any]) -> None:
+    """Materialize paired arms under explicit paths instead of one mixed blob."""
+    detail = role_visible_evidence(evidence).get("paired_control_detail")
+    arms = detail.get("arms") if isinstance(detail, dict) else None
+    if not isinstance(arms, dict):
+        return
+    for name, arm in arms.items():
+        if isinstance(arm, dict):
+            space.put(
+                f"paired_controls/{name}.json",
+                arm,
+                f"{name} control arm; agent-visible comparison evidence, not the packet under test",
+            )
 
 
 def build_teacher_role(
@@ -848,17 +1210,20 @@ def build_teacher_role(
     space.put("batch_diagnoses.json", diagnoses, "this batch's per-sample diagnoses")
     space.put("pools.json", pools_view,
               "accumulated target-reproduction, false-positive, failure, and infrastructure diagnoses")
-    space.put(
-        "teacher_evidence.json",
-        teacher_evidence or {
+    evidence = teacher_evidence or {
             "protocol": "teacher-evidence-view-v2",
             "sample_count": 0,
             "samples": [],
             "unavailable": "the caller did not provide an evaluator evidence view",
-        },
-        "ten-sample evidence view: bounded agent trace windows, candidate structure and visible feedback, evaluator reachability ladders, and Diagnostician explanations",
+        }
+    _put_arm_evidence(space, evidence)
+    space.put(
+        "teacher_evidence.json",
+        _evidence_index(evidence),
+        "ten-sample role evidence: bounded agent traces, mode-appropriate per-candidate feedback, paired arm files, and Diagnostician explanations; raw evaluator ladders remain private to diagnosis and Correction",
     )
-    return space.finish("teacher", "teacher.md")
+    template = "teacher.md"
+    return space.finish("teacher", template)
 
 
 def build_curator_role(
@@ -867,6 +1232,7 @@ def build_curator_role(
     candidate_updates: list[dict[str, Any]] | dict[str, Any],
     diagnoses: list[dict[str, Any]] | None = None,
     pools_view: dict[str, Any] | None = None,
+    teacher_evidence: dict[str, Any] | None = None,
 ) -> RoleRun:
     space = _Workspace(workspace)
     # A pre-findings caller passed pools as the fourth positional argument;
@@ -894,7 +1260,20 @@ def build_curator_role(
     if pools_view is not None:
         space.put("pools.json", pools_view,
                   "the same earlier-batch historical pool the Teacher used")
-    return space.finish("curator", "curator.md")
+    evidence = teacher_evidence or {
+            "protocol": "teacher-evidence-view-v2",
+            "sample_count": 0,
+            "samples": [],
+            "unavailable": "the paired initial/evolving/no-skill evidence was not supplied",
+        }
+    _put_arm_evidence(space, evidence)
+    space.put(
+        "teacher_evidence.json",
+        _evidence_index(evidence),
+        "the same per-sample agent-visible arm evidence supplied to Teacher; use it to verify causal claims without raw evaluator ladders",
+    )
+    template = "curator.md"
+    return space.finish("curator", template)
 
 
 FINAL_BATCH_FILES = (
@@ -999,6 +1378,7 @@ def build_correction_role(
     pools_view: dict[str, Any],
     baseline_evaluations: list[dict[str, Any]] | None = None,
     rolling_comparison: dict[str, Any] | None = None,
+    teacher_evidence: dict[str, Any] | None = None,
 ) -> RoleRun:
     space = _Workspace(workspace)
     space.copy_packet_as(previous_packet, "previous_skill",
@@ -1008,7 +1388,7 @@ def build_correction_role(
                          "the tentative/current packet being corrected",
                          snapshot_name="current_lessons_snapshot.json")
     space.put("batch_evaluation.json", batch_evaluation,
-              "current batch execution/evaluator results for the tentative/current packet")
+              "batch-level aggregation/index over per-sample analysis, reachability, and manifest artifacts; not a replacement for those raw evidence files")
     space.put("batch_diagnoses.json", batch_diagnoses,
               "per-sample diagnoses explaining the current batch outcomes")
     space.put("applied_updates.json", applied_updates,
@@ -1024,7 +1404,20 @@ def build_correction_role(
             rolling_comparison,
             "recent same-sample initial-skill versus evolving-skill comparison used only for calibration or rollback",
         )
-    return space.finish("correction", "correction.md")
+    evidence = teacher_evidence or {
+            "protocol": "teacher-evidence-view-v2",
+            "sample_count": 0,
+            "samples": [],
+            "unavailable": "the current-batch paired evidence was not supplied",
+        }
+    _put_arm_evidence(space, evidence)
+    space.put(
+        "teacher_evidence.json",
+        _evidence_index(evidence),
+        "the current-batch initial/evolving/no-skill evidence shared with Teacher and Curator",
+    )
+    template = "correction.md"
+    return space.finish("correction", template)
 
 
 def execute_role(
@@ -1062,6 +1455,16 @@ def execute_role(
             base_url=base_url,
             api_key_env=api_key_env,
             api_version=api_version,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout,
+        )
+    elif normalized_harness == "zcode":
+        status = _execute_zcode_role(
+            run,
+            model=model,
+            base_url=base_url,
+            api_key_env=api_key_env,
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout=timeout,
@@ -1211,4 +1614,140 @@ def _execute_dsh_role(
         "timed_out": timed_out,
         "stop_reason": stop_reason_hit,
         "seconds": seconds,
+    }
+
+
+def _execute_zcode_role(
+    run: RoleRun,
+    *,
+    model: str,
+    base_url: str,
+    api_key_env: str,
+    reasoning_effort: str,
+    max_output_tokens: int,
+    timeout: int,
+) -> dict[str, Any]:
+    """Run a distillation role in the isolated ZCode harness.
+
+    Role sessions have no submit service, but they use the same ZCode launcher,
+    localhost budget proxy, model-token clamp, and filesystem/network isolation
+    as benchmark coding episodes.  This keeps diagnosis, Teacher, and Curator
+    provenance on ZCode+GLM rather than silently falling back to DSH.
+    """
+    from types import SimpleNamespace
+
+    from harness_runtime.cli import (
+        _cleanup_cli_scratch,
+        _isolate_cli_agent_command,
+        _make_scratch,
+        _prepare_agent_env,
+        _terminate_process,
+        _zcode_command,
+        _zcode_isolated_env,
+    )
+
+    logs = run.workspace / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    stdout_path = logs / "zcode_stdout.txt"
+    sample_dir = run.workspace / ".zcode_role_run"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    scratch = _make_scratch(f"role_{run.role}", "zcode")
+    service_procs: list[subprocess.Popen] = []
+    started = time.monotonic()
+    returncode: int | None = None
+    timed_out = False
+    command: list[str] | None = None
+    env = _prepare_agent_env(run.workspace)
+    env["GT_ZCODE_HOST_WORKSPACE"] = str(run.workspace.resolve())
+    # _zcode_command consumes this argparse-shaped surface.  ZCode benchmark
+    # episodes intentionally require max reasoning; the role CLI's effort is
+    # recorded in provenance but mapped to that required launcher setting.
+    zcode_args = SimpleNamespace(
+        base_url=base_url,
+        api_key_env=api_key_env,
+        max_output_tokens=max_output_tokens,
+        max_iter=100,
+        timeout=timeout,
+        model=model,
+        zcode_reasoning_effort="max",
+        zcode_source_root="",
+        zcode_runtime_root="",
+        codex_provider_header=[],
+        codex_provider_bearer_token_env="",
+    )
+    try:
+        command, service_procs = _zcode_command(
+            zcode_args,
+            Path("/workspace"),
+            run.prompt,
+            env,
+            sample_dir,
+        )
+        isolated = _isolate_cli_agent_command(
+            command,
+            harness="zcode",
+            workspace=run.workspace,
+            scratch=scratch,
+            env=env,
+            agent_env=_zcode_isolated_env(env),
+        )
+        with stdout_path.open("w", encoding="utf-8") as stream:
+            stream.write("COMMAND " + json.dumps(isolated, ensure_ascii=False) + "\n")
+            stream.flush()
+            try:
+                completed = subprocess.run(
+                    isolated,
+                    cwd=run.workspace,
+                    env=env,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                    check=False,
+                )
+                returncode = completed.returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+    except Exception as exc:
+        return {
+            "subsession": run.role,
+            "harness": "zcode",
+            "status": "failed",
+            "returncode": returncode,
+            "workspace": str(run.workspace),
+            "output_file": str(run.output_file),
+            "stdout": str(stdout_path),
+            "command": command,
+            "error": f"{type(exc).__name__}: {exc}",
+            "seconds": round(time.monotonic() - started, 3),
+        }
+    finally:
+        for proc in service_procs:
+            try:
+                _terminate_process(proc)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        _cleanup_cli_scratch(scratch)
+
+    if timed_out:
+        status = "timeout"
+    elif returncode != 0:
+        status = "failed"
+    elif not run.output_file.is_file():
+        status = "missing_output"
+    else:
+        status = "ok"
+    return {
+        "subsession": run.role,
+        "harness": "zcode",
+        "status": status,
+        "returncode": returncode,
+        "workspace": str(run.workspace),
+        "output_file": str(run.output_file),
+        "stdout": str(stdout_path),
+        "command": command,
+        "timed_out": timed_out,
+        "seconds": round(time.monotonic() - started, 3),
     }

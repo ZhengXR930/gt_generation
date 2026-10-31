@@ -22,10 +22,20 @@ import re
 from pathlib import Path
 
 from reward_framework.adapters.base import SKILL_PATH_PLACEHOLDERS
-from reward_framework.distillation.skill_packet import TARGETS, read_lessons
+from reward_framework.adapters.agent_skill_export import (
+    LEVEL_SPECS,
+    STAGE_BUNDLE_SPEC,
+    STAGE_SPECS,
+    _strip_frontmatter,
+    stage_bundle_body,
+)
+from reward_framework.distillation.skill_packet import (
+    is_direct_stage_packet,
+    is_stage_packet,
+    read_lessons,
+    targets_for_packet,
+)
 
-SKILL_FILES = ("reproduction_skill/SKILL.md", "submission_skill/SKILL.md")
-NATIVE_SKILL_DIRS = {"reproduction_skill": "poc-reproduction", "submission_skill": "poc-submission"}
 REQUIRED_HELPERS = ("submit_history.py", "submit_preflight.py")
 
 _PLACEHOLDER_RE = re.compile(r"\$\{[A-Z_]+\}")
@@ -36,7 +46,7 @@ def check_installed_packet(source_packet: Path, agent_paths: dict[str, str], *, 
     """Return the ways this installation breaks packet transfer (empty = fine)."""
     return [
         *_check_skills(source_packet, Path(agent_paths.get("skill_packet") or "")),
-        *_check_helpers(Path(agent_paths.get("helpers") or "")),
+        *_check_helpers(source_packet, Path(agent_paths.get("helpers") or "")),
         *_check_submit_is_untouched(workspace),
     ]
 
@@ -46,9 +56,25 @@ def _check_skills(source_packet: Path, installed_root: Path) -> list[str]:
     if not installed_root.is_dir():
         return [f"agent_paths.skill_packet is not a directory: {installed_root}"]
 
-    for relative in SKILL_FILES:
+    if is_stage_packet(source_packet):
+        installed = installed_root / STAGE_BUNDLE_SPEC["native_name"] / "SKILL.md"
+        if not installed.is_file():
+            return ["installed packet is missing the aggregated five-stage lifecycle skill"]
+        installed_text = installed.read_text(encoding="utf-8", errors="replace")
+        expected_text, _ = stage_bundle_body(source_packet)
+        expected_text = _substitute_placeholders_for_compare(
+            expected_text,
+            installed_text=_strip_frontmatter(installed_text),
+        )
+        if _strip_frontmatter(installed_text).strip() != expected_text.strip():
+            errors.append("aggregated lifecycle skill differs from the five source stages")
+        return errors
+
+    specs = STAGE_SPECS if is_stage_packet(source_packet) else LEVEL_SPECS
+    for spec in specs:
+        relative = f"{spec['source_dir']}/SKILL.md"
         source = source_packet / relative
-        installed = _find_installed_skill(installed_root, relative)
+        installed = _find_installed_skill(installed_root, spec["native_name"], relative)
         if installed is None:
             errors.append(f"installed packet is missing {relative}")
             continue
@@ -88,12 +114,23 @@ def _check_lesson_resources(source_skill: Path, installed_skill: Path, relative:
     return errors
 
 
-def _find_installed_skill(root: Path, relative: str) -> Path | None:
+def _find_installed_skill(
+    root: Path, native_name: str, relative: str | None = None
+) -> Path | None:
     """Accept either the packet layout or a native Agent Skill export."""
+    if relative is None:
+        relative = native_name
+        if relative.startswith("skills/"):
+            native_name = STAGE_BUNDLE_SPEC["native_name"]
+        else:
+            native_name = {
+                "reproduction_skill/SKILL.md": "poc-reproduction",
+                "submission_skill/SKILL.md": "poc-submission",
+            }.get(relative, native_name)
     direct = root / relative
     if direct.is_file():
         return direct
-    native = root / NATIVE_SKILL_DIRS[relative.split("/", 1)[0]] / "SKILL.md"
+    native = root / native_name / "SKILL.md"
     return native if native.is_file() else None
 
 
@@ -104,17 +141,19 @@ def _same_lessons(source_packet: Path, relative: str, source_text: str, installe
     every adapter substitutes different absolute paths, so neither the whole file
     nor a naive line diff is the right comparison. Bullets cover both the learned
     lessons and the fixed R.A / S.A loops, so an adapter cannot quietly edit
-    either one. A packet straight from ``skill_packets/initial`` has no lesson
+    either one. The current empty packet is
+    ``skill_packets/dsh_deepseek_initial_two_layer_staged_100_100`` and has no lesson
     ids yet, so this must not depend on them.
     """
     expected = bullet_lines(source_text)
-    source_dir = relative.split("/", 1)[0]
+    source_dir = Path(relative).parent.as_posix()
     target = next(
-        (name for name, section in TARGETS.items()
+        (name for name, section in targets_for_packet(source_packet).items()
          if Path(section.path).parent.as_posix() == source_dir),
         None,
     )
-    if target is not None and (source_packet / TARGETS[target].lesson_dir / "INDEX.md").is_file():
+    targets = targets_for_packet(source_packet)
+    if target is not None and (source_packet / targets[target].lesson_dir / "INDEX.md").is_file():
         expected.extend(
             f"- [{lesson['lesson_id']}] {lesson['text']}"
             for lesson in read_lessons(source_packet)[target]
@@ -148,7 +187,13 @@ def bullet_lines(text: str) -> list[str]:
     return lines
 
 
-def _check_helpers(helpers_dir: Path) -> list[str]:
+def _check_helpers(source_packet: Path, helpers_dir: Path) -> list[str]:
+    # Both active staged layouts intentionally contain no helper skill.
+    # Submission history is evaluator/harness metadata, not an agent-facing
+    # skill dependency.  Keep the helper contract only for historical
+    # two-layer packets so their old runs remain reproducible.
+    if is_stage_packet(source_packet) or is_direct_stage_packet(source_packet):
+        return []
     if not helpers_dir.is_dir():
         return [f"agent_paths.helpers is not a directory: {helpers_dir}"]
     return [

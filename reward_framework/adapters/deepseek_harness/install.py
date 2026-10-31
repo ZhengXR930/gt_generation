@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from reward_framework.adapters.agent_skill_export import export_native_agent_skills
+from reward_framework.adapters.agent_skill_export import export_native_agent_skills, inject_stage_skills_into_prompt
 
 from reward_framework.adapters.deepseek_harness.contract import ADAPTER_NAME, INTERFACE_VERSION, resolve_bundle_dir
 from reward_framework.adapters.base import SKILL_PACKET_ENV, substitute_skill_path_placeholders
@@ -49,8 +49,8 @@ def export_bundle(packet: Path, destination: Path | None = None) -> dict:
         "# Reward Framework DeepSeek Harness Adapter\n\n"
         "This directory exports the current reward skill packet as native DSH "
         "filesystem skills. Mount `cordis.patch.yml` with `dsh --patch`; it "
-        "configures the built-in `skill-filesystem` provider so the built-in "
-        "`skill` tool can load `poc-reproduction` and `poc-submission`.\n",
+        "configures the built-in `skill-filesystem` provider. Five-stage "
+        "packets are exposed as one eagerly loaded lifecycle skill.\n",
         encoding="utf-8",
     )
     manifest = {
@@ -95,6 +95,7 @@ def install_workspace_skill_packet(
 ) -> dict:
     del harness, sample_id
     packet = Path(env[SKILL_PACKET_ENV]).expanduser().resolve()
+    inject_stage_skills_into_prompt(packet, env, scratch)
     skills_dir = workspace / ".dsh" / "skills"
     native_manifest = export_native_agent_skills(
         packet,
@@ -111,9 +112,9 @@ def install_workspace_skill_packet(
         "native_skill_export": native_manifest,
         "native_skill_root": str(skills_dir.resolve()),
     }
-    # These helpers are invoked by DSH inside the agent mount namespace.  Keep
-    # their mutable state under the task workspace rather than the host-only
-    # runner scratch directory, and substitute only guest-visible paths.
+    # Legacy packets may expose submission helpers.  The five-stage packet is
+    # deliberately helper-free; its five source stages are compiled into one
+    # agent-facing lifecycle skill and no helper path is injected.
     agent_workspace = Path("/workspace")
     agent_skills_dir = agent_workspace / ".dsh" / "skills"
     state_dir = skills_dir.parent / "state"
@@ -121,22 +122,25 @@ def install_workspace_skill_packet(
     patch_file = scratch / "dsh_native_skills.patch.yml"
     write_native_skill_patch(patch_file, agent_skills_dir)
     env["HARNESS_DSH_PATCH_FILE"] = str(patch_file)
-    substitute_skill_path_placeholders(
-        skills_dir,
-        helpers_dir=agent_skills_dir / "poc-submission" / "helpers",
-        state_dir=agent_workspace / ".dsh" / "state",
-        workspace=agent_workspace,
-    )
+    helper_skill = native_manifest.get("helper_skill")
+    helper_root = agent_skills_dir / str(helper_skill) / "helpers" if helper_skill else None
+    if helper_root is not None:
+        substitute_skill_path_placeholders(
+            skills_dir,
+            helpers_dir=helper_root,
+            state_dir=agent_workspace / ".dsh" / "state",
+            workspace=agent_workspace,
+        )
     manifest["agent_paths"] = {
         "skill_packet": str(skills_dir),
-        "helpers": str(skills_dir / "poc-submission" / "helpers"),
+        "helpers": str(helper_root or (agent_skills_dir / "helpers")),
         "state": str(state_dir),
         "workspace": str(workspace),
         "dsh_patch_file": str(patch_file),
     }
     manifest["agent_paths"] = {
         "skill_packet": str(agent_skills_dir),
-        "helpers": str(agent_skills_dir / "poc-submission" / "helpers"),
+        "helpers": str(helper_root or (agent_skills_dir / "helpers")),
         "state": str(agent_workspace / ".dsh" / "state"),
         "workspace": str(agent_workspace),
         "dsh_patch_file": "/run/gt-dsh-runtime/patch.yml",

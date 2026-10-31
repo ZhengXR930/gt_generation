@@ -13,6 +13,7 @@ run artifacts, never in the packet.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 from pathlib import Path
@@ -29,10 +30,15 @@ class Section(NamedTuple):
     heading: str
     capacity: int
     lesson_dir: str
+    lesson_prefix: str = ""
 
     @property
     def slug(self) -> str:
         """The id prefix for lessons in this section, e.g. ``R.B``."""
+        if self.lesson_prefix:
+            return self.lesson_prefix
+        if self.lesson_dir.startswith("skills/"):
+            return self.lesson_dir.split("/", 2)[1]
         return self.heading.split()[1]
 
 
@@ -46,6 +52,86 @@ TARGETS: dict[str, Section] = {
         "submission_skill/lessons",
     ),
 }
+
+# The legacy two-layer packet remains readable for historical baselines. New
+# packets use one fixed, agent-visible skill per reproduction stage. Each stage
+# has its own small lesson budget so the learned rules do not collapse into one
+# undifferentiated list.
+STAGE_NAMES = (
+    "construct_input",
+    "reach_vulnerable_code",
+    "trigger_condition",
+    "verify_result",
+    "iterate",
+)
+STAGE_TARGETS: dict[str, Section] = {
+    f"stage:{name}": Section(
+        f"skills/{name}/SKILL.md",
+        "## Learned lessons",
+        3,
+        f"skills/{name}/lessons",
+    )
+    for name in STAGE_NAMES
+}
+
+# Current packet layout: two runtime skills whose files are divided into
+# causal/behavioural stages. Lessons stay inline below their stage heading.
+DIRECT_STAGE_TARGETS: dict[str, Section] = {
+    "reproduction:construct_input": Section(
+        "reproduction_skill/SKILL.md", "## construct_input", 3,
+        "reproduction_skill", "construct_input",
+    ),
+    "reproduction:reach_vulnerable_code": Section(
+        "reproduction_skill/SKILL.md", "## reach_vulnerable_code", 3,
+        "reproduction_skill", "reach_vulnerable_code",
+    ),
+    "reproduction:trigger_condition": Section(
+        "reproduction_skill/SKILL.md", "## trigger_condition", 3,
+        "reproduction_skill", "trigger_condition",
+    ),
+    "reproduction:verify_result": Section(
+        "reproduction_skill/SKILL.md", "## verify_result", 3,
+        "reproduction_skill", "verify_result",
+    ),
+    "submission:when_to_submit": Section(
+        "submission_skill/SKILL.md", "## when_to_submit", 3,
+        "submission_skill", "when_to_submit",
+    ),
+    "submission:after_feedback": Section(
+        "submission_skill/SKILL.md", "## after_feedback", 3,
+        "submission_skill", "after_feedback",
+    ),
+    "submission:when_to_stop": Section(
+        "submission_skill/SKILL.md", "## when_to_stop", 3,
+        "submission_skill", "when_to_stop",
+    ),
+}
+
+
+def is_stage_packet(packet: Path) -> bool:
+    """Return whether *packet* uses the five-stage packet layout."""
+    return (packet / "skills").is_dir()
+
+
+def is_direct_stage_packet(packet: Path) -> bool:
+    """Return whether a two-file packet uses direct stage sections."""
+    metadata = packet / "PACKET_META.json"
+    if not metadata.is_file():
+        return False
+    try:
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("layout") == "two_layer_staged_v1"
+
+
+def targets_for_packet(packet: Path) -> dict[str, Section]:
+    """Select writable targets without changing legacy packet semantics."""
+    if is_stage_packet(packet):
+        return STAGE_TARGETS
+    if is_direct_stage_packet(packet):
+        return DIRECT_STAGE_TARGETS
+    return TARGETS
 
 # The curator vocabulary is MODIFY / REMOVE / SKIP. ACCEPT and MERGE are
 # tolerated as legacy spellings of MODIFY rather than rejected as malformed.
@@ -99,12 +185,65 @@ _KNOWN_MODULE_METADATA = {
 
 # --------------------------------------------------------------------------- packets
 
+PACKET_HASH_PROTOCOL = "sha256(sorted relative path + NUL + file bytes; excluding PACKET_META.json)"
+
+
+def packet_content_sha256(packet: Path) -> str:
+    """Return the content hash used for packet provenance.
+
+    ``PACKET_META.json`` is excluded so refreshing metadata never changes the
+    identity of the agent-visible packet.  The same protocol is used by the
+    historical packet snapshots and by new two-layer packets.
+    """
+    root = packet.resolve()
+    digest = hashlib.sha256()
+    files = sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and path.relative_to(root).as_posix() != "PACKET_META.json"
+    )
+    for path in files:
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def refresh_packet_metadata(
+    packet: Path,
+    *,
+    packet_name: str | None = None,
+    variant: str | None = None,
+) -> str | None:
+    """Refresh packet identity fields after materializing an update."""
+    metadata_path = packet / "PACKET_META.json"
+    if not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    if packet_name:
+        metadata["packet_name"] = packet_name
+    if variant:
+        metadata["variant"] = variant
+    metadata["content_hash_protocol"] = PACKET_HASH_PROTOCOL
+    digest = packet_content_sha256(packet)
+    metadata["content_sha256"] = digest
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return digest
+
 
 def copy_initial_packet(out: Path, source: Path = INITIAL_PACKET) -> Path:
     if out.exists():
         shutil.rmtree(out)
     shutil.copytree(source, out, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     normalize_packet(out)
+    refresh_packet_metadata(out, packet_name=out.name, variant="initial")
     return out
 
 
@@ -117,7 +256,7 @@ def normalize_packet(packet: Path) -> None:
     occurrence of an exact lesson, retain distinct lessons, and give every
     retained lesson a unique stable id.
     """
-    for section in TARGETS.values():
+    for section in targets_for_packet(packet).values():
         if _is_modular(packet, section):
             _normalize_modules(packet, section)
             continue
@@ -184,7 +323,9 @@ def materialize_modular_lessons(packet: Path) -> dict[str, list[dict[str, str]]]
     packets retain their original layout, while a layout experiment gets a
     separately named packet and an auditable conversion point.
     """
-    for target, section in TARGETS.items():
+    if is_direct_stage_packet(packet):
+        raise ValueError("direct stage packets keep lessons inline; modularization is not supported")
+    for target, section in targets_for_packet(packet).items():
         if _is_modular(packet, section):
             _normalize_modules(packet, section)
             continue
@@ -209,7 +350,7 @@ def materialize_modular_lessons(packet: Path) -> dict[str, list[dict[str, str]]]
             )
 
         # Replace exactly the old learned section, retaining all fixed material
-        # before and after it (including the submission helpers).
+        # before and after it.
         lines[start - 1:end] = _ROUTER.rstrip("\n").splitlines()
         _write(path, lines)
         _write_lesson_index(packet, target, section)
@@ -224,7 +365,7 @@ def read_lessons(packet: Path) -> dict[str, list[dict[str, str]]]:
             {"lesson_id": lesson.lesson_id, "text": lesson.text}
             for lesson in _read_target_lessons(packet, section)
         ]
-        for target, section in TARGETS.items()
+        for target, section in targets_for_packet(packet).items()
     }
 
 
@@ -238,7 +379,7 @@ def lessons_snapshot(packet: Path) -> dict[str, Any]:
             "free": max(section.capacity - len(lessons[target]), 0),
             "lessons": lessons[target],
         }
-        for target, section in TARGETS.items()
+        for target, section in targets_for_packet(packet).items()
     }
 
 
@@ -276,6 +417,7 @@ def apply_curator_decisions(
         (applied if "lesson_id" in outcome else skipped).append(outcome)
 
     _write_packet_changelog(target_packet, applied)
+    refresh_packet_metadata(target_packet, packet_name=target_packet.name, variant="evolving")
     return {
         "packet": str(target_packet),
         "applied": applied,
@@ -343,6 +485,7 @@ def apply_correction_decision(
             (applied if "lesson_id" in item else skipped).append(item)
 
     _write_packet_changelog(out_packet, applied)
+    refresh_packet_metadata(out_packet, packet_name=out_packet.name, variant="evolving")
     return {
         "packet": str(out_packet),
         "decision": decision,
@@ -353,11 +496,12 @@ def apply_correction_decision(
 
 
 def _remove_lesson(packet: Path, target: str, lesson_id: str) -> dict[str, Any]:
-    if target not in TARGETS:
+    targets = targets_for_packet(packet)
+    if target not in targets:
         return {"skip_reason": f"unknown or non-writable target {target!r}"}
     if not lesson_id:
         return {"skip_reason": "missing target_lesson_id for REMOVE"}
-    section = TARGETS[target]
+    section = targets[target]
     if _is_modular(packet, section):
         lessons = _read_target_lessons(packet, section)
         existing = next((lesson for lesson in lessons if lesson.lesson_id == lesson_id), None)
@@ -381,7 +525,8 @@ def _remove_lesson(packet: Path, target: str, lesson_id: str) -> dict[str, Any]:
     del lines[existing.line]
     remaining = _read_section(lines, section)
     if not remaining:
-        lines.insert(_insert_at(lines, section, remaining), "No learned lessons yet.")
+        sentinel = "No lesson yet." if is_direct_stage_packet(packet) else "No learned lessons yet."
+        lines.insert(_insert_at(lines, section, remaining), sentinel)
     _write(path, lines)
     return {"decision": "REMOVE", "mode": "remove", "lesson_id": lesson_id, "path": section.path}
 
@@ -405,7 +550,8 @@ def _apply_one(packet: Path, decision: dict[str, Any], index: dict[str, Any] | N
         return _remove_lesson(packet, target, requested)
     if action not in _WRITES:
         return {"skip_reason": f"unsupported decision {action!r}; use MODIFY, REMOVE, or SKIP"}
-    if target not in TARGETS:
+    targets = targets_for_packet(packet)
+    if target not in targets:
         return {"skip_reason": f"unknown or non-writable target {target!r}"}
     if not proposal:
         return {"skip_reason": "empty proposal"}
@@ -414,7 +560,7 @@ def _apply_one(packet: Path, decision: dict[str, Any], index: dict[str, Any] | N
     if lint_reasons:
         return {"skip_reason": "blocked by packet lint", "lint_reasons": lint_reasons}
 
-    section = TARGETS[target]
+    section = targets[target]
     path = packet / section.path
     lessons = _read_target_lessons(packet, section)
     if _is_modular(packet, section):
@@ -466,7 +612,7 @@ def _insert_at(lines: list[str], section: Section, lessons: list[Lesson]) -> int
     while end > start and not lines[end - 1].strip():
         end -= 1
     for index in range(end - 1, start - 1, -1):
-        if lines[index].strip().lower() == "no learned lessons yet.":
+        if lines[index].strip().lower() in {"no learned lessons yet.", "no lesson yet."}:
             del lines[index]
             end -= 1
     while end > start and not lines[end - 1].strip():
@@ -618,7 +764,7 @@ def _normalize_modules(packet: Path, section: Section) -> None:
             continue
         seen_ids.add(lesson.lesson_id)
         seen_text.add(_lesson_key(lesson.text))
-    target = next(name for name, candidate in TARGETS.items() if candidate == section)
+    target = next(name for name, candidate in targets_for_packet(packet).items() if candidate == section)
     _write_lesson_index(packet, target, section)
 
 
